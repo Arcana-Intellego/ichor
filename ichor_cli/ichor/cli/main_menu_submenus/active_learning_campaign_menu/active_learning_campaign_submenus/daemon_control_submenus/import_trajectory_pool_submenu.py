@@ -78,12 +78,11 @@ class ImportTrajectoryPoolFunctions:
             source=source,
             force=force,
             yes=False,
+            verbose=False,
         )
         rc = cmd_init(ns)
         if rc == 13 and not force:
             print("Pool already exists. Set force_reimport=true to replace it.")
-        elif rc != 0:
-            print("init returned exit code " + str(rc))
         import_trajectory_pool_menu_options.force_reimport = False
         _pause()
 

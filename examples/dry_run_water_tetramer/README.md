@@ -58,7 +58,7 @@ iterations, and writes a journal entry per phase transition.
 
 ```
 python -m ichor.hpc.active_learning.cli status --campaign-dir .
-python -m ichor.hpc.active_learning.cli journal --campaign-dir . | tail -20
+python -m ichor.hpc.active_learning.cli journal --campaign-dir . --last-n 20
 ```
 
 `status` shows the canonical state.json content. You should see

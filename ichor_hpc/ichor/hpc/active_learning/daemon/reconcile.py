@@ -7,9 +7,8 @@ recover; a silent reconstruction is exactly the bug class we want to avoid.
 "reconcile" inspects the on-disk artefacts that DO exist (QM_REFERENCE_DATA/
 committed iterations, TRAINED_MODELS/, journal entries) and proposes a
 "CampaignState" it believes is consistent with them. The proposal is
-written to "<state_path>.proposed" and the user must explicitly
-promote it ("mv state.json.proposed state.json") before restarting the
-daemon.
+written to "<state_path>.proposed" and the user must explicitly apply it
+through the guarded reconcile command before restarting the daemon.
 """
 from __future__ import annotations
 
@@ -2737,8 +2736,8 @@ def write_proposed_state(
     data_subdir: Union[str, Path] = Path(".DATA") / "ACTIVE_LEARNING",
 ) -> Path:
     """Write the proposed state to <state_path>.proposed and return the
-    path. The user promotes it manually via mv state.json.proposed
-    state.json after reviewing."""
+    path. The user applies it through the guarded reconcile command after
+    reviewing."""
     target = (
         Path(campaign_dir) / data_subdir / (DEFAULT_STATE_FILENAME + RECONCILE_SUFFIX)
     )

@@ -432,7 +432,14 @@ def test_resource_plan_human_output_includes_formula_and_evidence_contract(tmp_p
             }
         ],
     }
-    output = format_resource_plan(payload)
+    concise = format_resource_plan(payload)
+    assert "Status: submitted to Slurm" in concise
+    assert "CPUs per task: 10" in concise
+    assert "Memory per task: 10.0 GiB" in concise
+    assert "cpu_formula" not in concise
+    assert "evidence_sha256" not in concise
+
+    output = format_resource_plan(payload, verbose=True)
     assert "cpu_formula=diversity_pairs_per_worker" in output
     assert "evidence_sha256 pool.xyz " + "a" * 64 in output
     assert "scratch_template=scratch-template" in output

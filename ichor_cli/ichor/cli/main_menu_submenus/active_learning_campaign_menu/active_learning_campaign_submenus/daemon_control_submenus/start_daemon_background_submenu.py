@@ -12,6 +12,7 @@ flock remains the source of truth for whether the daemon is alive.
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
+import shlex
 
 import ichor.cli.global_menu_variables
 from consolemenu.items import FunctionItem
@@ -188,7 +189,7 @@ class StartDaemonBackgroundFunctions:
             else:
                 print("Saved campaign.yaml differs from the config lock:")
             print(edit_menu.format_saved_config_lock_review(config_override))
-            print("Run reconcile --apply for safe edits or revert blocked edits before starting.")
+            print("Run reconcile for a preview, then apply it only if reported safe.")
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
         if (
@@ -250,14 +251,24 @@ class StartDaemonBackgroundFunctions:
             if getattr(result, "readiness_error", None):
                 print("Startup failure: " + str(result.readiness_error))
         elif getattr(result, "startup_pending", False):
-            print("Detached daemon launched with PID " + str(result.pid))
+            print("Background process launched with PID " + str(result.pid))
             print(
                 "Startup is still in progress; the wait budget elapsed without "
                 "terminating the daemon."
             )
+        elif getattr(result, "ready", False):
+            print("Daemon started successfully in the background.")
+            print("PID: " + str(result.pid))
         else:
-            print("Detached daemon launched with PID " + str(result.pid))
-        print("Log: " + str(result.log_path))
+            print("Background process owns the campaign and startup continues.")
+            print("PID: " + str(result.pid))
+        quoted_campaign = shlex.quote(str(campaign_dir))
+        print("Monitor: ichor-al-daemon status --campaign-dir " + quoted_campaign)
+        print(
+            "Recent events: ichor-al-daemon journal --campaign-dir "
+            + quoted_campaign
+            + " --last-n 40"
+        )
         _log_info(
             "Background daemon launched for campaign " + str(campaign_dir)
             + " with PID " + str(result.pid)

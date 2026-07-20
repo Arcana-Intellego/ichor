@@ -360,7 +360,71 @@ def build_resource_plan(
     }
 
 
-def format_resource_plan(payload: Dict[str, Any]) -> str:
+def _human_status(value: Any) -> str:
+    return {
+        "prepared": "prepared for submission",
+        "submitted": "submitted to Slurm",
+        "completed": "completed",
+        "failed": "failed",
+        "superseded": "replaced by a later attempt",
+        "ready": "ready for submission",
+        "local": "runs locally without Slurm",
+        "evidence_not_yet_produced": "waiting for data from an earlier phase",
+        "evidence_invalid": "resource evidence is invalid",
+    }.get(str(value), str(value).replace("_", " "))
+
+
+def _gibibytes(value: Any) -> str:
+    try:
+        return format(float(value) / float(1024 ** 3), ".2f") + " GiB"
+    except (TypeError, ValueError):
+        return "not required"
+
+
+def format_resource_plan(
+    payload: Dict[str, Any],
+    *,
+    verbose: bool = False,
+) -> str:
+    if not verbose:
+        lines = [
+            "Resource plan",
+            "Campaign: " + str(payload["campaign_dir"]),
+            "Iteration: "
+            + str(payload.get("selected_iteration", payload.get("current_iteration"))),
+        ]
+        for plan in payload["plans"]:
+            lines.append("")
+            lines.append(str(plan["phase"]))
+            lines.append("  Status: " + _human_status(plan.get("status")))
+            resources = plan.get("resources")
+            if isinstance(resources, dict):
+                extra = resources.get("extra")
+                extra = extra if isinstance(extra, dict) else {}
+                lines.append("  Runs on: Slurm partition " + str(resources.get("partition")))
+                array_size = extra.get("array_size")
+                if array_size is not None:
+                    lines.append("  Array tasks: " + str(array_size))
+                    concurrency = extra.get("array_concurrency")
+                    if concurrency is not None:
+                        lines.append("  Maximum concurrent tasks: " + str(concurrency))
+                lines.append("  CPUs per task: " + str(resources.get("cpus_per_task")))
+                per_task = extra.get("per_task_allocation_gb")
+                if per_task is not None:
+                    lines.append("  Memory per task: " + str(per_task) + " GiB")
+                else:
+                    lines.append(
+                        "  Memory: " + str(resources.get("mem_per_cpu")) + " per CPU"
+                    )
+                scratch_bytes = extra.get("expected_scratch_bytes")
+                if scratch_bytes:
+                    lines.append("  Expected scratch space: " + _gibibytes(scratch_bytes))
+                for warning in resources.get("warnings") or []:
+                    lines.append("  Warning: " + str(warning))
+            elif plan.get("message"):
+                lines.append("  " + str(plan.get("message")))
+        return "\n".join(lines) + "\n"
+
     lines = [
         "Resource plan",
         "Campaign: " + str(payload["campaign_dir"]),

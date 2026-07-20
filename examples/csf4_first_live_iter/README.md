@@ -340,7 +340,8 @@ production settings must be selected explicitly in `campaign.yaml`.
 ## 7. launch the daemon
 
 ```
-ichor-al-daemon preflight --campaign-dir . --verbose
+ichor-al-daemon config-check --campaign-dir . --human
+ichor-al-daemon preflight --campaign-dir .
 ichor-al-daemon preflight --campaign-dir . --verbose --submit-environment-smoke
 ichor-al-daemon resource-plan --campaign-dir . --all
 ichor-al-daemon start --campaign-dir . --mode live --max-ticks 2000
@@ -377,7 +378,7 @@ not run forever even if something hangs). You can tail the journal in
 another shell:
 
 ```
-ichor-al-daemon journal --campaign-dir . | tail -n 20
+ichor-al-daemon journal --campaign-dir . --last-n 20
 ```
 
 The smoke config leaves Slurm arrays unthrottled with
@@ -443,7 +444,7 @@ If the run failed mid-iteration:
 
 ```
 # inspect what went wrong first
-ichor-al-daemon journal --campaign-dir . | tail -n 50
+ichor-al-daemon journal --campaign-dir . --last-n 50
 ichor-al-daemon status --campaign-dir .
 
 # if state.json is inconsistent, corrupt, or HALTED:
@@ -454,8 +455,9 @@ ichor-al-daemon reconcile --campaign-dir . --apply
 ```
 
 Do not move `state.json.proposed` over `state.json` manually. `--apply` holds the
-daemon lock, rechecks scheduler intent evidence, archives safe stale staging,
-updates the config lock, and verifies the final recovery contract.
+daemon lock, rechecks scheduler intent evidence, performs only the cleanup
+listed by the preview, updates the config lock, and verifies the final recovery
+contract. Staging is archived only when `--archive-staging` is explicitly used.
 
 Routine reconcile verifies complete metadata and file sizes without hashing
 large WFN, INT or Gaussian payloads. If `state.json` is missing or malformed,
@@ -470,7 +472,8 @@ on stderr; it is never started implicitly by ordinary reconcile.
 
 `DONE` is a successful terminal lifecycle, not a stopped daemon. To extend a
 completed campaign deliberately, first increase `campaign.max_iterations`, run
-and review `reconcile --apply`, then use the explicit reopen command:
+and review `reconcile`, apply the reviewed safe proposal, then use the explicit
+reopen command:
 
 ```
 ichor-al-daemon resume --campaign-dir . --reopen-converged --max-ticks 2000

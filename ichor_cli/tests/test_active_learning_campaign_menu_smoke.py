@@ -13,6 +13,7 @@ If any of these break, the menu wiring is the regression rather than the
 underlying daemon / config code (which has its own M1-M8 test suite).
 """
 import warnings
+import inspect
 from types import SimpleNamespace
 
 
@@ -31,22 +32,28 @@ def test_top_level_menu_imports_and_has_expected_items():
 
 def test_daemon_control_menu_items():
     from ichor.cli.main_menu_submenus.active_learning_campaign_menu.active_learning_campaign_submenus.daemon_control_menu import (
+        advanced_diagnostics_menu,
         daemon_control_menu,
+        recovery_maintenance_menu,
     )
     texts = [it.text for it in daemon_control_menu.items]
     for expected in (
-        "Toggle status JSON output",
-        "Toggle status verbose output",
         "Show status",
-        "Show sampling protocol summary",
-        "Show config editability windows",
-        "Recovery dashboard",
+        "Validate campaign config",
         "Campaign live preflight",
-        "Submit compute-node environment smoke",
+        "Resource Plan",
         "Initialise Campaign / Import Inputs",
         "Start/Resume Daemon (Foreground)",
         "Start/Resume Daemon (Background)",
         "Stop daemon",
+        "Recovery / Maintenance",
+        "Advanced Diagnostics",
+    ):
+        assert expected in texts, "missing item: " + expected
+
+    recovery_texts = [it.text for it in recovery_maintenance_menu.items]
+    for expected in (
+        "Recovery dashboard",
         "Reconcile state",
         "Reconcile --apply",
         "Reconcile --archive-staging --apply",
@@ -55,7 +62,44 @@ def test_daemon_control_menu_items():
         "Restore campaign.yaml proposal from config lock",
         "Reconcile state with --allow-fresh-init",
     ):
-        assert expected in texts, "missing item: " + expected
+        assert expected in recovery_texts, "missing recovery item: " + expected
+
+    advanced_texts = [it.text for it in advanced_diagnostics_menu.items]
+    for expected in (
+        "Toggle status JSON output",
+        "Toggle status verbose output",
+        "Show sampling protocol summary",
+        "Show config editability windows",
+        "Submit compute-node environment smoke",
+    ):
+        assert expected in advanced_texts, "missing diagnostic item: " + expected
+
+
+def test_daemon_menu_wrappers_do_not_append_raw_numeric_exit_messages():
+    import importlib
+
+    prefix = (
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus"
+    )
+    modules = [
+        importlib.import_module(prefix + ".daemon_control_menu"),
+        importlib.import_module(prefix + ".journal_menu"),
+        importlib.import_module(
+            prefix + ".daemon_control_submenus.import_trajectory_pool_submenu"
+        ),
+        importlib.import_module(
+            prefix + ".daemon_control_submenus.resource_plan_submenu"
+        ),
+        importlib.import_module(
+            prefix + ".daemon_control_submenus.start_daemon_foreground_submenu"
+        ),
+    ]
+
+    for module in modules:
+        source = inspect.getsource(module)
+        assert "returned exit code" not in source
+        assert "daemon exited with code" not in source
 
 
 def test_daemon_control_stop_can_request_job_cancellation(monkeypatch):
@@ -159,6 +203,40 @@ def test_daemon_control_archive_staging_dispatches_reconcile(monkeypatch):
         "restore_config_from_lock": False,
         "deep_verify": False,
     }
+
+
+def test_daemon_control_plain_apply_confirmation_matches_dispatched_flags(
+    monkeypatch,
+):
+    import importlib
+
+    import ichor.hpc.active_learning.cli as cli_mod
+
+    menu_mod = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.daemon_control_menu"
+    )
+    prompts = []
+    calls = []
+
+    def answer(prompt, _default):
+        prompts.append(prompt)
+        return "YES" if "Type YES" in prompt else ""
+
+    monkeypatch.setattr(
+        menu_mod,
+        "_guarded_campaign_dir_ns",
+        lambda: SimpleNamespace(campaign_dir="/tmp/campaign"),
+    )
+    monkeypatch.setattr(menu_mod, "user_input_free_flow", answer)
+    monkeypatch.setattr(cli_mod, "cmd_reconcile", lambda ns: calls.append(ns) or 0)
+
+    menu_mod.DaemonControlFunctions.reconcile_apply()
+
+    assert calls[0].apply is True
+    assert calls[0].archive_staging is False
+    assert "without archiving staging" in prompts[0]
+    assert "clean stale" not in prompts[0]
 
 
 def test_daemon_control_propagates_deep_reconcile_toggle(monkeypatch):
@@ -2184,8 +2262,41 @@ def test_preflight_menu_dispatches_campaign_aware_command(
     assert seen == {
         "campaign_dir": str(tmp_path.absolute()),
         "json": False,
-        "verbose": True,
+        "verbose": False,
     }
+
+
+def test_config_check_menu_dispatches_the_friendly_human_view(
+    tmp_path,
+    monkeypatch,
+):
+    import importlib
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.daemon_control_menu"
+    )
+    import ichor.hpc.active_learning.cli as daemon_cli
+
+    (tmp_path / "campaign.yaml").write_text("{}\n", encoding="utf-8")
+    set_selected_campaign_dir(tmp_path)
+    calls = []
+    monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
+    monkeypatch.setattr(
+        daemon_cli,
+        "cmd_config_check",
+        lambda ns: calls.append(ns) or 0,
+    )
+
+    menu.DaemonControlFunctions.config_check()
+
+    assert len(calls) == 1
+    assert calls[0].human is True
+    assert calls[0].json is False
 
 
 def test_submitted_environment_smoke_menu_requires_confirmation(
@@ -2278,6 +2389,7 @@ def test_init_pool_passes_verbatim_import_options(tmp_path, monkeypatch):
     assert calls[0].source == "pool.xyz"
     assert calls[0].force is False
     assert calls[0].yes is False
+    assert calls[0].verbose is False
 
 
 def test_init_pool_force_requires_confirmation_and_resets(tmp_path, monkeypatch):
@@ -2305,6 +2417,41 @@ def test_init_pool_force_requires_confirmation_and_resets(tmp_path, monkeypatch)
     assert calls
     assert calls[0].force is True
     assert menu.import_trajectory_pool_menu_options.force_reimport is False
+
+
+def test_resource_plan_menu_propagates_verbose_without_printing_exit_codes(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    import importlib
+
+    from ichor.cli.main_menu_submenus.active_learning_campaign_menu.campaign_context import (
+        set_selected_campaign_dir,
+    )
+
+    menu = importlib.import_module(
+        "ichor.cli.main_menu_submenus.active_learning_campaign_menu."
+        "active_learning_campaign_submenus.daemon_control_submenus."
+        "resource_plan_submenu"
+    )
+    import ichor.hpc.active_learning.cli as daemon_cli
+
+    set_selected_campaign_dir(tmp_path)
+    menu.resource_plan_options.verbose = True
+    calls = []
+    monkeypatch.setattr(menu, "user_input_free_flow", lambda *args, **kwargs: "")
+    monkeypatch.setattr(
+        daemon_cli,
+        "cmd_resource_plan",
+        lambda ns: calls.append(ns) or 14,
+    )
+
+    menu._run_resource_plan()
+
+    assert calls[0].verbose is True
+    assert "returned exit code" not in capsys.readouterr().out
+    menu.resource_plan_options.verbose = False
 
 
 def test_foreground_launch_uses_resume_when_selected(tmp_path, monkeypatch):

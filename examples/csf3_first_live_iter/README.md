@@ -161,7 +161,8 @@ are rejected so a staged input cannot disagree with its submitted resources.
 source ~/projects/ichor-active-learning/scripts/env_ichor_csf.sh --smoke
 
 ichor-al-daemon init
-ichor-al-daemon preflight --campaign-dir . --verbose
+ichor-al-daemon config-check --campaign-dir . --human
+ichor-al-daemon preflight --campaign-dir .
 ichor-al-daemon preflight --campaign-dir . --verbose --submit-environment-smoke
 ichor-al-daemon resource-plan --campaign-dir . --all
 ichor-al-daemon start --campaign-dir . --mode live --max-ticks 200
@@ -216,8 +217,8 @@ seen that `sacct` is lagging while `squeue` still shows active array tasks, so
 it will keep polling rather than halting the campaign.
 
 If the campaign becomes `HALTED`, inspect `status` and `journal`, run
-`ichor-al-daemon reconcile --campaign-dir .` as a dry run, and use
-`reconcile --apply` only after its recovery contract is safe. Do not overwrite
+`ichor-al-daemon reconcile --campaign-dir .` as a preview, and use
+`reconcile --apply` only after the preview reports that recovery is safe. Do not overwrite
 `state.json` with the proposal manually. A `DONE` campaign remains terminal;
 after deliberately increasing `campaign.max_iterations` and applying that
 config change through reconcile, extend it only with

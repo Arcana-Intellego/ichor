@@ -6,7 +6,7 @@ Console entry point 'ichor-al-daemon' registered in
     start      Start the live daemon detached by default; use --foreground to block.
     stop       Write a durable immediate or boundary stop request.
     status     Print the current state snapshot.
-    resume     Equivalent to start when state.json already exists.
+    resume     Continue a stopped or safely recovered campaign.
     reconcile  Inspect on-disk artefacts and propose a recovered state.
     journal    Tail or filter the campaign journal.
     init       Bootstrap campaign.yaml, daemon state, config lock, and pool.
@@ -24,6 +24,7 @@ import argparse
 import hashlib
 import inspect
 import os
+import shlex
 import signal
 from .strict_json import strict_json as json
 import secrets
@@ -326,6 +327,21 @@ def _campaign_paths(campaign_dir: Path):
         ),
         "stop_request": operational_path(campaign_dir, "stop_request.json"),
     }
+
+
+def _campaign_command(
+    campaign: Path,
+    command: str,
+    suffix: str = "",
+) -> str:
+    """Build one copyable daemon command for a campaign."""
+    return (
+        "ichor-al-daemon "
+        + str(command)
+        + " --campaign-dir "
+        + shlex.quote(str(campaign))
+        + str(suffix)
+    )
 
 
 def _stop_control_status(
@@ -1282,14 +1298,15 @@ def _launch_background_daemon(args: argparse.Namespace, campaign: Path) -> int:
             + " seconds; the live child was not terminated"
         )
     else:
-        print("daemon startup acknowledged in background")
-        print("  startup_state: " + str(startup_payload.get("state") or "unknown"))
+        startup_state = str(startup_payload.get("state") or "unknown")
+        if startup_state == "ready" or startup_payload.get("ready_at_iso"):
+            print("daemon started successfully in the background")
+        else:
+            print("background process owns the campaign and is still starting")
+        print("  startup state: " + startup_state)
     print("  pid: " + str(child.pid))
-    print("  log: " + str(log_path))
-    print("  pid_file: " + str(pid_path))
-    print("  startup_file: " + str(startup_path))
-    print("  status: ichor-al-daemon status --campaign-dir " + str(campaign))
-    print("  journal: ichor-al-daemon journal --campaign-dir " + str(campaign) + " --json | tail -n 40")
+    print("  status: " + _campaign_command(campaign, "status"))
+    print("  journal: " + _campaign_command(campaign, "journal", " --last-n 40"))
     return 0
 
 
@@ -1369,27 +1386,53 @@ def _format_contract_status(contract: Any) -> Optional[str]:
     return "not checked"
 
 
+_PHASE_TITLES: Dict[str, str] = {
+    CampaignPhase.INIT.value: "Campaign setup",
+    CampaignPhase.PHASE_A_DIVERSITY.value: "Bootstrap diversity selection",
+    CampaignPhase.INITIAL_GAUSSIAN.value: "Bootstrap Gaussian calculations",
+    CampaignPhase.INITIAL_AIMALL.value: "Bootstrap AIMAll calculations",
+    CampaignPhase.INITIAL_ALLOCATION_CHECK.value: "Bootstrap allocation check",
+    CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN.value: "Bootstrap replacement Gaussian calculations",
+    CampaignPhase.INITIAL_REPLACEMENT_AIMALL.value: "Bootstrap replacement AIMAll calculations",
+    CampaignPhase.REFERENCE_COMMIT.value: "QM reference-data publication",
+    CampaignPhase.INITIAL_FEREBUS.value: "Initial FEREBUS training",
+    CampaignPhase.SEED_SELECT.value: "ARIADNE seed selection",
+    CampaignPhase.ARIADNE_ARRAY.value: "ARIADNE landing",
+    CampaignPhase.PHASE_B_DIVERSITY.value: "Phase B diversity selection",
+    CampaignPhase.SPLIT.value: "QM batch allocation",
+    CampaignPhase.GAUSSIAN.value: "Gaussian calculations",
+    CampaignPhase.AIMALL.value: "AIMAll calculations",
+    CampaignPhase.ALLOCATION_CHECK.value: "Point-allocation check",
+    CampaignPhase.REPLACEMENT_GAUSSIAN.value: "Replacement Gaussian calculations",
+    CampaignPhase.REPLACEMENT_AIMALL.value: "Replacement AIMAll calculations",
+    CampaignPhase.FEREBUS.value: "FEREBUS retraining",
+    CampaignPhase.STOP_CHECK.value: "Iteration completion check",
+    CampaignPhase.DONE.value: "Campaign complete",
+    CampaignPhase.HALTED.value: "Campaign halted",
+}
+
+
 _PHASE_MEANINGS: Dict[str, str] = {
-    CampaignPhase.INIT.value: "campaign initialised; no sampling phase has run yet",
-    CampaignPhase.PHASE_A_DIVERSITY.value: "initial ICHOR diversity sampling is next",
-    CampaignPhase.INITIAL_GAUSSIAN.value: "initial Gaussian labelling is next",
-    CampaignPhase.INITIAL_AIMALL.value: "initial AIMAll postprocessing is next",
-    CampaignPhase.INITIAL_ALLOCATION_CHECK.value: "bootstrap point-allocation completeness is being checked",
-    CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN.value: "replacement bootstrap Gaussian labelling is next",
-    CampaignPhase.INITIAL_REPLACEMENT_AIMALL.value: "replacement bootstrap AIMAll postprocessing is next",
-    CampaignPhase.REFERENCE_COMMIT.value: "accepted AIMAll outputs and FEREBUS rows are being published",
-    CampaignPhase.INITIAL_FEREBUS.value: "bootstrap FEREBUS model training is next",
-    CampaignPhase.SEED_SELECT.value: "active-learning seed selection is next",
-    CampaignPhase.ARIADNE_ARRAY.value: "ARIADNE adversarial landing is next",
-    CampaignPhase.PHASE_B_DIVERSITY.value: "Phase B diversity selection is next",
-    CampaignPhase.SPLIT.value: "the pre-QM exact slot allocation is being verified",
-    CampaignPhase.GAUSSIAN.value: "active Gaussian labelling is next",
-    CampaignPhase.AIMALL.value: "active AIMAll postprocessing is next",
-    CampaignPhase.ALLOCATION_CHECK.value: "active point-allocation completeness is being checked",
-    CampaignPhase.REPLACEMENT_GAUSSIAN.value: "replacement active Gaussian labelling is next",
-    CampaignPhase.REPLACEMENT_AIMALL.value: "replacement active AIMAll postprocessing is next",
-    CampaignPhase.FEREBUS.value: "FEREBUS model retraining is next",
-    CampaignPhase.STOP_CHECK.value: "iteration stop/continue decision is next",
+    CampaignPhase.INIT.value: "prepare the campaign before its first run",
+    CampaignPhase.PHASE_A_DIVERSITY.value: "choose a diverse bootstrap set from the trajectory pool",
+    CampaignPhase.INITIAL_GAUSSIAN.value: "calculate Gaussian wavefunctions for the bootstrap set",
+    CampaignPhase.INITIAL_AIMALL.value: "analyse bootstrap wavefunctions with AIMAll",
+    CampaignPhase.INITIAL_ALLOCATION_CHECK.value: "check whether every bootstrap data slot has a valid result",
+    CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN.value: "calculate Gaussian replacements for missing bootstrap results",
+    CampaignPhase.INITIAL_REPLACEMENT_AIMALL.value: "analyse replacement bootstrap wavefunctions with AIMAll",
+    CampaignPhase.REFERENCE_COMMIT.value: "publish accepted QM data for model training",
+    CampaignPhase.INITIAL_FEREBUS.value: "train the first FEREBUS model set",
+    CampaignPhase.SEED_SELECT.value: "choose trajectory frames for adversarial sampling",
+    CampaignPhase.ARIADNE_ARRAY.value: "run adversarial ARIADNE landings from selected seeds",
+    CampaignPhase.PHASE_B_DIVERSITY.value: "select a safe, diverse set of ARIADNE results",
+    CampaignPhase.SPLIT.value: "assign selected geometries to the next QM batch",
+    CampaignPhase.GAUSSIAN.value: "calculate Gaussian wavefunctions for the active-learning batch",
+    CampaignPhase.AIMALL.value: "analyse active-learning wavefunctions with AIMAll",
+    CampaignPhase.ALLOCATION_CHECK.value: "check whether every active-learning data slot has a valid result",
+    CampaignPhase.REPLACEMENT_GAUSSIAN.value: "calculate Gaussian replacements for missing active-learning results",
+    CampaignPhase.REPLACEMENT_AIMALL.value: "analyse replacement active-learning wavefunctions with AIMAll",
+    CampaignPhase.FEREBUS.value: "train and assess the next FEREBUS model set",
+    CampaignPhase.STOP_CHECK.value: "decide whether another active-learning iteration is required",
     CampaignPhase.DONE.value: "campaign is complete",
     CampaignPhase.HALTED.value: "campaign is halted and needs user review",
 }
@@ -1437,6 +1480,14 @@ def _phase_meaning(phase: Any) -> str:
     return _PHASE_MEANINGS.get(str(phase or ""), "phase is not recognised")
 
 
+def _phase_title(phase: Any) -> str:
+    return _PHASE_TITLES.get(str(phase or ""), str(phase or "Unknown phase"))
+
+
+def _sentence_fragment(value: str) -> str:
+    return value[:1].lower() + value[1:] if value else value
+
+
 def _short_status_error(errors: Iterable[Any], *, limit: int = 180) -> str:
     for error in errors:
         text = str(error)
@@ -1467,43 +1518,12 @@ def _status_version(item: Dict[str, Any]) -> int:
 
 
 def _reference_data_product_status(phase: str, item: Dict[str, Any]) -> str:
-    if phase in _BOOTSTRAP_NOT_READY_PHASES:
-        version = _status_version(item)
-        if item.get("ok") is True and version >= 0:
-            return "available early (v" + str(version) + ")"
-        return "not produced yet"
-    if phase == CampaignPhase.INITIAL_FEREBUS.value:
-        version = _status_version(item)
-        if item.get("ok") is True and version >= 0:
-            return "ready for initial FEREBUS (v" + str(version) + ")"
-        return "using initial AIMAll handoff"
-    if phase in _TRAINING_REQUIRED_PHASES:
-        return _product_ok_text(item, label="QM reference data")
-    if phase in (CampaignPhase.DONE.value, CampaignPhase.HALTED.value):
-        return _product_ok_text(item, label="QM reference data")
+    del phase
     return _product_ok_text(item, label="QM reference data")
 
 
 def _models_product_status(phase: str, item: Dict[str, Any]) -> str:
-    if phase in _BOOTSTRAP_NOT_READY_PHASES:
-        version = _status_version(item)
-        if item.get("ok") is True and version >= 0:
-            return "available early (v" + str(version) + ")"
-        return "not produced yet"
-    if phase == CampaignPhase.INITIAL_FEREBUS.value:
-        version = _status_version(item)
-        if item.get("ok") is True and version >= 0:
-            return "available (v" + str(version) + ")"
-        return "being produced by INITIAL_FEREBUS"
-    if phase == CampaignPhase.FEREBUS.value:
-        version = _status_version(item)
-        if item.get("ok") is True and version >= 0:
-            return "current model ready (v" + str(version) + "); update in progress"
-        return "being produced by FEREBUS"
-    if phase in _MODELS_REQUIRED_PHASES:
-        return _product_ok_text(item, label="models")
-    if phase in (CampaignPhase.DONE.value, CampaignPhase.HALTED.value):
-        return _product_ok_text(item, label="models")
+    del phase
     return _product_ok_text(item, label="models")
 
 
@@ -1517,14 +1537,14 @@ def _format_data_products_summary(
     phase_name = str(phase or "")
     rows: List[tuple[str, Any]] = []
     if not isinstance(status, dict):
-        rows.append(("bootstrap QM reference data", "not checked"))
+        rows.append(("QM reference data", "not checked"))
         rows.append(("FEREBUS models", "not checked"))
     else:
         reference_data = status.get("reference_data")
         if isinstance(reference_data, dict):
             rows.append(
                 (
-                    "bootstrap QM reference data",
+                    "QM reference data",
                     _reference_data_product_status(phase_name, reference_data),
                 )
             )
@@ -1538,7 +1558,7 @@ def _format_data_products_summary(
                 for error in reference_data.get("errors") or []:
                     rows.append(("reference-data detail", error))
         else:
-            rows.append(("bootstrap QM reference data", "not checked"))
+            rows.append(("QM reference data", "not checked"))
 
         models = status.get("models")
         if isinstance(models, dict):
@@ -1558,8 +1578,11 @@ def _format_data_products_summary(
             rows.append(("artefact check", "problem - " + str(status.get("error"))))
 
     contract_text = _format_contract_status(state_contract)
-    if contract_text == "ok":
-        rows.append(("current phase contract", "ready for " + (phase_name or "current phase")))
+    if contract_text == "ok" and verbose and phase_name not in {
+        CampaignPhase.HALTED.value,
+        CampaignPhase.DONE.value,
+    }:
+        rows.append(("current phase check", "verified"))
     elif contract_text is not None:
         rows.append(("current phase contract", contract_text))
     else:
@@ -1719,7 +1742,11 @@ def _first_recommendation(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _format_recommendations(payload: Dict[str, Any]) -> List[str]:
+def _format_recommendations(
+    payload: Dict[str, Any],
+    *,
+    verbose: bool = False,
+) -> List[str]:
     first = _first_recommendation(payload)
     rows: List[tuple[str, Any]] = [
         ("severity", first.get("severity")),
@@ -1729,11 +1756,11 @@ def _format_recommendations(payload: Dict[str, Any]) -> List[str]:
     if first.get("command"):
         rows.append(("command", first.get("command")))
     details = first.get("details")
-    if isinstance(details, list):
+    if verbose and isinstance(details, list):
         for detail in details[:5]:
             rows.append(("detail", detail))
     recommendations = payload.get("recommendations")
-    if isinstance(recommendations, list) and len(recommendations) > 1:
+    if verbose and isinstance(recommendations, list) and len(recommendations) > 1:
         for recommendation in recommendations[1:4]:
             if isinstance(recommendation, dict):
                 rows.append(
@@ -1744,7 +1771,7 @@ def _format_recommendations(payload: Dict[str, Any]) -> List[str]:
                         + str(recommendation.get("primary")),
                     )
                 )
-    return _section("Next Action", rows)
+    return _section("Action", rows)
 
 
 def _format_pool_feasibility_status(feasibility: Any) -> List[str]:
@@ -1822,6 +1849,127 @@ def _daemon_activity_status(payload: Dict[str, Any]) -> str:
     if payload.get("lock_held") is None:
         return "unknown (lock probe failed)"
     return "not running"
+
+
+def _status_daemon_active(payload: Dict[str, Any]) -> bool:
+    return _daemon_activity_status(payload).startswith(("running", "starting"))
+
+
+def _status_active_job_count(payload: Dict[str, Any]) -> int:
+    pending = payload.get("pending_jobs")
+    if not isinstance(pending, dict):
+        return 0
+    return sum(1 for job_id in pending.values() if job_id)
+
+
+def _status_intent_counts(payload: Dict[str, Any]) -> Tuple[int, int]:
+    intents = payload.get("active_submission_intents")
+    if not isinstance(intents, list):
+        return 0, 0
+    scheduler = sum(
+        1
+        for intent in intents
+        if isinstance(intent, dict) and intent.get("job_id")
+    )
+    local = sum(
+        1
+        for intent in intents
+        if isinstance(intent, dict) and not intent.get("job_id")
+    )
+    return scheduler, local
+
+
+def _status_current_activity(payload: Dict[str, Any]) -> str:
+    phase = str(payload.get("phase") or "")
+    title = _sentence_fragment(_phase_title(phase))
+    daemon_active = _status_daemon_active(payload)
+    active_jobs = _status_active_job_count(payload)
+    scheduler_intents, local_intents = _status_intent_counts(payload)
+    if str(payload.get("background_startup_state") or "") in {
+        "prepared",
+        "spawned",
+        "ownership_acquired",
+    } and payload.get("background_pid_alive") is True:
+        stage = str(payload.get("background_startup_stage") or "initial checks")
+        return "The background process is still starting (" + stage + ")."
+    if active_jobs or scheduler_intents:
+        count = max(active_jobs, scheduler_intents)
+        if daemon_active:
+            return (
+                "The daemon is monitoring "
+                + str(count)
+                + " recorded Slurm job"
+                + ("." if count == 1 else "s.")
+            )
+        return (
+            "The daemon is stopped; "
+            + str(count)
+            + " recorded Slurm job"
+            + (" still needs monitoring or postprocessing." if count == 1 else "s still need monitoring or postprocessing.")
+        )
+    if local_intents:
+        intents = payload.get("active_submission_intents")
+        local_phase = phase
+        if isinstance(intents, list):
+            for intent in intents:
+                if isinstance(intent, dict) and not intent.get("job_id"):
+                    local_phase = str(intent.get("phase") or phase)
+                    break
+        local_title = _sentence_fragment(_phase_title(local_phase))
+        return (
+            "The daemon is completing local work for " + local_title + "."
+            if daemon_active
+            else "The daemon is stopped; local work for " + local_title + " is prepared but not running."
+        )
+    if phase == CampaignPhase.HALTED.value:
+        return "The campaign is halted; no work is running."
+    if phase == CampaignPhase.DONE.value:
+        return "The campaign is complete; no work is running."
+    if daemon_active:
+        return "The daemon is working on " + title + "."
+    return "The daemon is stopped; " + title + " is the next campaign step."
+
+
+def _status_health_rows(payload: Dict[str, Any]) -> List[Tuple[str, Any]]:
+    phase = str(payload.get("phase") or "")
+    first = _first_recommendation(payload)
+    severity = str(first.get("severity") or "watch")
+    condition = {
+        "info": "healthy",
+        "watch": "waiting or in progress",
+        "required": "user action required",
+        "blocked": "blocked",
+    }.get(severity, severity)
+    if phase == CampaignPhase.DONE.value:
+        condition = "complete"
+    elif phase == CampaignPhase.HALTED.value:
+        condition = "halted; user review required"
+    rows: List[Tuple[str, Any]] = [("condition", condition)]
+    products = payload.get("artifact_manifest_status")
+    if isinstance(products, dict):
+        reference = products.get("reference_data")
+        models = products.get("models")
+        if isinstance(reference, dict):
+            rows.append(
+                ("QM reference data", _reference_data_product_status(phase, reference))
+            )
+        if isinstance(models, dict):
+            rows.append(("FEREBUS models", _models_product_status(phase, models)))
+        if products.get("error"):
+            rows.append(("campaign data", "problem - " + str(products.get("error"))))
+    contract = _format_contract_status(payload.get("state_artifact_contract_status"))
+    if contract not in {None, "ok"}:
+        rows.append(("current data check", contract))
+    if phase == CampaignPhase.HALTED.value:
+        halt = payload.get("latest_halt_event")
+        context = payload.get("lifecycle_context")
+        reason = "unknown"
+        if isinstance(context, dict) and context.get("message"):
+            reason = str(context.get("message"))
+        elif isinstance(halt, dict) and halt.get("reason"):
+            reason = str(halt.get("reason"))
+        rows.append(("reason", reason))
+    return rows
 
 
 def _format_runtime_status(payload: Dict[str, Any], *, verbose: bool) -> List[str]:
@@ -1968,19 +2116,46 @@ def _iteration_summary(payload: Dict[str, Any]) -> str:
 
 
 def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path) -> str:
+    del journal_path  # the guarded status payload already contains journal evidence
     lines: List[str] = []
     lines.extend(
         _section(
             "Campaign",
+            (
+                [
+                    ("phase", _phase_title(payload.get("phase"))),
+                    ("purpose", _phase_meaning(payload.get("phase"))),
+                    ("iteration", _iteration_summary(payload)),
+                ]
+                + (
+                    [
+                        ("internal phase", payload.get("phase")),
+                        ("uid", payload.get("campaign_uid")),
+                        ("initialised", payload.get("campaign_started_iso")),
+                    ]
+                    if verbose
+                    else []
+                )
+            ),
+        )
+    )
+    lines.append("")
+    lines.extend(
+        _section(
+            "Now",
             [
-                ("phase", payload.get("phase")),
-                ("meaning", _phase_meaning(payload.get("phase"))),
-                ("iteration", _iteration_summary(payload)),
-                ("uid", payload.get("campaign_uid")),
-                ("initialised", payload.get("campaign_started_iso")),
+                ("daemon", _daemon_activity_status(payload)),
+                ("activity", _status_current_activity(payload)),
             ],
         )
     )
+    lines.append("")
+    lines.extend(_section("Health", _status_health_rows(payload)))
+    lines.append("")
+    lines.extend(_format_recommendations(payload, verbose=verbose))
+    if not verbose:
+        return "\n".join(lines) + "\n"
+
     pool_lines = _format_pool_feasibility_status(payload.get("pool_feasibility"))
     if pool_lines:
         lines.append("")
@@ -1991,12 +2166,15 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
             payload.get("artifact_manifest_status"),
             state_contract=payload.get("state_artifact_contract_status"),
             phase=payload.get("phase"),
-            verbose=verbose,
+            verbose=True,
         )
     )
     lines.append("")
-    lines.extend(_format_runtime_status(payload, verbose=verbose))
-    lines.extend(_format_lifecycle_status(payload))
+    lines.extend(_format_runtime_status(payload, verbose=True))
+    lifecycle = _format_lifecycle_status(payload)
+    if lifecycle:
+        lines.append("")
+        lines.extend(lifecycle)
     partial_array = payload.get("partial_array_recovery")
     if isinstance(partial_array, dict):
         publication = payload.get("ariadne_publication_recovery")
@@ -2046,38 +2224,23 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
                 ],
             )
         )
-    if payload.get("phase") == "HALTED":
-        halt = _latest_journal_event(journal_path, "halt")
-        lines.append("")
-        lines.extend(
-            _section(
-                "Halt",
-                [
-                    ("reason", (halt or {}).get("reason", "unknown")),
-                    ("from_phase", (halt or {}).get("from_phase")),
-                ],
-            )
-        )
     lines.append("")
-    lines.extend(_format_recommendations(payload))
-    if verbose:
-        lines.append("")
-        lines.extend(
-            _section(
-                "Paths",
-                [
-                    ("state", payload.get("state_path")),
-                    ("lock", payload.get("lock_path")),
-                    ("lease", payload.get("lease_path")),
-                    ("background_log", payload.get("background_log_path")),
-                    ("background_pid_file", payload.get("background_pid_path")),
-                    ("stop_request", payload.get("stop_request_path")),
-                ],
-            )
+    lines.extend(
+        _section(
+            "Paths",
+            [
+                ("state", payload.get("state_path")),
+                ("lock", payload.get("lock_path")),
+                ("lease", payload.get("lease_path")),
+                ("background_log", payload.get("background_log_path")),
+                ("background_pid_file", payload.get("background_pid_path")),
+                ("stop_request", payload.get("stop_request_path")),
+            ],
         )
-        if payload.get("lock_probe_error"):
-            lines.append("")
-            lines.extend(_section("Diagnostics", [("lock_probe_error", payload["lock_probe_error"])]))
+    )
+    if payload.get("lock_probe_error"):
+        lines.append("")
+        lines.extend(_section("Diagnostics", [("lock_probe_error", payload["lock_probe_error"])]))
     return "\n".join(lines) + "\n"
 
 
@@ -2144,7 +2307,13 @@ def _event_time(event: Dict[str, Any]) -> str:
         from datetime import datetime
 
         parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        return parsed.strftime("%Y-%m-%d %H:%M:%S")
+        if parsed.tzinfo is None:
+            from datetime import timezone
+
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        from datetime import timezone
+
+        return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     except Exception:
         if "T" in ts:
             date_part, tail = ts.split("T", 1)
@@ -2154,7 +2323,7 @@ def _event_time(event: Dict[str, Any]) -> str:
                 .replace("Z", "")
             )
             if date_part and time_part:
-                return date_part[:10] + " " + time_part[:8]
+                return date_part[:10] + " " + time_part[:8] + " UTC"
         return ts
 
 
@@ -2195,6 +2364,7 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "reference_data_committed": "QM reference data committed",
     "reference_commit_started": "QM reference commit started",
     "reference_commit_move_progress": "QM reference move progress",
+    "reference_commit_shard_progress": "FEREBUS row-shard progress",
     "reference_commit_shards_resolved": "FEREBUS row shards resolved",
     "reference_commit_cache_complete": "FEREBUS row cache complete",
     "reference_commit_published": "QM reference version published",
@@ -2224,6 +2394,7 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
         "FEREBUS candidate recovery materialised"
     ),
     "ferebus_candidate_reprocessed": "FEREBUS candidate reprocessed",
+    "ferebus_candidate_rejected": "FEREBUS candidate rejected",
     "ariadne_landing_rejected": "ARIADNE landing rejected",
     "ariadne_landing_summary": "ARIADNE landing summary",
     "ariadne_optional_diagnostics_warning": "ARIADNE diagnostics warning",
@@ -2237,6 +2408,7 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "ariadne_task_rejected_malformed_result": "ARIADNE malformed result",
     "ariadne_task_rejected_unusable_result": "ARIADNE result unusable",
     "ariadne_task_rejected_unsafe_landing": "ARIADNE landing rejected",
+    "ariadne_task_rejected_invalid_output": "ARIADNE output invalid",
     "ariadne_task_salvaged_from_nonzero_exit": "ARIADNE task salvaged",
     "error_calibration_summary": "error calibration summarised",
     "error_calibration_failed": "error calibration failed",
@@ -2248,12 +2420,17 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "partial_array_recovery_postprocess_only": "partial array postprocess ready",
     "committed_artifact_settle_retry": "waiting for committed artefacts",
     "resolved_phase_resources": "resources resolved",
+    "scheduler_usage_recorded": "Slurm usage recorded",
+    "scheduler_usage_warning": "Slurm usage unavailable",
+    "checkpoint_failed": "checkpoint failed",
+    "checkpoint_verified": "checkpoint verified",
     "user_cancelled_jobs": "user cancelled jobs",
     "user_stop_requested": "user stop requested",
     "user_stop_boundary_reached": "user stop boundary reached",
     "user_stop_control_invalid": "user stop control invalid",
     "user_stop_request_cancelled": "user stop request cancelled",
     "user_stop_resumed": "user stop resumed",
+    "stop_request_completion_deferred": "stop completion deferred",
     "sacct_empty_timeout": "Slurm accounting empty timeout",
     "sacct_missing_timeout": "Slurm accounting timeout",
     "sacct_unknown_timeout": "Slurm UNKNOWN timeout",
@@ -2286,12 +2463,25 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "daemon_lease_conflict": "daemon lease conflict",
     "daemon_lease_stale_recovered": "stale daemon lease recovered",
     "daemon_lease_cleanup_failed": "daemon lease cleanup failed",
+    "daemon_lease_heartbeat_failed": "daemon heartbeat write failed",
+    "daemon_lease_heartbeat_recovered": "daemon heartbeat recovered",
+    "environment_drift_halted": "environment change halted startup",
+    "environment_rebound": "environment generation changed",
+    "environment_generation_advanced": "environment generation advanced",
     "geometry_novelty_scale_precomputed": "novelty scale computed",
     "sampling_protocol_resolved": "sampling protocol resolved",
     "phase_b_novelty_threshold_relaxed": "Phase B novelty relaxed",
     "pool_feasibility_checked": "pool feasibility checked",
     "seed_posterior_fallback": "seed posterior fallback",
     "initial_training_existing_without_bootstrap_handoff": "bootstrap handoff missing",
+    "active_iteration_finalised": "active-learning iteration finalised",
+    "aimall_skipped_no_gaussian_acceptances": "AIMAll skipped because Gaussian produced no accepted results",
+    "ariadne_sampling_protocol_replay_failed": "ARIADNE sampling protocol replay failed",
+    "legacy_sampling_protocol_repreview": "sampling protocol preview regenerated",
+    "point_allocation_complete": "point allocation complete",
+    "point_allocation_quantum_recorded": "QM allocation result recorded",
+    "point_allocation_replacement_prepared": "replacement allocation prepared",
+    "dry_run_trajectory_pool_created": "dry-run trajectory pool created",
 }
 
 
@@ -2313,7 +2503,14 @@ def _event_int(event: Dict[str, Any], key: str) -> Optional[int]:
 
 
 _JOURNAL_OK_EVENTS = {
+    "active_iteration_finalised",
+    "adopted_accounted_job",
     "campaign_completed",
+    "checkpoint_verified",
+    "daemon_stopped",
+    "dry_run_trajectory_pool_created",
+    "environment_generation_advanced",
+    "environment_rebound",
     "scientific_convergence_reached",
     "phase_succeeded",
     "phase_succeeded_live",
@@ -2323,6 +2520,20 @@ _JOURNAL_OK_EVENTS = {
     "trajectory_pool_imported",
     "bootstrap_inputs_confirmed",
     "model_bootstrap_committed",
+    "phase_transition",
+    "point_allocation_complete",
+    "point_allocation_quantum_recorded",
+    "point_allocation_replacement_prepared",
+    "provenance_index_repaired",
+    "reconcile_applied",
+    "reconcile_resolved_terminal_intent",
+    "reference_commit_shards_resolved",
+    "reference_scales_computed",
+    "scheduler_usage_recorded",
+    "seed_selected",
+    "staging_archived",
+    "staging_restored_from_archive",
+    "subspace_built",
     "error_calibration_summary",
     "submission_intent_retired_without_submission",
     "user_stop_boundary_reached",
@@ -2330,6 +2541,7 @@ _JOURNAL_OK_EVENTS = {
 }
 
 _JOURNAL_RUN_EVENTS = {
+    "campaign_started",
     "daemon_started",
     "phase_pre_submit_intent",
     "phase_submitted",
@@ -2343,6 +2555,8 @@ _JOURNAL_RUN_EVENTS = {
     "reference_commit_cache_complete",
     "ferebus_candidate_recovery_prepared",
     "ferebus_candidate_recovery_materialised",
+    "model_bootstrap_staged",
+    "reference_commit_shard_progress",
 }
 
 _JOURNAL_WAIT_EVENTS = {
@@ -2351,9 +2565,25 @@ _JOURNAL_WAIT_EVENTS = {
     "postprocess_settle_retry",
     "committed_artifact_settle_retry",
     "user_stop_requested",
+    "shutdown_requested",
+    "stop_request_completion_deferred",
 }
 
 _JOURNAL_WARN_EVENTS = {
+    "aimall_skipped_no_gaussian_acceptances",
+    "anti_overlap_flagged",
+    "ariadne_legacy_missing_trajectory_sha256",
+    "ariadne_provenance_reconstructed",
+    "ariadne_publication_archived",
+    "ariadne_seed_provenance_repaired",
+    "ariadne_seed_provenance_staged",
+    "ariadne_stale_outputs_quarantined",
+    "ariadne_task_rejected_invalid_output",
+    "ariadne_task_rejected_malformed_result",
+    "ariadne_task_rejected_missing_result",
+    "ariadne_task_rejected_unsafe_landing",
+    "ariadne_task_rejected_unusable_result",
+    "ariadne_task_salvaged_from_nonzero_exit",
     "campaign_reopened",
     "phase_completion_replayed",
     "submission_intent_completion_deferred",
@@ -2363,11 +2593,28 @@ _JOURNAL_WARN_EVENTS = {
     "ariadne_optional_diagnostics_warning",
     "phase_b_novelty_threshold_relaxed",
     "daemon_lease_stale_recovered",
+    "daemon_interrupted",
+    "daemon_lease_cleanup_failed",
+    "daemon_lease_heartbeat_failed",
+    "daemon_lease_heartbeat_recovered",
     "user_stop_request_cancelled",
     "ferebus_quality_measurement_incomplete",
+    "initial_training_existing_without_bootstrap_handoff",
+    "legacy_sampling_protocol_repreview",
+    "provenance_index_repair_failed",
+    "scheduler_usage_warning",
+    "seed_posterior_fallback",
+    "squeue_liveness_inconclusive",
+    "transient_phase_retry",
 }
 
 _JOURNAL_FAIL_EVENTS = {
+    "ariadne_sampling_protocol_replay_failed",
+    "checkpoint_failed",
+    "daemon_lease_conflict",
+    "environment_drift_halted",
+    "expected_tasks_inference_failed",
+    "ferebus_candidate_rejected",
     "halt",
     "tick_error",
     "tick_exception_halted",
@@ -2381,7 +2628,30 @@ _JOURNAL_FAIL_EVENTS = {
     "live_postprocess_refused",
     "error_calibration_failed",
     "job_adopt_check_failed",
+    "submission_intent_expected_tasks_invalid",
+    "submission_intent_read_failed",
+    "submission_intent_update_failed",
+    "transient_retry_ledger_invalid",
     "user_stop_control_invalid",
+}
+
+_JOURNAL_INFO_EVENTS = {
+    "autotune_applied",
+    "effective_config_diff",
+    "geometry_novelty_scale_precomputed",
+    "pool_feasibility_checked",
+    "resolved_phase_resources",
+    "sampling_protocol_resolved",
+}
+
+_JOURNAL_DYNAMIC_EVENTS = {
+    "ariadne_landing_summary",
+    "failure_action",
+    "ferebus_candidate_reprocessed",
+    "ferebus_quality_summary",
+    "quantum_quality_summary",
+    "queue_lifecycle_update",
+    "user_cancelled_jobs",
 }
 
 _SQUEUE_RUNNING_STATES = {"R", "RUNNING", "CG", "COMPLETING"}
@@ -2403,7 +2673,16 @@ def _journal_event_severity(event: Dict[str, Any]) -> str:
         rejected = _event_int(event, "rejected")
         return "WARN" if rejected is not None and rejected > 0 else "OK"
     if raw == "queue_lifecycle_update":
+        queue_event = str(event.get("queue_event") or "")
         status = str(event.get("status") or "").upper()
+        if queue_event == "postprocess_started":
+            return "RUN"
+        if queue_event == "postprocess_finished":
+            return (
+                "FAIL"
+                if status in {"FAILED", "FAILURE", "ERROR"}
+                else "OK"
+            )
         if status in {
             "FAILED",
             "FAILURE",
@@ -2420,6 +2699,14 @@ def _journal_event_severity(event: Dict[str, Any]) -> str:
         if status in _SQUEUE_RUNNING_STATES:
             return "RUN"
         return "INFO"
+    if raw == "user_cancelled_jobs":
+        failed = _event_int(event, "n_failed") or 0
+        skipped = _event_int(event, "n_skipped") or 0
+        if failed > 0:
+            return "FAIL"
+        if skipped > 0:
+            return "WARN"
+        return "OK"
     if raw == "failure_action":
         action = str(event.get("action") or "").upper()
         if action == "HALT":
@@ -2448,6 +2735,8 @@ def _journal_event_severity(event: Dict[str, Any]) -> str:
         return "RUN"
     if raw in _JOURNAL_OK_EVENTS:
         return "OK"
+    if raw in _JOURNAL_INFO_EVENTS:
+        return "INFO"
     return "INFO"
 
 
@@ -2502,13 +2791,13 @@ def _journal_array_progress(event: Dict[str, Any]) -> str:
     if total <= 1 and failed in (None, 0) and missing in (None, 0):
         return ""
     parts = [
-        "T/C/R/P="
+        "total="
         + str(int(total))
-        + "/"
+        + " completed="
         + _format_progress_value(completed)
-        + "/"
+        + " running="
         + _format_progress_value(running)
-        + "/"
+        + " pending="
         + _format_progress_value(pending)
     ]
     if failed is not None and failed > 0:
@@ -2554,8 +2843,39 @@ def _journal_operator_summary(event: Dict[str, Any]) -> str:
         )
     if raw in {"phase_pre_submit_intent", "phase_submitted", "sbatch"}:
         return "array submitted" if _journal_array_progress(event) else "job submitted"
+    if raw == "phase_transition":
+        return (
+            "phase changed from "
+            + str(event.get("from_phase") or "unknown")
+            + " -> "
+            + str(event.get("to_phase") or "unknown")
+        )
     if raw == "queue_lifecycle_update":
+        queue_event = str(event.get("queue_event") or "")
         status = str(event.get("status") or "").upper()
+        if queue_event == "postprocess_started":
+            return "local postprocessing started"
+        if queue_event == "postprocess_finished":
+            return (
+                "local postprocessing failed"
+                if status in {"FAILED", "FAILURE", "ERROR"}
+                else "local postprocessing completed"
+            )
+        if queue_event == "terminal":
+            return (
+                "Slurm tasks failed"
+                if status in {
+                    "FAILED",
+                    "FAILURE",
+                    "CANCELLED",
+                    "TIMEOUT",
+                    "OUT_OF_MEMORY",
+                    "NODE_FAIL",
+                }
+                else "Slurm tasks completed"
+            )
+        if queue_event == "first_sacct":
+            return "Slurm accounting available"
         if status in _SQUEUE_PENDING_STATES:
             return "array pending" if _journal_array_progress(event) else "job pending"
         if status in _SQUEUE_RUNNING_STATES:
@@ -2624,14 +2944,20 @@ def _compact_event_details(event: Dict[str, Any]) -> str:
         ("error", "error"),
     ]
     parts: List[str] = []
+    seen_labels: set[str] = set()
     for key, label in detail_keys:
         if key in event and event.get(key) is not None:
+            if label in seen_labels:
+                continue
             value = _format_value(event.get(key))
             if key == "campaign_uid" and len(value) > 8:
                 value = value[:8]
             if key in {"reason", "error"} and len(value) > 90:
                 value = value[:87] + "..."
             parts.append(label + "=" + value)
+            seen_labels.add(label)
+    if _event_int(event, "_aggregated_count") not in {None, 1}:
+        parts.insert(0, "events=" + str(_event_int(event, "_aggregated_count")))
     progress = _journal_array_progress(event)
     if progress:
         insert_at = 1 if parts and parts[0].startswith("job=") else 0
@@ -2685,6 +3011,52 @@ def _verbose_event_details(event: Dict[str, Any]) -> str:
             value = value[:57] + "..."
         parts.append(str(key) + "=" + value)
     return " ".join(parts)
+
+
+_AGGREGATED_JOURNAL_EVENTS = {
+    "ariadne_provenance_reconstructed",
+    "ariadne_seed_provenance_repaired",
+    "ariadne_seed_provenance_staged",
+    "ariadne_task_rejected_invalid_output",
+    "ariadne_task_rejected_malformed_result",
+    "ariadne_task_rejected_missing_result",
+    "ariadne_task_rejected_unsafe_landing",
+    "ariadne_task_rejected_unusable_result",
+    "ariadne_task_salvaged_from_nonzero_exit",
+    "point_allocation_quantum_recorded",
+    "reference_commit_shard_progress",
+}
+
+
+def _aggregate_journal_events(
+    events: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Collapse repetitive task records while preserving first-seen order."""
+    aggregated: List[Dict[str, Any]] = []
+    positions: Dict[Tuple[str, str, str, str], int] = {}
+    for event in events:
+        raw = str(event.get("event") or "")
+        if raw not in _AGGREGATED_JOURNAL_EVENTS:
+            aggregated.append(event)
+            continue
+        key = (
+            raw,
+            str(event.get("phase") or ""),
+            str(event.get("iteration") if event.get("iteration") is not None else ""),
+            str(event.get("reason") or event.get("error") or ""),
+        )
+        if key not in positions:
+            compact = dict(event)
+            compact["_aggregated_count"] = 1
+            compact.pop("job_id", None)
+            positions[key] = len(aggregated)
+            aggregated.append(compact)
+            continue
+        index = positions[key]
+        aggregated[index]["_aggregated_count"] = int(
+            aggregated[index].get("_aggregated_count", 1)
+        ) + 1
+    return aggregated
 
 
 def _format_journal_events(events: Sequence[Dict[str, Any]], *, verbose: bool) -> str:
@@ -2789,7 +3161,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             )
             print("Run:", file=sys.stderr)
             print(
-                "  ichor-al-daemon init --campaign-dir " + str(campaign),
+                "  " + _campaign_command(campaign, "init"),
                 file=sys.stderr,
             )
             print(
@@ -2820,7 +3192,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                 print("  ... " + str(len(artefacts) - 12) + " more", file=sys.stderr)
             print("Run:", file=sys.stderr)
             print(
-                "  ichor-al-daemon reconcile --campaign-dir " + str(campaign),
+                "  " + _campaign_command(campaign, "reconcile"),
                 file=sys.stderr,
             )
             return 8
@@ -3564,10 +3936,31 @@ def _journal_cancel_jobs_summary(journal_path: Path, summary: Dict[str, Any]) ->
         pass
 
 
-def _print_cancel_jobs_summary(summary: Dict[str, Any]) -> None:
+def _print_cancel_jobs_summary(
+    summary: Dict[str, Any],
+    *,
+    verbose: bool = False,
+) -> None:
     cancelled = list(summary.get("cancelled") or [])
     skipped = list(summary.get("skipped") or [])
     failed = list(summary.get("failed") or [])
+    if not verbose:
+        print(
+            "Slurm cancellation: "
+            + str(len(cancelled))
+            + " cancelled, "
+            + str(len(skipped))
+            + " already inactive or not cancellable, "
+            + str(len(failed))
+            + " unresolved."
+        )
+        if failed:
+            print(
+                "Cancellation needs attention: "
+                + str(failed[0].get("reason") or "scheduler confirmation failed"),
+                file=sys.stderr,
+            )
+        return
     if cancelled:
         print("Cancelled Slurm jobs:")
         for item in cancelled:
@@ -3845,31 +4238,40 @@ def cmd_stop(args: argparse.Namespace) -> int:
     if cancel_summary is not None:
         _journal_cancel_jobs_summary(paths["journal"], cancel_summary)
     print(describe_stop_request(request))
-    print("request id: " + str(request.get("request_id")))
-    print("stop request: " + str(paths["stop_request"]))
+    stop_verbose = bool(getattr(args, "verbose", False))
+    if stop_verbose:
+        print("request id: " + str(request.get("request_id")))
+        print("stop request: " + str(paths["stop_request"]))
     background = _probe_background_daemon(
         paths["background_pid"],
         paths["background_log"],
         paths["background_startup"],
     )
-    if background.get("background_pid") is not None:
+    if stop_verbose and background.get("background_pid") is not None:
         suffix = " alive" if background.get("background_pid_alive") else " not running"
         print("background pid: " + str(background.get("background_pid")) + " (" + suffix.strip() + ")")
         print("background log: " + str(background.get("background_log_path")))
     if isinstance(background_signal, dict) and background_signal.get("attempted"):
-        print("background signal: " + str(background_signal.get("reason")))
-    elif (
-        isinstance(background_signal, dict)
-        and background.get("background_pid_alive") is True
-    ):
+        if stop_verbose:
+            print("background signal: " + str(background_signal.get("reason")))
+    elif isinstance(background_signal, dict) and background.get("background_pid_alive") is True:
         print(
             "background signal not sent: " + str(background_signal.get("reason")),
             file=sys.stderr,
         )
+    cancellation_failed = False
     if cancel_summary is not None:
-        _print_cancel_jobs_summary(cancel_summary)
-        if cancel_summary.get("failed"):
-            return 10
+        _print_cancel_jobs_summary(cancel_summary, verbose=stop_verbose)
+        cancellation_failed = bool(cancel_summary.get("failed"))
+    elif cancel_jobs:
+        print("No recorded Slurm jobs required cancellation.")
+    else:
+        print("Recorded Slurm jobs, if any, were left running.")
+    print("Monitor the stop:")
+    print("  " + _campaign_command(campaign, "status"))
+    print("  " + _campaign_command(campaign, "journal", " --last-n 20"))
+    if cancellation_failed:
+        return 10
     if (
         isinstance(background_signal, dict)
         and background_signal.get("attempted")
@@ -4015,8 +4417,7 @@ def format_recovery_dashboard(campaign_dir: Path) -> str:
     staging_archive_hint = "not needed"
     if int(staging_inventory.get("top_level_count") or 0) > 0:
         staging_archive_hint = (
-            "inspect first; if stale and no active jobs remain, run "
-            "reconcile --archive-staging --apply"
+            "preview reconcile first; archive only after the preview reports it is safe"
         )
     if staging_inventory.get("has_symlink") or staging_inventory.get("is_symlink"):
         staging_archive_hint = "unsafe: symlink present; inspect manually"
@@ -4079,7 +4480,9 @@ def format_recovery_dashboard(campaign_dir: Path) -> str:
             config_status = type(exc).__name__ + ": " + str(exc)[:120]
     lines.extend(_section("Config lock", [("status", config_status)]))
 
-    recommendation = "start/resume is safe"
+    status_command = _campaign_command(campaign, "status")
+    reconcile_command = _campaign_command(campaign, "reconcile")
+    recommendation = "no recovery action is needed; run " + status_command
     try:
         report = propose_recovery(campaign)
         partial = getattr(report, "partial_array_recovery", None)
@@ -4108,29 +4511,50 @@ def format_recovery_dashboard(campaign_dir: Path) -> str:
                 )
             )
         if report.unsafe_reasons:
-            recommendation = "run reconcile and inspect unsafe artefacts"
+            recommendation = "inspect the recovery blockers: " + reconcile_command
         elif state_invalid:
-            recommendation = "run reconcile"
+            recommendation = "preview recovery: " + reconcile_command
         elif state is None:
             artefacts = stateful_campaign_artifacts(campaign)
             recommendation = (
-                "run reconcile"
+                "preview recovery: " + reconcile_command
                 if artefacts
-                else "start/resume is safe for clean first run"
+                else (
+                    "initialise the campaign: ichor-al-daemon init --campaign-dir "
+                    + shlex.quote(str(campaign))
+                )
             )
+        elif state.phase is CampaignPhase.HALTED:
+            recommendation = "preview recovery: " + reconcile_command
     except Exception as exc:
-        recommendation = "run reconcile; recovery probe failed: " + str(exc)[:120]
-    if (
-        intents
-        or lock_status.get("lock_held")
+        recommendation = (
+            "preview recovery because the recovery check failed: "
+            + reconcile_command
+            + " ("
+            + str(exc)[:120]
+            + ")"
+        )
+    ownership_active = bool(
+        lock_status.get("lock_held")
         or _lease_is_fresh(
             lease_status.get("lease_heartbeat"),
             stale_seconds=stale_seconds,
             clock_skew_tolerance_seconds=clock_skew,
         )
         or background.get("background_pid_alive")
-    ):
-        recommendation = "stop --cancel-jobs first, then rerun reconcile"
+    )
+    has_slurm_job = any(
+        isinstance(intent, dict) and bool(intent.get("job_id"))
+        for intent in intents
+    )
+    if ownership_active or has_slurm_job:
+        recommendation = (
+            "cancel the recorded Slurm work first: ichor-al-daemon stop --campaign-dir "
+            + shlex.quote(str(campaign))
+            + " --cancel-jobs"
+            if has_slurm_job
+            else "monitor the active daemon: " + status_command
+        )
     if not cfg_path.is_file() and config_lock_path(campaign).is_file():
         recommendation = "restore campaign.yaml from config lock"
     lines.extend(_section("Recommendation", [("next action", recommendation)]))
@@ -4378,8 +4802,32 @@ def cmd_status(args: argparse.Namespace) -> int:
             "error": type(exc).__name__ + ": " + str(exc),
             "errors": [type(exc).__name__ + ": " + str(exc)],
         }
+    presentation_payload = dict(payload)
+    presentation_payload["_presentation_execution_identity_checked"] = True
+    try:
+        from .execution_identity import (
+            execution_identity_path,
+            read_execution_identity,
+        )
+
+        if execution_identity_path(campaign).is_file():
+            identity = read_execution_identity(
+                campaign,
+                expected_campaign_uid=str(state.campaign_uid),
+            )
+            presentation_payload["_presentation_execution_mode"] = str(
+                identity["mode"]
+            )
+    except Exception as exc:
+        presentation_payload["_presentation_execution_identity_error"] = (
+            type(exc).__name__ + ": " + str(exc)
+        )
     payload["recommendations"] = recommendation_dicts(
-        build_status_recommendations(campaign, payload, paths["journal"])
+        build_status_recommendations(
+            campaign,
+            presentation_payload,
+            paths["journal"],
+        )
     )
     payload["next_action"] = payload["recommendations"][0]["primary"]
     if bool(getattr(args, "json", False)):
@@ -4763,7 +5211,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
             if lock_review.changed:
                 print(
                     "campaign.yaml changed since the config lock was written; "
-                    "run reconcile --apply before reopening a completed campaign",
+                    "preview reconcile and apply only after it reports the change is safe",
                     file=sys.stderr,
                 )
                 formatted = format_config_review(lock_review)
@@ -5682,6 +6130,10 @@ def _reconcile_decision_payload(
         bool(contract_status.get("contract_ok"))
         and not blockers
         and not deep_pending
+        and selected_state.phase not in {
+            CampaignPhase.HALTED,
+            CampaignPhase.DONE,
+        }
     )
     why_not_runnable: List[str] = []
     if not bool(contract_status.get("contract_ok")):
@@ -5700,8 +6152,8 @@ def _reconcile_decision_payload(
         )
     if deep_pending:
         next_command = _reconcile_apply_command(campaign, report)
-    elif runnable and selected_state.phase is not CampaignPhase.DONE:
-        next_command = "ichor-al-daemon start --campaign-dir " + str(campaign)
+    elif runnable:
+        next_command = _campaign_command(campaign, "resume")
     elif cleanable and not blockers:
         next_command = _reconcile_apply_command(campaign, report)
     else:
@@ -5740,7 +6192,7 @@ def _reconcile_decision_payload(
         ),
         "selected_phase": selected_state.phase.value,
         "selected_iteration": int(selected_state.iteration),
-        "runnable": bool(runnable and selected_state.phase is not CampaignPhase.HALTED),
+        "runnable": bool(runnable),
         "decision": str(getattr(report, "decision", "") or ""),
         "why_selected": list(getattr(report, "notes", []) or []),
         "why_not_runnable": why_not_runnable,
@@ -5784,7 +6236,7 @@ def _reconcile_decision_payload(
 
 
 def _reconcile_apply_command(campaign: Path, report: Any) -> str:
-    command = "ichor-al-daemon reconcile --campaign-dir " + str(campaign)
+    command = _campaign_command(campaign, "reconcile")
     if bool(getattr(report, "deep_verification_required", False)):
         command += " --deep-verify"
     if ".DATA/STAGING is non-empty" in list(getattr(report, "unsafe_reasons", [])):
@@ -5827,22 +6279,22 @@ def _reconcile_result_label(
     apply_mode: bool = False,
 ) -> str:
     if apply_mode:
-        return "APPLIED"
+        return "applied"
     state = report.proposed_state
     cleanable = _reconcile_cleanable_reasons(report)
     blockers = _reconcile_hard_blockers(report, contract_status)
     phase = state.phase
     if blockers:
-        return "BLOCKED"
+        return "blocked"
     if cleanable:
-        return "CLEANUP REQUIRED"
+        return "safe to apply"
     if phase is CampaignPhase.HALTED:
-        return "BLOCKED"
+        return "blocked"
     if phase is CampaignPhase.DONE:
-        return "INSPECT ONLY"
+        return "no recovery needed"
     if not bool(contract_status.get("contract_ok")):
-        return "BLOCKED"
-    return "READY"
+        return "blocked"
+    return "safe to apply"
 
 
 def _reconcile_apply_status(
@@ -5850,11 +6302,9 @@ def _reconcile_apply_status(
     contract_status: Dict[str, Any],
 ) -> str:
     result = _reconcile_result_label(report, contract_status)
-    if result == "READY":
+    if result == "safe to apply":
         return "safe"
-    if result == "CLEANUP REQUIRED":
-        return "cleanup required; no hard blockers"
-    if result == "INSPECT ONLY":
+    if result == "no recovery needed":
         return "not applicable"
     return "blocked"
 
@@ -5914,7 +6364,12 @@ def _print_reconcile_list(label: str, items: Sequence[Any], *, indent: str = "  
         print(indent + "  - " + str(item))
 
 
-def _reconcile_read_current_state_summary(campaign: Path, report: Any) -> Dict[str, Any]:
+def _reconcile_read_current_state_summary(
+    campaign: Path,
+    report: Any,
+    *,
+    verbose: bool = False,
+) -> Dict[str, Any]:
     state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
     if not state_path.is_file():
         return {"state": "missing"}
@@ -5931,17 +6386,33 @@ def _reconcile_read_current_state_summary(campaign: Path, report: Any) -> Dict[s
             "campaign_uid": uid_status,
         }
     active_intents = list(getattr(report, "active_submission_intents", []) or [])
-    pending_count = len(getattr(state, "pending_jobs", {}) or {})
-    if active_intents:
-        job_text = str(len(active_intents)) + " active or unresolved submission intent(s)"
+    scheduler_intents = [
+        intent
+        for intent in active_intents
+        if isinstance(intent, dict) and intent.get("job_id")
+    ]
+    local_intents = [
+        intent
+        for intent in active_intents
+        if isinstance(intent, dict) and not intent.get("job_id")
+    ]
+    pending_jobs = getattr(state, "pending_jobs", {}) or {}
+    pending_count = sum(1 for job_id in pending_jobs.values() if job_id)
+    completed_markers = sum(1 for job_id in pending_jobs.values() if not job_id)
+    if scheduler_intents:
+        job_text = str(len(scheduler_intents)) + " recorded Slurm job(s)"
     elif pending_count:
-        job_text = str(pending_count) + " stale or unresolved state entr"
-        job_text += "y" if pending_count == 1 else "ies"
+        job_text = str(pending_count) + " recorded Slurm job(s)"
+    elif local_intents:
+        job_text = "none; local recovery work is prepared"
     else:
         job_text = "none"
-    return {
+    summary: Dict[str, Any] = {
         "state": state.phase.value + " at iteration " + str(int(state.iteration)),
-        "versions": (
+        "recorded jobs": job_text,
+    }
+    if verbose:
+        summary["versions"] = (
             "reference_data="
             + str(int(state.reference_data_version))
             + (
@@ -5960,11 +6431,12 @@ def _reconcile_read_current_state_summary(campaign: Path, report: Any) -> Dict[s
                     else ""
                 )
             )
-        ),
-        "recorded jobs": job_text,
-        "shutdown requested": "yes" if bool(state.shutdown_requested) else "no",
-        "campaign uid": str(state.campaign_uid),
-    }
+        )
+        summary["shutdown requested"] = "yes" if bool(state.shutdown_requested) else "no"
+        summary["campaign uid"] = str(state.campaign_uid)
+        if completed_markers:
+            summary["completed job markers"] = completed_markers
+    return summary
 
 
 def _reconcile_bootstrap_summary(campaign: Path, report: Any) -> str:
@@ -6064,7 +6536,12 @@ def _print_reconcile_header(campaign: Path, *, mode: str, result: str) -> None:
     print("ICHOR Reconcile")
     print("Campaign: " + str(campaign))
     print("Mode: " + mode)
-    print("Result: " + result)
+    if mode == "apply":
+        print("Recovery result: " + result)
+    elif mode == "restore-config":
+        print("Configuration recovery: " + result)
+    else:
+        print("Recovery preview: " + result)
     print("")
 
 
@@ -6095,9 +6572,18 @@ def _print_reconcile_recovery_target(
     print("")
 
 
-def _print_reconcile_current_position(campaign: Path, report: Any) -> None:
+def _print_reconcile_current_position(
+    campaign: Path,
+    report: Any,
+    *,
+    verbose: bool = False,
+) -> None:
     print("Current Position")
-    summary = _reconcile_read_current_state_summary(campaign, report)
+    summary = _reconcile_read_current_state_summary(
+        campaign,
+        report,
+        verbose=verbose,
+    )
     _print_reconcile_key_values(list(summary.items()))
     print("")
 
@@ -6256,12 +6742,18 @@ def _print_reconcile_intent_repairs(report: Any) -> None:
     print("")
 
 
-def _print_reconcile_config_changes(config_review: Any) -> None:
+def _print_reconcile_config_changes(
+    config_review: Any,
+    *,
+    verbose: bool = False,
+) -> None:
     if config_review is None:
         return
     allowed = list(getattr(config_review, "allowed_changes", []) or [])
     blocked = list(getattr(config_review, "blocked_changes", []) or [])
     if not allowed and not blocked:
+        if not verbose:
+            return
         print("Config Changes")
         _print_reconcile_key_values([("status", "no campaign.yaml changes against config lock")])
         print("")
@@ -6359,7 +6851,10 @@ def _print_reconcile_apply_plan_compact(
         )
         candidates = _reconcile_valid_candidates(campaign, contract_status, report)
         if candidates:
-            _print_reconcile_list("expected recovery after cleanup", candidates)
+            _print_reconcile_list(
+                "expected recovery after cleanup",
+                [str(item).split(" -> ", 1)[0] for item in candidates],
+            )
         print("  command:")
         print("    " + _reconcile_apply_command(campaign, report))
         print("")
@@ -6369,24 +6864,31 @@ def _print_reconcile_apply_plan_compact(
         print("  apply: not applicable")
         print("")
         return
-    canonical = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
-    if proposed_state_path is not None:
-        print("  manual promote:")
-        print("    mv " + str(proposed_state_path) + " " + str(canonical))
-    print("  safer command:")
-    print("    ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply")
+    print("  reviewed recovery command:")
+    print("    " + _reconcile_apply_command(campaign, report))
     print("")
 
 
-def _print_reconcile_inspect_compact(campaign: Path) -> None:
+def _print_reconcile_inspect_compact(
+    campaign: Path,
+    *,
+    include_staging: bool = False,
+) -> None:
     print("Inspect")
-    _print_reconcile_key_values(
-        [
-            ("status", "ichor-al-daemon status --campaign-dir " + str(campaign)),
-            ("journal", "ichor-al-daemon journal --campaign-dir " + str(campaign) + " --last-n 20"),
-            ("staging", "find " + str(campaign / ".DATA" / "STAGING") + " -maxdepth 3 -type f | sort"),
-        ]
-    )
+    commands: List[Tuple[str, Any]] = [
+        ("status", _campaign_command(campaign, "status")),
+        ("journal", _campaign_command(campaign, "journal", " --last-n 20")),
+    ]
+    if include_staging:
+        commands.append(
+            (
+                "staging",
+                "find "
+                + str(campaign / ".DATA" / "STAGING")
+                + " -maxdepth 3 -type f | sort",
+            )
+        )
+    _print_reconcile_key_values(commands)
     print("")
 
 
@@ -6403,47 +6905,50 @@ def _print_reconcile_operator_report(
 ) -> None:
     result = _reconcile_result_label(report, contract_status)
     _print_reconcile_header(campaign, mode=mode, result=result)
-    snapshot = getattr(report, "artifact_snapshot", None)
-    print("Verification")
-    if snapshot is None:
-        _print_reconcile_key_values(
-            [("status", "verification incomplete")]
-        )
-    else:
-        deep_required = bool(
-            getattr(report, "deep_verification_required", False)
-        )
-        status = (
-            "deep verified"
-            if snapshot.verification_level == "deep"
-            else "deep verification required"
-            if deep_required
-            else "authority verified"
-        )
-        _print_reconcile_key_values(
-            [
-                ("status", status),
-                ("files inspected", str(int(snapshot.files_inspected))),
-                (
-                    "payload hashed",
-                    str(int(snapshot.payload_files_hashed))
-                    + " files / "
-                    + str(int(snapshot.payload_bytes_hashed))
-                    + " bytes",
-                ),
-                ("anchor", str(snapshot.anchor_sha256)),
-            ]
-        )
-    print("")
+    if verbose:
+        snapshot = getattr(report, "artifact_snapshot", None)
+        print("Verification")
+        if snapshot is None:
+            _print_reconcile_key_values(
+                [("status", "verification incomplete")]
+            )
+        else:
+            deep_required = bool(
+                getattr(report, "deep_verification_required", False)
+            )
+            status = (
+                "deep verified"
+                if snapshot.verification_level == "deep"
+                else "deep verification required"
+                if deep_required
+                else "authority verified"
+            )
+            _print_reconcile_key_values(
+                [
+                    ("status", status),
+                    ("files inspected", str(int(snapshot.files_inspected))),
+                    (
+                        "payload hashed",
+                        str(int(snapshot.payload_files_hashed))
+                        + " files / "
+                        + str(int(snapshot.payload_bytes_hashed))
+                        + " bytes",
+                    ),
+                    ("anchor", str(snapshot.anchor_sha256)),
+                ]
+            )
+        print("")
     _print_reconcile_recovery_target(report, contract_status)
-    _print_reconcile_current_position(campaign, report)
+    _print_reconcile_current_position(campaign, report, verbose=verbose)
     _print_reconcile_last_failure_compact(report)
     _print_reconcile_safety(campaign, report, contract_status)
-    _print_reconcile_artefacts(campaign, report, contract_status, verbose=verbose)
-    _print_reconcile_intent_repairs(report)
+    if verbose:
+        _print_reconcile_artefacts(campaign, report, contract_status, verbose=True)
+        _print_reconcile_intent_repairs(report)
     _print_reconcile_partial_array(campaign, report)
-    _print_reconcile_config_changes(config_review)
-    _print_reconcile_contract_compact(campaign, report, contract_status)
+    _print_reconcile_config_changes(config_review, verbose=verbose)
+    if verbose:
+        _print_reconcile_contract_compact(campaign, report, contract_status)
     if runtime_status and runtime_status.get("reconcile_apply_blockers"):
         print("Runtime")
         _print_reconcile_list(
@@ -6464,7 +6969,15 @@ def _print_reconcile_operator_report(
         contract_status,
         proposed_state_path=proposed_state_path,
     )
-    _print_reconcile_inspect_compact(campaign)
+    blockers = _reconcile_hard_blockers(report, contract_status)
+    if verbose or blockers:
+        _print_reconcile_inspect_compact(
+            campaign,
+            include_staging=(
+                ".DATA/STAGING is non-empty"
+                in list(getattr(report, "unsafe_reasons", []))
+            ),
+        )
 
 
 def _print_reconcile_applied_operator_report(
@@ -6480,8 +6993,9 @@ def _print_reconcile_applied_operator_report(
     archived: Sequence[str],
     archived_reference_data_staging: Sequence[str],
     restored_bootstrap_handoff: Sequence[str],
+    verbose: bool = False,
 ) -> None:
-    _print_reconcile_header(campaign, mode="apply", result="APPLIED")
+    _print_reconcile_header(campaign, mode="apply", result="applied")
     _print_reconcile_recovery_target(report, contract_status)
     print("Applied Changes")
     cleanup_items: List[str] = []
@@ -6491,20 +7005,31 @@ def _print_reconcile_applied_operator_report(
     cleanup_items.extend("archived staging: " + _reconcile_relative_path(campaign, item) for item in archived)
     cleanup_items.extend("archived reference-data staging: " + _reconcile_relative_path(campaign, item) for item in archived_reference_data_staging)
     cleanup_items.extend("restored bootstrap staging: " + _reconcile_relative_path(campaign, item) for item in restored_bootstrap_handoff)
-    _print_reconcile_key_values(
-        [
-            ("state written", _reconcile_relative_path(campaign, campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME)),
-            ("previous state backup", _reconcile_relative_path(campaign, backup_path) if backup_path is not None else "none"),
-            ("applied proposal archive", _reconcile_relative_path(campaign, applied_proposal_path) if applied_proposal_path is not None else "none"),
-            ("final contract", "ok" if contract_status.get("contract_ok") else "invalid"),
-        ]
-    )
+    if verbose:
+        _print_reconcile_key_values(
+            [
+                ("state written", _reconcile_relative_path(campaign, campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME)),
+                ("previous state backup", _reconcile_relative_path(campaign, backup_path) if backup_path is not None else "none"),
+                ("applied proposal archive", _reconcile_relative_path(campaign, applied_proposal_path) if applied_proposal_path is not None else "none"),
+                ("final contract", "ok" if contract_status.get("contract_ok") else "invalid"),
+            ]
+        )
+    else:
+        _print_reconcile_key_values(
+            [
+                ("recovered state", "written and verified"),
+                (
+                    "final data check",
+                    "passed" if contract_status.get("contract_ok") else "failed",
+                ),
+            ]
+        )
     _print_reconcile_list("cleanup", cleanup_items)
     final_phase = report.proposed_state.phase
     if bool(contract_status.get("contract_ok")) and final_phase not in {CampaignPhase.HALTED, CampaignPhase.DONE}:
         _print_reconcile_list(
             "next",
-            ["ichor-al-daemon start --campaign-dir " + str(campaign)],
+            [_campaign_command(campaign, "resume")],
         )
     else:
         _print_reconcile_list(
@@ -6512,7 +7037,8 @@ def _print_reconcile_applied_operator_report(
             ["Campaign remains " + final_phase.value + "; do not start the daemon yet."],
         )
     print("")
-    _print_reconcile_contract_compact(campaign, report, contract_status)
+    if verbose:
+        _print_reconcile_contract_compact(campaign, report, contract_status)
 
 
 def _print_reconcile_apply_blocked(
@@ -6525,7 +7051,7 @@ def _print_reconcile_apply_blocked(
     print("ICHOR Reconcile", file=sys.stderr)
     print("Campaign: " + str(campaign), file=sys.stderr)
     print("Mode: apply", file=sys.stderr)
-    print("Result: BLOCKED", file=sys.stderr)
+    print("Recovery result: blocked", file=sys.stderr)
     print("", file=sys.stderr)
     print(title, file=sys.stderr)
     if reasons:
@@ -7087,7 +7613,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         if bool(getattr(args, "apply", False)):
             print(
                 "refusing --restore-config-from-lock together with --apply; "
-                "restore the config proposal first, then run reconcile --apply",
+                "restore the config proposal first, then preview reconcile",
                 file=sys.stderr,
             )
             return 2
@@ -7102,7 +7628,11 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 8
-        _print_reconcile_header(campaign, mode="restore-config", result="CONFIG PROPOSAL")
+        _print_reconcile_header(
+            campaign,
+            mode="restore-config",
+            result="proposal written",
+        )
         print("Config Proposal")
         _print_reconcile_key_values(
             [
@@ -7112,11 +7642,11 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             ]
         )
         print("")
-        print("Apply Plan")
-        print("  manual promote:")
-        print("    mv " + str(target_config) + " " + str(campaign / "campaign.yaml"))
-        print("  then run:")
-        print("    ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply")
+        print("Next")
+        print("  review the proposal and restore the locked values through the campaign config editor")
+        print("  do not move the proposal over campaign.yaml by hand")
+        print("  then preview recovery:")
+        print("    " + _campaign_command(campaign, "reconcile"))
         print("")
         return 0
     if bool(getattr(args, "apply", False)) and runtime_status.get("reconcile_apply_blockers"):
@@ -7126,7 +7656,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             reasons=list(runtime_status.get("reconcile_apply_blockers") or []),
             next_actions=[
                 "stop the daemon or wait for the lock/lease to clear",
-                "rerun reconcile --apply",
+                "rerun reconcile without --apply to review the new recovery preview",
             ],
         )
         _print_reconcile_runtime_warning(runtime_status, campaign)
@@ -7173,22 +7703,27 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         sys.stderr if bool(getattr(args, "json", False)) else sys.stdout
     )
     print("ICHOR Reconcile", file=inspection_stream, flush=True)
-    print(
-        "Verification: " + verification_level,
-        file=inspection_stream,
-        flush=True,
-    )
-    print(
-        "Scientific payload hashing: "
-        + ("enabled" if deep_verify else "disabled"),
-        file=inspection_stream,
-        flush=True,
-    )
-    print(
-        "Inspecting committed artefact chains...",
-        file=inspection_stream,
-        flush=True,
-    )
+    if bool(getattr(args, "verbose", False)) or deep_verify or bool(
+        getattr(args, "json", False)
+    ):
+        print(
+            "Verification: " + verification_level,
+            file=inspection_stream,
+            flush=True,
+        )
+        print(
+            "Scientific payload hashing: "
+            + ("enabled" if deep_verify else "disabled"),
+            file=inspection_stream,
+            flush=True,
+        )
+        print(
+            "Inspecting committed artefact chains...",
+            file=inspection_stream,
+            flush=True,
+        )
+    else:
+        print("Checking campaign recovery...", file=inspection_stream, flush=True)
     try:
         artifact_snapshot = build_committed_artifact_snapshot(
             campaign,
@@ -7383,8 +7918,8 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                     for item in blocking_intents
                 ],
                 next_actions=[
-                    "ichor-al-daemon stop --campaign-dir " + str(campaign) + " --cancel-jobs",
-                    "ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply",
+                    _campaign_command(campaign, "stop", " --cancel-jobs"),
+                    _campaign_command(campaign, "reconcile"),
                 ],
             )
             return 9
@@ -7771,10 +8306,11 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 ("contract", "ok" if recomputed_status.get("contract_ok") else "invalid"),
             ]
         )
-        _print_reconcile_list(
-            "trusted handoffs",
-            _reconcile_valid_candidates(campaign, recomputed_status, report),
-        )
+        if bool(getattr(args, "verbose", False)):
+            _print_reconcile_list(
+                "trusted handoffs",
+                _reconcile_valid_candidates(campaign, recomputed_status, report),
+            )
         print("")
 
     restored_bootstrap_handoff: List[str] = []
@@ -7994,8 +8530,8 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         _fail_reconcile_transaction(transaction, reason)
         print(reason, file=sys.stderr)
         print(
-            "The committed state and current pointers are coherent. Rerun "
-            "reconcile --apply to finish the recorded intent transaction.",
+            "The committed state and current pointers are coherent. Preview "
+            "reconcile, then apply the reviewed recovery to finish the recorded intent transaction.",
             file=sys.stderr,
         )
         return 9
@@ -8201,6 +8737,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         archived=archived,
         archived_reference_data_staging=archived_reference_data_staging,
         restored_bootstrap_handoff=restored_bootstrap_handoff,
+        verbose=bool(getattr(args, "verbose", False)),
     )
     return 0
 
@@ -8219,26 +8756,48 @@ def cmd_journal(args: argparse.Namespace) -> int:
         print("Timeline")
         print("  no journal yet at " + str(journal_path))
         return 4
+    since = getattr(args, "since", None)
+    if since is not None:
+        try:
+            from datetime import datetime
+
+            datetime.fromisoformat(str(since).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            print(
+                "invalid --since timestamp; use ISO-8601, for example "
+                "2026-07-20T12:30:00+00:00",
+                file=sys.stderr,
+            )
+            return 2
+    last_n = getattr(args, "last_n", None)
+    if last_n is not None and int(last_n) <= 0:
+        print("journal: error: --last-n must be a positive integer", file=sys.stderr)
+        return 2
     try:
         iterator = read_events(
             journal_path,
-            since=args.since,
-            event_type=args.event_type or None,
+            since=since,
+            event_type=getattr(args, "event_type", None) or None,
         )
-        last_n = getattr(args, "last_n", None)
         if last_n is None:
             events = list(iterator)
-        elif int(last_n) > 0:
-            events = list(deque(iterator, maxlen=int(last_n)))
         else:
-            events = []
-    except (JournalCorruptionError, ValueError, OSError) as exc:
+            events = list(deque(iterator, maxlen=int(last_n)))
+    except (JournalCorruptionError, OSError) as exc:
         print("journal is corrupt or unreadable: " + str(exc), file=sys.stderr)
+        return 5
+    except ValueError as exc:
+        print("journal contains an invalid timestamp: " + str(exc), file=sys.stderr)
         return 5
     if bool(getattr(args, "json", False)) or bool(getattr(args, "raw", False)):
         for event in events:
             print(json.dumps(event, sort_keys=True, allow_nan=False))
     else:
+        if (
+            not bool(getattr(args, "verbose", False))
+            and not (getattr(args, "event_type", None) or [])
+        ):
+            events = _aggregate_journal_events(events)
         print(
             _format_journal_events(
                 events,
@@ -8348,12 +8907,25 @@ def _prompt_bootstrap_alf(
         raise ValueError("CSV bootstrap ALF entries must be integers") from exc
 
 
-def _print_bootstrap_plan(plan: Any) -> None:
+def _print_bootstrap_plan(plan: Any, *, verbose: bool = False) -> None:
     labels = {
         "train": "Training",
         "int_val": "Internal validation",
         "ext_val": "External validation",
     }
+    if not verbose:
+        print("Bootstrap inputs")
+        print("  custom inputs: " + ("enabled" if plan.custom_enabled else "not supplied"))
+        print("  training geometries: " + str(plan.effective_training_count))
+        print(
+            "  internal validation geometries: "
+            + str(plan.configured_targets["int_val"])
+        )
+        print(
+            "  external validation geometries: "
+            + str(plan.configured_targets["ext_val"])
+        )
+        return
     print("Bootstrap discovery complete")
     print("")
     print("  custom bootstrap: " + ("enabled" if plan.custom_enabled else "disabled"))
@@ -8524,15 +9096,18 @@ def _pool_feasibility_summary(campaign: Path, config: CampaignConfig) -> Dict[st
         }
 
 
-def _print_pool_summary(summary: Dict[str, Any]) -> None:
+def _print_pool_summary(summary: Dict[str, Any], *, verbose: bool = False) -> None:
     if str(summary.get("status")) == "ok":
         print(
             "  trajectory pool: ok, frames="
             + str(summary.get("frames"))
             + ", atoms="
             + str(summary.get("atoms"))
-            + ", sha="
-            + str(summary.get("sha256", ""))[:12]
+            + (
+                ", sha=" + str(summary.get("sha256", ""))[:12]
+                if verbose
+                else ""
+            )
         )
     elif str(summary.get("status")) == "missing":
         print("  trajectory pool: missing")
@@ -8540,7 +9115,12 @@ def _print_pool_summary(summary: Dict[str, Any]) -> None:
         print("  trajectory pool: invalid - " + str(summary.get("error", "unknown")))
 
 
-def _print_pool_feasibility(summary: Dict[str, Any], *, file=None) -> None:
+def _print_pool_feasibility(
+    summary: Dict[str, Any],
+    *,
+    file=None,
+    verbose: bool = False,
+) -> None:
     stream = sys.stdout if file is None else file
     if summary.get("error"):
         print(
@@ -8557,7 +9137,7 @@ def _print_pool_feasibility(summary: Dict[str, Any], *, file=None) -> None:
         + str(summary.get("required_pool_frames")),
         file=stream,
     )
-    if summary.get("expression"):
+    if verbose and summary.get("expression"):
         print("    " + str(summary.get("expression")), file=stream)
 
 
@@ -8621,7 +9201,7 @@ def _bootstrap_fresh_campaign_state(
             "state.json is missing but this campaign has stateful run artefacts.",
             "Refusing to create a fresh state because that could overwrite provenance.",
             "Run:",
-            "  ichor-al-daemon reconcile --campaign-dir " + str(campaign) + " --apply",
+            "  " + _campaign_command(campaign, "reconcile"),
             "Stateful artefacts:",
         ]
         lines.extend("  - " + str(item) for item in artefacts[:12])
@@ -8736,7 +9316,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         print("campaign bootstrap inspection failed: " + str(exc), file=sys.stderr)
         return 18
 
-    _print_bootstrap_plan(plan)
+    init_verbose = bool(getattr(args, "verbose", False))
+    _print_bootstrap_plan(plan, verbose=init_verbose)
     if not _confirm_bootstrap_plan(assume_yes=bool(getattr(args, "yes", False))):
         print("Campaign initialisation cancelled; no campaign files were changed.")
         return 19
@@ -8794,7 +9375,11 @@ def cmd_init(args: argparse.Namespace) -> int:
         ).to_dict()
         if not bool(feasibility_summary.get("ok", False)):
             print("campaign bootstrap failed: trajectory pool is infeasible", file=sys.stderr)
-            _print_pool_feasibility(feasibility_summary, file=sys.stderr)
+            _print_pool_feasibility(
+                feasibility_summary,
+                file=sys.stderr,
+                verbose=True,
+            )
             return 17
 
     try:
@@ -8836,33 +9421,39 @@ def cmd_init(args: argparse.Namespace) -> int:
         pass
     print("Campaign initialised")
     print("  campaign: " + str(campaign))
-    print("  campaign.yaml: ok, schema v" + str(config.schema_version))
-    _print_pool_summary(pool_summary)
-    print(
-        "  bootstrap inputs: confirmed, identity="
-        + str(bootstrap_manifest.get("plan_identity_sha256", ""))[:12]
-        + "..."
-    )
+    print("  campaign.yaml: valid")
+    _print_pool_summary(pool_summary, verbose=init_verbose)
+    print("  bootstrap inputs: confirmed")
+    if init_verbose:
+        print("  campaign schema: " + str(config.schema_version))
+        print(
+            "  bootstrap identity: "
+            + str(bootstrap_manifest.get("plan_identity_sha256", ""))
+        )
     if feasibility_summary:
-        _print_pool_feasibility(feasibility_summary)
+        _print_pool_feasibility(feasibility_summary, verbose=init_verbose)
     print(
         "  state.json: "
         + str(bootstrap["state_status"])
         + ", phase="
         + str(state.phase.value)
     )
-    print("  config_lock.json: " + str(bootstrap["config_lock_status"]))
+    if init_verbose:
+        print("  config_lock.json: " + str(bootstrap["config_lock_status"]))
     print("")
     if str(pool_summary.get("status")) == "ok":
         print("Next:")
-        print("  ichor-al-daemon preflight --campaign-dir " + str(campaign))
-        print("  ichor-al-daemon start --campaign-dir " + str(campaign))
+        print("  " + _campaign_command(campaign, "preflight"))
+        print("  Live:    " + _campaign_command(campaign, "start", " --mode live"))
+        print(
+            "  Dry run: "
+            + _campaign_command(campaign, "start", " --mode dry_run")
+        )
     else:
         print("Next:")
         print(
-            "  ichor-al-daemon init --campaign-dir "
-            + str(campaign)
-            + " --source /path/to/pool.xyz"
+            "  "
+            + _campaign_command(campaign, "init", " --source /path/to/pool.xyz")
         )
     return 0
 
@@ -8880,6 +9471,23 @@ def cmd_config_check(args: argparse.Namespace) -> int:
     try:
         config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
     except Exception as exc:
+        if bool(getattr(args, "human", False)):
+            print("Config check")
+            print("Config")
+            print("  result: invalid")
+            print("  reason: " + type(exc).__name__ + ": " + str(exc))
+            print("")
+            print("Pool")
+            print("  result: not checked because campaign.yaml is invalid")
+            print("")
+            print("Action")
+            print("  correct campaign.yaml, then run:")
+            print(
+                "  ichor-al-daemon config-check --campaign-dir "
+                + shlex.quote(str(campaign))
+                + " --human"
+            )
+            return 2
         print(
             "campaign.yaml invalid: " + type(exc).__name__ + ": " + str(exc),
             file=sys.stderr,
@@ -8948,7 +9556,37 @@ def cmd_config_check(args: argparse.Namespace) -> int:
             "ok": False,
             "error": type(exc).__name__ + ": " + str(exc),
         }
-    print(json.dumps(summary, indent=2, sort_keys=True, allow_nan=False))
+    if bool(getattr(args, "human", False)):
+        pool = summary["pool_feasibility"]
+        print("Config check")
+        print("Config")
+        print("  result: valid")
+        print("  system: " + str(summary["campaign"]["system_name"]))
+        print(
+            "  planned active-learning iterations: "
+            + str(summary["campaign"]["max_iterations"])
+        )
+        print("")
+        print("Pool")
+        if bool(pool.get("ok", False)):
+            print("  result: sufficient for the configured campaign")
+            print("  frames available: " + str(pool.get("pool_n_frames")))
+            print("  frames required: " + str(pool.get("required_pool_frames")))
+            print("")
+            print("Action")
+            print("  no configuration or pool correction is required")
+        else:
+            print("  result: insufficient or unavailable")
+            print(
+                "  reason: "
+                + str(pool.get("error") or pool.get("expression") or "unknown")
+            )
+            print("")
+            print("Action")
+            print("  correct the campaign sizing or import a larger trajectory pool")
+    else:
+        # No flag intentionally retains the historical machine-readable output.
+        print(json.dumps(summary, indent=2, sort_keys=True, allow_nan=False))
     return 0 if bool(summary["pool_feasibility"].get("ok", False)) else 10
 
 
@@ -9019,6 +9657,12 @@ def _preflight_failure_details(payload: Dict[str, Any]) -> List[str]:
                 details.append("make sbatch available on the Slurm login node")
             elif name == "sacct":
                 details.append("make sacct available; the daemon needs it for polling")
+            elif name == "squeue":
+                details.append("make squeue available; the daemon uses it to confirm live Slurm ownership")
+            elif name == "batch_python":
+                details.append(
+                    "configure an absolute submitted Python path and install the ICHOR runtime in that environment"
+                )
             elif name == "bc":
                 details.append("make bc available; pyferebus scripts use it")
             elif name == "gaussian":
@@ -9108,11 +9752,10 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
                 + (" (" + str(avail.get("batch_python_version")) + ")" if avail.get("batch_python_version") else "")
                 + (": " + str(avail.get("batch_python_error")) if avail.get("batch_python_error") else "")
             ),
-            warn=not bool(avail.get("batch_python")),
         )
     )
     runtime_modules = avail.get("batch_runtime_modules")
-    if isinstance(runtime_modules, (list, tuple)):
+    if verbose and isinstance(runtime_modules, (list, tuple)):
         lines.append(
             "  submitted module stack: "
             + (", ".join(str(value) for value in runtime_modules) or "<none>")
@@ -9176,11 +9819,11 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
     lines.append("Campaign Config")
     if config.get("ok"):
         lines.append(_preflight_check_line("campaign.yaml", True, "valid"))
-        if config.get("schema_version") is not None:
+        if verbose and config.get("schema_version") is not None:
             lines.append("  schema version: " + str(config.get("schema_version")))
         if config.get("system_name"):
             lines.append("  system: " + str(config.get("system_name")))
-        if config.get("prior_mean_level_of_theory"):
+        if verbose and config.get("prior_mean_level_of_theory"):
             lines.append(
                 "  FEREBUS prior: type "
                 + str(config.get("prior_mean_type"))
@@ -9235,24 +9878,24 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
         required = pool.get("required_pool_frames")
         lines.append(_preflight_check_line("frames available", pool_ok, pool_n))
         lines.append(_preflight_check_line("frames required", pool_ok, required))
-        if pool.get("bootstrap_custom_count") is not None:
+        if verbose and pool.get("bootstrap_custom_count") is not None:
             lines.append(
                 "  bootstrap custom geometries: "
                 + str(pool.get("bootstrap_custom_count"))
             )
-        if pool.get("bootstrap_model_training_count") is not None:
+        if verbose and pool.get("bootstrap_model_training_count") is not None:
             lines.append(
                 "  bootstrap model training rows: "
                 + str(pool.get("bootstrap_model_training_count"))
             )
-        if pool.get("bootstrap_pool_frame_count") is not None:
+        if verbose and pool.get("bootstrap_pool_frame_count") is not None:
             lines.append(
                 "  bootstrap pool frames: "
                 + str(pool.get("bootstrap_pool_frame_count"))
             )
-        if pool.get("expression"):
+        if verbose and pool.get("expression"):
             lines.append("  requirement: " + str(pool.get("expression")))
-        if pool.get("reserve_after_bootstrap") is not None:
+        if verbose and pool.get("reserve_after_bootstrap") is not None:
             lines.append("  reserve after bootstrap: " + str(pool.get("reserve_after_bootstrap")))
         try:
             surplus = int(pool_n) - int(required)
@@ -9271,12 +9914,10 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
     lines.append("")
     lines.append("Next Action")
     if payload.get("ready"):
-        lines.append("  start live campaign:")
-        lines.append(
-            "    ichor-al-daemon start --campaign-dir "
-            + str(payload.get("campaign_dir"))
-            + " --mode live"
-        )
+        lines.append("  " + str(payload.get("next_action")))
+        command = payload.get("_presentation_next_command")
+        if command:
+            lines.append("    " + str(command))
     else:
         lines.append("  fix failed checks before live start")
         for detail in _preflight_failure_details(payload)[:12]:
@@ -9287,6 +9928,85 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
         for line in str(payload.get("missing_backend_message") or "").splitlines():
             lines.append("  " + line)
     return "\n".join(lines) + "\n"
+
+
+def _preflight_launch_advice(
+    campaign: Path,
+    payload: Dict[str, Any],
+) -> Tuple[str, Optional[str]]:
+    if not bool(payload.get("ready", False)):
+        return "fix failed checks before live start", None
+    paths = _campaign_paths(campaign)
+    lock = _probe_daemon_lock(paths["lock"])
+    stale_seconds, clock_skew = _runtime_liveness_policy(campaign)
+    lease = _probe_daemon_lease(
+        paths["lease"],
+        stale_seconds=stale_seconds,
+        clock_skew_tolerance_seconds=clock_skew,
+    )
+    background = _probe_background_daemon(
+        paths["background_pid"],
+        paths["background_log"],
+        paths["background_startup"],
+    )
+    daemon_active = bool(
+        lock.get("lock_held") is True
+        or background.get("background_pid_alive") is True
+        or _lease_is_fresh(
+            lease.get("lease_heartbeat"),
+            stale_seconds=stale_seconds,
+            clock_skew_tolerance_seconds=clock_skew,
+        )
+    )
+    status_command = _campaign_command(campaign, "status")
+    if daemon_active:
+        return "monitor the running campaign", status_command
+
+    state = None
+    try:
+        state = read_state(paths["state"])
+    except Exception:
+        pass
+    intents: List[Dict[str, Any]] = []
+    if state is not None:
+        try:
+            intents = _load_active_submission_intents(
+                campaign,
+                expected_campaign_uid=str(state.campaign_uid),
+                state=state,
+            )
+        except Exception:
+            intents = []
+        if any(job_id for job_id in state.pending_jobs.values()) or any(
+            intent.get("job_id") for intent in intents
+        ):
+            return (
+                "resume the daemon to monitor recorded Slurm work",
+                _campaign_command(campaign, "resume"),
+            )
+        if intents:
+            return (
+                "resume the daemon to continue prepared local work",
+                _campaign_command(campaign, "resume"),
+            )
+
+    try:
+        from .execution_identity import execution_identity_path
+
+        if execution_identity_path(campaign).is_file():
+            return (
+                "resume the existing campaign",
+                _campaign_command(campaign, "resume"),
+            )
+    except OSError:
+        return (
+            "preview campaign recovery before starting",
+            _campaign_command(campaign, "reconcile"),
+        )
+    return (
+        "start the campaign in live mode",
+        _campaign_command(campaign, "start", " --mode live"),
+    )
 
 
 def evaluate_campaign_preflight(
@@ -9526,10 +10246,20 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         payload["ready"] = bool(payload.get("ready", False)) and bool(
             smoke.get("ok", False)
         )
+    next_action, next_command = _preflight_launch_advice(campaign, payload)
+    payload["next_action"] = next_action
     if bool(getattr(args, "json", False)):
         print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
     else:
-        print(_format_preflight(payload, verbose=bool(getattr(args, "verbose", False))), end="")
+        presentation_payload = dict(payload)
+        presentation_payload["_presentation_next_command"] = next_command
+        print(
+            _format_preflight(
+                presentation_payload,
+                verbose=bool(getattr(args, "verbose", False)),
+            ),
+            end="",
+        )
     if payload["ready"]:
         return 0
     return 12
@@ -9581,7 +10311,13 @@ def cmd_resource_plan(args: argparse.Namespace) -> int:
     if bool(getattr(args, "json", False)):
         print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
     else:
-        print(format_resource_plan(payload), end="")
+        print(
+            format_resource_plan(
+                payload,
+                verbose=bool(getattr(args, "verbose", False)),
+            ),
+            end="",
+        )
     if not bool(getattr(args, "all", False)):
         statuses = {str(plan.get("status")) for plan in payload["plans"]}
         if "evidence_invalid" in statuses:
@@ -9623,13 +10359,22 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
                 allow_active_lease=False,
             )
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
-        print("checkpoint failed: " + str(exc), file=sys.stderr)
+        print("Checkpoint was not created: " + str(exc), file=sys.stderr)
+        print(
+            "Check the destination and campaign status, then run checkpoint-status.",
+            file=sys.stderr,
+        )
         return 2
     if bool(getattr(args, "json", False)):
         print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
     else:
-        print("Checkpoint verified: " + str(payload["checkpoint"]))
-        print("Manifest SHA-256: " + str(payload["manifest_sha256"]))
+        print("Checkpoint created and verified.")
+        print("  checkpoint: " + str(payload["checkpoint"]))
+        manifest = payload.get("manifest")
+        if isinstance(manifest, dict) and manifest.get("iteration") is not None:
+            print("  campaign iteration: " + str(manifest.get("iteration")))
+        print("Action")
+        print("  no further checkpoint action is required")
     return 0
 
 
@@ -9646,15 +10391,27 @@ def cmd_checkpoint_status(args: argparse.Namespace) -> int:
         )
         payload = checkpoint_status(campaign, destination)
     except (OSError, TypeError, ValueError) as exc:
-        print("checkpoint-status failed: " + str(exc), file=sys.stderr)
+        print("Checkpoint status could not be verified: " + str(exc), file=sys.stderr)
+        print("Do not restore from this checkpoint store until it is verified.", file=sys.stderr)
         return 2
     if bool(getattr(args, "json", False)):
         print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
     else:
-        print("Checkpoint status: " + str(payload["status"]))
-        print("Store: " + str(payload["store"]))
-        if isinstance(payload.get("current"), dict):
-            print("Iteration: " + str(payload["current"].get("iteration")))
+        if payload["status"] == "verified":
+            print("Current checkpoint is present and verified.")
+            if isinstance(payload.get("current"), dict):
+                print("  campaign iteration: " + str(payload["current"].get("iteration")))
+            print("Action")
+            print("  no checkpoint repair is required")
+        else:
+            print("No current checkpoint has been published for this campaign.")
+            print("Action")
+            print(
+                "  ichor-al-daemon checkpoint --campaign-dir "
+                + shlex.quote(str(campaign))
+                + " --destination "
+                + shlex.quote(str(destination))
+            )
     return 0 if payload["status"] == "verified" else 1
 
 
@@ -9665,13 +10422,16 @@ def cmd_verify_checkpoint(args: argparse.Namespace) -> int:
     try:
         payload = verify_checkpoint(args.checkpoint)
     except (OSError, TypeError, ValueError) as exc:
-        print("verify-checkpoint failed: " + str(exc), file=sys.stderr)
+        print("Checkpoint verification failed: " + str(exc), file=sys.stderr)
+        print("Do not restore this checkpoint.", file=sys.stderr)
         return 2
     if bool(getattr(args, "json", False)):
         print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
     else:
-        print("Checkpoint verified: " + str(payload["checkpoint"]))
-        print("Manifest SHA-256: " + str(payload["manifest_sha256"]))
+        print("Checkpoint is complete and all stored files were verified.")
+        print("  checkpoint: " + str(payload["checkpoint"]))
+        print("Action")
+        print("  this checkpoint is safe to use for a restore preview")
     return 0
 
 
@@ -9686,16 +10446,30 @@ def cmd_restore_checkpoint(args: argparse.Namespace) -> int:
             apply=bool(getattr(args, "apply", False)),
         )
     except (OSError, TypeError, ValueError) as exc:
-        print("restore-checkpoint failed: " + str(exc), file=sys.stderr)
+        print("Checkpoint restore failed: " + str(exc), file=sys.stderr)
+        print("No restored campaign was published.", file=sys.stderr)
         return 2
     if bool(getattr(args, "json", False)):
         print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
     elif payload["applied"]:
-        print("Checkpoint restored and verified: " + str(payload["target"]))
+        print("Checkpoint restored and verified.")
+        print("  restored campaign: " + str(payload["target"]))
+        print("Action")
+        print(
+            "  ichor-al-daemon status --campaign-dir "
+            + shlex.quote(str(payload["target"]))
+        )
     else:
         print("Checkpoint restore verified; no files were written.")
         print("Target: " + str(payload["target"]))
-        print("Re-run with --apply to restore.")
+        print("Action")
+        print(
+            "  ichor-al-daemon restore-checkpoint --checkpoint "
+            + shlex.quote(str(args.checkpoint))
+            + " --target-empty-dir "
+            + shlex.quote(str(args.target_empty_dir))
+            + " --apply"
+        )
     return 0
 
 
@@ -9760,11 +10534,9 @@ Examples:
             "--background",
             action="store_true",
             help=(
-                "Launch the daemon as a detached background child. The child owns "
-                "its PID file; the launcher waits for startup acknowledgement but "
-                "never terminates a live child merely because that wait expires. "
-                "Logs and durable startup status are stored under "
-                ".DATA/ACTIVE_LEARNING by default."
+                "Run the daemon in the background and return to the shell after "
+                "campaign ownership is confirmed. Use status to check whether "
+                "startup has completed."
             ),
         )
         process_group.add_argument(
@@ -9886,6 +10658,12 @@ Examples:
             "Plain stop only requests daemon shutdown and leaves jobs alone."
         ),
     )
+    p_stop.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Show request identifiers, control paths and process-signal details.",
+    )
     p_stop.set_defaults(func=cmd_stop, stop_mode="immediate")
 
     p_status = sub.add_parser(
@@ -9913,10 +10691,11 @@ Examples:
 
     p_resume = sub.add_parser(
         "resume",
-        help="Equivalent to start (kept for symmetry; works only when state.json exists).",
+        help="Continue a stopped or safely recovered campaign.",
         description=(
-            "Resume a campaign daemon. This accepts the same execution-mode "
-            "and background flags as start."
+            "Continue an existing campaign after a normal stop or reviewed "
+            "recovery. Resume preserves the campaign's previously selected "
+            "execution mode."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -10111,7 +10890,8 @@ Examples:
             "Examples:\n"
             "  ichor-al-daemon journal\n"
             "  ichor-al-daemon journal -e phase_submitted -n 20\n"
-            "  ichor-al-daemon journal -j | tail -n 40"
+            "  ichor-al-daemon journal --last-n 40\n"
+            "  ichor-al-daemon journal --json"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -10132,7 +10912,7 @@ Examples:
     p_jrn.add_argument(
         "-n",
         "--last-n",
-        type=int,
+        type=_positive_cli_int,
         default=None,
         help="Show only the last N events after filters are applied.",
     )
@@ -10176,8 +10956,10 @@ Examples:
         p.add_argument(
             "-f",
             "--force", action="store_true",
-            help="Overwrite an existing pool (DANGEROUS: invalidates every committed "
-                 "iteration's frame-id provenance).",
+            help=(
+                "Replace an existing uncommitted pool only. Campaigns with "
+                "committed run data are always refused."
+            ),
         )
         p.add_argument(
             "-y",
@@ -10187,6 +10969,12 @@ Examples:
                 "Accept the validated bootstrap summary non-interactively. "
                 "CSV inputs still require bootstrap/alf.yaml."
             ),
+        )
+        p.add_argument(
+            "-v",
+            "--verbose",
+            action="store_true",
+            help="Show hashes, ALFs and detailed bootstrap evidence.",
         )
 
     p_init = sub.add_parser(
@@ -10203,7 +10991,8 @@ Examples:
             "Examples:\n"
             "  ichor-al-daemon init\n"
             "  ichor-al-daemon init -c ~/campaigns/water_001 -s pool.xyz\n"
-            "  ichor-al-daemon start --campaign-dir ~/campaigns/water_001"
+            "  ichor-al-daemon start --campaign-dir ~/campaigns/water_001 --mode live\n"
+            "  ichor-al-daemon start --campaign-dir ~/campaigns/water_001 --mode dry_run"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -10294,6 +11083,11 @@ Examples:
         action="store_true",
         help="Print schema-v2 machine-readable JSON.",
     )
+    p_resource.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show formulae, evidence hashes, profile limits and telemetry details.",
+    )
     p_resource.set_defaults(func=cmd_resource_plan)
 
     p_checkpoint = sub.add_parser(
@@ -10353,6 +11147,17 @@ Examples:
         ),
     )
     add_campaign(p_cfg)
+    config_output = p_cfg.add_mutually_exclusive_group()
+    config_output.add_argument(
+        "--human",
+        action="store_true",
+        help="Print a concise Config and Pool summary for users.",
+    )
+    config_output.add_argument(
+        "--json",
+        action="store_true",
+        help="Explicitly request the existing machine-readable JSON output.",
+    )
     p_cfg.set_defaults(func=cmd_config_check)
 
     return parser

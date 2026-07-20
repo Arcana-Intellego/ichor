@@ -29,6 +29,7 @@ class ResourcePlanMenuOptions:
     phase: str = "PHASE_A_DIVERSITY"
     iteration: int | None = None
     json: bool = False
+    verbose: bool = False
 
 
 resource_plan_options = ResourcePlanMenuOptions()
@@ -59,9 +60,8 @@ def _run_resource_plan():
     )
     ns.iteration = resource_plan_options.iteration
     ns.json = bool(resource_plan_options.json)
-    rc = cmd_resource_plan(ns)
-    if rc != 0:
-        print("resource-plan returned exit code " + str(rc))
+    ns.verbose = bool(resource_plan_options.verbose)
+    cmd_resource_plan(ns)
     user_input_free_flow("Press enter to return to the menu: ", "")
 
 
@@ -80,6 +80,7 @@ def resource_plan_menu(parent=None):
             ),
             spec("iteration", "optional_int"),
             spec("json", "bool"),
+            spec("verbose", "bool"),
         ],
         _get,
         _set,

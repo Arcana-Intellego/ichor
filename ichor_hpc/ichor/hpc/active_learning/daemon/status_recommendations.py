@@ -1,6 +1,6 @@
 """User recommendations for ``ichor-al-daemon status``.
 
-The daemon state is a compact machine contract, but the status command is an
+The daemon state is a compact machine contract, but the status command is a
 user interface. Keep the decision table here so recommendations stay
 specific and testable instead of collapsing into one generic "run reconcile"
 message.
@@ -49,8 +49,35 @@ def _cmd(campaign_dir: Path, command: str) -> str:
     )
 
 
-def _start_cmd(campaign_dir: Path) -> str:
-    return _cmd(campaign_dir, "start") + " --mode live"
+def _resume_cmd(campaign_dir: Path) -> str:
+    return _cmd(campaign_dir, "resume")
+
+
+def _execution_mode(payload: Dict[str, Any]) -> Optional[str]:
+    value = payload.get("_presentation_execution_mode")
+    return str(value) if value in {"live", "dry_run"} else None
+
+
+def _daemon_is_active(payload: Dict[str, Any]) -> bool:
+    return bool(
+        payload.get("lock_held") is True
+        or payload.get("background_pid_alive") is True
+        or _lease_is_fresh(payload)
+    )
+
+
+def _phase_command(campaign_dir: Path, payload: Dict[str, Any]) -> str:
+    """Return a command valid for the campaign's recorded execution identity."""
+    phase = _phase(payload)
+    mode = _execution_mode(payload)
+    if mode is not None or (
+        phase != CampaignPhase.INIT.value
+        and payload.get("_presentation_execution_identity_checked") is not True
+    ):
+        return _resume_cmd(campaign_dir)
+    if phase == CampaignPhase.INIT.value:
+        return _cmd(campaign_dir, "start") + " --mode live"
+    return _reconcile_cmd(campaign_dir)
 
 
 def _reconcile_cmd(campaign_dir: Path, *, apply: bool = False) -> str:
@@ -187,88 +214,84 @@ def _stale_pid_recommendation(campaign: Path, payload: Dict[str, Any]) -> List[S
             severity="watch",
             primary="background PID metadata is stale; it will be replaced on the next background launch",
             why="the recorded background PID is not alive",
-            command=_start_cmd(campaign),
+            command=_phase_command(campaign, payload),
             details=["pid=" + str(payload.get("background_pid"))],
         )
     ]
 
 
 def _runtime_blockers(campaign: Path, payload: Dict[str, Any]) -> List[StatusRecommendation]:
-    recommendations: List[StatusRecommendation] = []
-    if payload.get("lock_held") is None:
-        recommendations.append(
-            StatusRecommendation(
-                code="runtime_probe_failed",
-                severity="blocked",
-                primary="inspect the daemon lock before starting or reconciling",
-                why="status could not determine whether the foreground lock is held",
-                command=_cmd(campaign, "status") + " --verbose",
-                details=[_short_error(payload.get("lock_probe_error"))],
-            )
+    probe_errors: List[str] = []
+    if (
+        payload.get("lock_probe_error")
+        or ("lock_held" in payload and payload.get("lock_held") is None)
+    ):
+        probe_errors.append(
+            _short_error(payload.get("lock_probe_error"))
+            or "the daemon lock could not be checked"
         )
     if payload.get("lease_probe_error"):
-        recommendations.append(
+        probe_errors.append(_short_error(payload.get("lease_probe_error")))
+    if probe_errors:
+        return [
             StatusRecommendation(
                 code="runtime_probe_failed",
                 severity="blocked",
-                primary="inspect the daemon lease before starting or reconciling",
-                why="status could not read the daemon lease heartbeat",
+                primary="inspect daemon ownership before starting or recovering the campaign",
+                why="status could not establish whether another daemon owns this campaign",
                 command=_cmd(campaign, "status") + " --verbose",
-                details=[_short_error(payload.get("lease_probe_error"))],
+                details=probe_errors,
             )
-        )
-    if payload.get("lock_held") is True:
-        recommendations.append(
+        ]
+    if _daemon_is_active(payload):
+        evidence: List[str] = []
+        if payload.get("lock_held") is True:
+            evidence.append("campaign lock held")
+        if _lease_is_fresh(payload):
+            evidence.append("recent daemon heartbeat")
+        if payload.get("background_pid_alive") is True:
+            evidence.append("background process is alive")
+        return [
             StatusRecommendation(
-                code="daemon_running_lock",
+                code="daemon_running",
                 severity="watch",
-                primary="a daemon appears to own the foreground lock; monitor it instead of starting another",
-                why="the daemon lock is currently held",
-                command=_journal_cmd(campaign),
+                primary="the daemon is running; monitor it instead of starting another",
+                why=", ".join(evidence),
+                command=_journal_cmd(campaign) + " --last-n 40",
             )
-        )
-    if _lease_is_fresh(payload):
-        recommendations.append(
-            StatusRecommendation(
-                code="daemon_running_lease",
-                severity="watch",
-                primary="a daemon lease heartbeat is fresh; monitor the running daemon",
-                why="the lease heartbeat is recent",
-                command=_journal_cmd(campaign),
-            )
-        )
-    if payload.get("background_pid_alive") is True:
-        recommendations.append(
-            StatusRecommendation(
-                code="daemon_running_background",
-                severity="watch",
-                primary="the background daemon is running; monitor journal/status or stop it intentionally",
-                why="the recorded background PID is alive",
-                command=_journal_cmd(campaign),
-                details=["pid=" + str(payload.get("background_pid"))],
-            )
-        )
-    return recommendations
+        ]
+    return []
 
 
 def _job_recommendations(campaign: Path, payload: Dict[str, Any]) -> List[StatusRecommendation]:
     recommendations: List[StatusRecommendation] = []
+    daemon_active = _daemon_is_active(payload)
     pending = _active_pending_jobs(payload)
     if pending:
         recommendations.append(
             StatusRecommendation(
                 code="pending_state_job",
                 severity="watch",
-                primary="a Slurm job is recorded in state; wait for daemon postprocess or stop it intentionally",
-                why="state.json still contains active pending job IDs",
-                command=_journal_cmd(campaign),
+                primary=(
+                    "Slurm work is recorded; monitor the running daemon"
+                    if daemon_active
+                    else "resume the daemon so it can monitor and postprocess the recorded Slurm work"
+                ),
+                why="campaign state contains active Slurm job IDs",
+                command=(
+                    _journal_cmd(campaign) + " --last-n 40"
+                    if daemon_active
+                    else _resume_cmd(campaign)
+                ),
                 details=[phase + "=" + job_id for phase, job_id in sorted(pending.items())],
             )
         )
     intents = _active_submission_intents(payload)
-    if intents:
+    scheduler_intents = [intent for intent in intents if intent.get("job_id")]
+    local_intents = [intent for intent in intents if not intent.get("job_id")]
+    if scheduler_intents:
         details = []
-        for intent in intents[:5]:
+        for intent in scheduler_intents[:5]:
             details.append(
                 str(intent.get("phase", "?"))
                 + "@"
@@ -285,9 +308,44 @@ def _job_recommendations(campaign: Path, payload: Dict[str, Any]) -> List[Status
             StatusRecommendation(
                 code="active_submission_intent",
                 severity="watch",
-                primary="a submission intent is still active; let the daemon adopt/postprocess it or stop it intentionally",
-                why="submission intent files show active scheduler work",
-                command=_journal_cmd(campaign),
+                primary=(
+                    "submitted Slurm work is recorded; monitor the running daemon"
+                    if daemon_active
+                    else "resume the daemon so it can adopt or postprocess the submitted Slurm work"
+                ),
+                why="saved submission information contains a Slurm job ID",
+                command=(
+                    _journal_cmd(campaign) + " --last-n 40"
+                    if daemon_active
+                    else _resume_cmd(campaign)
+                ),
+                details=details,
+            )
+        )
+    if local_intents:
+        details = [
+            str(intent.get("phase", "?"))
+            + " iteration "
+            + str(intent.get("iteration", "?"))
+            + " "
+            + str(intent.get("status", "?"))
+            for intent in local_intents[:5]
+        ]
+        recommendations.append(
+            StatusRecommendation(
+                code="local_submission_intent",
+                severity="watch",
+                primary=(
+                    "local phase work is in progress; monitor the daemon"
+                    if daemon_active
+                    else "resume the daemon to continue the prepared local phase work"
+                ),
+                why="saved phase information has no Slurm job attached",
+                command=(
+                    _journal_cmd(campaign) + " --last-n 40"
+                    if daemon_active
+                    else _resume_cmd(campaign)
+                ),
                 details=details,
             )
         )
@@ -333,7 +391,7 @@ def _scheduler_uncertain_resume_recommendation(
             "resume will not resubmit while scheduler ownership remains recorded"
         ),
         why=_short_error(context.get("message")),
-        command=_cmd(campaign, "resume") + " --mode live",
+        command=_resume_cmd(campaign),
         details=[phase + "=" + job_id],
     )
 
@@ -386,7 +444,7 @@ def _halt_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecom
             command=_reconcile_cmd(campaign),
             details=[
                 "threshold-only edits reuse hash-bound model evidence",
-                "use reconcile --retrain-ferebus --apply to discard no output silently",
+                "after a safe preview, reconcile --retrain-ferebus --apply archives the rejected candidate before retraining",
             ],
         )
     if "SEED_POOL_EXHAUSTED" in upper:
@@ -405,9 +463,9 @@ def _halt_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecom
         return StatusRecommendation(
             code="halted_backend_submission_failed",
             severity="required",
-            primary="fix the configured backend/profile problem, then apply reconcile before restarting",
+            primary="fix the configured backend or profile problem, then preview recovery",
             why="backend submission failed before the phase could run: " + _short_error(reason),
-            command=_reconcile_cmd(campaign, apply=True),
+            command=_reconcile_cmd(campaign),
         )
     if any(token in upper for token in ("NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "REVOKED")):
         return StatusRecommendation(
@@ -529,7 +587,7 @@ def _artifact_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusR
 
 _PHASE_ACTIONS: Dict[str, tuple[str, str]] = {
     CampaignPhase.INIT.value: (
-        "start the daemon to begin the campaign",
+        "choose live or dry-run mode and start the campaign",
         "campaign is initialised and no daemon work is active",
     ),
     CampaignPhase.PHASE_A_DIVERSITY.value: (
@@ -655,12 +713,35 @@ def _phase_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusReco
     action = _PHASE_ACTIONS.get(phase)
     if action is not None:
         primary, why = action
+        mode = _execution_mode(payload)
+        if (
+            phase != CampaignPhase.INIT.value
+            and mode is None
+            and payload.get("_presentation_execution_identity_checked") is True
+        ):
+            return StatusRecommendation(
+                code="execution_identity_unavailable",
+                severity="required",
+                primary="preview recovery before continuing; the campaign execution mode could not be established",
+                why="the campaign has progressed but its execution identity is missing or unreadable",
+                command=_reconcile_cmd(campaign),
+            )
+        if mode is not None:
+            primary = primary.replace("start the daemon", "resume the daemon")
         return StatusRecommendation(
             code="phase_" + phase.lower() + "_ready",
             severity="info",
             primary=primary,
             why=why,
-            command=_start_cmd(campaign),
+            command=_phase_command(campaign, payload),
+            details=(
+                [
+                    _cmd(campaign, "start") + " --mode dry_run",
+                    "choose live only after preflight passes",
+                ]
+                if phase == CampaignPhase.INIT.value and mode is None
+                else []
+            ),
         )
     return StatusRecommendation(
         code="phase_unknown",
@@ -687,6 +768,7 @@ def build_status_recommendations(
                 severity="required",
                 primary="repair campaign.yaml before assessing pool feasibility or restarting",
                 why=_short_error(config_status.get("error")),
+                command=_cmd(campaign, "config-check") + " --human",
             )
         ]
     if payload.get("partial_array_recovery_error"):
@@ -751,6 +833,7 @@ def build_status_recommendations(
                 severity="blocked",
                 primary="fix bootstrap/seed sizing or import a larger trajectory pool before starting",
                 why=str(feasibility.get("error") or feasibility.get("expression") or "trajectory pool is infeasible"),
+                command=_cmd(campaign, "config-check") + " --human",
                 details=[
                     "pool_n_frames=" + str(feasibility.get("pool_n_frames")),
                     "required_pool_frames=" + str(feasibility.get("required_pool_frames")),
@@ -792,7 +875,7 @@ def build_status_recommendations(
                     "no .DATA/ACTIVE_LEARNING/state.json exists, but the campaign "
                     "contains stateful run artefacts"
                 ),
-                command=_reconcile_cmd(campaign, apply=True),
+                command=_reconcile_cmd(campaign),
             )
         ]
     if status_error == "state_schema_invalid":
@@ -805,9 +888,26 @@ def build_status_recommendations(
                 command=_reconcile_cmd(campaign),
             )
         ]
+    if status_error == "state_unreadable":
+        return [
+            StatusRecommendation(
+                code="state_unreadable",
+                severity="blocked",
+                primary="check that state.json is readable, then preview recovery",
+                why=_short_error(payload.get("state_error")),
+                command=_reconcile_cmd(campaign),
+                details=[_cmd(campaign, "status") + " --verbose"],
+            )
+        ]
+
+    runtime = _runtime_blockers(campaign, payload)
+    if runtime:
+        return runtime
 
     stop_request = payload.get("stop_request")
     if isinstance(stop_request, dict) and not payload.get("shutdown_requested"):
+        from .stop_control import describe_stop_request
+
         if str(stop_request.get("status")) == "cancelling":
             return [
                 StatusRecommendation(
@@ -825,20 +925,11 @@ def build_status_recommendations(
                 )
             ]
         request_completed = str(stop_request.get("status")) == "completed"
-        daemon_active = (
-            payload.get("lock_held") is True
-            or payload.get("background_pid_alive") is True
-            or _lease_is_fresh(payload)
+        daemon_active = _daemon_is_active(payload)
+        stop_description = describe_stop_request(
+            stop_request,
+            completed=request_completed,
         )
-        target = "the next daemon tick"
-        if stop_request.get("target_phase") is not None:
-            target = (
-                str(stop_request.get("target_phase"))
-                + "@"
-                + str(stop_request.get("target_iteration"))
-            )
-        elif stop_request.get("target_iteration") is not None:
-            target = "iteration " + str(stop_request.get("target_iteration"))
         return [
             StatusRecommendation(
                 code="user_stop_draining",
@@ -852,13 +943,7 @@ def build_status_recommendations(
                         else "resume the daemon so it can honour the pending stop boundary"
                     )
                 ),
-                why=(
-                    str(stop_request.get("mode"))
-                    + " stop request is "
-                    + str(stop_request.get("status"))
-                    + "; target is "
-                    + target
-                ),
+                why=stop_description,
                 command=(
                     _cmd(campaign, "resume")
                     if request_completed or not daemon_active
@@ -870,10 +955,6 @@ def build_status_recommendations(
                 ],
             )
         ]
-
-    runtime = _runtime_blockers(campaign, payload)
-    if runtime:
-        return runtime
 
     stale_pid = _stale_pid_recommendation(campaign, payload)
 
@@ -889,7 +970,7 @@ def build_status_recommendations(
                 primary=(
                     "resume the campaign to clear the explicit user stop"
                     if stopped
-                    else "run reconcile before clearing an unclassified stop request"
+                    else "preview recovery before clearing an unclassified stop request"
                 ),
                 why=(
                     str(context.get("message"))
@@ -899,7 +980,7 @@ def build_status_recommendations(
                 command=(
                     _cmd(campaign, "resume")
                     if stopped
-                    else _reconcile_cmd(campaign, apply=True)
+                    else _reconcile_cmd(campaign)
                 ),
             )
         ] + stale_pid

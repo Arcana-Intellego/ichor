@@ -121,9 +121,7 @@ class DaemonControlFunctions:
             return
         ns.json = bool(daemon_control_menu_options.status_json)
         ns.verbose = bool(daemon_control_menu_options.status_verbose)
-        rc = cmd_status(ns)
-        if rc != 0:
-            print("status returned exit code " + str(rc))
+        cmd_status(ns)
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -136,11 +134,9 @@ class DaemonControlFunctions:
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
         ns.json = bool(daemon_control_menu_options.preflight_json)
-        ns.verbose = True
+        ns.verbose = False
         ns.submit_environment_smoke = False
-        rc = cmd_preflight(ns)
-        if rc != 0:
-            print("campaign preflight returned exit code " + str(rc))
+        cmd_preflight(ns)
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -151,13 +147,12 @@ class DaemonControlFunctions:
         if ns is None:
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
+        ns.human = True
+        ns.json = False
         try:
-            rc = cmd_config_check(ns)
+            cmd_config_check(ns)
         except Exception as exc:
             print("config-check failed: " + type(exc).__name__ + ": " + str(exc))
-            rc = 2
-        if rc != 0:
-            print("config-check returned exit code " + str(rc))
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -180,9 +175,7 @@ class DaemonControlFunctions:
         ns.json = False
         ns.verbose = True
         ns.submit_environment_smoke = True
-        rc = cmd_preflight(ns)
-        if rc != 0:
-            print("submitted environment smoke returned exit code " + str(rc))
+        cmd_preflight(ns)
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -203,9 +196,7 @@ class DaemonControlFunctions:
             return
         ns.destination = None
         ns.json = False
-        rc = cmd_checkpoint(ns)
-        if rc != 0:
-            print("checkpoint returned exit code " + str(rc))
+        cmd_checkpoint(ns)
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -218,9 +209,7 @@ class DaemonControlFunctions:
             return
         ns.destination = None
         ns.json = False
-        rc = cmd_checkpoint_status(ns)
-        if rc not in {0, 1}:
-            print("checkpoint-status returned exit code " + str(rc))
+        cmd_checkpoint_status(ns)
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -354,9 +343,8 @@ class DaemonControlFunctions:
                 "",
             )
             ns.cancel_jobs = str(cancel).strip() == "YES"
-        rc = cmd_stop(ns)
-        if rc != 0:
-            print("stop returned exit code " + str(rc))
+        ns.verbose = False
+        cmd_stop(ns)
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -400,9 +388,7 @@ class DaemonControlFunctions:
         ns.apply = False
         ns.json = bool(daemon_control_menu_options.reconcile_json)
         ns.verbose = bool(daemon_control_menu_options.reconcile_verbose)
-        rc = cmd_reconcile(ns)
-        if rc != 0:
-            print("reconcile returned exit code " + str(rc))
+        cmd_reconcile(ns)
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -415,7 +401,7 @@ class DaemonControlFunctions:
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
         answer = user_input_free_flow(
-            "Apply safe reconcile proposal and clean stale uncommitted staging? Type YES: ",
+            "Apply the safe reconcile proposal without archiving staging? Type YES: ",
             "",
         )
         if answer != "YES":
@@ -427,9 +413,7 @@ class DaemonControlFunctions:
         ns.apply = True
         ns.archive_staging = False
         ns.restore_config_from_lock = False
-        rc = cmd_reconcile(ns)
-        if rc != 0:
-            print("reconcile --apply returned exit code " + str(rc))
+        cmd_reconcile(ns)
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -454,9 +438,7 @@ class DaemonControlFunctions:
         ns.apply = True
         ns.archive_staging = True
         ns.restore_config_from_lock = False
-        rc = cmd_reconcile(ns)
-        if rc != 0:
-            print("reconcile --archive-staging --apply returned exit code " + str(rc))
+        cmd_reconcile(ns)
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -474,7 +456,6 @@ class DaemonControlFunctions:
         ns.json = False
         preview_rc = cmd_reconcile(ns)
         if preview_rc != 0:
-            print("scratch inventory returned exit code " + str(preview_rc))
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
         answer = user_input_free_flow(
@@ -486,9 +467,7 @@ class DaemonControlFunctions:
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
         ns.apply = True
-        rc = cmd_reconcile(ns)
-        if rc != 0:
-            print("reconcile --clean-scratch --apply returned exit code " + str(rc))
+        cmd_reconcile(ns)
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -512,9 +491,7 @@ class DaemonControlFunctions:
         ns.allow_fresh_init = False
         ns.apply = False
         ns.restore_config_from_lock = True
-        rc = cmd_reconcile(ns)
-        if rc != 0:
-            print("reconcile --restore-config-from-lock returned exit code " + str(rc))
+        cmd_reconcile(ns)
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -538,9 +515,7 @@ class DaemonControlFunctions:
         ns.apply = False
         ns.restore_config_from_lock = False
         ns.restore_config_lock_history = True
-        rc = cmd_reconcile(ns)
-        if rc != 0:
-            print("reconcile --restore-config-lock-history returned exit code " + str(rc))
+        cmd_reconcile(ns)
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -564,9 +539,7 @@ class DaemonControlFunctions:
         ns = DaemonControlFunctions._set_reconcile_defaults(ns)
         ns.allow_fresh_init = True
         ns.apply = False
-        rc = cmd_reconcile(ns)
-        if rc != 0:
-            print("reconcile returned exit code " + str(rc))
+        cmd_reconcile(ns)
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -591,9 +564,7 @@ class DaemonControlFunctions:
         ns.apply = True
         ns.force_resubmit_array_tasks = True
         ns.archive_existing_array_task_outputs = True
-        rc = cmd_reconcile(ns)
-        if rc != 0:
-            print("reconcile --force-resubmit-array-tasks returned exit code " + str(rc))
+        cmd_reconcile(ns)
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -616,9 +587,7 @@ class DaemonControlFunctions:
         ns = DaemonControlFunctions._set_reconcile_defaults(ns)
         ns.apply = True
         ns.retrain_ferebus = True
-        rc = cmd_reconcile(ns)
-        if rc != 0:
-            print("reconcile --retrain-ferebus returned exit code " + str(rc))
+        cmd_reconcile(ns)
         user_input_free_flow("Press enter to return to the menu: ", "")
 
     @staticmethod
@@ -641,7 +610,14 @@ daemon_control_menu = ConsoleMenu(
 )
 
 
-daemon_control_menu_items = [
+advanced_diagnostics_menu = ConsoleMenu(
+    title="Advanced Diagnostics",
+    subtitle="Configure detailed and machine-readable diagnostic views.\n",
+    show_exit_option=True,
+)
+
+
+advanced_diagnostics_menu_items = [
     FunctionItem("Toggle status JSON output", DaemonControlFunctions.toggle_status_json),
     FunctionItem("Toggle status verbose output", DaemonControlFunctions.toggle_status_verbose),
     FunctionItem("Toggle preflight JSON output", DaemonControlFunctions.toggle_preflight_json),
@@ -651,8 +627,6 @@ daemon_control_menu_items = [
         "Toggle deep reconcile verification",
         DaemonControlFunctions.toggle_reconcile_deep_verify,
     ),
-    FunctionItem("Show status", DaemonControlFunctions.show_status),
-    FunctionItem("Validate campaign config", DaemonControlFunctions.config_check),
     FunctionItem(
         "Show sampling protocol summary",
         DaemonControlFunctions.show_sampling_protocol_summary,
@@ -662,18 +636,23 @@ daemon_control_menu_items = [
         DaemonControlFunctions.show_saved_config_editability_windows,
     ),
     FunctionItem(
-        "Recovery dashboard",
-        DaemonControlFunctions.show_recovery_dashboard,
-    ),
-    SubmenuItem(
-        RESOURCE_PLAN_MENU_DESCRIPTION.title,
-        RESOURCE_PLAN_MENU,
-        daemon_control_menu,
-    ),
-    FunctionItem("Campaign live preflight", DaemonControlFunctions.preflight_backends),
-    FunctionItem(
         "Submit compute-node environment smoke",
         DaemonControlFunctions.submitted_environment_smoke,
+    ),
+]
+
+
+recovery_maintenance_menu = ConsoleMenu(
+    title="Recovery / Maintenance",
+    subtitle="Preview recovery first, then apply only a reviewed safe proposal.\n",
+    show_exit_option=True,
+)
+
+
+recovery_maintenance_menu_items = [
+    FunctionItem(
+        "Recovery dashboard",
+        DaemonControlFunctions.show_recovery_dashboard,
     ),
     FunctionItem(
         "Show checkpoint status",
@@ -683,22 +662,6 @@ daemon_control_menu_items = [
         "Create campaign checkpoint",
         DaemonControlFunctions.create_checkpoint,
     ),
-    SubmenuItem(
-        IMPORT_TRAJECTORY_POOL_MENU_DESCRIPTION.title,
-        import_trajectory_pool_menu,
-        daemon_control_menu,
-    ),
-    SubmenuItem(
-        START_DAEMON_FOREGROUND_MENU_DESCRIPTION.title,
-        start_daemon_foreground_menu,
-        daemon_control_menu,
-    ),
-    SubmenuItem(
-        START_DAEMON_BACKGROUND_MENU_DESCRIPTION.title,
-        start_daemon_background_menu,
-        daemon_control_menu,
-    ),
-    FunctionItem("Stop daemon", DaemonControlFunctions.stop_daemon),
     FunctionItem("Reconcile state", DaemonControlFunctions.reconcile),
     FunctionItem(
         "Reconcile --apply",
@@ -731,6 +694,48 @@ daemon_control_menu_items = [
     FunctionItem(
         "Reconcile state with --allow-fresh-init",
         DaemonControlFunctions.reconcile_allow_fresh_init,
+    ),
+]
+
+
+add_items_to_menu(advanced_diagnostics_menu, advanced_diagnostics_menu_items)
+add_items_to_menu(recovery_maintenance_menu, recovery_maintenance_menu_items)
+
+
+daemon_control_menu_items = [
+    FunctionItem("Show status", DaemonControlFunctions.show_status),
+    FunctionItem("Validate campaign config", DaemonControlFunctions.config_check),
+    FunctionItem("Campaign live preflight", DaemonControlFunctions.preflight_backends),
+    SubmenuItem(
+        RESOURCE_PLAN_MENU_DESCRIPTION.title,
+        RESOURCE_PLAN_MENU,
+        daemon_control_menu,
+    ),
+    SubmenuItem(
+        IMPORT_TRAJECTORY_POOL_MENU_DESCRIPTION.title,
+        import_trajectory_pool_menu,
+        daemon_control_menu,
+    ),
+    SubmenuItem(
+        START_DAEMON_FOREGROUND_MENU_DESCRIPTION.title,
+        start_daemon_foreground_menu,
+        daemon_control_menu,
+    ),
+    SubmenuItem(
+        START_DAEMON_BACKGROUND_MENU_DESCRIPTION.title,
+        start_daemon_background_menu,
+        daemon_control_menu,
+    ),
+    FunctionItem("Stop daemon", DaemonControlFunctions.stop_daemon),
+    SubmenuItem(
+        "Recovery / Maintenance",
+        recovery_maintenance_menu,
+        daemon_control_menu,
+    ),
+    SubmenuItem(
+        "Advanced Diagnostics",
+        advanced_diagnostics_menu,
+        daemon_control_menu,
     ),
 ]
 

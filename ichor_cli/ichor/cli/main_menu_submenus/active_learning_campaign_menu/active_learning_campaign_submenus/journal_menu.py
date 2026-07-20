@@ -90,9 +90,7 @@ class JournalFunctions:
             **_journal_output_kwargs(),
         )
         ns.last_n = None
-        rc = cmd_journal(ns)
-        if rc != 0:
-            print("journal returned exit code " + str(rc))
+        cmd_journal(ns)
         _pause()
 
     @staticmethod
@@ -114,9 +112,7 @@ class JournalFunctions:
             ),
             **_journal_output_kwargs(),
         )
-        rc = cmd_journal(ns)
-        if rc != 0:
-            print("journal returned exit code " + str(rc))
+        cmd_journal(ns)
         _pause()
 
     @staticmethod
@@ -149,9 +145,7 @@ class JournalFunctions:
             event_type=None,
             **_journal_output_kwargs(),
         )
-        rc = cmd_journal(ns)
-        if rc != 0:
-            print("journal returned exit code " + str(rc))
+        cmd_journal(ns)
         _pause()
 
     @staticmethod
@@ -172,9 +166,7 @@ class JournalFunctions:
             verbose=False,
             list_event_types=True,
         )
-        rc = cmd_journal(ns)
-        if rc != 0:
-            print("journal returned exit code " + str(rc))
+        cmd_journal(ns)
         _pause()
 
     @staticmethod

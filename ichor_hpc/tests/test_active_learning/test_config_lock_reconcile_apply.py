@@ -406,11 +406,11 @@ def test_reconcile_refuses_nonempty_campaign_without_trusted_campaign_identity(
     assert rc == 0
     out = capsys.readouterr().out
     assert "ICHOR Reconcile" in out
-    assert "Result: BLOCKED" in out
-    assert "Recovery Contract" in out
+    assert "Recovery preview: blocked" in out
+    assert "Recovery Contract" not in out
     assert "no recoverable trusted campaign_uid" in out
-    assert "selected phase: HALTED iteration 0" in out
-    assert "status        : not runnable" in out
+    assert "decision: stay HALTED" in out
+    assert "status: blocked" in out
     assert "=== Recovery guidance ===" not in out
     assert "Recovery Target" in out
     assert "Apply Plan" in out
@@ -1191,9 +1191,10 @@ def test_reconcile_apply_promotes_state_and_cleans_ferebus_staging(tmp_path, cap
     assert state.reference_data_version == 0
     assert state.models_version == -1
     assert not stale.exists()
-    assert "Result: APPLIED" in out
+    assert "Recovery result: applied" in out
     assert "Applied Changes" in out
-    assert "state written" in out
+    assert "recovered state" in out
+    assert "written and verified" in out
     assert not (campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json.proposed").exists()
     assert sorted(
         (campaign / ".DATA" / "ACTIVE_LEARNING").glob(
@@ -1559,7 +1560,7 @@ def test_reconcile_restore_config_from_lock_writes_proposal(tmp_path, capsys):
     proposed = campaign / "campaign.yaml.proposed"
     assert rc == 0
     assert proposed.is_file()
-    assert "Result: CONFIG PROPOSAL" in out
+    assert "Configuration recovery: proposal written" in out
     assert "Config Proposal" in out
     restored = CampaignConfig.from_yaml(proposed)
     assert restored.system_name == "RESTORED"
@@ -1863,7 +1864,8 @@ def test_reconcile_apply_recovers_prebootstrap_phase_a_submission_failure(
     assert recovered.reference_data_version == -1
     assert recovered.validation_set_version == -1
     assert recovered.models_version == -1
-    assert "ichor-al-daemon start --campaign-dir " + str(campaign) in out
+    assert "ichor-al-daemon resume --campaign-dir" in out
+    assert str(campaign) in out
     intent = submission_intent.load_intent(
         campaign,
         CampaignPhase.PHASE_A_DIVERSITY.value,

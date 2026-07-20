@@ -37,8 +37,7 @@ and safely upserts ``~/ichor_config.yaml``::
 After installation, source the matching runtime helper in every new CSF shell
 before running :code:`ichor-cli` or :code:`ichor-al-daemon`::
 
-    source scripts/env_ichor_csf.sh csf4 --smoke
-    source scripts/env_ichor_csf.sh csf3 --smoke
+    source scripts/env_ichor_csf.sh --smoke
 
 Run the bundled example to confirm the install works (~30 seconds on a
 laptop, no cluster required)::
@@ -48,8 +47,8 @@ laptop, no cluster required)::
     ichor-al-daemon start --mode dry_run --foreground --max-ticks 200
     ichor-al-daemon status
 
-After the third command you should see :code:`"phase": "DONE"` and
-:code:`"models_version": 2`. The campaign has run two iterations of the
+After the third command you should see that the campaign is complete and that
+FEREBUS models are ready. The campaign has run two iterations of the
 full pipeline -- using dry-run stub backends, so no Gaussian / AIMAll /
 FEREBUS / ARIADNE binaries are required. See
 :code:`examples/dry_run_water_tetramer/README.md` for the full walkthrough
@@ -526,9 +525,12 @@ Use the same production resolver without writing state or submitting work::
     ichor-al-daemon resource-plan --campaign-dir .
     ichor-al-daemon resource-plan --campaign-dir . --phase AIMALL
     ichor-al-daemon resource-plan --campaign-dir . --all
+    ichor-al-daemon resource-plan --campaign-dir . --all --verbose
     ichor-al-daemon resource-plan --campaign-dir . --all --json
 
-The default is the current phase and iteration. Submitted or completed work
+The default concise view is for the current phase and iteration. Use
+:code:`--verbose` for formula components, evidence hashes, profile limits and
+telemetry internals, or :code:`--json` for machine-readable output. Submitted or completed work
 shows its immutable resource record; ready work is previewed from validated
 evidence; local phases report no Slurm resources. Under :code:`--all`, future
 evidence that has not yet been produced is informational. Explicitly
@@ -631,7 +633,8 @@ hashes and pointer coherence are checked without recursively walking
 pointdirs, scripts, logs or scratch. WFN, INT, Gaussian and model payloads are
 not opened or statted. Plain reconcile is diagnostic: it may write the
 proposal file and warn about a live daemon, but it does not alter
-:code:`state.json`. Review the proposal, then use the guarded apply path::
+:code:`state.json`. Review the preview, then use the guarded apply path only
+when it reports that recovery is safe::
 
     ichor-al-daemon reconcile --campaign-dir . --apply
 
@@ -661,7 +664,7 @@ alive. Stop the daemon first when reconcile reports live jobs or an active
 runtime::
 
     ichor-al-daemon stop --campaign-dir . --cancel-jobs
-    ichor-al-daemon reconcile --campaign-dir . --apply
+    ichor-al-daemon reconcile --campaign-dir .
 
 The reconcile path is conservative: it ALWAYS positions the daemon at a
 "safe" re-entry point (STOP_CHECK for completed iterations or INIT when
@@ -683,7 +686,9 @@ present, write a proposal from the lock::
 This creates :code:`campaign.yaml.proposed` only. The proposal is dense by
 design: it is a full config snapshot restored from
 :code:`config_lock.json`, not a sparse menu-style save. Inspect it, then
-promote it manually before running :code:`reconcile --apply`.
+restore an equivalent :code:`campaign.yaml` through the normal configuration
+workflow, then run a fresh reconcile preview. Do not replace an authoritative
+campaign file with an unreviewed proposal.
 
 What reconcile still does not do:
 

@@ -538,6 +538,53 @@ def test_parser_rejects_missing_subcommand():
         build_parser().parse_args([])
 
 
+def test_config_check_default_and_explicit_json_are_compatible(
+    tmp_path,
+    capsys,
+):
+    campaign = _campaign_with_config(tmp_path)
+
+    default_rc = main(["config-check", "--campaign-dir", str(campaign)])
+    default_output = capsys.readouterr().out
+    explicit_rc = main(
+        ["config-check", "--campaign-dir", str(campaign), "--json"]
+    )
+    explicit_output = capsys.readouterr().out
+
+    assert explicit_rc == default_rc
+    assert explicit_output == default_output
+    assert isinstance(json.loads(default_output), dict)
+
+
+def test_config_check_human_separates_config_and_pool_results(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+
+    rc = main(["config-check", "--campaign-dir", str(campaign), "--human"])
+
+    assert rc == 10
+    out = capsys.readouterr().out
+    assert out.startswith("Config check\nConfig\n  result: valid\n")
+    assert "\nPool\n  result: insufficient or unavailable\n" in out
+    assert "\nAction\n" in out
+    assert not out.lstrip().startswith("{")
+
+
+def test_config_check_human_reports_invalid_yaml_as_a_config_failure(
+    tmp_path,
+    capsys,
+):
+    campaign = _campaign_with_config(tmp_path)
+    (campaign / "campaign.yaml").write_text("campaign: [\n", encoding="utf-8")
+
+    rc = main(["config-check", "--campaign-dir", str(campaign), "--human"])
+
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "Config\n  result: invalid" in out
+    assert "Pool\n  result: not checked" in out
+    assert "config-check --campaign-dir" in out
+
+
 def test_cli_preflight_prints_operator_dashboard_by_default(tmp_path, capsys, monkeypatch):
     campaign = _campaign_with_config(tmp_path)
     state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
@@ -568,6 +615,10 @@ def test_cli_preflight_prints_operator_dashboard_by_default(tmp_path, capsys, mo
     assert "  [OK] frames required: 90" in out
     assert "Next Action\n" in out
     assert "ichor-al-daemon start --campaign-dir " in out
+    assert "submitted module stack" not in out
+    assert "schema version" not in out
+    assert "FEREBUS prior contract" not in out
+    assert "requirement:" not in out
     assert not out.lstrip().startswith("{")
 
 
@@ -728,6 +779,48 @@ def test_cli_preflight_can_submit_explicit_environment_smoke(
     assert "[OK] compute-node runtime: job 12345" in out
 
 
+def test_cli_preflight_json_recomputes_next_action_after_smoke_failure(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    _write_locked_state(campaign, fresh_campaign_state(max_iterations=2))
+    monkeypatch.setattr(cli_mod, "check_backends", _backend_availability)
+    monkeypatch.setattr(
+        cli_mod,
+        "_pool_feasibility_summary",
+        lambda _campaign, _config: _pool_feasibility_payload(),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "run_submitted_environment_smoke",
+        lambda **_kwargs: {
+            "schema_version": 1,
+            "submitted": True,
+            "ok": False,
+            "job_id": "12345",
+            "output_path": str(campaign / "smoke.out"),
+            "error": "import failed",
+        },
+    )
+
+    rc = main(
+        [
+            "preflight",
+            "--campaign-dir",
+            str(campaign),
+            "--submit-environment-smoke",
+            "--json",
+        ]
+    )
+
+    assert rc == 12
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is False
+    assert payload["next_action"] == "fix failed checks before live start"
+
+
 def test_cli_preflight_reports_all_failures_together(tmp_path, capsys, monkeypatch):
     campaign = _campaign_with_config(tmp_path)
 
@@ -757,6 +850,67 @@ def test_cli_preflight_reports_all_failures_together(tmp_path, capsys, monkeypat
     assert "fix failed checks before live start" in out
     assert "install/build ariadne in the configured submitted Python venv" in out
     assert "fix trajectory pool feasibility" in out
+
+
+def test_cli_preflight_marks_missing_submitted_python_as_failed_and_actionable(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    _write_locked_state(campaign, fresh_campaign_state(max_iterations=2))
+    monkeypatch.setattr(
+        cli_mod,
+        "check_backends",
+        lambda: _backend_availability(
+            squeue=False,
+            squeue_path="",
+            batch_python=False,
+            batch_python_error="configured executable is missing",
+        ),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_pool_feasibility_summary",
+        lambda _campaign, _config: _pool_feasibility_payload(),
+    )
+
+    rc = main(["preflight", "--campaign-dir", str(campaign)])
+
+    assert rc == 12
+    out = capsys.readouterr().out
+    assert "[FAIL] squeue: not found" in out
+    assert "[FAIL] configured python:" in out
+    assert "make squeue available" in out
+    assert "configure an absolute submitted Python path" in out
+
+
+def test_cli_preflight_ready_campaign_with_active_daemon_recommends_monitoring(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    _write_locked_state(campaign, fresh_campaign_state(max_iterations=2))
+    monkeypatch.setattr(cli_mod, "check_backends", _backend_availability)
+    monkeypatch.setattr(
+        cli_mod,
+        "_pool_feasibility_summary",
+        lambda _campaign, _config: _pool_feasibility_payload(),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_probe_daemon_lock",
+        lambda _path: {"lock_held": True},
+    )
+
+    rc = main(["preflight", "--campaign-dir", str(campaign)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "monitor the running campaign" in out
+    assert "ichor-al-daemon status --campaign-dir" in out
+    assert "start --campaign-dir" not in out
 
 
 def test_cli_preflight_warns_when_pool_has_no_surplus(tmp_path, capsys, monkeypatch):
@@ -789,7 +943,7 @@ def test_recovery_dashboard_reports_missing_state(tmp_path):
 
     assert "Recovery dashboard" in text
     assert "state.json: missing" in text
-    assert "start/resume is safe for clean first run" in text
+    assert "initialise the campaign: ichor-al-daemon init" in text
 
 
 def test_recovery_dashboard_reports_invalid_state(tmp_path):
@@ -801,7 +955,7 @@ def test_recovery_dashboard_reports_invalid_state(tmp_path):
     text = cli_mod.format_recovery_dashboard(campaign)
 
     assert "state.json: invalid" in text
-    assert "run reconcile" in text
+    assert "ichor-al-daemon reconcile" in text
 
 
 def test_recovery_dashboard_reports_last_exception_and_staging(tmp_path):
@@ -832,7 +986,8 @@ def test_recovery_dashboard_reports_last_exception_and_staging(tmp_path):
     assert "boom" in text
     assert "Staging" in text
     assert "non-empty top_level=1" in text
-    assert "reconcile --archive-staging --apply" in text
+    assert "inspect the recovery blockers: ichor-al-daemon reconcile" in text
+    assert "--apply" not in text
 
 
 def test_recovery_dashboard_reports_active_intents(tmp_path):
@@ -848,7 +1003,8 @@ def test_recovery_dashboard_reports_active_intents(tmp_path):
 
     assert "Submission intents" in text
     assert "INITIAL_FEREBUS@0 PRE_SUBMIT" in text
-    assert "stop --cancel-jobs first" in text
+    assert "ichor-al-daemon reconcile" in text
+    assert "--cancel-jobs" not in text
 
 
 def test_live_job_name_rejects_control_characters_and_caps_length():
@@ -965,6 +1121,28 @@ def test_cli_status_reads_recorded_environment_without_live_capture(
     assert environment["last_transition"] == transition_time
 
 
+def test_cli_status_bound_dry_run_campaign_recommends_resume_without_mode_change(
+    tmp_path,
+    capsys,
+):
+    from ichor.hpc.active_learning import execution_identity
+
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=2)
+    _write_locked_state(campaign, state)
+    execution_identity.ensure_execution_identity(
+        campaign,
+        campaign_uid=str(state.campaign_uid),
+        config=CampaignConfig.from_yaml(campaign / "campaign.yaml"),
+        requested_mode="dry_run",
+    )
+
+    assert main(["status", "--campaign-dir", str(campaign)]) == 0
+    out = capsys.readouterr().out
+    assert "ichor-al-daemon resume --campaign-dir" in out
+    assert "--mode live" not in out
+
+
 def test_cli_status_init_hides_not_due_committed_artifact_errors(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
@@ -976,17 +1154,16 @@ def test_cli_status_init_hides_not_due_committed_artifact_errors(tmp_path, capsy
     assert rc == 0
     out = capsys.readouterr().out
     assert "Campaign\n" in out
-    assert "  phase: INIT" in out
-    assert "  meaning: campaign initialised; no sampling phase has run yet" in out
-    assert "  initialised:" in out
-    assert "Trajectory Pool\n" in out
-    assert "Data Products\n" in out
-    assert "  bootstrap QM reference data: not produced yet" in out
+    assert "  phase: Campaign setup" in out
+    assert "  purpose: prepare the campaign before its first run" in out
+    assert "Now\n" in out
+    assert "  activity: The daemon is stopped; campaign setup is the next campaign step." in out
+    assert "Health\n" in out
+    assert "  QM reference data: not produced yet" in out
     assert "  FEREBUS models: not produced yet" in out
-    assert "  current phase contract: ready for INIT" in out
-    assert "Runtime\n" in out
-    assert "  daemon: not running" in out
-    assert "Next Action\n" in out
+    assert "Action\n" in out
+    assert "  command: ichor-al-daemon start" in out
+    assert " --mode live" in out
     assert "CommittedArtifactError" not in out
     assert "training status: problem" not in out
 
@@ -1004,18 +1181,15 @@ def test_cli_status_default_prints_operator_friendly_summary(tmp_path, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "Campaign\n" in out
-    assert "  phase: STOP_CHECK" in out
+    assert "  phase: Iteration completion check" in out
     assert "  iteration: 3 of 5 active iterations planned" in out
-    assert "Data Products\n" in out
-    assert "  current phase contract: problem - CommittedArtifactError:" in out
-    assert "  bootstrap QM reference data: not produced yet" in out
+    assert "Health\n" in out
+    assert "  current data check: problem - CommittedArtifactError:" in out
+    assert "  QM reference data: not produced yet" in out
     assert "  FEREBUS models: not produced yet" in out
-    assert "Runtime\n" in out
+    assert "Now\n" in out
     assert "  daemon: not running" in out
-    assert "  recorded Slurm jobs: none recorded in state" in out
-    assert "  submission intents: none" in out
-    assert "  shutdown requested: no" in out
-    assert "Next Action\n" in out
+    assert "Action\n" in out
     assert "  severity: required" in out
     assert "  primary: run reconcile; STOP_CHECK needs the latest coherent committed reference-data/model pair" in out
     assert "  why: CommittedArtifactError:" in out
@@ -1023,6 +1197,9 @@ def test_cli_status_default_prints_operator_friendly_summary(tmp_path, capsys):
     assert "training v0: problem" not in out
     assert "background_pid" not in out
     assert "shutdown_requested" not in out
+    assert "uid:" not in out
+    assert "config lock" not in out.lower()
+    assert "ledger" not in out.lower()
     assert not out.lstrip().startswith("{")
 
 
@@ -1040,11 +1217,12 @@ def test_cli_status_reports_initial_ferebus_bootstrap_contract_problem(tmp_path,
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "Data Products\n" in out
-    assert "  current phase contract: problem - CommittedArtifactError:" in out
+    assert "Health\n" in out
+    assert "  current data check: problem - CommittedArtifactError:" in out
     assert "initial_ferebus_point_allocation_invalid" in out
-    assert "  bootstrap QM reference data: using initial AIMAll handoff" in out
-    assert "  FEREBUS models: being produced by INITIAL_FEREBUS" in out
+    assert "  QM reference data: not produced yet" in out
+    assert "  FEREBUS models: not produced yet" in out
+    assert "being produced" not in out
 
 
 def test_cli_status_backend_submission_failure_recommends_reconcile_apply(tmp_path, capsys):
@@ -1066,9 +1244,34 @@ def test_cli_status_backend_submission_failure_recommends_reconcile_apply(tmp_pa
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "fix the configured backend/profile problem" in out
+    assert "fix the configured backend or profile problem, then preview recovery" in out
     assert "ichor-al-daemon reconcile --campaign-dir " in out
-    assert " --apply" in out
+    assert " --apply" not in out
+
+
+def test_cli_status_halted_rendering_survives_a_malformed_journal(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.HALTED
+    state.lifecycle_context = {
+        "disposition": "halted",
+        "message": "known lifecycle failure",
+        "reason_code": "test_failure",
+        "from_phase": CampaignPhase.INIT.value,
+        "iteration": 0,
+        "timestamp_iso": "2026-07-20T00:00:00+00:00",
+    }
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    (data / "journal.ndjson").write_text("{bad json\n", encoding="utf-8")
+
+    rc = main(["status", "--campaign-dir", str(campaign)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Campaign halted" in out
+    assert "known lifecycle failure" in out
 
 
 def test_reconcile_apply_contract_guard_rejects_invalid_state(tmp_path):
@@ -1111,9 +1314,28 @@ def test_cli_status_default_summarises_active_submission_intents(tmp_path, capsy
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "GAUSSIAN@0 SUBMITTED job_id=12345" in out
-    assert "expected=20" in out
-    assert "a submission intent is still active" in out
+    assert "recorded Slurm job still needs monitoring or postprocessing" in out
+    assert "ichor-al-daemon resume --campaign-dir" in out
+    assert "GAUSSIAN@0" not in out
+    assert "job_id=12345" not in out
+
+
+def test_cli_status_describes_jobless_intent_as_prepared_local_work(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=5)
+    _write_locked_state(campaign, state)
+    submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=CampaignPhase.INITIAL_FEREBUS.value,
+        iteration=0,
+    )
+
+    assert main(["status", "--campaign-dir", str(campaign)]) == 0
+    out = capsys.readouterr().out
+    assert "local work for initial FEREBUS training is prepared but not running" in out
+    assert "active Slurm job" not in out
+    assert "ichor-al-daemon resume --campaign-dir" in out
 
 
 def test_cli_status_reports_stale_lock_file_as_not_held(tmp_path, capsys):
@@ -1201,7 +1423,7 @@ def test_cli_status_returns_4_when_state_missing(tmp_path, capsys):
     rc = main(["status", "--campaign-dir", str(campaign)])
     out = capsys.readouterr().out
     assert rc == 4
-    assert "Next Action" in out
+    assert "Action" in out
     assert "bootstrap the fresh campaign" in out
     assert "fresh init safe: true" in out
 
@@ -1215,6 +1437,30 @@ def test_cli_status_returns_json_recommendation_when_state_missing(tmp_path, cap
     assert payload["fresh_init_safe"] is True
     assert payload["recommendations"][0]["code"] == "state_missing_fresh_init"
     assert payload["next_action"] == payload["recommendations"][0]["primary"]
+
+
+def test_cli_status_unreadable_state_has_a_dedicated_recommendation(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    (data / DEFAULT_STATE_FILENAME).write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        cli_mod,
+        "read_state",
+        lambda _path: (_ for _ in ()).throw(OSError("permission denied")),
+    )
+
+    rc = main(["status", "--campaign-dir", str(campaign), "--json"])
+
+    assert rc != 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status_error"] == "state_unreadable"
+    assert payload["recommendations"][0]["code"] == "state_unreadable"
+    assert "reconcile" in payload["recommendations"][0]["command"]
 
 
 def test_cli_status_recommends_reconcile_when_state_missing_with_artefacts(
@@ -1247,8 +1493,26 @@ def test_cli_init_bootstraps_fresh_state_and_config_lock(tmp_path, capsys):
     assert state.phase is CampaignPhase.INIT
     assert state.max_iterations == 2
     assert (campaign / DEFAULT_DATA_SUBDIR / "config_lock.json").is_file()
-    assert "ichor-al-daemon start --campaign-dir " + str(campaign) in out
-    assert "ichor-al-daemon init --campaign-dir " + str(campaign) + " --source" not in out
+    assert "ichor-al-daemon start --campaign-dir " in out
+    assert " --mode live" in out
+    assert " --mode dry_run" in out
+    assert "pool SHA-256" not in out
+    assert "ALF (1-based)" not in out
+    assert " --source /path/to/pool.xyz" not in out
+
+
+def test_cli_init_verbose_retains_bootstrap_diagnostics(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+
+    rc = main(
+        ["init", "--campaign-dir", str(campaign), "--yes", "--verbose"]
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Bootstrap discovery complete" in out
+    assert "pool SHA-256" in out
+    assert "bootstrap identity" in out
 
 
 def test_cli_init_rerun_preserves_existing_campaign_uid(tmp_path, capsys):
@@ -1288,7 +1552,7 @@ def test_status_recommendations_cover_runtime_and_job_blockers(tmp_path):
     campaign = _campaign_with_config(tmp_path)
 
     assert _recommendation_codes(campaign, {"lock_held": True}) == [
-        "daemon_running_lock"
+        "daemon_running"
     ]
     assert _recommendation_codes(
         campaign,
@@ -1297,7 +1561,7 @@ def test_status_recommendations_cover_runtime_and_job_blockers(tmp_path):
                 {"phase": "GAUSSIAN", "iteration": 0, "status": "SUBMITTED"}
             ]
         },
-    ) == ["active_submission_intent"]
+    ) == ["local_submission_intent"]
     assert _recommendation_codes(
         campaign,
         {"pending_jobs": {"INITIAL_GAUSSIAN": "12345"}},
@@ -1378,7 +1642,7 @@ def test_status_recommends_repolling_preserved_scheduler_job(tmp_path):
     ]
     assert "will not resubmit" in recommendations[0].primary
     assert recommendations[0].command.startswith("ichor-al-daemon resume ")
-    assert recommendations[0].command.endswith(" --mode live")
+    assert "--mode" not in recommendations[0].command
 
 
 @pytest.mark.parametrize(
@@ -1570,8 +1834,10 @@ def test_cli_stop_records_request_without_rewriting_state(tmp_path, capsys):
     assert output_lines[0] == (
         "immediate stop requested during INIT in iteration 0"
     )
-    assert output_lines[1].startswith("request id: ")
-    assert output_lines[2].startswith("stop request: ")
+    assert output_lines[1] == "Recorded Slurm jobs, if any, were left running."
+    assert output_lines[2] == "Monitor the stop:"
+    assert output_lines[3].strip().startswith("ichor-al-daemon status")
+    assert "request id:" not in "\n".join(output_lines)
     s = read_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME)
     assert s.shutdown_requested is False
     request = read_stop_request(campaign, expected_campaign_uid=s.campaign_uid)
@@ -1714,7 +1980,7 @@ def test_cli_stop_cancel_jobs_records_cancellation_without_rewriting_state(
     request = read_stop_request(campaign, expected_campaign_uid=state.campaign_uid)
     assert request["status"] == "requested"
     assert request["cancellation_summary"]["cancelled"][0]["job_id"] == "123"
-    assert "Cancelled Slurm jobs" in out
+    assert "Slurm cancellation: 1 cancelled" in out
 
 
 def test_cli_stop_cancel_jobs_records_ferebus_intent_for_daemon_cleanup(
@@ -1952,8 +2218,7 @@ def test_cli_stop_cancel_jobs_skips_invalid_squeue_job_id(
     out = capsys.readouterr().out
 
     assert rc == 0
-    assert "Skipped Slurm jobs" in out
-    assert "not active in squeue" in out
+    assert "Slurm cancellation: 0 cancelled, 1 already inactive or not cancellable" in out
     stopped = read_state(data / DEFAULT_STATE_FILENAME)
     assert stopped.shutdown_requested is False
     assert stopped.pending_jobs[CampaignPhase.INITIAL_GAUSSIAN.value] == "789"
@@ -2039,6 +2304,13 @@ def test_cli_status_reports_pending_stop_request(tmp_path, capsys):
         "resume the daemon so it can honour the pending stop boundary"
     )
 
+    assert main(["status", "--campaign-dir", str(campaign)]) == 0
+    out = capsys.readouterr().out
+    assert "stop requested after iteration 1" in out
+    assert "after_iteration" not in out
+    assert "request_id" not in out
+    assert "SEED_SELECT@" not in out
+
 
 def test_reconcile_apply_refuses_malformed_stop_control(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
@@ -2122,7 +2394,7 @@ def test_cli_start_background_spawns_child_without_shell(tmp_path, monkeypatch, 
     assert payload["campaign_dir"] == str(campaign.resolve())
     assert payload["log_path"].endswith(cli_mod.BACKGROUND_LOG_FILENAME)
     assert payload["state"] == "ownership_acquired"
-    assert "daemon startup acknowledged in background" in capsys.readouterr().out
+    assert "background process owns the campaign and is still starting" in capsys.readouterr().out
 
 
 def test_cli_resume_background_clears_shutdown_and_spawns_resume(tmp_path, monkeypatch):
@@ -2417,7 +2689,7 @@ def test_cli_immediate_stop_signals_authenticated_background_startup(
         lambda target, signum: signals.append((target, signum)),
     )
 
-    rc = main(["stop", "--campaign-dir", str(campaign), "--immediate"])
+    rc = main(["stop", "--campaign-dir", str(campaign), "--immediate", "--verbose"])
 
     assert rc == 0
     assert signals == [(pid, cli_mod.signal.SIGTERM)]
@@ -2462,10 +2734,49 @@ def test_cli_stop_when_no_state_returns_4(tmp_path):
         ({"event": "sacct_error_timeout"}, "FAIL"),
         ({"event": "campaign_completed"}, "OK"),
         ({"event": "phase_completion_replayed"}, "WARN"),
+        ({"event": "user_cancelled_jobs", "n_failed": 1}, "FAIL"),
+        ({"event": "user_cancelled_jobs", "n_skipped": 1}, "WARN"),
+        ({"event": "user_cancelled_jobs", "n_cancelled": 2}, "OK"),
     ],
 )
 def test_journal_event_severity_uses_event_semantics(event, expected):
     assert cli_mod._journal_event_severity(event) == expected
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        (
+            {
+                "event": "queue_lifecycle_update",
+                "queue_event": "terminal",
+                "status": "COMPLETED",
+            },
+            "Slurm tasks completed",
+        ),
+        (
+            {
+                "event": "queue_lifecycle_update",
+                "queue_event": "postprocess_started",
+                "status": "started",
+            },
+            "local postprocessing started",
+        ),
+        (
+            {
+                "event": "queue_lifecycle_update",
+                "queue_event": "postprocess_finished",
+                "status": "failed",
+            },
+            "local postprocessing failed",
+        ),
+    ],
+)
+def test_journal_queue_lifecycle_names_scheduler_and_local_work_separately(
+    event,
+    expected,
+):
+    assert cli_mod._journal_operator_summary(event) == expected
 
 
 def test_cli_journal_json_prints_filtered_events(tmp_path, capsys):
@@ -2579,7 +2890,7 @@ def test_cli_journal_left_justifies_columns_for_long_events(tmp_path, capsys):
     assert "job=16175294" in lines[2]
     assert "sacct_rows_missing_but_squeue_active" not in lines[2]
     assert "Slurm job is still active" not in lines[2]
-    assert "T/C/R/P=4/-/-/-" in lines[2]
+    assert "total=4 completed=- running=- pending=-" in lines[2]
     assert "missing=2" in lines[2]
 
 
@@ -2609,7 +2920,7 @@ def test_cli_journal_formats_array_progress_tuple_with_squeue_counts(tmp_path, c
     assert "[WAIT]" in out
     assert "waiting for accounting" in out
     assert "job=1840120" in out
-    assert "T/C/R/P=70/50/10/10" in out
+    assert "total=70 completed=50 running=10 pending=10" in out
     assert "missing=10" in out
 
 
@@ -2629,6 +2940,58 @@ def test_cli_journal_filtered_empty_prints_timeline_message(tmp_path, capsys):
 
     assert rc == 0
     assert capsys.readouterr().out == "Timeline\n  no matching events\n"
+
+
+def test_cli_journal_invalid_since_is_not_reported_as_corruption(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    append_event(data / "journal.ndjson", "daemon_started")
+
+    rc = main(
+        ["journal", "--campaign-dir", str(campaign), "--since", "not-a-time"]
+    )
+
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert "invalid --since timestamp" in captured.err
+    assert "journal is malformed" not in captured.err
+
+
+def test_cli_journal_rejects_non_positive_last_n_during_argument_parsing():
+    with pytest.raises(SystemExit) as exc_info:
+        main(["journal", "--last-n", "0"])
+    assert exc_info.value.code == 2
+
+
+def test_cli_journal_aggregates_repetitive_seed_events_by_default(
+    tmp_path,
+    capsys,
+):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    journal = data / "journal.ndjson"
+    for seed in (1, 2, 3):
+        append_event(
+            journal,
+            "ariadne_task_salvaged_from_nonzero_exit",
+            phase=CampaignPhase.ARIADNE_ARRAY.value,
+            iteration=1,
+            seed=seed,
+            reason="usable output retained",
+        )
+
+    assert main(["journal", "--campaign-dir", str(campaign)]) == 0
+    default_output = capsys.readouterr().out
+    assert default_output.count("ARIADNE task salvaged") == 1
+    assert "events=3" in default_output
+
+    assert main(
+        ["journal", "--campaign-dir", str(campaign), "--verbose"]
+    ) == 0
+    verbose_output = capsys.readouterr().out
+    assert verbose_output.count("ARIADNE task salvaged") == 3
 
 
 def test_cli_journal_json_keeps_raw_event_names(tmp_path, capsys):
@@ -2699,7 +3062,7 @@ def test_cli_journal_verbose_prints_event_details(tmp_path, capsys):
     assert "2026-06-27 14:42:55" in out
     assert "iter=0" in out
     assert "job=123" in out
-    assert "T/C/R/P=10/0/-/-" in out
+    assert "total=10 completed=0 running=- pending=-" in out
     assert "  expected_tasks: 10" not in out
     assert "  iteration: 0" not in out
 
@@ -2722,9 +3085,39 @@ def test_cli_reconcile_writes_proposed_state(tmp_path, capsys):
     captured = capsys.readouterr()
     assert "proposed state:" in captured.out
     assert "state.json.proposed" in captured.out
-    assert "reference-data versions: committed" in captured.out
-    assert "model versions" in captured.out
-    assert "committed [], valid []" in captured.out
+    assert "Recovery preview: safe to apply" in captured.out
+    assert "reference-data versions: committed" not in captured.out
+    assert "model versions" not in captured.out
+
+
+def test_reconcile_current_position_does_not_count_empty_job_markers_as_jobs(
+    tmp_path,
+):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state()
+    state.pending_jobs = {"INITIAL_GAUSSIAN": None, "INITIAL_AIMALL": None}
+    (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
+    write_state(
+        campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME,
+        state,
+    )
+    report = SimpleNamespace(
+        active_submission_intents=[],
+        valid_reference_data_versions=[],
+        valid_model_versions=[],
+        notes=[],
+    )
+
+    concise = cli_mod._reconcile_read_current_state_summary(campaign, report)
+    verbose = cli_mod._reconcile_read_current_state_summary(
+        campaign,
+        report,
+        verbose=True,
+    )
+
+    assert concise["recorded jobs"] == "none"
+    assert "completed job markers" not in concise
+    assert verbose["completed job markers"] == 2
 
 
 def test_cli_reconcile_json_outputs_machine_readable_decision(tmp_path, capsys):
@@ -2747,6 +3140,29 @@ def test_cli_reconcile_json_outputs_machine_readable_decision(tmp_path, capsys):
     assert payload["verification"]["payload_files_hashed"] == 0
     assert "Proposed state written" not in captured.out
     assert "Scientific payload hashing: disabled" in captured.err
+
+
+@pytest.mark.parametrize("phase", [CampaignPhase.HALTED, CampaignPhase.DONE])
+def test_reconcile_json_contract_never_calls_terminal_phases_runnable(
+    tmp_path,
+    phase,
+):
+    campaign = _campaign_with_config(tmp_path)
+    report = cli_mod.propose_recovery(campaign)
+    report.proposed_state.phase = phase
+
+    payload = cli_mod._reconcile_decision_payload(
+        campaign,
+        report,
+        {
+            "contract_ok": True,
+            "trusted_handoffs": [],
+            "missing_or_invalid_inputs": [],
+        },
+    )
+
+    assert payload["runnable"] is False
+    assert "selected phase is terminal: " + phase.value in payload["why_not_runnable"]
 
 
 def test_cli_reconcile_deep_verify_reports_deep_level_on_stderr(tmp_path, capsys):
@@ -2869,15 +3285,16 @@ def test_cli_reconcile_cleanable_scripts_reports_candidate_without_manual_mv(
     assert rc == 0
     out = capsys.readouterr().out
     assert "ICHOR Reconcile" in out
-    assert "Result: CLEANUP REQUIRED" in out
+    assert "Recovery preview: safe to apply" in out
     assert "Current Position" in out
     assert "Last Failure" in out
     assert "reason: too_many_failures: 1/1" in out
     assert "Recovery Safety" in out
     assert "stale sbatch scripts" in out
     assert "expected recovery after cleanup" in out
+    assert "expected recovery after cleanup" in out
     assert "PHASE_B_DIVERSITY@1" in out
-    assert "RESULTS.json" in out
+    assert "RESULTS.json" not in out
     assert "Apply Plan" in out
     assert "=== Recovery guidance ===" not in out
     assert "Operator-review artefacts:" not in out
@@ -3014,13 +3431,15 @@ def test_cli_reconcile_apply_prints_final_recomputed_phase(
     assert rc == 0
     out = capsys.readouterr().out
     assert "ICHOR Reconcile" in out
-    assert "Result: APPLIED" in out
+    assert "Recovery result: applied" in out
     assert "Applied Changes" in out
     assert "recover to PHASE_B_DIVERSITY iteration 1" in out
-    assert "Recovery Contract" in out
-    assert "status        : ok" in out
-    assert "RESULTS.json" in out
-    assert "ichor-al-daemon start --campaign-dir " + str(campaign) in out
+    assert "recovered state" in out
+    assert "written and verified" in out
+    assert "final data check: passed" in out
+    assert "Recovery Contract" not in out
+    assert "RESULTS.json" not in out
+    assert "ichor-al-daemon resume --campaign-dir " in out
 
 
 def test_cli_resume_refuses_halted_state(tmp_path, capsys):
@@ -3207,7 +3626,9 @@ def test_cli_reopen_done_requires_config_lock_reconcile_first(tmp_path, capsys):
     ])
 
     assert rc == 7
-    assert "reconcile --apply" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "preview reconcile" in error
+    assert "apply only after it reports" in error
     unchanged = read_state(data / DEFAULT_STATE_FILENAME)
     assert unchanged.phase is CampaignPhase.DONE
     assert unchanged.iteration == 2
@@ -3284,7 +3705,8 @@ def test_cli_start_missing_state_for_clean_campaign_recommends_init(tmp_path, ca
     assert rc == 8
     err = capsys.readouterr().err
     assert "state.json is missing for a fresh campaign" in err
-    assert "ichor-al-daemon init --campaign-dir " + str(campaign) in err
+    assert "ichor-al-daemon init --campaign-dir" in err
+    assert str(campaign) in err
     assert "reconcile --campaign-dir" not in err
 
 
@@ -3300,7 +3722,8 @@ def test_cli_start_missing_state_with_artefacts_recommends_reconcile(
     assert rc == 8
     err = capsys.readouterr().err
     assert "state.json is missing but this campaign is not empty" in err
-    assert "ichor-al-daemon reconcile --campaign-dir " + str(campaign) in err
+    assert "ichor-al-daemon reconcile --campaign-dir" in err
+    assert str(campaign) in err
 
 
 def test_cli_start_rejects_removed_execution_flags(tmp_path):
@@ -3406,3 +3829,64 @@ def test_cli_start_live_reaches_daemon_with_all_backends_present(
     assert captured["daemon_kwargs"]["job_finder"] == ("finder", campaign.resolve())
     assert captured["daemon_kwargs"]["job_name_accounting_finder"] == "accounting"
     assert captured["daemon_kwargs"]["job_liveness_checker"] == "liveness"
+
+
+def test_checkpoint_status_absence_prints_the_safe_creation_command(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import checkpoints
+
+    campaign = _campaign_with_config(tmp_path)
+    config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+    destination = tmp_path / "checkpoint-store"
+    config.retention.checkpoint_destination = str(destination)
+    config.to_yaml(campaign / "campaign.yaml")
+    monkeypatch.setattr(
+        checkpoints,
+        "checkpoint_status",
+        lambda _campaign, _destination: {"status": "absent"},
+    )
+
+    rc = main(["checkpoint-status", "--campaign-dir", str(campaign)])
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "No current checkpoint has been published" in out
+    assert "ichor-al-daemon checkpoint --campaign-dir" in out
+
+
+def test_restore_checkpoint_preview_prints_the_exact_apply_command(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import checkpoints
+
+    checkpoint = tmp_path / "checkpoint"
+    target = tmp_path / "restored"
+    monkeypatch.setattr(
+        checkpoints,
+        "restore_checkpoint",
+        lambda _checkpoint, _target, *, apply: {
+            "applied": bool(apply),
+            "target": str(target),
+        },
+    )
+
+    rc = main(
+        [
+            "restore-checkpoint",
+            "--checkpoint",
+            str(checkpoint),
+            "--target-empty-dir",
+            str(target),
+        ]
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "verified; no files were written" in out
+    assert "restore-checkpoint --checkpoint" in out
+    assert "--apply" in out

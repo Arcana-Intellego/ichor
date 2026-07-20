@@ -63,9 +63,9 @@ After installation, source the matching runtime helper in each new CSF shell
 before running the CLI or daemon:
 
 ```
-source scripts/env_ichor_csf.sh csf4 --smoke
+source scripts/env_ichor_csf.sh --smoke
 # or
-source scripts/env_ichor_csf.sh csf3 --smoke
+source scripts/env_ichor_csf.sh --smoke
 ```
 
 ## Active learning daemon
@@ -91,7 +91,7 @@ When not already inside a campaign directory, pass `-c/--campaign-dir`.
 | ------------------ | ----------------------------------------------------- | ------------------ | ------------------------- |
 | sbatch / sacct     | Cluster-side (SLURM)                                  | `--live`           | `which sbatch`            |
 | Gaussian g16       | `module load gaussian/g16c01_em64t_detectcpu`         | `--live`           | `which g16`               |
-| AIMAll             | Operator-installed at `~/AIMAll/aimqb.ish`            | `--live`           | `ls ~/AIMAll/aimqb.ish`   |
+| AIMAll             | User-installed at `~/AIMAll/aimqb.ish`                | `--live`           | `ls ~/AIMAll/aimqb.ish`   |
 | FEREBUS            | Build `FEREBUS_CPU` binary + editable `pyferebus`      | `--live`           | `python -c "import pyferebus"` |
 | ARIADNE            | Build/install sibling `ARIADNE` into the venv          | `--live` (skip with `--mock-ariadne`) | `python -c "import ariadne"`   |
 | POLUS              | Editable sibling `POLUS/polus_core_subpackage`         | `--live`           | `python -c "import polus.samplers.RS.randomSampling"` |

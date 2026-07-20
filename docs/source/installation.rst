@@ -29,8 +29,7 @@ compiler variables, and verifies ARIADNE/PLUMED:
 
 .. code-block:: text
 
-    source scripts/env_ichor_csf.sh csf4 --smoke
-    source scripts/env_ichor_csf.sh csf3 --smoke
+    source scripts/env_ichor_csf.sh --smoke
 
 +++++++++++++++++++++++++++++++++
 Setting up ichor_config.yaml file

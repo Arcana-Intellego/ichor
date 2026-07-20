@@ -167,7 +167,7 @@ class StartDaemonForegroundFunctions:
             else:
                 print("Saved campaign.yaml differs from the config lock:")
             print(edit_menu.format_saved_config_lock_review(config_override))
-            print("Run reconcile --apply for safe edits or revert blocked edits before starting.")
+            print("Run reconcile for a preview, then apply it only if reported safe.")
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
         from ichor.hpc.active_learning.cli import cmd_resume, cmd_start
@@ -214,10 +214,9 @@ class StartDaemonForegroundFunctions:
             background_pid=None,
         )
         if start_daemon_foreground_menu_options.selected_command == "resume":
-            rc = cmd_resume(ns)
+            cmd_resume(ns)
         else:
-            rc = cmd_start(ns)
-        print("daemon exited with code " + str(rc))
+            cmd_start(ns)
         user_input_free_flow("Press enter to return to the menu: ", "")
 
 
