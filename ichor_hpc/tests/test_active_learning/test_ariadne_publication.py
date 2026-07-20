@@ -11,6 +11,10 @@ from ichor.hpc.active_learning.daemon.ariadne_publication import (
     archive_ariadne_publication,
     classify_ariadne_publication,
 )
+from ichor.hpc.active_learning.daemon.live_executor import (
+    archive_stale_ariadne_publication,
+)
+from ichor.hpc.active_learning.daemon.phase_executor import BackendSubmissionError
 from ichor.hpc.active_learning.daemon.state import CampaignPhase, atomic_write_json
 from ichor.hpc.active_learning.cli import _perform_reconcile_apply_mutations
 from ichor.hpc.active_learning.handoff_manifests import (
@@ -25,7 +29,12 @@ from ichor.hpc.active_learning.layout import active_ariadne_dir, active_iteratio
 CAMPAIGN_UID = "12345678-1234-5678-1234-567812345678"
 
 
-def _write_publication(campaign: Path, *, iteration: int = 1) -> Path:
+def _write_publication(
+    campaign: Path,
+    *,
+    iteration: int = 1,
+    accepted: bool = True,
+) -> Path:
     iteration_dir = active_iteration_dir(campaign, iteration)
     root = active_ariadne_dir(iteration_dir)
     root.mkdir(parents=True)
@@ -36,10 +45,10 @@ def _write_publication(campaign: Path, *, iteration: int = 1) -> Path:
             "campaign_uid": CAMPAIGN_UID,
             "iteration": iteration,
             "expected_n": 1,
-            "n_accepted": 1,
-            "n_rejected": 0,
-            "accepted": [{"seed_id": 1}],
-            "rejected": [],
+            "n_accepted": 1 if accepted else 0,
+            "n_rejected": 0 if accepted else 1,
+            "accepted": [{"seed_id": 1}] if accepted else [],
+            "rejected": [] if accepted else [{"seed_id": 1, "reason": "test"}],
         },
     )
     atomic_write_json(root / "AUDIT.json", {"iteration": iteration})
@@ -50,10 +59,10 @@ def _write_publication(campaign: Path, *, iteration: int = 1) -> Path:
         config_sha256="config",
         failure_threshold_fraction=0.0,
         expected_n=1,
-        n_accepted=1,
-        n_rejected=0,
-        accepted=True,
-        reasons=[],
+        n_accepted=1 if accepted else 0,
+        n_rejected=0 if accepted else 1,
+        accepted=accepted,
+        reasons=[] if accepted else ["test rejection"],
     )
     return iteration_dir
 
@@ -172,6 +181,37 @@ def test_complete_publication_is_only_archived_when_retry_forces_replacement(tmp
     assert not ariadne_batch_decision_path(active_iteration_dir(tmp_path, 1)).exists()
 
 
+def test_direct_postprocess_recovery_archives_accepted_complete_publication(tmp_path):
+    _write_publication(tmp_path, accepted=True)
+    state = SimpleNamespace(iteration=1, campaign_uid=CAMPAIGN_UID)
+
+    archived = archive_stale_ariadne_publication(
+        tmp_path,
+        state,
+        retry_task_ids=[],
+    )
+
+    assert archived["changed"] is True
+    assert classify_ariadne_publication(tmp_path, 1)["state"] == "absent"
+
+
+def test_direct_postprocess_recovery_preserves_rejected_complete_publication(tmp_path):
+    _write_publication(tmp_path, accepted=False)
+    state = SimpleNamespace(iteration=1, campaign_uid=CAMPAIGN_UID)
+    classification = classify_ariadne_publication(tmp_path, 1)
+    assert classification["state"] == "complete"
+    assert classification["accepted"] is False
+
+    with pytest.raises(BackendSubmissionError, match="preserved for user review"):
+        archive_stale_ariadne_publication(
+            tmp_path,
+            state,
+            retry_task_ids=[],
+        )
+
+    assert ariadne_batch_decision_path(active_iteration_dir(tmp_path, 1)).is_file()
+
+
 def test_reconcile_mutation_archives_stale_publication(tmp_path):
     iteration_dir = _write_publication(tmp_path)
     _make_results_stale(iteration_dir)
@@ -211,4 +251,40 @@ def test_reconcile_mutation_archives_stale_publication(tmp_path):
 
     assert len(result["archived_ariadne_publication"]) == 1
     assert recorded[0][0] == "archive_ariadne_publication"
+    assert classify_ariadne_publication(tmp_path, 1)["state"] == "absent"
+
+
+def test_reconcile_mutation_archives_accepted_uncommitted_publication(tmp_path):
+    _write_publication(tmp_path, accepted=True)
+    classification = classify_ariadne_publication(
+        tmp_path,
+        1,
+        expected_campaign_uid=CAMPAIGN_UID,
+    )
+    classification["archive_for_replay"] = True
+    transaction = SimpleNamespace(record_paths=lambda *_args, **_kwargs: None)
+    report = SimpleNamespace(
+        proposed_state=SimpleNamespace(
+            phase=CampaignPhase.ARIADNE_ARRAY,
+            iteration=1,
+            campaign_uid=CAMPAIGN_UID,
+        ),
+        ariadne_publication_recovery=classification,
+        unsafe_reasons=[],
+    )
+
+    result = _perform_reconcile_apply_mutations(
+        tmp_path,
+        report,
+        transaction=transaction,
+        retrain_ferebus=False,
+        force_resubmit_array=False,
+        partial_array=None,
+        force_array_phase=CampaignPhase.ARIADNE_ARRAY,
+        force_array_iteration=1,
+        archive_existing_array_outputs=False,
+        data_staging_archive_mode=None,
+    )
+
+    assert len(result["archived_ariadne_publication"]) == 1
     assert classify_ariadne_publication(tmp_path, 1)["state"] == "absent"

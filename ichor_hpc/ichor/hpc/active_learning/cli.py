@@ -5225,8 +5225,12 @@ def _perform_reconcile_apply_mutations(
         "archived_ariadne_publication": [],
     }
     publication = getattr(report, "ariadne_publication_recovery", None)
-    if isinstance(publication, dict) and bool(
-        publication.get("archive_required", False)
+    archive_for_replay = bool(
+        isinstance(publication, dict)
+        and publication.get("archive_for_replay", False)
+    )
+    if isinstance(publication, dict) and (
+        bool(publication.get("archive_required", False)) or archive_for_replay
     ):
         iteration = int(report.proposed_state.iteration)
         intent = _submission_intent.load_intent(
@@ -5246,6 +5250,7 @@ def _perform_reconcile_apply_mutations(
                 else None
             ),
             classification=publication,
+            force=archive_for_replay,
         )
         if bool(archived_publication.get("changed", False)):
             paths = [str(archived_publication["archive_dir"])]

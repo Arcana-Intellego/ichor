@@ -938,6 +938,145 @@ def test_phase_entry_complete_failure_halts_instead_of_advancing(tmp_path):
     assert events[-1]["reason"] == "postprocess_only_validation_failed"
 
 
+def test_existing_jobless_ariadne_postprocess_intent_skips_scheduler_lookup(
+    tmp_path,
+    monkeypatch,
+):
+    class LocalPostprocessExecutor(MockPhaseExecutor):
+        def __init__(self):
+            super().__init__(treat_as_sbatch=set(_SBATCH_PHASES))
+            self.calls = 0
+
+        def submit_or_run(self, state, phase):
+            self.calls += 1
+            return PhaseResult(is_complete=True)
+
+    executor = LocalPostprocessExecutor()
+
+    def unexpected_scheduler_lookup(*_args, **_kwargs):
+        raise AssertionError("scheduler lookup attempted for local postprocessing")
+
+    d = _make_daemon(
+        tmp_path,
+        executor=executor,
+        job_name_accounting_finder=unexpected_scheduler_lookup,
+    )
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 1
+    source = {
+        "decision_contract": {
+            "failure_threshold_fraction": 0.25,
+            "config_sha256": "c" * 64,
+        },
+        "source_sha256": "d" * 64,
+    }
+    active_intent = {
+        "status": "PRE_SUBMIT",
+        "job_id": None,
+        "postprocess_source": source,
+        "environment_generation": 1,
+        "environment_generation_digest_sha256": "e" * 64,
+    }
+    monkeypatch.setattr(
+        d,
+        "_ariadne_postprocess_source_if_complete",
+        lambda _state: source,
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "load_active_intent",
+        lambda *_args, **_kwargs: active_intent,
+    )
+    monkeypatch.setattr(d, "_verify_environment_boundary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        d,
+        "_verify_committed_artifacts_if_enabled",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(d, "_checkpoint_before_seed_selection", lambda *_args: None)
+    monkeypatch.setattr(d, "_verify_intent_environment_binding", lambda *_args: None)
+    monkeypatch.setattr(d, "_advance", lambda *_args, **_kwargs: True)
+    completed = []
+    monkeypatch.setattr(
+        d,
+        "_complete_intent_after_advance",
+        lambda *args, **kwargs: completed.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "write_pre_submit_intent",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("replacement postprocess intent was written")
+        ),
+    )
+
+    status = d._on_phase_entry(state, CampaignPhase.ARIADNE_ARRAY)
+
+    assert status == TickStatus.ADVANCED
+    assert executor.calls == 1
+    assert len(completed) == 1
+
+
+def test_ariadne_postprocess_intent_copies_original_decision_contract(
+    tmp_path,
+    monkeypatch,
+):
+    class LocalPostprocessExecutor(MockPhaseExecutor):
+        def submit_or_run(self, state, phase):
+            return PhaseResult(is_complete=True)
+
+    d = _make_daemon(tmp_path, executor=LocalPostprocessExecutor())
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 1
+    d._last_environment_binding = {
+        "generation": 7,
+        "generation_digest_sha256": "7" * 64,
+    }
+    source = {
+        "decision_contract": {
+            "failure_threshold_fraction": 0.125,
+            "config_sha256": "6" * 64,
+        },
+        "source_sha256": "5" * 64,
+    }
+    monkeypatch.setattr(
+        d,
+        "_ariadne_postprocess_source_if_complete",
+        lambda _state: source,
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "load_active_intent",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(d, "_verify_environment_boundary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        d,
+        "_verify_committed_artifacts_if_enabled",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(d, "_checkpoint_before_seed_selection", lambda *_args: None)
+    monkeypatch.setattr(d, "_infer_expected_tasks_from_artifacts", lambda *_args: 3)
+    captured = []
+    monkeypatch.setattr(
+        submission_intent,
+        "write_pre_submit_intent",
+        lambda *_args, **kwargs: captured.append(kwargs) or {},
+    )
+    monkeypatch.setattr(d, "_advance", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(d, "_complete_intent_after_advance", lambda *_args, **_kwargs: None)
+
+    status = d._on_phase_entry(state, CampaignPhase.ARIADNE_ARRAY)
+
+    assert status == TickStatus.ADVANCED
+    assert len(captured) == 1
+    assert captured[0]["decision_contract"] == source["decision_contract"]
+    assert captured[0]["postprocess_source"] == source
+    assert captured[0]["environment_generation"] == 7
+
+
 def test_scheduler_free_completion_retires_pre_submit_intent(tmp_path):
     d = _make_daemon(tmp_path)
     state = fresh_campaign_state(max_iterations=1)

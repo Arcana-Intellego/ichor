@@ -2259,6 +2259,21 @@ def propose_recovery(
             )
             unsafe_reasons.append(reason)
             blocking_artifacts.append("invalid ARIADNE publication")
+        elif publication_state == "complete" and bool(
+            ariadne_publication_recovery.get("accepted", False)
+        ):
+            ariadne_publication_recovery["archive_for_replay"] = True
+            unsafe_reasons.append("stale ARIADNE publication")
+            blocking_artifacts.append("stale ARIADNE publication")
+            notes.append(
+                "accepted ARIADNE publication was not committed by state and will "
+                "be archived before local postprocessing replay"
+            )
+        elif publication_state == "complete":
+            unsafe_reasons.append(
+                "complete rejected ARIADNE batch decision requires user review"
+            )
+            blocking_artifacts.append("rejected ARIADNE batch decision")
         elif bool(ariadne_publication_recovery.get("archive_required", False)):
             unsafe_reasons.append("stale ARIADNE publication")
             blocking_artifacts.append("stale ARIADNE publication")

@@ -790,7 +790,20 @@ def archive_stale_ariadne_publication(
             raise AriadnePublicationError(
                 str(classification.get("reason") or "invalid publication")
             )
-        force = bool(retry_task_ids) and bool(classification.get("files"))
+        publication_state = str(classification.get("state") or "")
+        if publication_state == "complete" and not bool(
+            classification.get("accepted", False)
+        ):
+            raise AriadnePublicationError(
+                "complete rejected ARIADNE batch decision is preserved for user review"
+            )
+        force = bool(classification.get("files")) and (
+            bool(retry_task_ids)
+            or (
+                publication_state == "complete"
+                and bool(classification.get("accepted", False))
+            )
+        )
         if not bool(classification.get("archive_required", False)) and not force:
             return None
         intent = load_intent(
@@ -2756,6 +2769,22 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
     def postprocess(self, state, phase, observations: Sequence[Any]) -> PhaseResult:
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
+        if phase_name == CampaignPhase.ARIADNE_ARRAY.value:
+            archived = archive_stale_ariadne_publication(
+                self.campaign_dir,
+                state,
+                retry_task_ids=[],
+            )
+            if isinstance(archived, dict) and bool(archived.get("changed", False)):
+                self._journal_event(
+                    "ariadne_publication_archived",
+                    phase=phase_name,
+                    iteration=int(getattr(state, "iteration", 0)),
+                    reason="ariadne_postprocess_only_recovery",
+                    archive_id=str(archived.get("archive_id") or ""),
+                    archive_manifest=str(archived.get("manifest_path") or ""),
+                    n_files=int(len(archived.get("archived_paths") or [])),
+                )
         handler = self._live_postprocess_handlers().get(phase_name)
         if handler is not None:
             #handlers take (state, phase, observations) so the shared
@@ -4084,12 +4113,28 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
         try:
             from .error_calibration_contract import (
-                active_environment_binding,
                 calibration_context_sha256,
             )
+            from .submission_intent import (
+                ariadne_producer_environment_binding,
+                load_intent,
+            )
 
-            calibration_environment = active_environment_binding(
-                self.campaign_dir
+            postprocess_intent = load_intent(
+                self.campaign_dir,
+                "ARIADNE_ARRAY",
+                int(state.iteration),
+                expected_campaign_uid=str(state.campaign_uid),
+            )
+            if not isinstance(postprocess_intent, dict):
+                raise ValueError(
+                    "submission intent is unavailable for ARIADNE provenance"
+                )
+            calibration_environment = ariadne_producer_environment_binding(
+                self.campaign_dir,
+                postprocess_intent,
+                expected_campaign_uid=str(state.campaign_uid),
+                expected_iteration=int(state.iteration),
             )
             calibration_context = calibration_context_sha256(
                 self.config,

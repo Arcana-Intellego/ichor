@@ -226,7 +226,7 @@ def classify_ariadne_publication(
         }
 
     try:
-        read_ariadne_batch_decision(
+        validated_decision = read_ariadne_batch_decision(
             active_iteration_dir(campaign, int(iteration)),
             expected_iteration=int(iteration),
             expected_campaign_uid=expected_campaign_uid,
@@ -247,6 +247,12 @@ def classify_ariadne_publication(
         "archive_required": False,
         "reason": "ARIADNE derived publication is internally consistent",
         "files": files,
+        "accepted": bool(
+            validated_decision["current_evaluation"].get("accepted", False)
+        ),
+        "current_evaluation_sha256": str(
+            validated_decision.get("current_evaluation_sha256") or ""
+        ),
     }
 
 

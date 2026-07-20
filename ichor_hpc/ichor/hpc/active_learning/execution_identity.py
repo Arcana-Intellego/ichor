@@ -112,6 +112,8 @@ def _validate_ferebus_transition_boundary(campaign: Path, state: Any) -> None:
 def _validate_ariadne_retry_transition_boundary(
     campaign: Path,
     state: Any,
+    *,
+    task_scan: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Validate an all-retry or all-complete ARIADNE recovery boundary."""
     from .daemon.array_recovery import scan_array_tasks
@@ -135,11 +137,15 @@ def _validate_ariadne_retry_transition_boundary(
         )
 
     try:
-        scan = scan_array_tasks(
-            campaign,
-            phase,
-            int(state.iteration),
-            force_resubmit=False,
+        scan = (
+            dict(task_scan)
+            if isinstance(task_scan, Mapping)
+            else scan_array_tasks(
+                campaign,
+                phase,
+                int(state.iteration),
+                force_resubmit=False,
+            )
         )
         observed_phase = str(scan["phase"])
         observed_iteration = int(scan["iteration"])
@@ -196,103 +202,69 @@ def _validate_ariadne_retry_transition_boundary(
         )
 
     from .daemon.ariadne_publication import classify_ariadne_publication
-    from .daemon.submission_intent import load_intent
+    from .daemon.submission_intent import resolve_ariadne_postprocess_source
 
     publication = classify_ariadne_publication(
         campaign,
         int(state.iteration),
         expected_campaign_uid=str(state.campaign_uid),
     )
-    if str(publication.get("state") or "") not in {
+    publication_state = str(publication.get("state") or "")
+    replayable_states = {
         "absent",
         "incomplete",
         "stale_results_binding",
         "archive_incomplete",
-    }:
+    }
+    if publication_state == "complete" and not bool(
+        publication.get("accepted", False)
+    ):
+        raise ExecutionIdentityError(
+            "environment transition at an all-complete ARIADNE boundary is "
+            "blocked by a complete rejected batch decision"
+        )
+    if publication_state not in replayable_states and not (
+        publication_state == "complete"
+        and bool(publication.get("accepted", False))
+    ):
         raise ExecutionIdentityError(
             "environment transition at an all-complete ARIADNE boundary requires "
-            "derived publication to be absent or conclusively incomplete; observed "
-            + str(publication.get("state") or "unknown")
+            "derived publication to be absent, recoverably incomplete, or an "
+            "accepted uncommitted publication; observed "
+            + (publication_state or "unknown")
             + ": "
             + str(publication.get("reason") or "")
-        )
-    intent = load_intent(
-        campaign,
-        phase.value,
-        int(state.iteration),
-        expected_campaign_uid=str(state.campaign_uid),
-    )
-    if not isinstance(intent, Mapping) or str(intent.get("status") or "") != "FAILED":
-        raise ExecutionIdentityError(
-            "environment transition at an all-complete ARIADNE boundary requires "
-            "the terminal producer submission intent"
-        )
-    if not str(intent.get("job_id") or ""):
-        raise ExecutionIdentityError(
-            "all-complete ARIADNE producer intent has no scheduler JobID"
-        )
-    producer_generation = intent.get("environment_generation")
-    producer_digest = str(intent.get("environment_generation_digest_sha256") or "")
-    if (
-        isinstance(producer_generation, bool)
-        or not isinstance(producer_generation, int)
-        or producer_generation < 0
-        or len(producer_digest) != 64
-        or any(ch not in "0123456789abcdef" for ch in producer_digest)
-    ):
-        raise ExecutionIdentityError(
-            "all-complete ARIADNE producer intent lacks a valid environment binding"
-        )
-    recovery = intent.get("array_recovery")
-    metadata = intent.get("submission_metadata")
-    if not isinstance(recovery, Mapping) or not isinstance(metadata, Mapping):
-        raise ExecutionIdentityError(
-            "all-complete ARIADNE producer intent lacks retry ownership evidence"
-        )
-    raw_counts = (
-        recovery.get("logical_total"),
-        recovery.get("n_reuse"),
-        recovery.get("n_retry"),
-        intent.get("logical_expected_tasks"),
-        intent.get("retry_expected_tasks"),
-        intent.get("expected_tasks"),
-    )
-    if any(
-        isinstance(value, bool) or not isinstance(value, int) or value < 0
-        for value in raw_counts
-    ):
-        raise ExecutionIdentityError(
-            "all-complete ARIADNE producer task counts are malformed"
-        )
-    producer_counts = tuple(int(value) for value in raw_counts)
-    expected_counts = (
-        logical_total,
-        0,
-        logical_total,
-        logical_total,
-        logical_total,
-        logical_total,
-    )
-    if producer_counts != expected_counts:
-        raise ExecutionIdentityError(
-            "all-complete ARIADNE outputs are not bound to one full-array producer "
-            "attempt"
         )
     expected_task_set_sha256 = hashlib.sha256(
         ",".join(str(task_id) for task_id in expected_task_ids).encode("ascii")
     ).hexdigest()
-    if str(metadata.get("logical_task_set_sha256") or "") != expected_task_set_sha256:
-        raise ExecutionIdentityError(
-            "all-complete ARIADNE producer task-set digest mismatch"
+    try:
+        source = resolve_ariadne_postprocess_source(
+            campaign,
+            campaign_uid=str(state.campaign_uid),
+            iteration=int(state.iteration),
+            logical_total=int(logical_total),
+            logical_task_set_sha256=expected_task_set_sha256,
         )
+    except Exception as exc:
+        raise ExecutionIdentityError(
+            "environment transition at an all-complete ARIADNE boundary could "
+            "not validate the producer contract: "
+            + type(exc).__name__
+            + ": "
+            + str(exc)[:200]
+        ) from exc
     return {
         "transition_kind": "ariadne_postprocess_only",
         "logical_total": int(logical_total),
-        "producer_submission_identity": str(intent.get("submission_identity") or ""),
-        "producer_job_id": str(intent.get("job_id") or ""),
-        "producer_environment_generation": int(producer_generation),
-        "producer_environment_generation_digest_sha256": producer_digest,
-        "publication_state": str(publication.get("state") or ""),
+        "producer_submission_identity": str(source["submission_identity"]),
+        "producer_job_id": str(source["job_id"]),
+        "producer_environment_generation": int(source["environment_generation"]),
+        "producer_environment_generation_digest_sha256": str(
+            source["environment_generation_digest_sha256"]
+        ),
+        "publication_state": publication_state,
+        "postprocess_source": dict(source),
     }
 
 
@@ -990,6 +962,30 @@ def read_active_environment_generation(
     }
 
 
+def read_environment_generation(
+    campaign_dir: Union[str, Path],
+    *,
+    generation: int,
+    expected_campaign_uid: str,
+) -> Dict[str, Any]:
+    """Read one immutable historical environment generation by number."""
+    campaign = Path(campaign_dir).resolve()
+    generation_number = _exact_non_negative_int(
+        generation, "environment generation"
+    )
+    path = campaign_owned_path(
+        campaign,
+        environment_generations_dir(campaign)
+        / ("generation-" + str(generation_number).zfill(6) + ".json"),
+    )
+    return _validate_generation_payload(
+        _read_json_object(path, "environment generation"),
+        expected_generation=generation_number,
+        expected_campaign_uid=str(expected_campaign_uid),
+        path=path,
+    )
+
+
 def environment_status(
     campaign_dir: Union[str, Path],
     *,
@@ -1419,6 +1415,11 @@ def advance_environment_generation(
     try:
         from .daemon.journal import append_event
 
+        journal_transition_context = {
+            key: value
+            for key, value in transition_context.items()
+            if key != "postprocess_source"
+        }
         append_event(
             operational_path(campaign, "journal.ndjson"),
             "environment_generation_advanced",
@@ -1434,7 +1435,7 @@ def advance_environment_generation(
                 for key in _ENVIRONMENT_FINGERPRINT_KEYS
                 if active_generation.get(key) != candidate.get(key)
             ],
-            **transition_context,
+            **journal_transition_context,
         )
     except Exception:
         pass

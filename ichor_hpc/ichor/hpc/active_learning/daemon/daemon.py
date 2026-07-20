@@ -1462,6 +1462,21 @@ class Daemon:
         checkpoint_status = self._checkpoint_before_seed_selection(state)
         if checkpoint_status is not None:
             return checkpoint_status
+        postprocess_source = None
+        if phase is CampaignPhase.ARIADNE_ARRAY:
+            try:
+                postprocess_source = self._ariadne_postprocess_source_if_complete(
+                    state
+                )
+            except Exception as exc:
+                return self._halt(
+                    state,
+                    phase,
+                    "ariadne_postprocess_source_invalid: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)[:180],
+                )
         active_intent = None
         if phase_name in SBATCH_PHASES:
             try:
@@ -1476,6 +1491,11 @@ class Daemon:
                     "submission_intent_invalid: "
                     + type(exc).__name__ + ": " + str(exc)[:160],
                 )
+        local_postprocess_intent = bool(
+            isinstance(active_intent, Mapping)
+            and isinstance(active_intent.get("postprocess_source"), Mapping)
+            and postprocess_source is not None
+        )
         if active_intent is not None:
             intent_environment_status = self._verify_intent_environment_binding(
                 state,
@@ -1490,7 +1510,11 @@ class Daemon:
         # would then race a duplicate into the same staging dirs. if we find it, adopt + poll it
         # instead. only for sbatch phases (inline phases have no job) and only when a finder is wired
         # (live mode); mock/dry leave it None and submit as before. (A24/A25)
-        if self.job_finder is not None and phase_name in SBATCH_PHASES:
+        if (
+            self.job_finder is not None
+            and phase_name in SBATCH_PHASES
+            and not local_postprocess_intent
+        ):
             lookup_inconclusive = False
             lookup_rows = []
             try:
@@ -1560,7 +1584,11 @@ class Daemon:
                     "active_submission_adoption_inconclusive: "
                     "sacct lookup failed or was inconclusive; refusing to supersede active intent",
                 )
-        if active_intent is not None and phase_name in SBATCH_PHASES:
+        if (
+            active_intent is not None
+            and phase_name in SBATCH_PHASES
+            and not local_postprocess_intent
+        ):
             active_job_id = active_intent.get("job_id")
             if active_job_id is None:
                 recovered = self._recover_pre_submit_intent_without_job_id(
@@ -1665,36 +1693,46 @@ class Daemon:
         intent_written = False
         if phase_name in SBATCH_PHASES:
             try:
-                planned_expected_tasks = self._infer_expected_tasks_from_artifacts(
-                    state,
-                    phase,
-                )
-                _submission_intent.write_pre_submit_intent(
-                    self.campaign_dir,
-                    campaign_uid=str(getattr(state, "campaign_uid", "")),
-                    phase_name=phase_name,
-                    iteration=int(state.iteration),
-                    replacement_round=int(
-                        getattr(state, "replacement_round", 0)
-                    ),
-                    expected_tasks=planned_expected_tasks,
-                    decision_contract=self._submission_decision_contract(),
-                    scheduler_identity_kind=self.scheduler_identity_kind,
-                    environment_generation=(
-                        None
-                        if self._last_environment_binding is None
-                        else int(self._last_environment_binding["generation"])
-                    ),
-                    environment_generation_digest_sha256=(
-                        None
-                        if self._last_environment_binding is None
-                        else str(
-                            self._last_environment_binding[
-                                "generation_digest_sha256"
-                            ]
-                        )
-                    ),
-                )
+                if not local_postprocess_intent:
+                    planned_expected_tasks = self._infer_expected_tasks_from_artifacts(
+                        state,
+                        phase,
+                    )
+                    _submission_intent.write_pre_submit_intent(
+                        self.campaign_dir,
+                        campaign_uid=str(getattr(state, "campaign_uid", "")),
+                        phase_name=phase_name,
+                        iteration=int(state.iteration),
+                        replacement_round=int(
+                            getattr(state, "replacement_round", 0)
+                        ),
+                        expected_tasks=planned_expected_tasks,
+                        decision_contract=(
+                            dict(postprocess_source["decision_contract"])
+                            if postprocess_source is not None
+                            else self._submission_decision_contract()
+                        ),
+                        postprocess_source=(
+                            dict(postprocess_source)
+                            if postprocess_source is not None
+                            else None
+                        ),
+                        scheduler_identity_kind=self.scheduler_identity_kind,
+                        environment_generation=(
+                            None
+                            if self._last_environment_binding is None
+                            else int(self._last_environment_binding["generation"])
+                        ),
+                        environment_generation_digest_sha256=(
+                            None
+                            if self._last_environment_binding is None
+                            else str(
+                                self._last_environment_binding[
+                                    "generation_digest_sha256"
+                                ]
+                            )
+                        ),
+                    )
                 intent_written = True
             except Exception as exc:
                 return self._halt(
@@ -2371,6 +2409,51 @@ class Daemon:
             ),
             "config_sha256": config_fingerprint(canonical_config(self.config)),
         }
+
+    def _ariadne_postprocess_source_if_complete(
+        self,
+        state: CampaignState,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve the original producer for scheduler-free postprocessing."""
+        from ..execution_identity import (
+            _validate_ariadne_retry_transition_boundary,
+        )
+        from .array_recovery import scan_array_tasks
+        from .submission_intent import ACTIVE_STATUSES, load_intent
+
+        current = load_intent(
+            self.campaign_dir,
+            CampaignPhase.ARIADNE_ARRAY.value,
+            int(state.iteration),
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        if current is None:
+            return None
+        scan = scan_array_tasks(
+            self.campaign_dir,
+            CampaignPhase.ARIADNE_ARRAY,
+            int(state.iteration),
+            force_resubmit=False,
+        )
+        if not bool(scan.get("all_complete", False)):
+            return None
+        if (
+            isinstance(current, dict)
+            and str(current.get("status") or "") in ACTIVE_STATUSES
+            and not isinstance(current.get("postprocess_source"), Mapping)
+        ):
+            return None
+        context = _validate_ariadne_retry_transition_boundary(
+            self.campaign_dir,
+            state,
+            task_scan=scan,
+        )
+        source = context.get("postprocess_source")
+        if not isinstance(source, dict):
+            raise ValueError(
+                "all-complete ARIADNE recovery has no producer source contract"
+            )
+        return dict(source)
 
     def _collect_terminal_resource_usage(
         self,

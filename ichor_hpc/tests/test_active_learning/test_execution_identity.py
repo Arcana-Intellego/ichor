@@ -32,7 +32,16 @@ from ichor.hpc.active_learning.daemon.state import (
 )
 from ichor.hpc.active_learning.daemon.daemon import Daemon, TickStatus
 from ichor.hpc.active_learning.daemon.phase_executor import PhaseResult
-from ichor.hpc.active_learning.daemon.submission_intent import load_intent
+from ichor.hpc.active_learning.daemon.submission_intent import (
+    ariadne_producer_environment_binding,
+    intent_path,
+    load_intent,
+    mark_failed,
+    mark_submitted,
+    mark_superseded,
+    resolve_ariadne_postprocess_source,
+    write_pre_submit_intent,
+)
 from ichor.hpc.active_learning.cli import build_parser
 
 
@@ -443,6 +452,70 @@ def _patch_ariadne_retry_transition(
     )
 
 
+def _write_full_ariadne_producer_intent(
+    campaign,
+    state,
+    *,
+    logical_total=3,
+    status="FAILED",
+):
+    task_digest = hashlib.sha256(
+        ",".join(str(index) for index in range(int(logical_total))).encode("ascii")
+    ).hexdigest()
+    active = read_active_environment_generation(
+        campaign,
+        expected_campaign_uid=str(state.campaign_uid),
+    )["generation"]
+    write_pre_submit_intent(
+        campaign,
+        campaign_uid=str(state.campaign_uid),
+        phase_name=CampaignPhase.ARIADNE_ARRAY.value,
+        iteration=int(state.iteration),
+        expected_tasks=int(logical_total),
+        decision_contract={
+            "failure_threshold_fraction": 0.25,
+            "config_sha256": "c" * 64,
+        },
+        environment_generation=int(active["generation"]),
+        environment_generation_digest_sha256=str(active["digest_sha256"]),
+    )
+    mark_submitted(
+        campaign,
+        CampaignPhase.ARIADNE_ARRAY.value,
+        int(state.iteration),
+        "12345",
+        expected_tasks=int(logical_total),
+        submission_metadata={
+            "array_recovery": {
+                "logical_total": int(logical_total),
+                "n_complete": 0,
+                "n_reuse": 0,
+                "n_retry": int(logical_total),
+            },
+            "logical_task_set_sha256": task_digest,
+        },
+    )
+    mark_failed(
+        campaign,
+        CampaignPhase.ARIADNE_ARRAY.value,
+        int(state.iteration),
+        "test postprocess failure",
+    )
+    if status == "SUPERSEDED":
+        mark_superseded(
+            campaign,
+            CampaignPhase.ARIADNE_ARRAY.value,
+            int(state.iteration),
+            "reconcile_apply_retry",
+        )
+    return load_intent(
+        campaign,
+        CampaignPhase.ARIADNE_ARRAY.value,
+        int(state.iteration),
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+
+
 def test_rebind_accepts_fully_retryable_ariadne_boundary(
     tmp_path,
     monkeypatch,
@@ -588,27 +661,11 @@ def test_rebind_accepts_single_generation_ariadne_postprocess_only_boundary(
             "files": [],
         },
     )
-    task_digest = hashlib.sha256(b"0,1,2").hexdigest()
-    monkeypatch.setattr(
-        "ichor.hpc.active_learning.daemon.submission_intent.load_intent",
-        lambda *_args, **_kwargs: {
-            "status": "FAILED",
-            "job_id": "12345",
-            "submission_identity": "r0000-a0001-test",
-            "environment_generation": 0,
-            "environment_generation_digest_sha256": "a" * 64,
-            "logical_expected_tasks": 3,
-            "retry_expected_tasks": 3,
-            "expected_tasks": 3,
-            "array_recovery": {
-                "logical_total": 3,
-                "n_reuse": 0,
-                "n_retry": 3,
-            },
-            "submission_metadata": {
-                "logical_task_set_sha256": task_digest,
-            },
-        },
+    producer = _write_full_ariadne_producer_intent(
+        campaign,
+        state,
+        logical_total=3,
+        status="SUPERSEDED",
     )
 
     result = rebind_environment(
@@ -620,6 +677,115 @@ def test_rebind_accepts_single_generation_ariadne_postprocess_only_boundary(
     assert result["changed"] is True
     assert result["transition_kind"] == "ariadne_postprocess_only"
     assert result["producer_environment_generation"] == 0
+    assert result["producer_job_id"] == "12345"
+    assert result["postprocess_source"]["attempt_id"] == producer["attempt_id"]
+    active = read_active_environment_generation(
+        campaign,
+        expected_campaign_uid=state.campaign_uid,
+    )["generation"]
+    postprocess_intent = write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=CampaignPhase.ARIADNE_ARRAY.value,
+        iteration=1,
+        expected_tasks=3,
+        decision_contract=dict(result["postprocess_source"]["decision_contract"]),
+        postprocess_source=dict(result["postprocess_source"]),
+        environment_generation=int(active["generation"]),
+        environment_generation_digest_sha256=str(active["digest_sha256"]),
+    )
+    producer_environment = ariadne_producer_environment_binding(
+        campaign,
+        postprocess_intent,
+        expected_campaign_uid=state.campaign_uid,
+        expected_iteration=1,
+    )
+    assert int(active["generation"]) == 1
+    assert producer_environment["generation"] == 0
+
+
+def test_postprocess_source_survives_repeated_local_failure_and_reconcile(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, _config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 1
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    producer = _write_full_ariadne_producer_intent(campaign, state)
+    task_digest = hashlib.sha256(b"0,1,2").hexdigest()
+    source = resolve_ariadne_postprocess_source(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        iteration=1,
+        logical_total=3,
+        logical_task_set_sha256=task_digest,
+    )
+    active = read_active_environment_generation(
+        campaign,
+        expected_campaign_uid=state.campaign_uid,
+    )["generation"]
+    write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=CampaignPhase.ARIADNE_ARRAY.value,
+        iteration=1,
+        expected_tasks=3,
+        decision_contract=dict(source["decision_contract"]),
+        postprocess_source=source,
+        environment_generation=int(active["generation"]),
+        environment_generation_digest_sha256=str(active["digest_sha256"]),
+    )
+    mark_failed(
+        campaign,
+        CampaignPhase.ARIADNE_ARRAY.value,
+        1,
+        "second local postprocess failure",
+    )
+    mark_superseded(
+        campaign,
+        CampaignPhase.ARIADNE_ARRAY.value,
+        1,
+        "reconcile_apply_retry",
+    )
+
+    repeated = resolve_ariadne_postprocess_source(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        iteration=1,
+        logical_total=3,
+        logical_task_set_sha256=task_digest,
+    )
+
+    assert repeated == source
+    assert repeated["attempt_id"] == producer["attempt_id"]
+    assert repeated["job_id"] == "12345"
+
+
+def test_postprocess_source_rejects_arbitrary_supersession(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, _config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 1
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    _write_full_ariadne_producer_intent(campaign, state)
+    mark_superseded(
+        campaign,
+        CampaignPhase.ARIADNE_ARRAY.value,
+        1,
+        "unrelated_supersession",
+    )
+
+    with pytest.raises(ValueError, match="SUPERSEDED by reconcile_apply_retry"):
+        resolve_ariadne_postprocess_source(
+            campaign,
+            campaign_uid=state.campaign_uid,
+            iteration=1,
+            logical_total=3,
+            logical_task_set_sha256=hashlib.sha256(b"0,1,2").hexdigest(),
+        )
 
 
 def test_rebind_rejects_all_complete_ariadne_without_full_attempt_binding(
@@ -651,26 +817,17 @@ def test_rebind_rejects_all_complete_ariadne_without_full_attempt_binding(
             "files": [],
         },
     )
-    monkeypatch.setattr(
-        "ichor.hpc.active_learning.daemon.submission_intent.load_intent",
-        lambda *_args, **_kwargs: {
-            "status": "FAILED",
-            "job_id": "12345",
-            "environment_generation": 0,
-            "environment_generation_digest_sha256": "a" * 64,
-            "logical_expected_tasks": 3,
-            "retry_expected_tasks": 1,
-            "expected_tasks": 1,
-            "array_recovery": {
-                "logical_total": 3,
-                "n_reuse": 2,
-                "n_retry": 1,
-            },
-            "submission_metadata": {
-                "logical_task_set_sha256": hashlib.sha256(b"2").hexdigest(),
-            },
-        },
-    )
+    _write_full_ariadne_producer_intent(campaign, state, logical_total=3)
+    path = intent_path(campaign, CampaignPhase.ARIADNE_ARRAY.value, 1)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["expected_tasks"] = 1
+    payload["retry_expected_tasks"] = 1
+    payload["array_recovery"]["n_reuse"] = 2
+    payload["array_recovery"]["n_retry"] = 1
+    payload["submission_metadata"]["logical_task_set_sha256"] = hashlib.sha256(
+        b"2"
+    ).hexdigest()
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(
         ExecutionIdentityError,

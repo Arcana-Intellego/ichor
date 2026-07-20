@@ -7,7 +7,7 @@ attempt was in progress and must run the adoption check before resubmitting.
 """
 from __future__ import annotations
 
-from ..strict_json import strict_json as json
+import hashlib
 import math
 import re
 import uuid
@@ -15,10 +15,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Union
 
+from ..strict_json import strict_json as json
+from ..submit.slurm_contracts import validate_parent_job_id
+from .filesystem import operational_path
 from .job_names import live_job_name
 from .state import CampaignPhase, CampaignState, atomic_write_json
-from .filesystem import operational_path
-from ..submit.slurm_contracts import validate_parent_job_id
 
 
 INTENT_SCHEMA_VERSION = 2
@@ -39,6 +40,21 @@ _STATUS_TRANSITIONS = {
 _SCALAR_SUBMISSION_PHASES = frozenset({
     "PHASE_A_DIVERSITY",
     "PHASE_B_DIVERSITY",
+})
+
+_POSTPROCESS_SOURCE_KEYS = frozenset({
+    "campaign_uid",
+    "phase",
+    "iteration",
+    "attempt_id",
+    "submission_identity",
+    "job_id",
+    "environment_generation",
+    "environment_generation_digest_sha256",
+    "logical_total",
+    "logical_task_set_sha256",
+    "decision_contract",
+    "source_sha256",
 })
 
 
@@ -230,6 +246,26 @@ def _validate_intent_payload(
             raise ValueError(
                 "submission intent environment generation digest is invalid"
             )
+    postprocess_source = data.get("postprocess_source")
+    if postprocess_source is not None:
+        source = _validated_postprocess_source(
+            postprocess_source
+        )
+        if str(phase_name) != CampaignPhase.ARIADNE_ARRAY.value:
+            raise ValueError(
+                "postprocess_source is valid only for an ARIADNE_ARRAY intent"
+            )
+        if data.get("job_id") is not None:
+            raise ValueError("ARIADNE postprocess intent must remain jobless")
+        if data.get("expected_tasks") != int(source["logical_total"]):
+            raise ValueError(
+                "ARIADNE postprocess intent expected_tasks mismatch"
+            )
+        if data.get("decision_contract") != source["decision_contract"]:
+            raise ValueError(
+                "ARIADNE postprocess intent decision contract differs from its producer"
+            )
+        data["postprocess_source"] = source
     return data
 
 
@@ -254,6 +290,306 @@ def _validated_decision_contract(value: Any) -> Dict[str, Any]:
         raise ValueError("submission intent decision config_sha256 is invalid")
     contract["failure_threshold_fraction"] = parsed_threshold
     return contract
+
+
+def _canonical_postprocess_source_sha256(value: Mapping[str, Any]) -> str:
+    payload = dict(value)
+    payload.pop("source_sha256", None)
+    raw = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _validated_sha256(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(label + " must be a SHA-256 digest")
+    return value
+
+
+def _validated_postprocess_source(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("submission intent postprocess_source must be an object")
+    source = dict(value)
+    if set(source) != _POSTPROCESS_SOURCE_KEYS:
+        missing = sorted(_POSTPROCESS_SOURCE_KEYS - set(source))
+        unexpected = sorted(set(source) - _POSTPROCESS_SOURCE_KEYS)
+        raise ValueError(
+            "submission intent postprocess_source keys are invalid; missing="
+            + repr(missing)
+            + ", unexpected="
+            + repr(unexpected)
+        )
+    campaign_uid = source.get("campaign_uid")
+    if not isinstance(campaign_uid, str) or not campaign_uid:
+        raise ValueError("postprocess source campaign_uid must be non-empty")
+    if source.get("phase") != CampaignPhase.ARIADNE_ARRAY.value:
+        raise ValueError("postprocess source phase must be ARIADNE_ARRAY")
+    source["iteration"] = _exact_int(
+        source.get("iteration"), "postprocess source iteration"
+    )
+    attempt_id = source.get("attempt_id")
+    if (
+        not isinstance(attempt_id, str)
+        or len(attempt_id) != 32
+        or any(character not in "0123456789abcdef" for character in attempt_id)
+    ):
+        raise ValueError("postprocess source attempt_id is invalid")
+    submission_identity = source.get("submission_identity")
+    if not isinstance(submission_identity, str) or not submission_identity:
+        raise ValueError("postprocess source submission_identity must be non-empty")
+    source["job_id"] = validate_parent_job_id(str(source.get("job_id") or ""))
+    source["environment_generation"] = _exact_int(
+        source.get("environment_generation"),
+        "postprocess source environment_generation",
+    )
+    source["environment_generation_digest_sha256"] = _validated_sha256(
+        source.get("environment_generation_digest_sha256"),
+        "postprocess source environment generation digest",
+    )
+    source["logical_total"] = _exact_int(
+        source.get("logical_total"),
+        "postprocess source logical_total",
+        minimum=1,
+    )
+    source["logical_task_set_sha256"] = _validated_sha256(
+        source.get("logical_task_set_sha256"),
+        "postprocess source logical task-set digest",
+    )
+    source["decision_contract"] = _validated_decision_contract(
+        source.get("decision_contract")
+    )
+    recorded_digest = _validated_sha256(
+        source.get("source_sha256"),
+        "postprocess source digest",
+    )
+    if recorded_digest != _canonical_postprocess_source_sha256(source):
+        raise ValueError("postprocess source digest does not match its content")
+    source["source_sha256"] = recorded_digest
+    return source
+
+
+def _validate_postprocess_source_environment(
+    campaign_dir: Union[str, Path],
+    source: Mapping[str, Any],
+) -> None:
+    from ..execution_identity import read_environment_generation
+
+    generation = read_environment_generation(
+        campaign_dir,
+        generation=int(source["environment_generation"]),
+        expected_campaign_uid=str(source["campaign_uid"]),
+    )
+    if str(generation["digest_sha256"]) != str(
+        source["environment_generation_digest_sha256"]
+    ):
+        raise ValueError(
+            "postprocess source environment generation digest mismatch"
+        )
+
+
+def resolve_ariadne_postprocess_source(
+    campaign_dir: Union[str, Path],
+    *,
+    campaign_uid: str,
+    iteration: int,
+    logical_total: int,
+    logical_task_set_sha256: str,
+    intent: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Resolve one full-array producer through local postprocess retries."""
+    expected_iteration = _exact_int(iteration, "postprocess source iteration")
+    expected_total = _exact_int(
+        logical_total, "postprocess source logical_total", minimum=1
+    )
+    expected_task_digest = _validated_sha256(
+        logical_task_set_sha256,
+        "postprocess source logical task-set digest",
+    )
+    current = (
+        dict(intent)
+        if isinstance(intent, Mapping)
+        else load_intent(
+            campaign_dir,
+            CampaignPhase.ARIADNE_ARRAY.value,
+            expected_iteration,
+            expected_campaign_uid=str(campaign_uid),
+        )
+    )
+    if not current:
+        raise ValueError("all-complete ARIADNE producer intent is unavailable")
+    if str(current.get("campaign_uid") or "") != str(campaign_uid):
+        raise ValueError("all-complete ARIADNE producer campaign UID mismatch")
+    if str(current.get("phase") or "") != CampaignPhase.ARIADNE_ARRAY.value:
+        raise ValueError("all-complete ARIADNE producer phase mismatch")
+    if int(current.get("iteration", -1)) != expected_iteration:
+        raise ValueError("all-complete ARIADNE producer iteration mismatch")
+
+    status = str(current.get("status") or "")
+    reason = str(current.get("reason") or "")
+    nested = current.get("postprocess_source")
+    if nested is not None:
+        if status not in {"PRE_SUBMIT", "FAILED", "SUPERSEDED"}:
+            raise ValueError(
+                "postprocess source wrapper must be PRE_SUBMIT, FAILED or SUPERSEDED"
+            )
+        if status == "SUPERSEDED" and reason != "reconcile_apply_retry":
+            raise ValueError(
+                "superseded postprocess source wrapper has an unsupported reason"
+            )
+        if status == "PRE_SUBMIT" and current.get("job_id") is not None:
+            raise ValueError("jobless postprocess intent unexpectedly owns a JobID")
+        source = _validated_postprocess_source(nested)
+    else:
+        if status != "FAILED" and not (
+            status == "SUPERSEDED" and reason == "reconcile_apply_retry"
+        ):
+            raise ValueError(
+                "all-complete ARIADNE producer must be FAILED or "
+                "SUPERSEDED by reconcile_apply_retry"
+            )
+        job_id = current.get("job_id")
+        if not isinstance(job_id, str) or not job_id:
+            raise ValueError("all-complete ARIADNE producer has no scheduler JobID")
+        recovery = current.get("array_recovery")
+        metadata = current.get("submission_metadata")
+        if not isinstance(recovery, Mapping) or not isinstance(metadata, Mapping):
+            raise ValueError(
+                "all-complete ARIADNE producer lacks retry ownership evidence"
+            )
+        raw_counts = (
+            recovery.get("logical_total"),
+            recovery.get("n_reuse"),
+            recovery.get("n_retry"),
+            current.get("logical_expected_tasks"),
+            current.get("retry_expected_tasks"),
+            current.get("expected_tasks"),
+        )
+        if any(
+            isinstance(item, bool) or not isinstance(item, int) or item < 0
+            for item in raw_counts
+        ):
+            raise ValueError("all-complete ARIADNE producer task counts are malformed")
+        if tuple(int(item) for item in raw_counts) != (
+            expected_total,
+            0,
+            expected_total,
+            expected_total,
+            expected_total,
+            expected_total,
+        ):
+            raise ValueError(
+                "all-complete ARIADNE outputs are not bound to one full-array "
+                "producer attempt"
+            )
+        if str(metadata.get("logical_task_set_sha256") or "") != expected_task_digest:
+            raise ValueError("all-complete ARIADNE producer task-set digest mismatch")
+        source = {
+            "campaign_uid": str(campaign_uid),
+            "phase": CampaignPhase.ARIADNE_ARRAY.value,
+            "iteration": expected_iteration,
+            "attempt_id": str(current.get("attempt_id") or ""),
+            "submission_identity": str(current.get("submission_identity") or ""),
+            "job_id": str(job_id),
+            "environment_generation": current.get("environment_generation"),
+            "environment_generation_digest_sha256": current.get(
+                "environment_generation_digest_sha256"
+            ),
+            "logical_total": expected_total,
+            "logical_task_set_sha256": expected_task_digest,
+            "decision_contract": current.get("decision_contract"),
+        }
+        source["source_sha256"] = _canonical_postprocess_source_sha256(source)
+        source = _validated_postprocess_source(source)
+
+    expected_identity = (
+        str(campaign_uid),
+        CampaignPhase.ARIADNE_ARRAY.value,
+        expected_iteration,
+        expected_total,
+        expected_task_digest,
+    )
+    observed_identity = (
+        str(source["campaign_uid"]),
+        str(source["phase"]),
+        int(source["iteration"]),
+        int(source["logical_total"]),
+        str(source["logical_task_set_sha256"]),
+    )
+    if observed_identity != expected_identity:
+        raise ValueError(
+            "postprocess source does not match the current ARIADNE task set"
+        )
+    _validate_postprocess_source_environment(campaign_dir, source)
+    return source
+
+
+def ariadne_producer_environment_binding(
+    campaign_dir: Union[str, Path],
+    intent: Mapping[str, Any],
+    *,
+    expected_campaign_uid: str,
+    expected_iteration: int,
+) -> Dict[str, Any]:
+    """Return the environment that produced ARIADNE seed predictions."""
+    if (
+        str(intent.get("campaign_uid") or "") != str(expected_campaign_uid)
+        or str(intent.get("phase") or "") != CampaignPhase.ARIADNE_ARRAY.value
+        or int(intent.get("iteration", -1)) != int(expected_iteration)
+    ):
+        raise ValueError("ARIADNE producer intent identity mismatch")
+    nested = intent.get("postprocess_source")
+    if nested is not None:
+        source = _validated_postprocess_source(nested)
+        if (
+            str(source["campaign_uid"]) != str(expected_campaign_uid)
+            or int(source["iteration"]) != int(expected_iteration)
+        ):
+            raise ValueError("ARIADNE postprocess source identity mismatch")
+        _validate_postprocess_source_environment(campaign_dir, source)
+        return {
+            "generation": int(source["environment_generation"]),
+            "generation_digest_sha256": str(
+                source["environment_generation_digest_sha256"]
+            ),
+        }
+    generation = intent.get("environment_generation")
+    digest = intent.get("environment_generation_digest_sha256")
+    if generation is None and digest is None:
+        from .error_calibration_contract import active_environment_binding
+
+        unbound = active_environment_binding(campaign_dir)
+        if not bool(unbound.get("bound", False)):
+            return {
+                "generation": int(unbound["generation"]),
+                "generation_digest_sha256": str(
+                    unbound["generation_digest_sha256"]
+                ),
+            }
+        raise ValueError(
+            "ARIADNE producer intent lacks an environment generation binding"
+        )
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+        raise ValueError("ARIADNE producer environment generation is malformed")
+    _validated_sha256(digest, "ARIADNE producer environment generation digest")
+    source = {
+        "campaign_uid": str(expected_campaign_uid),
+        "environment_generation": int(generation),
+        "environment_generation_digest_sha256": str(digest),
+    }
+    _validate_postprocess_source_environment(campaign_dir, source)
+    return {
+        "generation": int(generation),
+        "generation_digest_sha256": str(digest),
+    }
 
 
 def intent_dir(campaign_dir: Union[str, Path]) -> Path:
@@ -580,6 +916,7 @@ def write_pre_submit_intent(
     replacement_round: int = 0,
     expected_tasks: Optional[int] = None,
     decision_contract: Optional[Dict[str, Any]] = None,
+    postprocess_source: Optional[Dict[str, Any]] = None,
     scheduler_identity_kind: str = "slurm",
     environment_generation: Optional[int] = None,
     environment_generation_digest_sha256: Optional[str] = None,
@@ -662,6 +999,10 @@ def write_pre_submit_intent(
         payload["expected_tasks"] = parsed_expected
     if decision_contract is not None:
         payload["decision_contract"] = _validated_decision_contract(decision_contract)
+    if postprocess_source is not None:
+        payload["postprocess_source"] = _validated_postprocess_source(
+            postprocess_source
+        )
     if (environment_generation is None) != (
         environment_generation_digest_sha256 is None
     ):
