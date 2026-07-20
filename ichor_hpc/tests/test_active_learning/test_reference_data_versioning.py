@@ -14,6 +14,10 @@ from ichor.hpc.active_learning.daemon.input_staging import (
     accepted_allocation_pointdirs,
     commit_reference_data_delta,
 )
+from ichor.hpc.active_learning.daemon.reference_commit import (
+    classify_reference_commit,
+    prepare_reference_data_delta,
+)
 from ichor.hpc.active_learning.point_allocation import (
     accepted_attempts,
     create_point_allocation,
@@ -323,6 +327,39 @@ def test_reference_commit_moves_without_copying_or_payload_rehash(
     ]
     assert shard_progress[-1]["processed_points"] == len(sources)
     assert shard_progress[-1]["total_points"] == len(sources)
+
+
+def test_reference_commit_can_be_prepared_without_moving_pointdirs(tmp_path):
+    campaign = tmp_path / "campaign"
+    _complete_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        first_frame_id=0,
+    )
+    staging = campaign / ".DATA" / "STAGING" / "initial"
+    sources = sorted(staging.glob("*.pointdir"))
+
+    ledger_path = prepare_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
+
+    transaction = classify_reference_commit(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+    )
+    assert ledger_path.is_file()
+    assert transaction["state"] == "prepared"
+    assert all(path.is_dir() for path in sources)
+    assert not list(
+        (campaign / "QM_REFERENCE_DATA" / "iteration-000000.staging").glob(
+            "*.pointdir"
+        )
+    )
 
 
 def test_aimall_row_sidecar_uses_one_matrix_file_per_point(tmp_path):

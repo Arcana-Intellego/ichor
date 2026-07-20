@@ -393,6 +393,7 @@ class _Int:
     net_charge = 0.0
     iqa = -75.0
     integration_error = 1.0e-6
+    dft_model = ""
 
 
 def test_aimall_rejects_partial_int_set(tmp_path):
@@ -416,4 +417,20 @@ def test_aimall_accepts_one_int_per_atom(tmp_path):
     )
     pdir = PointDirectory(fixture)
     ok, reason = validate_aimall_completed(pdir)
+    assert ok, reason
+
+
+def test_aimall_completion_validation_does_not_classify_method_quality(tmp_path):
+    incomplete_quality = SimpleNamespace(
+        atom_name="O1",
+        net_charge=0.0,
+        iqa=float("nan"),
+        integration_error=None,
+        dft_model="",
+    )
+    ints = SimpleNamespace(path=str(tmp_path), ints=[incomplete_quality])
+    pdir = SimpleNamespace(ints=ints, atoms=[0])
+
+    ok, reason = validate_aimall_completed(pdir)
+
     assert ok, reason

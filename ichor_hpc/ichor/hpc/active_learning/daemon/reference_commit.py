@@ -641,6 +641,112 @@ def _finish_existing(
     return view, names, False
 
 
+def _prepare_reference_data_delta(
+    campaign: Path,
+    *,
+    version: int,
+    context: str,
+    iteration: int,
+) -> Tuple[
+    ReferenceDataVersioning,
+    Path,
+    Dict[str, Any],
+    Path,
+    Dict[str, Any],
+    Optional[ReferenceDataView],
+]:
+    versioning = ReferenceDataVersioning(qm_reference_data_dir(campaign))
+    if versioning.iteration_path(version).exists():
+        raise ValueError("reference-data version is already published")
+    allocation_path, allocation = _allocation(
+        campaign,
+        context=str(context),
+        iteration=int(iteration),
+    )
+    parent_view = None
+    if version > 0:
+        parent_view = versioning.resolve(version - 1, verification="index")
+    elif versioning.list_committed_versions():
+        raise ValueError("bootstrap reference data must be the first commit")
+    ledger_path = transaction_path(
+        campaign,
+        context=str(context),
+        iteration=int(iteration),
+    )
+    if ledger_path.is_file():
+        ledger = _read_ledger(ledger_path)
+        expected = (
+            int(ledger["reference_data_version"]),
+            str(ledger["context"]),
+            int(ledger["iteration"]),
+            str(ledger["point_allocation_sha256"]),
+        )
+        observed = (
+            int(version),
+            str(context),
+            int(iteration),
+            allocation_manifest_sha256(allocation_path),
+        )
+        if expected != observed:
+            raise ValueError(
+                "reference-commit ledger identity conflicts with allocation"
+            )
+    else:
+        ledger = _new_ledger(
+            campaign,
+            version=int(version),
+            context=str(context),
+            iteration=int(iteration),
+            allocation_path=allocation_path,
+            allocation=allocation,
+            parent_view=parent_view,
+        )
+        _write_ledger(ledger_path, ledger, status="prepared")
+
+    staging = versioning.staging_path(version)
+    if not staging.exists():
+        staging.parent.mkdir(parents=True, exist_ok=True)
+        staging.mkdir(parents=True, exist_ok=False)
+        _fsync_parent_dir(staging)
+    elif staging.is_symlink() or not staging.is_dir():
+        raise ValueError("reference-commit staging is not a regular directory")
+    return (
+        versioning,
+        ledger_path,
+        ledger,
+        allocation_path,
+        allocation,
+        parent_view,
+    )
+
+
+def prepare_reference_data_delta(
+    campaign_dir: Path,
+    *,
+    reference_data_version: int,
+    context: str,
+    iteration: int,
+) -> Path:
+    """Prepare the standard commit ledger without moving scientific payloads."""
+    campaign = Path(campaign_dir).resolve()
+    version = int(reference_data_version)
+    if str(context) not in {"bootstrap", "active"}:
+        raise ValueError("reference commit context must be bootstrap or active")
+    if (version == 0) != (str(context) == "bootstrap") or int(iteration) != version:
+        raise ValueError(
+            "reference commit context, iteration and version are inconsistent"
+        )
+    _versioning, ledger_path, _ledger, _allocation_path, _allocation_payload, _parent = (
+        _prepare_reference_data_delta(
+            campaign,
+            version=version,
+            context=str(context),
+            iteration=int(iteration),
+        )
+    )
+    return ledger_path
+
+
 def commit_reference_data_delta(
     campaign_dir: Path,
     *,
@@ -664,43 +770,19 @@ def commit_reference_data_delta(
             raise ValueError("published reference version lacks its transaction ledger")
         return _finish_existing(campaign, versioning, version, ledger_path)
 
-    allocation_path, allocation = _allocation(
+    (
+        versioning,
+        ledger_path,
+        ledger,
+        allocation_path,
+        allocation,
+        parent_view,
+    ) = _prepare_reference_data_delta(
         campaign,
+        version=version,
         context=str(context),
         iteration=int(iteration),
     )
-    parent_view = None
-    if version > 0:
-        parent_view = versioning.resolve(version - 1, verification="index")
-    elif versioning.list_committed_versions():
-        raise ValueError("bootstrap reference data must be the first commit")
-    if ledger_path.is_file():
-        ledger = _read_ledger(ledger_path)
-        expected = (
-            int(ledger["reference_data_version"]),
-            str(ledger["context"]),
-            int(ledger["iteration"]),
-            str(ledger["point_allocation_sha256"]),
-        )
-        observed = (
-            version,
-            str(context),
-            int(iteration),
-            allocation_manifest_sha256(allocation_path),
-        )
-        if expected != observed:
-            raise ValueError("reference-commit ledger identity conflicts with allocation")
-    else:
-        ledger = _new_ledger(
-            campaign,
-            version=version,
-            context=str(context),
-            iteration=int(iteration),
-            allocation_path=allocation_path,
-            allocation=allocation,
-            parent_view=parent_view,
-        )
-        _write_ledger(ledger_path, ledger, status="prepared")
     _emit(
         progress_callback,
         "reference_commit_started",
@@ -710,12 +792,6 @@ def commit_reference_data_delta(
     )
 
     staging = versioning.staging_path(version)
-    if not staging.exists():
-        staging.parent.mkdir(parents=True, exist_ok=True)
-        staging.mkdir(parents=True, exist_ok=False)
-        _fsync_parent_dir(staging)
-    elif staging.is_symlink() or not staging.is_dir():
-        raise ValueError("reference-commit staging is not a regular directory")
     _move_points(campaign, staging, ledger_path, ledger, progress_callback)
     _copy_allocation_metadata(allocation_path, staging, version=version)
     quality_evidence = _copy_quality_evidence(campaign, staging, ledger, allocation)
@@ -941,6 +1017,7 @@ __all__ = [
     "REFERENCE_COMMIT_TRANSACTION_SCHEMA_VERSION",
     "classify_reference_commit",
     "commit_reference_data_delta",
+    "prepare_reference_data_delta",
     "inventory_reference_commits",
     "transaction_path",
 ]

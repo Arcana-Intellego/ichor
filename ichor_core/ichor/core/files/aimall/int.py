@@ -200,12 +200,37 @@ class Int(ReadFile, HasData):
                     )
                 line = next(f)
 
-            next(f)
-            self.dft_model = next(f).split(":")[-1].strip()
+            model = None
+            integration_line = None
+            for line in f:
+                if "Integration is over atom" in line:
+                    integration_line = line
+                    break
+                stripped = line.strip()
+                if not stripped.startswith("Model:"):
+                    continue
+                value = stripped.partition(":")[2].strip()
+                if not value:
+                    raise ValueError(
+                        "empty AIMAll Model record in " + str(self.path)
+                    )
+                if model is not None:
+                    raise ValueError(
+                        "duplicate AIMAll Model record in " + str(self.path)
+                    )
+                model = value
+            if model is None:
+                raise ValueError(
+                    "missing AIMAll Model record before atom integration in "
+                    + str(self.path)
+                )
+            if integration_line is None:
+                raise ValueError(
+                    "missing AIMAll atom integration section in " + str(self.path)
+                )
+            self.dft_model = model
 
-            line = next(f)
-            while "Integration is over atom" not in line:
-                line = next(f)
+            line = integration_line
             self.atom_name = line.split()[-1].strip().capitalize()
 
             line = next(f)

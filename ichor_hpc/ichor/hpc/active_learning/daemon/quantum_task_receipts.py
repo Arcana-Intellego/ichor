@@ -111,13 +111,30 @@ def write_quantum_task_receipt(
         "ADOPTED",
     }:
         raise ValueError("quantum task receipt requires an active submitted intent")
+    return _write_quantum_task_receipt(
+        root,
+        phase_name=phase_name,
+        iteration=iteration_value,
+        logical_task_id=logical_task_value,
+        intent=intent,
+    )
+
+
+def _write_quantum_task_receipt(
+    root: Path,
+    *,
+    phase_name: str,
+    iteration: int,
+    logical_task_id: int,
+    intent: Mapping[str, Any],
+) -> Path:
     inputs, outputs = _task_files(root, phase_name)
     payload = {
         "schema_version": QUANTUM_TASK_RECEIPT_SCHEMA_VERSION,
         "campaign_uid": str(intent["campaign_uid"]),
         "phase": str(phase_name),
-        "iteration": iteration_value,
-        "logical_task_id": logical_task_value,
+        "iteration": int(iteration),
+        "logical_task_id": int(logical_task_id),
         "attempt_id": str(intent["attempt_id"]),
         "submission_identity": str(intent["submission_identity"]),
         "job_id": str(intent["job_id"]),
@@ -129,6 +146,39 @@ def write_quantum_task_receipt(
     target = root / _receipt_name(phase_name)
     atomic_write_json(target, payload)
     return target
+
+
+def write_quantum_task_receipt_from_terminal_intent(
+    pointdir: Path,
+    *,
+    phase_name: str,
+    iteration: int,
+    logical_task_id: int,
+    intent: Mapping[str, Any],
+) -> Path:
+    """Reconstruct a missing receipt from one proven completed array intent."""
+    root = Path(pointdir)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("quantum task pointdir is missing or symlinked")
+    if (
+        str(intent.get("status") or "") != "COMPLETED"
+        or str(intent.get("phase") or "") != str(phase_name)
+        or int(intent.get("iteration", -1)) != int(iteration)
+        or not str(intent.get("job_id") or "")
+    ):
+        raise ValueError(
+            "quantum task receipt reconstruction requires a matching completed intent"
+        )
+    return _write_quantum_task_receipt(
+        root,
+        phase_name=str(phase_name),
+        iteration=_exact_int(iteration, "quantum task receipt iteration"),
+        logical_task_id=_exact_int(
+            logical_task_id,
+            "quantum task receipt logical_task_id",
+        ),
+        intent=intent,
+    )
 
 
 def read_quantum_task_receipt(
@@ -193,4 +243,5 @@ __all__ = [
     "QUANTUM_TASK_RECEIPT_SCHEMA_VERSION",
     "read_quantum_task_receipt",
     "write_quantum_task_receipt",
+    "write_quantum_task_receipt_from_terminal_intent",
 ]

@@ -192,6 +192,7 @@ KNOWN_EVENT_TYPES = (
     "point_allocation_replacement_prepared",
     "point_allocation_quantum_recorded",
     "aimall_skipped_no_gaussian_acceptances",
+    "aimall_quality_revalidated",
     "ariadne_sampling_protocol_replay_failed",
     "legacy_sampling_protocol_repreview",
     "partial_array_recovery_postprocess_only",

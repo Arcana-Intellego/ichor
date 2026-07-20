@@ -279,6 +279,7 @@ def write_quantum_quality_manifest(
     iteration: int,
     records: Sequence[Dict[str, Any]],
     gates: Any,
+    manifest_path: Optional[Path] = None,
 ) -> Path:
     staging = Path(staging_dir)
     staging.mkdir(parents=True, exist_ok=True)
@@ -292,7 +293,12 @@ def write_quantum_quality_manifest(
         "n_rejected": int(sum(1 for r in records if not bool(r.get("accepted")))),
         "records": list(records),
     }
-    path = staging / QUANTUM_QUALITY_MANIFEST
+    path = (
+        Path(manifest_path)
+        if manifest_path is not None
+        else staging / QUANTUM_QUALITY_MANIFEST
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(path, payload)
     return path
 

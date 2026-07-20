@@ -321,6 +321,46 @@ def test_int_rejects_unsupported_aimall_major_version(tmp_path):
         _ = Int(target).net_charge
 
 
+def test_int_reads_model_after_optional_informational_lines(tmp_path):
+    source = example_dir / "WATER_MONOMER0000_atomicfiles" / "o1.int"
+    target = tmp_path / "o1.int"
+    text = source.read_text(encoding="utf-8").replace(
+        " Optional parameters read from input.\n\nModel:",
+        " Optional parameters read from input.\n"
+        " No interatomic surface integrations with Promega or Sculpt yet.\n\n"
+        "Model:",
+        1,
+    )
+    target.write_text(text, encoding="utf-8", newline="\n")
+
+    assert Int(target).dft_model == "Restricted B3LYP"
+
+
+@pytest.mark.parametrize(
+    ("replacement", "message"),
+    [
+        ("Method information unavailable", "missing AIMAll Model record"),
+        ("Model:", "empty AIMAll Model record"),
+        (
+            "Model:  Restricted B3LYP\nModel:  Restricted B3LYP",
+            "duplicate AIMAll Model record",
+        ),
+    ],
+)
+def test_int_rejects_invalid_model_section(tmp_path, replacement, message):
+    source = example_dir / "WATER_MONOMER0000_atomicfiles" / "o1.int"
+    target = tmp_path / "o1.int"
+    text = source.read_text(encoding="utf-8").replace(
+        "Model:  Restricted B3LYP",
+        replacement,
+        1,
+    )
+    target.write_text(text, encoding="utf-8", newline="\n")
+
+    with pytest.raises(ValueError, match=message + ".*o1[.]int"):
+        _ = Int(target).dft_model
+
+
 def test_int_rejects_nonfinite_spherical_multipole(tmp_path):
     source = example_dir / "WATER_MONOMER0000_atomicfiles" / "o1.int"
     target = tmp_path / "o1.int"

@@ -2761,7 +2761,7 @@ class DryRunPhaseExecutor:
             "List of critical points",
             "Optional parameters",
             "",
-            "DFT Model: " + str(method),
+            "Model: " + str(method),
             "Integration is over atom " + str(atom_name),
             "Results of the basin integration",
             "N = 0.0 Charge = 0.0",

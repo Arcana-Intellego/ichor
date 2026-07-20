@@ -121,6 +121,10 @@ from .daemon.artifact_snapshot import (
     ArtefactSnapshotError,
     build_committed_artifact_snapshot,
 )
+from .daemon.aimall_quality_revalidation import (
+    apply_aimall_quality_revalidation,
+    inspect_aimall_quality_revalidation,
+)
 from .daemon.array_recovery import (
     array_ledger_path,
     archive_existing_array_task_outputs,
@@ -2476,6 +2480,7 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "initial_training_existing_without_bootstrap_handoff": "bootstrap handoff missing",
     "active_iteration_finalised": "active-learning iteration finalised",
     "aimall_skipped_no_gaussian_acceptances": "AIMAll skipped because Gaussian produced no accepted results",
+    "aimall_quality_revalidated": "AIMAll quality revalidated",
     "ariadne_sampling_protocol_replay_failed": "ARIADNE sampling protocol replay failed",
     "legacy_sampling_protocol_repreview": "sampling protocol preview regenerated",
     "point_allocation_complete": "point allocation complete",
@@ -2504,6 +2509,7 @@ def _event_int(event: Dict[str, Any], key: str) -> Optional[int]:
 
 _JOURNAL_OK_EVENTS = {
     "active_iteration_finalised",
+    "aimall_quality_revalidated",
     "adopted_accounted_job",
     "campaign_completed",
     "checkpoint_verified",
@@ -6023,13 +6029,19 @@ def _print_reconcile_bullets(title: str, items: Sequence[Any]) -> None:
 def _reconcile_cleanable_reasons(report: Any) -> List[str]:
     cleanable: List[str] = []
     reasons = list(getattr(report, "unsafe_reasons", []))
+    revalidation = getattr(report, "aimall_quality_revalidation", None)
+    revalidation_ready = bool(
+        isinstance(revalidation, Mapping)
+        and revalidation.get("state") in {"eligible", "resumable"}
+        and revalidation.get("eligible") is True
+    )
     if ".DATA/SCRIPTS contains sbatch scripts" in reasons:
         cleanable.append(".DATA/SCRIPTS contains sbatch scripts")
     if "dangling model staging directories exist" in reasons:
         cleanable.append("dangling model staging directories exist")
     if "dangling reference-data staging directories exist" in reasons:
         cleanable.append("dangling reference-data staging directories exist")
-    if ".DATA/STAGING is non-empty" in reasons:
+    if ".DATA/STAGING is non-empty" in reasons and not revalidation_ready:
         cleanable.append(
             ".DATA/STAGING is non-empty (requires --archive-staging when safe)"
         )
@@ -6042,6 +6054,12 @@ def _reconcile_hard_blockers(
     report: Any,
     contract_status: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
+    revalidation = getattr(report, "aimall_quality_revalidation", None)
+    revalidation_ready = bool(
+        isinstance(revalidation, Mapping)
+        and revalidation.get("state") in {"eligible", "resumable"}
+        and revalidation.get("eligible") is True
+    )
     cleanable_exact = {
         ".DATA/SCRIPTS contains sbatch scripts",
         "dangling model staging directories exist",
@@ -6061,6 +6079,8 @@ def _reconcile_hard_blockers(
         if reason in cleanable_exact:
             continue
         if reason == ".DATA/STAGING is non-empty":
+            if revalidation_ready:
+                continue
             blockers.append(
                 ".DATA/STAGING is non-empty unless --archive-staging is explicitly requested"
             )
@@ -6068,6 +6088,8 @@ def _reconcile_hard_blockers(
         blockers.append(str(reason))
     for item in getattr(report, "blocking_artifacts", []):
         text = str(item)
+        if revalidation_ready and text == ".DATA/STAGING":
+            continue
         if text in cleanable_blocking_artifacts:
             continue
         blockers.append(text)
@@ -6126,6 +6148,12 @@ def _reconcile_decision_payload(
             or str(getattr(snapshot, "verification_level", "authority")) != "deep"
         )
     )
+    revalidation = getattr(report, "aimall_quality_revalidation", None)
+    revalidation_ready = bool(
+        isinstance(revalidation, Mapping)
+        and revalidation.get("state") in {"eligible", "resumable"}
+        and revalidation.get("eligible") is True
+    )
     runnable = (
         bool(contract_status.get("contract_ok"))
         and not blockers
@@ -6154,7 +6182,7 @@ def _reconcile_decision_payload(
         next_command = _reconcile_apply_command(campaign, report)
     elif runnable:
         next_command = _campaign_command(campaign, "resume")
-    elif cleanable and not blockers:
+    elif revalidation_ready or (cleanable and not blockers):
         next_command = _reconcile_apply_command(campaign, report)
     else:
         next_command = "inspect blockers before restarting"
@@ -6223,6 +6251,9 @@ def _reconcile_decision_payload(
             dict(getattr(report, "ferebus_candidate_recovery", {}) or {})
             or None
         ),
+        "aimall_quality_revalidation": (
+            dict(revalidation) if isinstance(revalidation, Mapping) else None
+        ),
         "active_submission_intents": list(getattr(report, "active_submission_intents", []) or []),
         "receipt_backed_intent_repairs": list(
             getattr(report, "receipt_backed_intent_repairs", []) or []
@@ -6239,7 +6270,17 @@ def _reconcile_apply_command(campaign: Path, report: Any) -> str:
     command = _campaign_command(campaign, "reconcile")
     if bool(getattr(report, "deep_verification_required", False)):
         command += " --deep-verify"
-    if ".DATA/STAGING is non-empty" in list(getattr(report, "unsafe_reasons", [])):
+    revalidation = getattr(report, "aimall_quality_revalidation", None)
+    revalidation_ready = bool(
+        isinstance(revalidation, Mapping)
+        and revalidation.get("state") in {"eligible", "resumable"}
+        and revalidation.get("eligible") is True
+    )
+    if (
+        ".DATA/STAGING is non-empty"
+        in list(getattr(report, "unsafe_reasons", []))
+        and not revalidation_ready
+    ):
         command += " --archive-staging"
     return command + " --apply"
 
@@ -6286,6 +6327,13 @@ def _reconcile_result_label(
     phase = state.phase
     if blockers:
         return "blocked"
+    revalidation = getattr(report, "aimall_quality_revalidation", None)
+    if (
+        isinstance(revalidation, Mapping)
+        and revalidation.get("state") in {"eligible", "resumable"}
+        and revalidation.get("eligible") is True
+    ):
+        return "safe to apply"
     if cleanable:
         return "safe to apply"
     if phase is CampaignPhase.HALTED:
@@ -6572,6 +6620,38 @@ def _print_reconcile_recovery_target(
     print("")
 
 
+def _print_reconcile_aimall_quality_revalidation(report: Any) -> None:
+    revalidation = getattr(report, "aimall_quality_revalidation", None)
+    if not isinstance(revalidation, Mapping) or revalidation.get("state") not in {
+        "eligible",
+        "resumable",
+        "complete",
+    }:
+        return
+    print("AIMAll Quality Revalidation")
+    validation = (
+        "all candidates pass the locked quality gates"
+        if bool(revalidation.get("all_accepted_on_revalidation"))
+        else str(revalidation.get("reason") or "not available")
+    )
+    _print_reconcile_key_values(
+        [
+            ("status", str(revalidation.get("state"))),
+            ("candidates", int(revalidation.get("candidate_count") or 0)),
+            ("previous reason", str(revalidation.get("old_reason") or "-")),
+            ("validation", validation),
+            (
+                "allocation generation",
+                revalidation.get("allocation_generation")
+                if revalidation.get("allocation_generation") is not None
+                else "pending",
+            ),
+            ("scheduler work", "none; no Slurm jobs will be submitted"),
+        ]
+    )
+    print("")
+
+
 def _print_reconcile_current_position(
     campaign: Path,
     report: Any,
@@ -6832,12 +6912,32 @@ def _print_reconcile_apply_plan_compact(
 ) -> None:
     cleanable = [_reconcile_human_reason(item) for item in _reconcile_cleanable_reasons(report)]
     blockers = _reconcile_hard_blockers(report, contract_status)
+    revalidation = getattr(report, "aimall_quality_revalidation", None)
+    revalidation_ready = bool(
+        isinstance(revalidation, Mapping)
+        and revalidation.get("state") in {"eligible", "resumable"}
+        and revalidation.get("eligible") is True
+    )
     print("Apply Plan")
     if proposed_state_path is not None:
         print("  proposed state: " + _reconcile_relative_path(campaign, proposed_state_path))
     if blockers:
         print("  apply: blocked")
         _print_reconcile_list("next action", ["inspect blockers before restarting"])
+        print("")
+        return
+    if revalidation_ready:
+        _print_reconcile_list(
+            "if applied",
+            [
+                "revalidate the parser-rejected AIMAll point(s)",
+                "complete the existing point allocation",
+                "prepare QM reference publication without submitting Slurm work",
+                "recover to REFERENCE_COMMIT",
+            ],
+        )
+        print("  command:")
+        print("    " + _reconcile_apply_command(campaign, report))
         print("")
         return
     if cleanable:
@@ -6941,6 +7041,7 @@ def _print_reconcile_operator_report(
     _print_reconcile_recovery_target(report, contract_status)
     _print_reconcile_current_position(campaign, report, verbose=verbose)
     _print_reconcile_last_failure_compact(report)
+    _print_reconcile_aimall_quality_revalidation(report)
     _print_reconcile_safety(campaign, report, contract_status)
     if verbose:
         _print_reconcile_artefacts(campaign, report, contract_status, verbose=True)
@@ -7788,6 +7889,17 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 return 8
             print("campaign config could not be reviewed: " + str(exc), file=sys.stderr)
     _apply_runtime_config_to_recovered_state(report, config)
+    if config is not None:
+        revalidation_inspection = inspect_aimall_quality_revalidation(
+            campaign,
+            config=config,
+        )
+        if revalidation_inspection.get("state") in {
+            "eligible",
+            "resumable",
+            "complete",
+        }:
+            report.aimall_quality_revalidation = revalidation_inspection
     if (
         bool(getattr(args, "apply", False))
         and report.deep_verification_required
@@ -7805,6 +7917,111 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 10
+    revalidation = getattr(report, "aimall_quality_revalidation", None)
+    revalidation_ready = bool(
+        isinstance(revalidation, Mapping)
+        and revalidation.get("state") in {"eligible", "resumable"}
+        and revalidation.get("eligible") is True
+    )
+    if bool(getattr(args, "apply", False)) and revalidation_ready:
+        if config is None:
+            print(
+                "refusing AIMAll quality revalidation because campaign.yaml is missing",
+                file=sys.stderr,
+            )
+            return 8
+        if config_review is not None and config_review.blocked_changes:
+            print(
+                "refusing AIMAll quality revalidation because campaign.yaml has locked changes",
+                file=sys.stderr,
+            )
+            print(format_config_review(config_review), file=sys.stderr)
+            return 8
+        preliminary_contract = recovery_contract_status(
+            campaign,
+            report.proposed_state,
+            verification=verification_level,
+            artifact_snapshot=artifact_snapshot,
+        )
+        preliminary_blockers = _reconcile_hard_blockers(
+            report,
+            preliminary_contract,
+        )
+        if preliminary_blockers:
+            _print_reconcile_apply_blocked(
+                campaign,
+                title="AIMAll Quality Revalidation",
+                reasons=preliminary_blockers,
+                next_actions=["inspect blockers before applying revalidation"],
+            )
+            return 9
+        try:
+            artifact_snapshot.assert_anchors_unchanged(campaign)
+            revalidation_result = apply_aimall_quality_revalidation(
+                campaign,
+                config=config,
+            )
+            from .daemon.journal import append_event
+
+            try:
+                append_event(
+                    _campaign_paths(campaign)["journal"],
+                    "aimall_quality_revalidated",
+                    phase=CampaignPhase.AIMALL.value,
+                    iteration=int(revalidation_result["iteration"]),
+                    candidate_count=int(revalidation_result["candidate_count"]),
+                    prior_reason=str(revalidation_result["old_reason"]),
+                    allocation_generation=int(
+                        revalidation_result["allocation_generation"]
+                    ),
+                    ledger_path=str(revalidation_result["ledger_path"]),
+                    scheduler_jobs_submitted=0,
+                )
+            except Exception as journal_exc:
+                print(
+                    "AIMAll quality revalidation completed, but its journal event "
+                    "could not be written: "
+                    + type(journal_exc).__name__
+                    + ": "
+                    + str(journal_exc),
+                    file=sys.stderr,
+                )
+            artifact_snapshot = build_committed_artifact_snapshot(
+                campaign,
+                verification_level=verification_level,
+                progress_stream=(sys.stderr if deep_verify else None),
+            )
+            report = propose_recovery(
+                campaign,
+                allow_fresh_init_on_nonempty=bool(
+                    getattr(args, "allow_fresh_init", False)
+                ),
+                artifact_snapshot=artifact_snapshot,
+                verification_level=verification_level,
+            )
+            report.aimall_quality_revalidation = revalidation_result
+            _apply_runtime_config_to_recovered_state(report, config)
+            config_review = review_config_changes(
+                campaign,
+                config,
+                report.proposed_state,
+                initialise_missing=False,
+                force_retrain_ferebus=retrain_ferebus,
+            )
+        except Exception as exc:
+            print(
+                "AIMAll quality revalidation did not complete: "
+                + type(exc).__name__
+                + ": "
+                + str(exc),
+                file=sys.stderr,
+            )
+            print(
+                "No backend job was submitted. Rerun reconcile to inspect or "
+                "resume the recorded correction transaction.",
+                file=sys.stderr,
+            )
+            return 9
     if bool(getattr(args, "apply", False)):
         try:
             artifact_snapshot.assert_anchors_unchanged(campaign)

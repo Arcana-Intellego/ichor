@@ -15,6 +15,7 @@ from ichor.hpc.active_learning.point_allocation import (
     pending_attempts,
     read_point_allocation,
     record_quantum_results,
+    revalidate_rejected_quantum_results,
 )
 
 
@@ -183,6 +184,158 @@ def test_quantum_result_batch_replay_is_idempotent_and_conflicts_fail(tmp_path):
             batch_identity="a" * 64,
             result_fingerprint="c" * 64,
         )
+
+
+def test_parser_revalidation_preserves_rejected_generation_and_is_idempotent(
+    tmp_path,
+):
+    path, payload = _create(
+        tmp_path,
+        targets={"train": 2, "int_val": 0, "ext_val": 0, "total": 2},
+        n_reserve=0,
+    )
+    attempts = pending_attempts(payload)
+    rejected = record_quantum_results(
+        path,
+        [
+            {
+                "candidate_id": attempt["candidate_id"],
+                "accepted": False,
+                "pointdir": "/staging/" + attempt["candidate_id"] + ".pointdir",
+                "quality_manifest": None,
+                "reason": "dft_model_missing_or_unsupported",
+            }
+            for attempt in attempts
+        ],
+    )
+    corrections = [
+        {
+            "candidate_id": attempt["candidate_id"],
+            "accepted": True,
+            "prior_reason": "dft_model_missing_or_unsupported",
+            "pointdir": attempt["pointdir"],
+            "quality_manifest": "/staging/revalidated-quality.json",
+            "quantum_acceptance_receipt": (
+                "receipts/" + attempt["candidate_id"] + ".json"
+            ),
+            "quantum_acceptance_receipt_sha256": "a" * 64,
+            "accepted_pointdir_content_sha256": "b" * 64,
+        }
+        for attempt in [slot["attempts"][-1] for slot in rejected["slots"]]
+    ]
+
+    with pytest.raises(ValueError, match="exactly the eligible vacant slots"):
+        revalidate_rejected_quantum_results(
+            path,
+            corrections[:1],
+            expected_generation=1,
+            batch_identity="e" * 64,
+            result_fingerprint="f" * 64,
+        )
+
+    updated = revalidate_rejected_quantum_results(
+        path,
+        corrections,
+        expected_generation=1,
+        batch_identity="c" * 64,
+        result_fingerprint="d" * 64,
+    )
+    replayed = revalidate_rejected_quantum_results(
+        path,
+        corrections,
+        expected_generation=1,
+        batch_identity="c" * 64,
+        result_fingerprint="d" * 64,
+    )
+
+    assert replayed == updated
+    assert updated["generation"] == 2
+    assert updated["summary"]["complete"] is True
+    assert updated["applied_quantum_batches"][-1]["kind"] == "quality_revalidation"
+    rejected_history = json.loads(
+        (tmp_path / "history" / "generation-000001.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert rejected_history["summary"]["deficit_total"] == 2
+    assert all(
+        slot["attempts"][-1]["status"] == "rejected"
+        for slot in rejected_history["slots"]
+    )
+
+
+def test_parser_revalidation_preserves_148_existing_acceptance_bindings(tmp_path):
+    path, payload = _create(
+        tmp_path,
+        targets={"train": 100, "int_val": 50, "ext_val": 0, "total": 150},
+        n_reserve=0,
+    )
+    attempts = pending_attempts(payload)
+    results = []
+    for index, attempt in enumerate(attempts):
+        accepted = index < 148
+        result = {
+            "candidate_id": attempt["candidate_id"],
+            "accepted": accepted,
+            "pointdir": "/staging/" + attempt["candidate_id"] + ".pointdir",
+            "quality_manifest": "/staging/original-quality.json",
+        }
+        if accepted:
+            result.update(
+                {
+                    "quantum_acceptance_receipt": (
+                        "receipts/" + attempt["candidate_id"] + ".json"
+                    ),
+                    "quantum_acceptance_receipt_sha256": format(index + 1, "064x"),
+                    "accepted_pointdir_content_sha256": format(index + 1000, "064x"),
+                }
+            )
+        else:
+            result["reason"] = "dft_model_missing_or_unsupported"
+        results.append(result)
+    rejected = record_quantum_results(path, results)
+    original_acceptances = {
+        attempt["candidate_id"]: dict(attempt)
+        for attempt in accepted_attempts(rejected)
+    }
+    rejected_attempts = [
+        slot["attempts"][-1]
+        for slot in rejected["slots"]
+        if slot.get("accepted_attempt") is None
+    ]
+    corrections = [
+        {
+            "candidate_id": attempt["candidate_id"],
+            "accepted": True,
+            "prior_reason": "dft_model_missing_or_unsupported",
+            "pointdir": attempt["pointdir"],
+            "quality_manifest": "/staging/revalidated-quality.json",
+            "quantum_acceptance_receipt": (
+                "receipts/" + attempt["candidate_id"] + "-revalidated.json"
+            ),
+            "quantum_acceptance_receipt_sha256": "a" * 64,
+            "accepted_pointdir_content_sha256": "b" * 64,
+        }
+        for attempt in rejected_attempts
+    ]
+
+    updated = revalidate_rejected_quantum_results(
+        path,
+        corrections,
+        expected_generation=1,
+        batch_identity="c" * 64,
+        result_fingerprint="d" * 64,
+    )
+
+    assert updated["summary"]["accepted_total"] == 150
+    assert updated["summary"]["deficit_total"] == 0
+    updated_by_id = {
+        attempt["candidate_id"]: attempt for attempt in accepted_attempts(updated)
+    }
+    assert {
+        candidate_id: updated_by_id[candidate_id]
+        for candidate_id in original_acceptances
+    } == original_acceptances
 
 
 def test_replacement_completion_preserves_exact_counts(tmp_path):

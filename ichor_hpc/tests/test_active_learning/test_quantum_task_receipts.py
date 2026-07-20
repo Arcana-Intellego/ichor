@@ -7,8 +7,11 @@ import pytest
 from ichor.hpc.active_learning.daemon.quantum_task_receipts import (
     read_quantum_task_receipt,
     write_quantum_task_receipt,
+    write_quantum_task_receipt_from_terminal_intent,
 )
 from ichor.hpc.active_learning.daemon.submission_intent import (
+    load_intent,
+    mark_completed,
     mark_submitted,
     write_pre_submit_intent,
 )
@@ -118,3 +121,32 @@ def test_quantum_task_receipt_rejects_fractional_identity(tmp_path):
             iteration=1,
             logical_task_id=0.5,
         )
+
+
+def test_quantum_task_receipt_can_be_reconstructed_from_completed_intent(tmp_path):
+    campaign, pointdir = _submitted_gaussian(tmp_path)
+    mark_completed(campaign, "GAUSSIAN", 1)
+    intent = load_intent(
+        campaign,
+        "GAUSSIAN",
+        1,
+        expected_campaign_uid="receipt-test",
+    )
+
+    write_quantum_task_receipt_from_terminal_intent(
+        pointdir,
+        phase_name="GAUSSIAN",
+        iteration=1,
+        logical_task_id=0,
+        intent=intent,
+    )
+    payload = read_quantum_task_receipt(
+        pointdir,
+        phase_name="GAUSSIAN",
+        iteration=1,
+        logical_task_id=0,
+    )
+
+    assert payload["attempt_id"] == intent["attempt_id"]
+    assert payload["submission_identity"] == intent["submission_identity"]
+    assert payload["job_id"] == "12345"

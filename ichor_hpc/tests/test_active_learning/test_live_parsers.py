@@ -446,7 +446,7 @@ def test_iter_gaussian_happy_path(tmp_path):
     assert result.failure_reason is None
 
 
-def test_initial_aimall_happy_path(tmp_path):
+def test_initial_aimall_happy_path(tmp_path, monkeypatch):
     ex = _make_executor(tmp_path)
     staging = _bind_staging(ex, FIXTURES / "initial_quantum")
     _seed_point_allocation(
@@ -463,9 +463,24 @@ def test_initial_aimall_happy_path(tmp_path):
         rejected=[],
     )
     state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
+    from ichor.hpc.active_learning.daemon import quantum_quality as quality_module
+
+    evaluated = []
+    real_evaluate = quality_module.evaluate_aimall_pointdir
+
+    def track_evaluation(pointdir, *args, **kwargs):
+        evaluated.append(Path(pointdir.path).name)
+        return real_evaluate(pointdir, *args, **kwargs)
+
+    monkeypatch.setattr(
+        quality_module,
+        "evaluate_aimall_pointdir",
+        track_evaluation,
+    )
     result = _parse_quantum_fixture(ex, state, CampaignPhase("INITIAL_AIMALL"))
     assert result.is_complete is True
     assert result.failure_reason is None
+    assert sorted(evaluated) == sorted(path.name for path in staging.glob("*.pointdir"))
     events = _read_journal_events(tmp_path / "campaign")
     succeeded = [e for e in events if e.get("event") == "phase_succeeded_live"]
     assert succeeded[-1]["phase"] == "INITIAL_AIMALL"

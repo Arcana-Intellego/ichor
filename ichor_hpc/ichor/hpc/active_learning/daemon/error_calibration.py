@@ -434,8 +434,21 @@ def lookup_calibrated_abs_error(
     )
 
 
-def write_iteration_audit(iter_dir: Any, payload: Mapping[str, Any]) -> Path:
-    path = audit_path(iter_dir)
+def write_iteration_audit(
+    iter_dir: Any,
+    payload: Mapping[str, Any],
+    *,
+    filename: Optional[str] = None,
+) -> Path:
+    if filename is None:
+        path = audit_path(iter_dir)
+    else:
+        from ..layout import active_calibration_dir
+
+        name = str(filename)
+        if Path(name).name != name or not name.endswith(".json"):
+            raise ErrorCalibrationError("calibration audit filename is invalid")
+        path = active_calibration_dir(iter_dir) / name
     path.parent.mkdir(parents=True, exist_ok=True)
     data = dict(payload)
     data["schema_version"] = CALIBRATION_AUDIT_SCHEMA_VERSION
@@ -637,6 +650,7 @@ def update_from_aimall_acceptance(
     models_version: int,
     accepted_pointdirs: Sequence[Any],
     quality_records: Sequence[Mapping[str, Any]],
+    audit_filename: Optional[str] = None,
 ) -> Dict[str, Any]:
     if not _enabled(config):
         audit = {
@@ -648,7 +662,7 @@ def update_from_aimall_acceptance(
             "n_total_records": int(len(load_records(campaign_dir))),
             "skipped": {"disabled": int(len(accepted_pointdirs))},
         }
-        write_iteration_audit(iter_dir, audit)
+        write_iteration_audit(iter_dir, audit, filename=audit_filename)
         return audit
 
     q_by_pointdir = _quality_by_pointdir(quality_records)
@@ -717,7 +731,7 @@ def update_from_aimall_acceptance(
         "model_error": model_error,
         "skipped": skipped,
     }
-    write_iteration_audit(iter_dir, audit)
+    write_iteration_audit(iter_dir, audit, filename=audit_filename)
     return audit
 
 

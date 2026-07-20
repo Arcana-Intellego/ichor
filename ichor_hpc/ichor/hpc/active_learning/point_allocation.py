@@ -1037,6 +1037,163 @@ def record_quantum_results(
     )
 
 
+def revalidate_rejected_quantum_results(
+    path: str | Path,
+    results: Sequence[Mapping[str, Any]],
+    *,
+    expected_generation: int,
+    batch_identity: str,
+    result_fingerprint: str,
+) -> Dict[str, Any]:
+    """Promote an exact set of terminal parser rejections to accepted results."""
+    manifest = Path(path)
+    normalised: Dict[str, Dict[str, Any]] = {}
+    for raw in results:
+        if not isinstance(raw, Mapping):
+            raise ValueError("quantum revalidation result must be a JSON object")
+        result = dict(raw)
+        candidate_id = str(result.get("candidate_id") or "").strip()
+        if not candidate_id or candidate_id in normalised:
+            raise ValueError(
+                "quantum revalidation candidate IDs must be unique and non-empty"
+            )
+        if result.get("accepted") is not True:
+            raise ValueError("quantum revalidation results must all be accepted")
+        if str(result.get("prior_reason") or "") != (
+            "dft_model_missing_or_unsupported"
+        ):
+            raise ValueError("quantum revalidation prior reason is ineligible")
+        terminal_probe = {
+            "status": "accepted",
+            "pointdir": result.get("pointdir"),
+            "reason": None,
+            "quality_manifest": result.get("quality_manifest"),
+            "quantum_acceptance_receipt": result.get(
+                "quantum_acceptance_receipt"
+            ),
+            "quantum_acceptance_receipt_sha256": result.get(
+                "quantum_acceptance_receipt_sha256"
+            ),
+            "accepted_pointdir_content_sha256": result.get(
+                "accepted_pointdir_content_sha256"
+            ),
+        }
+        _validate_terminal_attempt(
+            terminal_probe,
+            "quantum revalidation result " + repr(candidate_id),
+        )
+        normalised[candidate_id] = result
+    if not normalised:
+        raise ValueError("quantum revalidation result set is empty")
+    for digest, label in (
+        (batch_identity, "quantum revalidation batch identity"),
+        (result_fingerprint, "quantum revalidation result fingerprint"),
+    ):
+        if (
+            not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise ValueError(label + " is invalid")
+
+    def mutate(payload):
+        applied_batches = payload.setdefault("applied_quantum_batches", [])
+        if not isinstance(applied_batches, list):
+            raise ValueError(
+                "point-allocation applied quantum batches must be a list"
+            )
+        matching_batches = [
+            record
+            for record in applied_batches
+            if isinstance(record, Mapping)
+            and str(record.get("batch_identity") or "") == str(batch_identity)
+        ]
+        if matching_batches:
+            if (
+                len(matching_batches) != 1
+                or str(matching_batches[0].get("result_fingerprint") or "")
+                != str(result_fingerprint)
+                or str(matching_batches[0].get("kind") or "")
+                != "quality_revalidation"
+                or list(matching_batches[0].get("candidate_ids") or [])
+                != sorted(normalised)
+            ):
+                raise ValueError("quantum revalidation batch identity conflicts")
+            return payload
+        if int(payload.get("generation", -1)) != int(expected_generation):
+            raise ValueError(
+                "stale point-allocation generation: expected "
+                + str(int(expected_generation))
+                + ", found "
+                + str(int(payload.get("generation", -1)))
+            )
+        eligible_candidate_ids = set()
+        matching_attempts: Dict[
+            str, Tuple[Dict[str, Any], int, Dict[str, Any]]
+        ] = {}
+        for slot in payload["slots"]:
+            if slot.get("accepted_attempt") is not None:
+                continue
+            attempts = list(slot.get("attempts") or [])
+            if not attempts:
+                continue
+            attempt_index = len(attempts) - 1
+            attempt = attempts[attempt_index]
+            candidate_id = str(attempt.get("candidate_id") or "")
+            if (
+                str(attempt.get("status") or "") == "rejected"
+                and str(attempt.get("reason") or "")
+                == "dft_model_missing_or_unsupported"
+            ):
+                eligible_candidate_ids.add(candidate_id)
+            if candidate_id in normalised:
+                matching_attempts[candidate_id] = (slot, attempt_index, attempt)
+        if (
+            set(matching_attempts) != set(normalised)
+            or eligible_candidate_ids != set(normalised)
+        ):
+            raise ValueError(
+                "quantum revalidation does not cover exactly the eligible vacant slots"
+            )
+        for candidate_id, result in normalised.items():
+            slot, attempt_index, attempt = matching_attempts[candidate_id]
+            if (
+                str(attempt.get("status") or "") != "rejected"
+                or str(attempt.get("reason") or "") != str(result["prior_reason"])
+                or str(attempt.get("pointdir") or "")
+                != str(result.get("pointdir") or "")
+            ):
+                raise ValueError(
+                    "quantum revalidation conflicts with recorded rejection for "
+                    + candidate_id
+                )
+            attempt["status"] = "accepted"
+            attempt["reason"] = None
+            attempt["quality_manifest"] = str(result["quality_manifest"])
+            for evidence_key in (
+                "quantum_acceptance_receipt",
+                "quantum_acceptance_receipt_sha256",
+                "accepted_pointdir_content_sha256",
+            ):
+                attempt[evidence_key] = str(result[evidence_key])
+            slot["accepted_attempt"] = int(attempt_index)
+        applied_batches.append(
+            {
+                "batch_identity": str(batch_identity),
+                "result_fingerprint": str(result_fingerprint),
+                "source_generation": int(payload.get("generation", 0)),
+                "candidate_ids": sorted(normalised),
+                "kind": "quality_revalidation",
+            }
+        )
+        return payload
+
+    return _mutate_manifest(
+        manifest,
+        mutate,
+        expected_generation=None,
+    )
+
+
 def allocate_replacements(
     path: str | Path,
     *,
@@ -1126,6 +1283,7 @@ __all__ = [
     "create_point_allocation",
     "read_point_allocation",
     "record_quantum_results",
+    "revalidate_rejected_quantum_results",
     "allocate_replacements",
     "pending_attempts",
     "accepted_attempts",

@@ -1015,25 +1015,6 @@ def validate_aimall_completed(pdir) -> tuple:
         return False, "aimall_geometry_unreadable"
     if n_int != n_atoms:
         return False, "aimall_partial_" + str(n_int) + "_of_" + str(n_atoms) + "_int"
-    try:
-        for int_file in ints.ints:
-            iqa = getattr(int_file, "iqa")
-            integration_error = getattr(int_file, "integration_error")
-            if iqa is None or not math.isfinite(float(iqa)):
-                return False, "iqa_missing_or_nonfinite"
-            if integration_error is None or not math.isfinite(float(integration_error)):
-                return False, "integration_error_missing_or_nonfinite"
-    except Exception:
-        return False, "aimall_quality_parse_failure"
-    try:
-        from .quantum_quality import evaluate_aimall_pointdir
-
-        quality = evaluate_aimall_pointdir(pdir)
-    except Exception:
-        return False, "aimall_quality_parse_failure"
-    if not bool(quality.get("accepted")):
-        reasons = list(quality.get("reasons") or [])
-        return False, str(reasons[0] if reasons else "aimall_quality_rejected")
     return True, ""
 
 
@@ -2983,10 +2964,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     ),
                 )
 
-            kept = []
-            rejected = []
+            structurally_complete = []
+            structural_failures = {}
+            pointdirs = []
             for candidate in gaussian_accepted:
                 pdir = PointDirectory(candidate)
+                pointdirs.append(pdir)
                 failure_reason = None
                 for validator in validators:
                     ok, reason = validator(pdir)
@@ -2994,15 +2977,15 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         failure_reason = reason
                         break
                 if failure_reason is None:
-                    kept.append(pdir)
+                    structurally_complete.append(pdir)
                 else:
-                    rejected.append((Path(candidate).name, failure_reason))
+                    structural_failures[Path(candidate).name] = str(failure_reason)
 
             quality_records = []
             quality_kept = []
             quality_rejected = []
             try:
-                publish_task_receipts(kept)
+                publish_task_receipts(structurally_complete)
             except Exception as exc:
                 return PhaseResult(
                     is_complete=True,
@@ -3013,12 +2996,22 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         + str(exc)[:180]
                     ),
                 )
-            for pdir in kept:
+            for pdir in pointdirs:
                 record = evaluate_aimall_pointdir(
                     pdir,
                     getattr(self.config, "quality_gates", None),
                     expected_method=str(self.config.gaussian.method),
                 )
+                pointdir_name = str(
+                    record.get("pointdir", Path(getattr(pdir, "path", pdir)).name)
+                )
+                structural_reason = structural_failures.get(pointdir_name)
+                if structural_reason is not None:
+                    reasons = sorted(
+                        set(record.get("reasons") or []) | {structural_reason}
+                    )
+                    record["accepted"] = False
+                    record["reasons"] = reasons
                 quality_records.append(record)
                 if bool(record.get("accepted")):
                     quality_kept.append(pdir)
@@ -3029,16 +3022,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                             ";".join(record.get("reasons") or ["quantum_quality_rejected"]),
                         )
                     )
-            for pdir_name, reason in rejected:
-                quality_records.append(
-                    {
-                        "pointdir": str(pdir_name),
-                        "accepted": False,
-                        "reasons": [str(reason)],
-                    }
-                )
             kept = quality_kept
-            rejected = list(rejected) + quality_rejected
+            rejected = quality_rejected
             quality_path = write_quantum_quality_manifest(
                 staging_root,
                 phase_name=phase_name,

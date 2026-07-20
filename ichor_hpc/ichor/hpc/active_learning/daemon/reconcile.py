@@ -299,6 +299,7 @@ class ReconciliationReport:
     partial_array_recovery: Optional[Dict[str, Any]] = None
     ariadne_publication_recovery: Optional[Dict[str, Any]] = None
     ferebus_candidate_recovery: Optional[Dict[str, Any]] = None
+    aimall_quality_revalidation: Optional[Dict[str, Any]] = None
     bootstrap_handoff: Optional[Dict[str, Any]] = None
     phase_a_handoff: Optional[Dict[str, Any]] = None
     artifact_snapshot: Optional[CommittedArtifactSnapshot] = field(

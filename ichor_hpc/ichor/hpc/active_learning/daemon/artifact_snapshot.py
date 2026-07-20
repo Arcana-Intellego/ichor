@@ -27,6 +27,7 @@ from ..versioning.trained_models import (
     TrainedModelVersioning,
     resolve_trained_model_chain,
 )
+from .filesystem import campaign_owned_path
 
 
 VERIFICATION_LEVELS = frozenset({"authority", "metadata", "deep"})
@@ -195,6 +196,10 @@ class CommittedArtifactSnapshot:
         default_factory=tuple,
         repr=False,
     )
+    aimall_quality_revalidations: Tuple[Mapping[str, Any], ...] = field(
+        default_factory=tuple,
+        repr=False,
+    )
 
     @property
     def valid_reference_data_versions(self) -> Tuple[int, ...]:
@@ -277,6 +282,16 @@ class CommittedArtifactSnapshot:
         if current_control_paths != recorded_control_paths:
             raise ArtefactSnapshotError(
                 "committed artefact authority inventory changed after reconcile inspection"
+            )
+        current_revalidations = set(_quality_revalidation_anchor_paths(campaign))
+        recorded_revalidations = {
+            path
+            for path in recorded_paths
+            if "/allocation/quality_revalidations/" in path
+        }
+        if current_revalidations != recorded_revalidations:
+            raise ArtefactSnapshotError(
+                "AIMAll quality-revalidation inventory changed after reconcile inspection"
             )
         observed = _anchor_records(campaign_dir, recorded_paths)
         digest = _anchor_digest(observed)
@@ -426,6 +441,43 @@ def _authoritative_anchor_paths(
                     "authority control entry is unsafe: " + str(candidate)
                 )
             paths.add(candidate.relative_to(campaign).as_posix())
+    paths.update(_quality_revalidation_anchor_paths(campaign))
+    return tuple(sorted(paths))
+
+
+def _quality_revalidation_anchor_paths(campaign: Path) -> Tuple[str, ...]:
+    from .aimall_quality_revalidation import (
+        inventory_aimall_quality_revalidations,
+    )
+
+    inventory = inventory_aimall_quality_revalidations(campaign)
+    errors = list(inventory.get("errors") or [])
+    if errors:
+        raise ArtefactSnapshotError(
+            "AIMAll quality-revalidation evidence is invalid: "
+            + str(errors[0].get("path") or "unknown")
+            + ": "
+            + str(errors[0].get("error") or "invalid ledger")
+        )
+    paths = set()
+    for record in inventory.get("records", []):
+        paths.add(str(record["path"]))
+        payload = record.get("payload") or {}
+        binding = payload.get("corrected_quality_manifest")
+        if isinstance(binding, Mapping) and binding.get("path"):
+            quality_path = campaign_owned_path(
+                campaign,
+                campaign / str(binding["path"]),
+            )
+            if quality_path.is_symlink() or not quality_path.is_file():
+                raise ArtefactSnapshotError(
+                    "AIMAll corrected quality evidence is missing"
+                )
+            if sha256_file(quality_path) != str(binding.get("sha256") or ""):
+                raise ArtefactSnapshotError(
+                    "AIMAll corrected quality evidence has changed"
+                )
+            paths.add(quality_path.relative_to(campaign).as_posix())
     return tuple(sorted(paths))
 
 
@@ -506,11 +558,15 @@ def build_committed_artifact_snapshot(
     completion_receipt_errors: Tuple[Mapping[str, Any], ...] = ()
     reconcile_transactions: Tuple[Mapping[str, Any], ...] = ()
     reference_commit_transactions: Tuple[Mapping[str, Any], ...] = ()
+    aimall_quality_revalidations: Tuple[Mapping[str, Any], ...] = ()
 
     from .reconcile_transaction import inventory_reconcile_transactions
     from .reference_commit import inventory_reference_commits
     from .submission_intent import inventory_intents
     from .completion_receipts import inventory_completion_receipts
+    from .aimall_quality_revalidation import (
+        inventory_aimall_quality_revalidations,
+    )
 
     intent_inventory = inventory_intents(campaign)
     submission_intents = tuple(
@@ -535,6 +591,18 @@ def build_committed_artifact_snapshot(
             campaign,
             verification=("authority" if level == "authority" else "metadata"),
         )
+    )
+    revalidation_inventory = inventory_aimall_quality_revalidations(campaign)
+    if revalidation_inventory.get("errors"):
+        error = revalidation_inventory["errors"][0]
+        raise ArtefactSnapshotError(
+            "AIMAll quality-revalidation evidence is invalid: "
+            + str(error.get("path") or "unknown")
+            + ": "
+            + str(error.get("error") or "invalid ledger")
+        )
+    aimall_quality_revalidations = tuple(
+        dict(record) for record in revalidation_inventory.get("records", [])
     )
 
     if committed_references:
@@ -681,6 +749,7 @@ def build_committed_artifact_snapshot(
         completion_receipt_errors=completion_receipt_errors,
         reconcile_transactions=reconcile_transactions,
         reference_commit_transactions=reference_commit_transactions,
+        aimall_quality_revalidations=aimall_quality_revalidations,
     )
 
 

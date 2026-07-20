@@ -418,6 +418,27 @@ def _halt_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecom
             command=_journal_cmd(campaign) + " --event-type halt --last-n 5",
         )
     if reason_code == "replacement_reserve_exhausted":
+        from .aimall_quality_revalidation import (
+            has_aimall_quality_revalidation_candidates,
+        )
+
+        if has_aimall_quality_revalidation_candidates(campaign):
+            return StatusRecommendation(
+                code="halted_replacement_reserve_exhausted",
+                severity="required",
+                primary=(
+                    "preview recovery of AIMAll points rejected by the old INT parser"
+                ),
+                why=(
+                    "the vacant allocation slots have the exact parser-related "
+                    "rejection reason and may be revalidated without rerunning a backend"
+                ),
+                command=_reconcile_cmd(campaign),
+                details=[
+                    "reconcile will verify the original AIMAll task evidence and locked quality gates",
+                    "no Slurm job is submitted during this correction",
+                ],
+            )
         return StatusRecommendation(
             code="halted_replacement_reserve_exhausted",
             severity="blocked",
