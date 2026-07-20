@@ -2228,12 +2228,127 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             next_phase_override=override,
         )
 
-    def _seed_selection_posterior(self, state, training_atoms):
+    def _seed_selection_pool(self, state):
+        context = getattr(self, "_active_seed_selection_context", None)
+        if isinstance(context, dict) and context.get("pool") is not None:
+            return context["pool"]
+        from ..acquisition.trajectory_pool import TrajectoryPool
+
+        return TrajectoryPool.load(self.campaign_dir)
+
+    def _seed_selection_prepare_context(self, _state, pool) -> None:
+        context = getattr(self, "_active_seed_selection_context", None)
+        if not isinstance(context, dict) or context.get("pool") is not pool:
+            return
+        cache = context.get("cache")
+        if cache is not None and not bool(context.get("features_ready", False)):
+            cache.ensure_features()
+            context["features_ready"] = True
+
+    def _seed_selection_population(self, pool):
+        context = getattr(self, "_active_seed_selection_context", None)
+        if isinstance(context, dict) and context.get("pool") is pool:
+            return pool
+        return super()._seed_selection_population(pool)
+
+    def _seed_selection_progress_callback(self, _state):
+        context = getattr(self, "_active_seed_selection_context", None)
+        reporter = context.get("progress") if isinstance(context, dict) else None
+        return reporter.callback if reporter is not None else None
+
+    def _seed_selection_model_set(self, state):
+        context = getattr(self, "_active_seed_selection_context", None)
+        if isinstance(context, dict) and context.get("model_set") is not None:
+            return context["model_set"]
+        return super()._seed_selection_model_set(state)
+
+    def _seed_selection_finished(self, state, *, selection_published: bool) -> None:
+        context = getattr(self, "_active_seed_selection_context", None)
+        if not isinstance(context, dict):
+            return
+        cache = context.get("cache")
+        indexed = context.get("indexed_posterior")
+        if cache is not None:
+            try:
+                if bool(selection_published) and indexed is not None:
+                    close = getattr(indexed, "close", None)
+                    if callable(close):
+                        close()
+                cache.finalise(selection_published=bool(selection_published))
+                if (
+                    bool(selection_published)
+                    and indexed is not None
+                    and bool(getattr(indexed, "resolved", True))
+                ):
+                    cache.prune_superseded(
+                        active_feature_cache_id=indexed.feature_cache_id,
+                        active_variance_cache_id=indexed.variance_cache_id,
+                    )
+            except Exception as exc:
+                self._journal_event(
+                    "seed_selection_cache",
+                    phase="SEED_SELECT",
+                    iteration=int(state.iteration),
+                    cache_kind="derived_cleanup",
+                    cache_status="failed",
+                    error=type(exc).__name__ + ": " + str(exc)[:240],
+                )
+        reporter = context.get("progress")
+        if reporter is not None and bool(selection_published):
+            reporter.finish(selection_published=True)
+
+    def _seed_selection_posterior(
+        self,
+        state,
+        training_atoms,
+        *,
+        eligible_indices=None,
+    ):
         """Live seed selection ranks the exploit half by the real GP posterior
         variance, so the most uncertain pool frames get attacked."""
         models_version = int(getattr(state, "models_version", -1))
         if models_version < 0:
-            return super()._seed_selection_posterior(state, training_atoms)
+            return super()._seed_selection_posterior(
+                state,
+                training_atoms,
+                eligible_indices=eligible_indices,
+            )
+        context = getattr(self, "_active_seed_selection_context", None)
+        if isinstance(context, dict) and context.get("posterior") is not None:
+            try:
+                from .seed_selection_runtime import SeedSelectionRuntimeCache
+
+                cache = context.get("cache")
+                if cache is None:
+                    model_set = context["model_set"]
+                    cache = SeedSelectionRuntimeCache(
+                        self.campaign_dir,
+                        pool=context["pool"],
+                        posterior=context["posterior"],
+                        model_set_sha256=str(model_set.model_set_sha256),
+                        model_manifest_sha256=str(model_set.head_manifest_sha256),
+                        iteration=int(state.iteration),
+                        progress=context.get("progress"),
+                    )
+                    context["cache"] = cache
+                indexed = cache.ensure_indexed_posterior(
+                    eligible_indices=(
+                        list(context["pool"].frame_ids())
+                        if eligible_indices is None
+                        else list(eligible_indices)
+                    ),
+                    chunk_size=int(self.config.seed_selection.variance_chunk_size),
+                    defer_variances=True,
+                )
+                context["indexed_posterior"] = indexed
+                return indexed
+            except Exception as exc:
+                raise BackendSubmissionError(
+                    "live seed-selection cache preparation failed: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                ) from exc
         try:
             from pathlib import Path as _Path
             from .model_contract import smoke_total_energy_posterior
@@ -2272,17 +2387,108 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
     def _inline_seed_select(self, state):
         """Live SEED_SELECT must never use the dry-run no-pool placeholder."""
         from ..acquisition.trajectory_pool import TrajectoryPool
+        from ..handoff_manifests import seeds_picked_path
 
+        iteration_dir = self._iter_dir(state.iteration)
+        if seeds_picked_path(iteration_dir).is_file():
+            try:
+                from .seed_selection_runtime import (
+                    finalise_seed_selection_workspace,
+                )
+
+                finalise_seed_selection_workspace(
+                    self.campaign_dir,
+                    iteration=int(state.iteration),
+                )
+            except Exception as exc:
+                self._journal_event(
+                    "seed_selection_cache",
+                    phase="SEED_SELECT",
+                    iteration=int(state.iteration),
+                    cache_kind="shortlist_projections",
+                    cache_status="cleanup_failed",
+                    error=type(exc).__name__ + ": " + str(exc)[:240],
+                )
+            return super()._inline_seed_select(state)
+
+        progress = None
         try:
-            TrajectoryPool.load(self.campaign_dir)
+            from ichor.core.adversarial.posterior import TotalEnergyPosterior
+            from ..versioning.trained_models import load_trained_models
+            from .seed_selection_runtime import (
+                SeedSelectionProgressReporter,
+                SeedSelectionRuntimeCache,
+            )
+
+            progress = SeedSelectionProgressReporter(
+                self.campaign_dir,
+                campaign_uid=str(state.campaign_uid),
+                iteration=int(state.iteration),
+                journal_event=self._journal_event,
+            )
+            pool = TrajectoryPool.load(self.campaign_dir)
+            model_set, models = load_trained_models(
+                self.campaign_dir,
+                int(state.models_version),
+                verification="metadata",
+                reference_verification="metadata",
+            )
+            posterior = TotalEnergyPosterior(
+                models,
+                property_name="iqa",
+                scaled=True,
+            )
+            cache = SeedSelectionRuntimeCache(
+                self.campaign_dir,
+                pool=pool,
+                posterior=posterior,
+                model_set_sha256=str(model_set.model_set_sha256),
+                model_manifest_sha256=str(model_set.head_manifest_sha256),
+                iteration=int(state.iteration),
+                progress=progress,
+            )
+            progress.bind_inputs(
+                trajectory_sha256=str(pool.sha256),
+                model_set_sha256=str(model_set.model_set_sha256),
+                model_manifest_sha256=str(model_set.head_manifest_sha256),
+            )
         except Exception as exc:
+            if progress is not None:
+                progress.update(
+                    "failed",
+                    force=True,
+                    status="failed",
+                    error=type(exc).__name__ + ": " + str(exc)[:240],
+                )
             raise BackendSubmissionError(
-                "live seed selection requires an imported trajectory pool: "
+                "live seed selection requires an imported trajectory pool and loadable "
+                "committed models: "
                 + type(exc).__name__
                 + ": "
                 + str(exc)
             ) from exc
-        return super()._inline_seed_select(state)
+        self._active_seed_selection_context = {
+            "pool": pool,
+            "model_set": model_set,
+            "models": models,
+            "posterior": posterior,
+            "progress": progress,
+            "cache": cache,
+            "indexed_posterior": None,
+            "features_ready": False,
+        }
+        try:
+            return super()._inline_seed_select(state)
+        except Exception as exc:
+            progress.update(
+                "failed",
+                force=True,
+                status="failed",
+                error=type(exc).__name__ + ": " + str(exc)[:240],
+            )
+            raise
+        finally:
+            self._active_seed_selection_context = None
 
     def _inline_reference_commit(self, state):
         """Run the shared transactional reference publication contract."""
@@ -3323,8 +3529,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         the dry-run path does -- the only difference is what the cache
         gets populated with.
         """
-        from ..acquisition.trajectory_pool import TrajectoryPool
-        from ichor.core.adversarial.acquisition import SeedLocalAdversarialAcquisition
+        from ichor.core.adversarial.acquisition import compute_reference_scales
         from pathlib import Path as _Path
         from .model_contract import validate_reference_scales
         from .artifact_contracts import verify_committed_model_version
@@ -3399,45 +3604,51 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 ) from exc
             return False
 
-        # load the committed models for this iteration. trying to do this
-        # before the policy check would be wasted work on the no-refresh
-        # branch.
+        # Load once when this method is called outside the shared live
+        # SEED_SELECT context; normal daemon execution reuses the objects that
+        # were verified at command entry.
+        context = getattr(self, "_active_seed_selection_context", None)
         from ..versioning.trained_models import (
             TrainedModelVersioning,
             load_trained_models,
             trained_model_set_path,
         )
         from ..versioning.manifest import sha256_file
-
-        models_dir = TrainedModelVersioning(
-            _Path(self.campaign_dir) / self.models_dir_name
-        ).iteration_path(models_version)
-        if not models_dir.is_dir():
-            message = "reference scales require committed models: " + str(models_dir)
-            raise BackendSubmissionError(message)
-        try:
-            verify_committed_model_version(
-                self.campaign_dir,
-                models_version,
-                models_dir_name=self.models_dir_name,
-                verification="metadata",
-            )
-        except Exception as exc:
-            raise BackendSubmissionError(
-                "reference scale model contract failed: "
-                + type(exc).__name__
-                + ": "
-                + str(exc)
-            ) from exc
-        model_manifest_sha256 = sha256_file(trained_model_set_path(models_dir))
+        from ..acquisition.trajectory_pool import TrajectoryPool
 
         try:
-            _, models = load_trained_models(
-                self.campaign_dir,
-                models_version,
-                verification="metadata",
-            )
-            pool = TrajectoryPool.load(_Path(self.campaign_dir))
+            if isinstance(context, dict):
+                model_set = context["model_set"]
+                models = context["models"]
+                pool = context["pool"]
+                posterior = context["posterior"]
+                model_manifest_sha256 = str(model_set.head_manifest_sha256)
+            else:
+                models_dir = TrainedModelVersioning(
+                    _Path(self.campaign_dir) / self.models_dir_name
+                ).iteration_path(models_version)
+                if not models_dir.is_dir():
+                    raise FileNotFoundError(
+                        "reference scales require committed models: "
+                        + str(models_dir)
+                    )
+                verify_committed_model_version(
+                    self.campaign_dir,
+                    models_version,
+                    models_dir_name=self.models_dir_name,
+                    verification="metadata",
+                )
+                _, models = load_trained_models(
+                    self.campaign_dir,
+                    models_version,
+                    verification="metadata",
+                    reference_verification="metadata",
+                )
+                pool = TrajectoryPool.load(_Path(self.campaign_dir))
+                posterior = None
+                model_manifest_sha256 = sha256_file(
+                    trained_model_set_path(models_dir)
+                )
         except Exception as exc:
             self._journal_event(
                 "reference_scales_computed",
@@ -3451,6 +3662,68 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 + ": "
                 + str(exc)
             ) from exc
+
+        from ..layout import active_iteration_dir, active_protocol_dir
+        from ..reference_scale_snapshot import read_reference_scale_snapshot
+
+        iter_dir = active_iteration_dir(self.campaign_dir, int(state.iteration))
+        protocol_dir = active_protocol_dir(iter_dir)
+        sidecar = protocol_dir / "reference_scales.json"
+        if sidecar.is_file() and not sidecar.is_symlink():
+            try:
+                existing_snapshot = read_reference_scale_snapshot(
+                    sidecar,
+                    expected_iteration=int(state.iteration),
+                )
+                if (
+                    int(existing_snapshot["models_version"]) == models_version
+                    and str(existing_snapshot["model_set_manifest_sha256"])
+                    == str(model_manifest_sha256)
+                ):
+                    scales = validate_reference_scales(
+                        dict(existing_snapshot["values"])
+                    )
+                    state.reference_scales = scales
+                    state.reference_scales_iteration = int(
+                        existing_snapshot["source_iteration"]
+                    )
+                    state.reference_scales_models_version = models_version
+                    state.reference_scales_model_manifest_sha256 = str(
+                        model_manifest_sha256
+                    )
+                    reporter = (
+                        context.get("progress")
+                        if isinstance(context, dict)
+                        else None
+                    )
+                    if reporter is not None:
+                        reporter.cache(
+                            "reference_scales",
+                            "adopted",
+                            source_iteration=int(
+                                existing_snapshot["source_iteration"]
+                            ),
+                        )
+                        reporter.update(
+                            "reference_scales",
+                            force=True,
+                            completed=1,
+                            total=1,
+                            cache_status="adopted",
+                        )
+                    self._journal_event(
+                        "reference_scales_computed",
+                        iteration=int(state.iteration),
+                        policy=str(policy),
+                        n_keys=int(len(scales)),
+                        models_version=models_version,
+                        adopted_existing=True,
+                    )
+                    return False
+            except Exception:
+                # A conflicting immutable sidecar remains a publication error;
+                # the normal write below will reject it after recomputation.
+                pass
 
         # pick a representative anchor geometry to fit the local subspace
         # around. the first frame in the trajectory pool is a fine choice;
@@ -3482,18 +3755,83 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 + str(exc)
             ) from exc
 
+        reporter = context.get("progress") if isinstance(context, dict) else None
+        runtime_cache = context.get("cache") if isinstance(context, dict) else None
+        cached_neighbours = None
+        neighbour_cache_id = None
+        if reporter is not None:
+            reporter.update(
+                "reference_neighbours",
+                force=True,
+                completed=0,
+                total=int(pool.n_frames()),
+            )
+        if runtime_cache is not None:
+            cached_neighbours, neighbour_cache_id = (
+                runtime_cache.load_reference_neighbours(
+                    anchor_frame_id=0,
+                    max_neighbours=int(
+                        acquisition_config.subspace.neighbour_count
+                    ),
+                    deduplicate_rmsd=float(
+                        acquisition_config.subspace.neighbour_deduplicate_rmsd
+                    ),
+                )
+            )
+            if reporter is not None and cached_neighbours is not None:
+                reporter.update(
+                    "reference_neighbours",
+                    force=True,
+                    completed=int(pool.n_frames()),
+                    total=int(pool.n_frames()),
+                    cache_status="reused",
+                )
+
+        def _reference_progress(payload):
+            if reporter is not None:
+                values = dict(payload)
+                stage = str(values.pop("stage", "reference_scales"))
+                reporter.update(stage, **values)
+
         try:
-            # building the acquisition triggers _build_reference_scales as
-            # a side effect (because we pass external_reference_scales=None).
-            acq = SeedLocalAdversarialAcquisition(
+            # The reference-scale service computes only the state needed for
+            # the iteration snapshot.
+            acq = compute_reference_scales(
                 models=models,
                 seed=anchor_atoms,
                 trajectory=pool,
                 config=acquisition_config,
                 seed_frame_id=0,
-                external_reference_scales=None,
+                posterior_override=posterior,
+                preselected_neighbours=cached_neighbours,
+                reference_progress=_reference_progress,
+                use_prepared_reference_stencils=True,
             )
             scales = validate_reference_scales(dict(acq.reference_scales))
+            if runtime_cache is not None and cached_neighbours is None:
+                runtime_cache.store_reference_neighbours(
+                    cache_id=str(neighbour_cache_id),
+                    anchor_frame_id=0,
+                    max_neighbours=int(
+                        acquisition_config.subspace.neighbour_count
+                    ),
+                    deduplicate_rmsd=float(
+                        acquisition_config.subspace.neighbour_deduplicate_rmsd
+                    ),
+                    neighbours=acq.subspace.neighbours,
+                )
+            if reporter is not None:
+                reporter.update(
+                    "reference_scales",
+                    force=True,
+                    completed=1,
+                    total=1,
+                    cache_status=(
+                        "neighbours_reused"
+                        if cached_neighbours is not None
+                        else "neighbours_built"
+                    ),
+                )
         except Exception as exc:
             self._journal_event(
                 "reference_scales_computed",

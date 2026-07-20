@@ -22,7 +22,7 @@ DEFAULT_DAEMON_RUNTIME_MODULES: List[str] = (
 )
 
 SUBMITTED_PYTHON_IMPORTS = {
-    "ichor_core": ("ichor.core",),
+    "ichor_core": ("ichor.core", "scipy"),
     "ichor_hpc": ("ichor.hpc",),
     "ariadne": ("ariadne",),
     "pyferebus": (

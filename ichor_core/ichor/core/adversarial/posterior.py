@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Dict, Hashable, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from pathlib import Path
+from typing import Callable, Dict, Hashable, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
+from scipy.linalg import solve_triangular
 from ichor.core.atoms import Atoms
 from ichor.core.models.models import Models
 
@@ -13,6 +15,33 @@ GeometryInput = Union[Atoms, Dict[str, np.ndarray], np.ndarray]
 VARIANCE_NEGATIVE_TOLERANCE = 1.0e-10
 POSTERIOR_CACHE_MAX_SIZE = 4096
 _VARIANCE_CLIPPED_COUNT = 0
+
+
+def _solve_prepared_lower(factor: np.ndarray, right_hand_side: np.ndarray) -> np.ndarray:
+    """Solve a validated lower-triangular system for prepared batch work."""
+    lower = _check_finite_array(factor, "prepared model Cholesky factor")
+    rhs = _check_finite_array(right_hand_side, "prepared train-test covariance")
+    if lower.ndim != 2 or lower.shape[0] != lower.shape[1]:
+        raise ValueError("prepared model Cholesky factor must be square")
+    if rhs.ndim != 2 or rhs.shape[0] != lower.shape[0]:
+        raise ValueError("prepared train-test covariance shape mismatch")
+    upper_scale = max(1.0, float(np.max(np.abs(lower))))
+    upper_tolerance = (
+        np.finfo(float).eps * max(1, int(lower.shape[0])) * upper_scale * 16.0
+    )
+    if np.any(np.abs(np.triu(lower, k=1)) > upper_tolerance):
+        raise ValueError("prepared model Cholesky factor must be lower triangular")
+    diagonal = np.diag(lower)
+    if np.any(diagonal <= 0.0):
+        raise ValueError("prepared model Cholesky diagonal must be positive")
+    solved = solve_triangular(
+        lower,
+        rhs,
+        lower=True,
+        check_finite=False,
+        overwrite_b=False,
+    )
+    return _check_finite_array(solved, "prepared posterior projection")
 
 
 
@@ -187,6 +216,39 @@ def _estimated_signal_variance(model, *, lower_cholesky: Optional[np.ndarray] = 
     return tau2
 
 
+def _estimated_signal_variance_prepared(
+    model,
+    *,
+    lower_cholesky: np.ndarray,
+) -> float:
+    """Prepared-path signal scale using the validated triangular solver."""
+    y_raw = getattr(model, "y")
+    x_raw = getattr(model, "x")
+    cache_key = (
+        _model_numeric_identity(model),
+        id(y_raw),
+        np.asarray(y_raw).shape,
+        id(x_raw),
+        np.asarray(x_raw).shape,
+        int(getattr(model, "ntrain", 0)),
+    )
+    cached = getattr(model, "_ichor_al_signal_variance_cache", None)
+    if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == cache_key:
+        return float(cached[1])
+    y = _check_finite_array(model.y, "model.y").reshape((-1, 1))
+    x = _check_finite_array(model.x, "model.x")
+    mean = _check_finite_array(model.mean.value(x), "model mean").reshape((-1, 1))
+    whitened = _solve_prepared_lower(lower_cholesky, y - mean)
+    tau2 = float((whitened.T @ whitened).reshape(-1)[0] / max(model.ntrain, 1))
+    if not np.isfinite(tau2) or tau2 <= 0.0:
+        tau2 = 1.0
+    try:
+        setattr(model, "_ichor_al_signal_variance_cache", (cache_key, float(tau2)))
+    except Exception:
+        pass
+    return tau2
+
+
 
 def model_posterior_covariance(model, x1: np.ndarray, x2: np.ndarray, scaled: bool = True) -> np.ndarray:
     x1 = _ensure_2d(x1)
@@ -205,6 +267,131 @@ def model_posterior_covariance(model, x1: np.ndarray, x2: np.ndarray, scaled: bo
             lower_cholesky=factor,
         ) * posterior
     return _check_finite_array(posterior, "posterior covariance")
+
+
+class PreparedTotalEnergyPosteriorBatch:
+    """Reusable posterior state for a fixed set of feature rows.
+
+    The expensive train-query covariance and lower-Cholesky solve are performed
+    once per atom. Subsequent variance and rectangular covariance requests use
+    indexed slices of those immutable projections.
+    """
+
+    def __init__(
+        self,
+        *,
+        posterior: "TotalEnergyPosterior",
+        row_ids: np.ndarray,
+        features: Mapping[str, np.ndarray],
+        projections: Mapping[str, np.ndarray],
+        means: np.ndarray,
+        variances: np.ndarray,
+        signal_variances: Mapping[str, float],
+    ) -> None:
+        ids = np.asarray(row_ids, dtype=np.int64).reshape(-1)
+        if len(set(int(value) for value in ids)) != int(ids.size):
+            raise ValueError("prepared posterior row IDs must be unique")
+        self.posterior = posterior
+        self.row_ids = ids
+        self.features = {str(key): np.asarray(value) for key, value in features.items()}
+        self.projections = {
+            str(key): np.asarray(value) for key, value in projections.items()
+        }
+        self.means = _check_finite_array(means, "prepared posterior means").reshape(-1)
+        self.variances = _check_variance_array(
+            variances, "prepared posterior variances"
+        ).reshape(-1)
+        self.signal_variances = {
+            str(key): float(value) for key, value in signal_variances.items()
+        }
+        if self.means.shape != ids.shape or self.variances.shape != ids.shape:
+            raise ValueError("prepared posterior value count mismatch")
+        expected_atoms = set(str(atom) for atom in posterior._property_models)
+        if (
+            set(self.features) != expected_atoms
+            or set(self.projections) != expected_atoms
+            or set(self.signal_variances) != expected_atoms
+        ):
+            raise ValueError("prepared posterior atom coverage mismatch")
+        for atom, model in posterior._property_models.items():
+            feature_shape = (
+                int(ids.size),
+                int(getattr(model, "nfeats", self.features[str(atom)].shape[1])),
+            )
+            projection_shape = (int(model.ntrain), int(ids.size))
+            if self.features[str(atom)].shape != feature_shape:
+                raise ValueError(
+                    "prepared posterior feature shape mismatch for atom "
+                    + str(atom)
+                )
+            if self.projections[str(atom)].shape != projection_shape:
+                raise ValueError(
+                    "prepared posterior projection shape mismatch for atom "
+                    + str(atom)
+                )
+            signal = float(self.signal_variances[str(atom)])
+            if not np.isfinite(signal) or signal <= 0.0:
+                raise ValueError(
+                    "prepared posterior signal variance is invalid for atom "
+                    + str(atom)
+                )
+        self._positions = {int(value): index for index, value in enumerate(ids)}
+
+    def _row_positions(self, row_ids: Sequence[int]) -> np.ndarray:
+        try:
+            return np.asarray(
+                [self._positions[int(value)] for value in row_ids], dtype=np.int64
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise KeyError("prepared posterior row ID is unavailable") from exc
+
+    def variances_by_index(self, row_ids: Sequence[int]) -> np.ndarray:
+        positions = self._row_positions(row_ids)
+        return _check_variance_array(
+            self.variances[positions], "prepared indexed variances"
+        )
+
+    def means_by_index(self, row_ids: Sequence[int]) -> np.ndarray:
+        positions = self._row_positions(row_ids)
+        return _check_finite_array(
+            self.means[positions], "prepared indexed means"
+        )
+
+    def cross_covariances_by_index(
+        self,
+        left_row_ids: Sequence[int],
+        right_row_ids: Sequence[int],
+    ) -> np.ndarray:
+        left_positions = self._row_positions(left_row_ids)
+        right_positions = self._row_positions(right_row_ids)
+        total = np.zeros(
+            (int(left_positions.size), int(right_positions.size)), dtype=float
+        )
+        for atom, model in self.posterior._property_models.items():
+            feature_rows = self.features[str(atom)]
+            left_features = np.asarray(feature_rows[left_positions], dtype=float)
+            right_features = np.asarray(feature_rows[right_positions], dtype=float)
+            prior = _model_prior_covariance(model, left_features, right_features)
+            expected = (int(left_positions.size), int(right_positions.size))
+            if prior.shape != expected:
+                raise ValueError(
+                    "prepared kernel cross-covariance shape for atom "
+                    + str(atom)
+                    + " must be "
+                    + repr(expected)
+                )
+            projection = self.projections[str(atom)]
+            left_projection = np.asarray(projection[:, left_positions], dtype=float)
+            right_projection = np.asarray(projection[:, right_positions], dtype=float)
+            atom_covariance = prior - left_projection.T @ right_projection
+            atom_covariance *= float(self.signal_variances[str(atom)])
+            total += atom_covariance
+        return _check_finite_array(total, "prepared posterior cross-covariances")
+
+    def covariance_matrix_by_index(self, row_ids: Sequence[int]) -> np.ndarray:
+        covariance = self.cross_covariances_by_index(row_ids, row_ids)
+        covariance = 0.5 * (covariance + covariance.T)
+        return _check_finite_array(covariance, "prepared posterior covariance matrix")
 
 
 @dataclass
@@ -241,7 +428,269 @@ class TotalEnergyPosterior:
             "n_covariance_scalar_calls": 0,
             "n_covariance_matrix_batched_calls": 0,
             "n_covariance_matrix_scalar_fallbacks": 0,
+            "n_prepared_batches": 0,
+            "n_prepared_projection_solves": 0,
         }
+
+    def _normalise_feature_arrays(
+        self,
+        feature_arrays: Mapping[str, np.ndarray],
+    ) -> Tuple[Dict[str, np.ndarray], int]:
+        if not isinstance(feature_arrays, Mapping):
+            raise TypeError("prepared posterior features must be a mapping")
+        normalised: Dict[str, np.ndarray] = {}
+        n_rows: Optional[int] = None
+        for atom, model in self._property_models.items():
+            if atom not in feature_arrays:
+                raise KeyError("prepared posterior features missing atom " + str(atom))
+            values = _check_finite_array(
+                feature_arrays[atom], "prepared features for atom " + str(atom)
+            )
+            values = _ensure_2d(values)
+            expected_features = int(getattr(model, "nfeats", values.shape[1]))
+            if values.shape[1] != expected_features:
+                raise ValueError(
+                    "prepared feature dimension for atom "
+                    + str(atom)
+                    + " must be "
+                    + str(expected_features)
+                )
+            _check_kernel_active_dims(
+                model, expected_features, "prepared atom " + str(atom)
+            )
+            if n_rows is None:
+                n_rows = int(values.shape[0])
+            elif int(values.shape[0]) != n_rows:
+                raise ValueError("prepared feature row counts do not match")
+            normalised[str(atom)] = values
+        return normalised, int(n_rows or 0)
+
+    def prepare_feature_batch(
+        self,
+        feature_arrays: Mapping[str, np.ndarray],
+        *,
+        row_ids: Optional[Sequence[int]] = None,
+        projection_directory: Optional[Union[str, Path]] = None,
+        max_resident_projection_bytes: Optional[int] = None,
+        projection_resume_columns: Optional[Mapping[str, int]] = None,
+        projection_progress_callback: Optional[
+            Callable[[str, int, int], None]
+        ] = None,
+    ) -> PreparedTotalEnergyPosteriorBatch:
+        """Prepare one immutable feature batch for repeated indexed queries."""
+        features, n_rows = self._normalise_feature_arrays(feature_arrays)
+        ids = (
+            np.arange(n_rows, dtype=np.int64)
+            if row_ids is None
+            else np.asarray(row_ids, dtype=np.int64).reshape(-1)
+        )
+        if ids.shape != (n_rows,):
+            raise ValueError("prepared posterior row ID count mismatch")
+        total_means = np.zeros(n_rows, dtype=float)
+        total_variances = np.zeros(n_rows, dtype=float)
+        projections: Dict[str, np.ndarray] = {}
+        signal_variances: Dict[str, float] = {}
+        total_projection_bytes = sum(
+            int(model.ntrain) * int(n_rows) * np.dtype(np.float64).itemsize
+            for model in self._property_models.values()
+        )
+        projection_limit = (
+            None
+            if max_resident_projection_bytes is None
+            else max(1, int(max_resident_projection_bytes))
+        )
+        use_disk = (
+            projection_limit is not None
+            and total_projection_bytes > projection_limit
+        )
+        projection_root: Optional[Path] = None
+        if use_disk:
+            if projection_directory is None:
+                raise ValueError(
+                    "prepared posterior projections exceed the resident-memory "
+                    "limit but no projection directory was supplied"
+                )
+            projection_root = Path(projection_directory)
+            if projection_root.is_symlink():
+                raise ValueError("prepared posterior projection directory is symlinked")
+            projection_root.mkdir(parents=True, exist_ok=True)
+        resume_columns = {
+            str(atom): int(completed)
+            for atom, completed in (projection_resume_columns or {}).items()
+        }
+        unknown_resume_atoms = set(resume_columns) - set(self._property_models)
+        if unknown_resume_atoms:
+            raise ValueError(
+                "prepared projection resume contains unknown atoms "
+                + repr(sorted(unknown_resume_atoms))
+            )
+        if resume_columns and not use_disk:
+            raise ValueError(
+                "prepared projection resume requires disk-backed projections"
+            )
+
+        for atom_position, (atom, model) in enumerate(self._property_models.items()):
+            rows = features[str(atom)]
+            predictions = _check_finite_array(
+                model.predict(rows), "prepared model predictions"
+            ).reshape(-1)
+            if predictions.shape != (n_rows,):
+                raise ValueError(
+                    "prepared model prediction count mismatch for atom " + str(atom)
+                )
+            total_means += predictions
+            prior_diagonal = _model_prior_diagonal(model, rows)
+            if prior_diagonal.shape != (n_rows,):
+                raise ValueError(
+                    "prepared kernel diagonal count mismatch for atom " + str(atom)
+                )
+            expected = (int(model.ntrain), n_rows)
+            factor = _model_lower_cholesky(model)
+            signal = (
+                _estimated_signal_variance_prepared(
+                    model,
+                    lower_cholesky=factor,
+                )
+                if self.scaled
+                else 1.0
+            )
+            if use_disk:
+                assert projection_root is not None
+                projection_path = (
+                    projection_root
+                    / ("projection-" + str(atom_position).zfill(4) + ".npy")
+                )
+                completed_columns = int(resume_columns.get(str(atom), 0))
+                if completed_columns < 0 or completed_columns > n_rows:
+                    raise ValueError(
+                        "prepared projection resume count is invalid for atom "
+                        + str(atom)
+                    )
+                if completed_columns:
+                    if projection_path.is_symlink() or not projection_path.is_file():
+                        raise ValueError(
+                            "prepared projection resume file is missing for atom "
+                            + str(atom)
+                        )
+                    projection = np.lib.format.open_memmap(
+                        projection_path,
+                        mode="r+",
+                    )
+                    if (
+                        projection.shape != expected
+                        or projection.dtype != np.dtype(np.float64)
+                    ):
+                        raise ValueError(
+                            "prepared projection resume array is invalid for atom "
+                            + str(atom)
+                        )
+                else:
+                    projection = np.lib.format.open_memmap(
+                        projection_path,
+                        mode="w+",
+                        dtype=np.float64,
+                        shape=expected,
+                    )
+                # Keep the train-query matrix and its solution comfortably below
+                # the aggregate resident limit while retaining BLAS-sized blocks.
+                bytes_per_column = max(1, int(model.ntrain)) * 8
+                work_budget = max(1, int(projection_limit or 1) // 4)
+                column_chunk = max(1, min(n_rows, work_budget // bytes_per_column))
+                squared_norms = np.empty(n_rows, dtype=float)
+                if completed_columns:
+                    squared_norms[:completed_columns] = np.sum(
+                        projection[:, :completed_columns]
+                        * projection[:, :completed_columns],
+                        axis=0,
+                    )
+                for start in range(completed_columns, n_rows, column_chunk):
+                    stop = min(n_rows, start + column_chunk)
+                    train_query = _check_finite_array(
+                        model.r(rows[start:stop]),
+                        "prepared train-test covariance",
+                    )
+                    expected_chunk = (int(model.ntrain), int(stop - start))
+                    if train_query.shape != expected_chunk:
+                        raise ValueError(
+                            "prepared train-test covariance shape for atom "
+                            + str(atom)
+                            + " must be "
+                            + repr(expected_chunk)
+                        )
+                    solved = _solve_prepared_lower(factor, train_query)
+                    self._diagnostic_add("n_prepared_projection_solves")
+                    projection[:, start:stop] = solved
+                    squared_norms[start:stop] = np.sum(solved * solved, axis=0)
+                    projection.flush()
+                    if projection_progress_callback is not None:
+                        projection_progress_callback(
+                            str(atom), int(start), int(stop)
+                        )
+                projection.flush()
+            else:
+                train_query = _check_finite_array(
+                    model.r(rows), "prepared train-test covariance"
+                )
+                if train_query.shape != expected:
+                    raise ValueError(
+                        "prepared train-test covariance shape for atom "
+                        + str(atom)
+                        + " must be "
+                        + repr(expected)
+                    )
+                projection = _solve_prepared_lower(factor, train_query)
+                self._diagnostic_add("n_prepared_projection_solves")
+                squared_norms = np.sum(projection * projection, axis=0)
+            atom_variance = signal * (prior_diagonal - squared_norms)
+            total_variances += atom_variance
+            projections[str(atom)] = projection
+            signal_variances[str(atom)] = float(signal)
+        self._diagnostic_add("n_prepared_batches")
+        return PreparedTotalEnergyPosteriorBatch(
+            posterior=self,
+            row_ids=ids,
+            features=features,
+            projections=projections,
+            means=total_means,
+            variances=total_variances,
+            signal_variances=signal_variances,
+        )
+
+    def prepare_points(
+        self,
+        points: Sequence[GeometryInput],
+        *,
+        row_ids: Optional[Sequence[int]] = None,
+    ) -> PreparedTotalEnergyPosteriorBatch:
+        features = [self._features(point) for point in points]
+        arrays = {
+            atom: self._stack_feature_rows(features, atom)
+            for atom in self._property_models
+        }
+        return self.prepare_feature_batch(arrays, row_ids=row_ids)
+
+    def variances_from_feature_arrays(
+        self,
+        feature_arrays: Mapping[str, np.ndarray],
+        *,
+        chunk_size: Optional[int] = None,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> np.ndarray:
+        features, n_rows = self._normalise_feature_arrays(feature_arrays)
+        if n_rows == 0:
+            return np.zeros(0, dtype=float)
+        size = n_rows if chunk_size is None else max(1, int(chunk_size))
+        output = np.empty(n_rows, dtype=float)
+        for start in range(0, n_rows, size):
+            stop = min(n_rows, start + size)
+            batch = self.prepare_feature_batch(
+                {atom: values[start:stop] for atom, values in features.items()},
+                row_ids=np.arange(start, stop, dtype=np.int64),
+            )
+            output[start:stop] = batch.variances
+            if progress_callback is not None:
+                progress_callback(int(stop), int(n_rows))
+        return _check_variance_array(output, "prepared feature variances")
 
     @staticmethod
     def _cache_get(cache: OrderedDict, key):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple, Union
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from ichor.core.atoms import Atom, Atoms
@@ -235,6 +235,7 @@ def select_local_neighbours(
     trajectory,
     max_neighbours: int,
     deduplicate_rmsd: float = 1.0e-3,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> List[Neighbour]:
     """Select a local neighbourhood around the seed from a trajectory.
 
@@ -258,12 +259,18 @@ def select_local_neighbours(
     """
     #Build the (frame_id, atoms) pair generator from whichever form was passed.
     if hasattr(trajectory, "frame") and hasattr(trajectory, "frame_ids"):
-        pairs = ((int(fid), trajectory.frame(fid)) for fid in trajectory.frame_ids())
+        frame_ids = trajectory.frame_ids()
+        pairs = ((int(fid), trajectory.frame(fid)) for fid in frame_ids)
+        try:
+            total_frames = int(len(frame_ids))
+        except TypeError:
+            total_frames = 0
     else:
         pairs = ((int(idx), atoms) for idx, atoms in enumerate(trajectory))
+        total_frames = int(len(trajectory))
 
     ranked: List[Neighbour] = []
-    for frame_id, atoms in pairs:
+    for position, (frame_id, atoms) in enumerate(pairs, start=1):
         ranked.append(
             Neighbour(
                 index=frame_id,
@@ -271,6 +278,10 @@ def select_local_neighbours(
                 aligned_distance=aligned_mass_weighted_distance(seed_atoms, atoms),
             )
         )
+        if progress_callback is not None and (
+            (total_frames > 0 and position == total_frames) or position % 256 == 0
+        ):
+            progress_callback(int(position), int(total_frames))
     ranked.sort(key=lambda item: item.aligned_distance)
 
     selected: List[Neighbour] = []

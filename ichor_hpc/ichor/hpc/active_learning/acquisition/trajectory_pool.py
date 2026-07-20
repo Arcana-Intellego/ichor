@@ -341,6 +341,11 @@ class TrajectoryPool:
     def __len__(self) -> int:
         return self.n_frames()
 
+    def __getitem__(self, frame_id):
+        if isinstance(frame_id, slice):
+            return [self.frame(index) for index in range(*frame_id.indices(len(self)))]
+        return self.frame(frame_id)
+
     def frame(self, frame_id: int) -> Atoms:
         """Return a detached copy of the frame at the stable frame ID."""
         if isinstance(frame_id, bool) or not isinstance(frame_id, (int, np.integer)):

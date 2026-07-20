@@ -1489,7 +1489,9 @@ def _phase_title(phase: Any) -> str:
 
 
 def _sentence_fragment(value: str) -> str:
-    return value[:1].lower() + value[1:] if value else value
+    if not value or (len(value) > 1 and value[:2].isupper()):
+        return value
+    return value[:1].lower() + value[1:]
 
 
 def _short_status_error(errors: Iterable[Any], *, limit: int = 180) -> str:
@@ -1883,12 +1885,124 @@ def _status_intent_counts(payload: Dict[str, Any]) -> Tuple[int, int]:
     return scheduler, local
 
 
+def _seed_selection_progress_record(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    progress = payload.get("seed_selection_progress")
+    if not isinstance(progress, dict) or progress.get("state") != "current":
+        return None
+    record = progress.get("record")
+    return dict(record) if isinstance(record, dict) else None
+
+
+def _format_seed_selection_progress(record: Dict[str, Any]) -> str:
+    stage = str(record.get("stage") or "loading")
+    completed = _event_int(record, "completed")
+    total = _event_int(record, "total")
+    count = (
+        " " + str(completed) + "/" + str(total)
+        if completed is not None and total is not None and total > 0
+        else ""
+    )
+    details: List[str] = []
+    try:
+        elapsed = float(record.get("elapsed_seconds"))
+    except (TypeError, ValueError):
+        elapsed = -1.0
+    if np.isfinite(elapsed) and elapsed >= 1.0:
+        elapsed_seconds = int(elapsed)
+        hours, remainder = divmod(elapsed_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        details.append(
+            (
+                str(hours) + "h " + str(minutes).zfill(2) + "m"
+                if hours
+                else str(minutes) + "m " + str(seconds).zfill(2) + "s"
+            )
+            + " elapsed"
+        )
+    try:
+        throughput = float(record.get("throughput_per_second"))
+    except (TypeError, ValueError):
+        throughput = -1.0
+    if np.isfinite(throughput) and throughput > 0.0:
+        unit = {
+            "d_optimal": "seeds/s",
+            "random": "seeds/s",
+            "publishing": "seeds/s",
+            "reference_scales": "modes/s",
+            "loading": "items/s",
+        }.get(stage, "frames/s")
+        details.append(format(throughput, ".2f") + " " + unit)
+    progress_suffix = " (" + ", ".join(details) + ")" if details else ""
+
+    def _finish(message: str) -> str:
+        return message + progress_suffix + "."
+
+    if stage == "loading":
+        return _finish("Loading and validating the trajectory pool and models" + count)
+    if stage == "features":
+        return _finish("Building cached trajectory features" + count)
+    if stage == "reference_neighbours":
+        return _finish("Finding reference-scale neighbours" + count)
+    if stage == "reference_scales":
+        sample = _event_int(record, "sample")
+        samples = _event_int(record, "samples")
+        mode = _event_int(record, "mode")
+        modes = _event_int(record, "modes")
+        reference_pass = str(record.get("reference_pass") or "").strip()
+        if sample is not None and samples is not None and reference_pass:
+            return _finish(
+                "Computing reference scales: sample "
+                + str(sample)
+                + "/"
+                + str(samples)
+                + ", "
+                + reference_pass.replace("_", " ")
+                + " stencils"
+            )
+        if None not in {sample, samples, mode, modes}:
+            return _finish(
+                "Computing reference scales: sample "
+                + str(sample)
+                + "/"
+                + str(samples)
+                + ", mode "
+                + str(mode)
+                + "/"
+                + str(modes)
+            )
+        return _finish("Computing reference scales" + count)
+    if stage == "filtering":
+        return _finish("Filtering eligible trajectory frames" + count)
+    if stage == "random":
+        return _finish("Selecting the deterministic random subset" + count)
+    if stage == "variance":
+        return _finish("Scoring posterior variance" + count)
+    if stage == "shortlist":
+        return _finish("Preparing the D-optimal shortlist" + count)
+    if stage == "d_optimal":
+        shortlist = _event_int(record, "shortlist_size")
+        shortlist_suffix = (
+            " from " + str(shortlist) + " shortlisted frames"
+            if shortlist is not None
+            else ""
+        )
+        return _finish("Selecting D-optimal seeds" + count + shortlist_suffix)
+    if stage == "publishing":
+        return _finish("Publishing the seed selection" + count)
+    if stage == "failed":
+        return "Seed selection stopped after an error."
+    if stage == "complete":
+        return "Seed selection has been published."
+    return "Seed selection is running (" + stage.replace("_", " ") + ")."
+
+
 def _status_current_activity(payload: Dict[str, Any]) -> str:
     phase = str(payload.get("phase") or "")
     title = _sentence_fragment(_phase_title(phase))
     daemon_active = _status_daemon_active(payload)
     active_jobs = _status_active_job_count(payload)
     scheduler_intents, local_intents = _status_intent_counts(payload)
+    progress = _seed_selection_progress_record(payload)
     if str(payload.get("background_startup_state") or "") in {
         "prepared",
         "spawned",
@@ -1911,6 +2025,12 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
             + " recorded Slurm job"
             + (" still needs monitoring or postprocessing." if count == 1 else "s still need monitoring or postprocessing.")
         )
+    if (
+        phase == CampaignPhase.SEED_SELECT.value
+        and daemon_active
+        and progress is not None
+    ):
+        return _format_seed_selection_progress(progress)
     if local_intents:
         intents = payload.get("active_submission_intents")
         local_phase = phase
@@ -2087,6 +2207,18 @@ def _format_runtime_status(payload: Dict[str, Any], *, verbose: bool) -> List[st
                 ),
             ]
         )
+        progress = payload.get("seed_selection_progress")
+        if isinstance(progress, dict):
+            rows.append(("seed-selection progress", progress.get("state")))
+            if progress.get("age_seconds") is not None:
+                rows.append(
+                    (
+                        "seed-selection progress age",
+                        str(round(float(progress["age_seconds"]), 1)) + "s",
+                    )
+                )
+            if progress.get("reason"):
+                rows.append(("seed-selection progress detail", progress.get("reason")))
     return _section("Runtime", rows)
 
 
@@ -2373,6 +2505,9 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "reference_commit_cache_complete": "FEREBUS row cache complete",
     "reference_commit_published": "QM reference version published",
     "models_committed": "models committed",
+    "seed_selection_started": "seed selection started",
+    "seed_selection_progress": "seed selection progress",
+    "seed_selection_cache": "seed selection cache",
     "seed_selected": "seeds selected",
     "anti_overlap_flagged": "anti-overlap flagged",
     "reference_scales_computed": "reference scales computed",
@@ -2563,6 +2698,8 @@ _JOURNAL_RUN_EVENTS = {
     "ferebus_candidate_recovery_materialised",
     "model_bootstrap_staged",
     "reference_commit_shard_progress",
+    "seed_selection_started",
+    "seed_selection_progress",
 }
 
 _JOURNAL_WAIT_EVENTS = {
@@ -2648,6 +2785,7 @@ _JOURNAL_INFO_EVENTS = {
     "pool_feasibility_checked",
     "resolved_phase_resources",
     "sampling_protocol_resolved",
+    "seed_selection_cache",
 }
 
 _JOURNAL_DYNAMIC_EVENTS = {
@@ -2844,6 +2982,16 @@ def _journal_operator_summary(
     previous_event: Optional[Dict[str, Any]] = None,
 ) -> str:
     raw = str(event.get("event", ""))
+    if raw == "seed_selection_started":
+        return "seed selection started"
+    if raw == "seed_selection_progress":
+        return _format_seed_selection_progress(event).rstrip(".")
+    if raw == "seed_selection_cache":
+        return (
+            str(event.get("cache_kind") or "derived data").replace("_", " ")
+            + " cache "
+            + str(event.get("cache_status") or "updated").replace("_", " ")
+        )
     if raw in {"user_stop_requested", "user_stop_boundary_reached"}:
         from .daemon.stop_control import describe_stop_request
 
@@ -2988,7 +3136,10 @@ def _compact_event_details(event: Dict[str, Any]) -> str:
     ]
     parts: List[str] = []
     seen_labels: set[str] = set()
+    raw = str(event.get("event", ""))
     for key, label in detail_keys:
+        if raw == "seed_selection_progress" and key == "elapsed_seconds":
+            continue
         if key in event and event.get(key) is not None:
             if label in seen_labels:
                 continue
@@ -3005,7 +3156,6 @@ def _compact_event_details(event: Dict[str, Any]) -> str:
     if progress:
         insert_at = 1 if parts and parts[0].startswith("job=") else 0
         parts.insert(insert_at, progress)
-    raw = str(event.get("event", ""))
     if raw in {"sacct_missing_timeout", "sacct_empty_timeout", "sacct_unknown_timeout"}:
         streak = _event_int(event, "streak")
         max_ticks = _event_int(event, "max_ticks")
@@ -4609,6 +4759,99 @@ def format_recovery_dashboard(campaign_dir: Path) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _load_seed_selection_progress_status(
+    campaign: Path,
+    state: CampaignState,
+    runtime_payload: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    from datetime import datetime, timezone
+
+    path = (
+        Path(campaign)
+        / ".DATA"
+        / "ACTIVE_LEARNING"
+        / "runtime_progress"
+        / "SEED_SELECT.json"
+    )
+    if not path.exists() and not path.is_symlink():
+        return None
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("progress path is not a regular file")
+        record = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(record, dict) or record.get("schema_version") != 1:
+            raise ValueError("unsupported seed-selection progress schema")
+        if str(record.get("campaign_uid") or "") != str(state.campaign_uid):
+            raise ValueError("progress campaign identity mismatch")
+        if str(record.get("phase") or "") != CampaignPhase.SEED_SELECT.value:
+            raise ValueError("progress phase mismatch")
+        if int(record.get("iteration")) != int(state.iteration):
+            return {"state": "stale", "reason": "iteration_mismatch"}
+        updated = datetime.fromisoformat(str(record.get("updated_iso") or ""))
+        if updated.tzinfo is None:
+            raise ValueError("progress update time has no timezone")
+        age = max(
+            0.0,
+            (datetime.now(timezone.utc) - updated.astimezone(timezone.utc)).total_seconds(),
+        )
+        daemon_active = _daemon_activity_status(dict(runtime_payload)).startswith(
+            ("running", "starting")
+        )
+        recorded_pid = int(record.get("pid"))
+        active_pid = None
+        if runtime_payload.get("background_pid_alive") is True:
+            active_pid = runtime_payload.get("background_pid")
+        heartbeat = runtime_payload.get("lease_heartbeat")
+        if active_pid is None and isinstance(heartbeat, dict):
+            try:
+                if _lease_is_fresh(
+                    heartbeat,
+                    stale_seconds=int(
+                        runtime_payload.get("lease_stale_seconds") or 900
+                    ),
+                    clock_skew_tolerance_seconds=int(
+                        runtime_payload.get("clock_skew_tolerance_seconds") or 60
+                    ),
+                ):
+                    active_pid = heartbeat.get("pid")
+            except Exception:
+                active_pid = None
+        if (
+            active_pid is None
+            and runtime_payload.get("lock_held") is True
+            and recorded_pid == int(os.getpid())
+        ):
+            active_pid = recorded_pid
+        pid_matches = active_pid is not None and int(active_pid) == recorded_pid
+        startup = runtime_payload.get("background_startup_payload")
+        launch_id = (
+            str(startup.get("launch_id") or "").strip()
+            if isinstance(startup, dict)
+            else ""
+        )
+        start_matches = not launch_id or str(
+            record.get("daemon_start_identity") or ""
+        ) == launch_id
+        current = (
+            state.phase is CampaignPhase.SEED_SELECT
+            and daemon_active
+            and pid_matches
+            and start_matches
+            and str(record.get("status") or "") in {"running", "complete"}
+        )
+        return {
+            "state": "current" if current else "stale",
+            "age_seconds": float(age),
+            "record": record if current else None,
+            "reason": None if current else "inactive_or_old",
+        }
+    except Exception as exc:
+        return {
+            "state": "malformed",
+            "reason": type(exc).__name__ + ": " + str(exc),
+        }
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     campaign = resolve_campaign_dir(
         args.campaign_dir,
@@ -4707,6 +4950,13 @@ def cmd_status(args: argparse.Namespace) -> int:
             paths["background_startup"],
         )
     )
+    progress_status = _load_seed_selection_progress_status(
+        campaign,
+        state,
+        payload,
+    )
+    if progress_status is not None:
+        payload["seed_selection_progress"] = progress_status
     try:
         from .execution_identity import read_active_environment_generation
         from .daemon.journal import tail_events

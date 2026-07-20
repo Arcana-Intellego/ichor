@@ -721,7 +721,34 @@ class DryRunPhaseExecutor:
             "STOP_CHECK": self._inline_stop_check,
         }
 
-    def _seed_selection_posterior(self, state, training_atoms):
+    def _seed_selection_pool(self, _state):
+        return self._ensure_dry_run_trajectory_pool()
+
+    def _seed_selection_population(self, pool):
+        return pool.to_atoms_list()
+
+    def _seed_selection_prepare_context(self, _state, _pool) -> None:
+        return None
+
+    def _seed_selection_progress_callback(self, _state):
+        return None
+
+    def _seed_selection_model_set(self, state):
+        model_version = int(getattr(state, "models_version", -1))
+        return TrainedModelVersioning(
+            self.campaign_dir / self.models_dir_name
+        ).resolve(model_version, verification="deep")
+
+    def _seed_selection_finished(self, _state, *, selection_published: bool) -> None:
+        return None
+
+    def _seed_selection_posterior(
+        self,
+        state,
+        training_atoms,
+        *,
+        eligible_indices=None,
+    ):
         """Posterior whose .variance(atoms) drives the exploit half of seed
         selection. The dry run has no trained GP, so every frame looks equally
         uncertain (a flat posterior); the live executor overrides this with the
@@ -861,16 +888,15 @@ class DryRunPhaseExecutor:
                 raise BackendSubmissionError(
                     "existing seed selection model version does not match state"
                 )
-            pool = self._ensure_dry_run_trajectory_pool()
+            pool = self._seed_selection_pool(state)
             if str(picked["trajectory_sha256"]) != str(pool.sha256):
                 raise BackendSubmissionError(
                     "existing seed selection trajectory SHA does not match the pool"
                 )
-            pool_frames = pool.to_atoms_list()
             picked_records = list(picked["seed_records"])
             try:
                 selected_frames = [
-                    pool_frames[int(record["pool_row_index_zero_based"])]
+                    pool.frame(int(record["pool_row_index_zero_based"]))
                     for record in picked_records
                 ]
             except (IndexError, KeyError, TypeError, ValueError) as exc:
@@ -919,8 +945,22 @@ class DryRunPhaseExecutor:
                 "seed_selected", iteration=int(state.iteration), reused_existing=True,
                 repaired_recent_seeds=(not has_current),
             )
+            self._seed_selection_finished(state, selection_published=True)
             return {}
         ensure_index(self.campaign_dir)
+        progress_callback = self._seed_selection_progress_callback(state)
+        if progress_callback is not None:
+            progress_callback(
+                "loading",
+                {"completed": 0, "total": 2},
+            )
+        pool = self._seed_selection_pool(state)
+        if progress_callback is not None:
+            progress_callback(
+                "loading",
+                {"completed": 2, "total": 2},
+            )
+        self._seed_selection_prepare_context(state, pool)
         # refresh reference scales per acquisition.references.refresh_policy.
         self._maybe_refresh_reference_scales(state)
         from ..sampling_protocol import resolve_or_load_sampling_protocol
@@ -930,8 +970,6 @@ class DryRunPhaseExecutor:
             self.config,
             iteration=int(state.iteration),
         )
-
-        pool = self._ensure_dry_run_trajectory_pool()
 
         from ..custom_bootstrap import read_custom_bootstrap_manifest
 
@@ -969,10 +1007,19 @@ class DryRunPhaseExecutor:
             bootstrap_forbidden | training_forbidden | recent_forbidden
         )
 
-        training_atoms = pool.to_atoms_list()
+        training_atoms = self._seed_selection_population(pool)
         training_frame_ids = list(pool.frame_ids())
+        eligible_indices = [
+            int(index)
+            for index, frame_id in enumerate(training_frame_ids)
+            if int(frame_id) not in forbidden
+        ]
 
-        posterior = self._seed_selection_posterior(state, training_atoms)
+        posterior = self._seed_selection_posterior(
+            state,
+            training_atoms,
+            eligible_indices=eligible_indices,
+        )
         if str(self.config.seed_selection.strategy) == "d_optimal":
             (
                 score_transform,
@@ -1019,6 +1066,7 @@ class DryRunPhaseExecutor:
                 self.config.seed_selection.d_optimal_degenerate_policy
             ),
             score_transform=score_transform,
+            progress_callback=progress_callback,
         )
         requested_n = int(self.config.seed_selection.n_seeds_per_iteration)
         if selection.n <= 0:
@@ -1112,9 +1160,7 @@ class DryRunPhaseExecutor:
             raise BackendSubmissionError(
                 "seed selection requires a committed model version"
             )
-        model_set = TrainedModelVersioning(
-            self.campaign_dir / self.models_dir_name
-        ).resolve(model_version, verification="deep")
+        model_set = self._seed_selection_model_set(state)
         from .input_staging import read_ferebus_manifest
         from ..ferebus_prior import contract_from_payload
 
@@ -1186,7 +1232,12 @@ class DryRunPhaseExecutor:
         }
         seeds_picked_payload["diagnostics"] = diagnostics_payload
         from ..seed_identity import write_ariadne_task_map
-        selected_frames = [training_atoms[int(index)] for index in selection.indices]
+        if progress_callback is not None:
+            progress_callback(
+                "publishing",
+                {"completed": 0, "total": int(selection.n)},
+            )
+        selected_frames = [pool.frame(int(index)) for index in selection.indices]
         comments = [
             "active iteration "
             + str(int(state.iteration))
@@ -1228,6 +1279,12 @@ class DryRunPhaseExecutor:
             bootstrap_forbidden_set_size=int(len(bootstrap_forbidden)),
             skipped_unknown_provenance=int(selection.skipped_unknown_provenance),
         )
+        if progress_callback is not None:
+            progress_callback(
+                "publishing",
+                {"completed": int(selection.n), "total": int(selection.n)},
+            )
+        self._seed_selection_finished(state, selection_published=True)
         return {}
 
     def _allocation_check(self, state, *, context: str) -> PhaseResult:

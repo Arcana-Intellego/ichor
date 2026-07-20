@@ -71,6 +71,50 @@ class _CovariancePosterior:
         raise AssertionError("seed selection must not build a full pool covariance matrix")
 
 
+class _PreparedCovariancePosterior(_CovariancePosterior):
+    allow_prepared_legacy_fallback = False
+
+    def __init__(self, atoms, covariance):
+        super().__init__(atoms, covariance)
+        self.prepared_calls = []
+        self.cross_shapes = []
+
+    def variances_by_index(self, indices):
+        return np.asarray([self._cov[int(i), int(i)] for i in indices], dtype=float)
+
+    def prepare_indexed_batch(self, indices):
+        self.prepared_calls.append(tuple(int(value) for value in indices))
+        return self
+
+    def cross_covariances_by_index(self, left, right):
+        self.cross_shapes.append((len(left), len(right)))
+        return np.asarray(self._cov[np.ix_(list(left), list(right))], dtype=float)
+
+
+class _FailingPreparedCovariancePosterior(_PreparedCovariancePosterior):
+    allow_prepared_legacy_fallback = True
+    prepared_batch_available = True
+
+    def __init__(self, atoms, covariance):
+        super().__init__(atoms, covariance)
+        self._invariant_failed = False
+
+    def cross_covariances_by_index(self, left, right):
+        if not self._invariant_failed:
+            self._invariant_failed = True
+            raise ValueError("injected prepared invariant failure")
+        return super().cross_covariances_by_index(left, right)
+
+
+class _PreparationFailurePosterior(_PreparedCovariancePosterior):
+    allow_prepared_legacy_fallback = True
+    prepared_batch_available = False
+
+    def prepare_indexed_batch(self, indices):
+        self.prepared_calls.append(tuple(int(value) for value in indices))
+        raise ValueError("injected projection preparation failure")
+
+
 def _atoms_with_indexed_variances(n):
     """Return (atoms_list, posterior, variances) where variance(atoms[i]) = i."""
     atoms = [object() for _ in range(n)]   # opaque marker; posterior keys on id
@@ -320,7 +364,7 @@ def test_variance_chunk_size_passed_to_batched_posterior():
         variance_chunk_size=3,
     )
     assert out.variance_indices == [7, 6, 5, 4]
-    assert posterior.chunk_sizes == [3, 3]
+    assert posterior.chunk_sizes == [3]
 
 
 def test_variance_chunk_size_is_backward_compatible_with_old_batched_posterior():
@@ -539,6 +583,185 @@ def test_d_optimal_fail_policy_reports_model_space_degeneracy():
             d_optimal_score_power=0.0,
             d_optimal_degenerate_policy="fail",
         )
+
+
+@pytest.mark.parametrize(
+    "covariance,bulk_fraction,rng_seed",
+    [
+        (np.diag([8.0, 7.0, 6.0, 5.0, 4.0, 3.0]), 0.0, 0),
+        (np.ones((6, 6), dtype=float), 0.0, 0),
+        (np.eye(6, dtype=float), 0.0, 0),
+        (
+            np.asarray(
+                [
+                    [5.0, 3.8, 0.2, 0.1, 0.0, 0.0],
+                    [3.8, 5.0, 0.3, 0.1, 0.0, 0.0],
+                    [0.2, 0.3, 4.0, 2.5, 0.2, 0.1],
+                    [0.1, 0.1, 2.5, 4.0, 0.3, 0.2],
+                    [0.0, 0.0, 0.2, 0.3, 3.0, 1.5],
+                    [0.0, 0.0, 0.1, 0.2, 1.5, 3.0],
+                ]
+            ),
+            0.5,
+            17,
+        ),
+    ],
+)
+def test_prepared_d_optimal_matches_legacy_frame_ids(
+    covariance, bulk_fraction, rng_seed
+):
+    atoms = [object() for _ in range(len(covariance))]
+    legacy = select_seeds(
+        atoms,
+        _CovariancePosterior(atoms, covariance),
+        n_seeds=4,
+        bulk_fraction=bulk_fraction,
+        rng_seed=rng_seed,
+        strategy="d_optimal",
+        d_optimal_pool_multiplier=4,
+        d_optimal_score_power=0.0,
+    )
+    prepared = select_seeds(
+        atoms,
+        _PreparedCovariancePosterior(atoms, covariance),
+        n_seeds=4,
+        bulk_fraction=bulk_fraction,
+        rng_seed=rng_seed,
+        strategy="d_optimal",
+        d_optimal_pool_multiplier=4,
+        d_optimal_score_power=0.0,
+    )
+
+    assert prepared.indices == legacy.indices
+    assert prepared.selection_origins == legacy.selection_origins
+    assert prepared.diagnostics["d_optimal_selected"] == legacy.diagnostics[
+        "d_optimal_selected"
+    ]
+
+
+@pytest.mark.parametrize("rng_seed", range(12))
+def test_prepared_d_optimal_matches_legacy_for_random_psd_fixtures(rng_seed):
+    rng = np.random.default_rng(rng_seed)
+    n_candidates = 18
+    rank = 7 if rng_seed % 3 else 3
+    factors = rng.normal(size=(n_candidates, rank))
+    covariance = factors @ factors.T
+    covariance += np.diag(rng.uniform(1.0e-8, 1.0e-4, size=n_candidates))
+    atoms = [object() for _ in range(n_candidates)]
+    kwargs = {
+        "n_seeds": 9,
+        "bulk_fraction": (0.0, 0.25, 0.5)[rng_seed % 3],
+        "rng_seed": 1000 + rng_seed,
+        "strategy": "d_optimal",
+        "d_optimal_pool_multiplier": 3,
+        "d_optimal_jitter": 1.0e-10,
+        "d_optimal_score_power": (0.0, 0.5, 1.0)[rng_seed % 3],
+        "d_optimal_degenerate_policy": "score_backfill",
+    }
+
+    legacy = select_seeds(
+        atoms,
+        _CovariancePosterior(atoms, covariance),
+        **kwargs,
+    )
+    prepared = select_seeds(
+        atoms,
+        _PreparedCovariancePosterior(atoms, covariance),
+        **kwargs,
+    )
+
+    assert prepared.indices == legacy.indices
+    assert prepared.selection_origins == legacy.selection_origins
+    for prepared_row, legacy_row in zip(
+        prepared.selection_diagnostics,
+        legacy.selection_diagnostics,
+    ):
+        assert prepared_row["selection_index"] == legacy_row["selection_index"]
+        for key in (
+            "d_optimal_conditional_variance",
+            "d_optimal_raw_conditional_variance",
+            "d_optimal_gain",
+            "d_optimal_max_correlation_to_selected",
+        ):
+            if key in prepared_row and key in legacy_row:
+                assert prepared_row[key] == pytest.approx(
+                    legacy_row[key],
+                    rel=1.0e-8,
+                    abs=1.0e-10,
+                )
+
+
+def test_prepared_d_optimal_uses_one_preparation_and_covariance_columns_only():
+    rng = np.random.default_rng(77)
+    factors = rng.normal(size=(100, 12))
+    covariance = factors @ factors.T + np.eye(100) * 1.0e-6
+    atoms = [object() for _ in range(100)]
+    posterior = _PreparedCovariancePosterior(atoms, covariance)
+
+    result = select_seeds(
+        atoms,
+        posterior,
+        n_seeds=20,
+        bulk_fraction=0.25,
+        rng_seed=41,
+        strategy="d_optimal",
+        d_optimal_pool_multiplier=4,
+        d_optimal_score_power=0.0,
+    )
+
+    assert result.n == 20
+    assert len(posterior.prepared_calls) == 1
+    assert all(shape != (100, 100) for shape in posterior.cross_shapes)
+    assert max(right for _left, right in posterior.cross_shapes) <= 5
+    assert sum(1 for _left, right in posterior.cross_shapes if right == 1) <= 15
+
+
+def test_prepared_d_optimal_invariant_failure_uses_indexed_legacy_fallback():
+    rng = np.random.default_rng(79)
+    factors = rng.normal(size=(30, 8))
+    covariance = factors @ factors.T + np.eye(30) * 1.0e-6
+    atoms = [object() for _ in range(30)]
+    posterior = _FailingPreparedCovariancePosterior(atoms, covariance)
+
+    result = select_seeds(
+        atoms,
+        posterior,
+        n_seeds=8,
+        bulk_fraction=0.25,
+        rng_seed=43,
+        strategy="d_optimal",
+        d_optimal_pool_multiplier=4,
+        d_optimal_score_power=0.0,
+    )
+
+    assert result.n == 8
+    assert result.diagnostics["d_optimal_prepared_fallback"] is True
+    assert "injected prepared invariant failure" in result.diagnostics[
+        "d_optimal_prepared_fallback_reason"
+    ]
+    assert posterior.covariance_matrix_called is False
+
+
+def test_prepared_d_optimal_preparation_failure_is_not_retried():
+    rng = np.random.default_rng(83)
+    factors = rng.normal(size=(20, 6))
+    covariance = factors @ factors.T + np.eye(20) * 1.0e-6
+    atoms = [object() for _ in range(20)]
+    posterior = _PreparationFailurePosterior(atoms, covariance)
+
+    with pytest.raises(ValueError, match="projection preparation failure"):
+        select_seeds(
+            atoms,
+            posterior,
+            n_seeds=6,
+            bulk_fraction=0.25,
+            rng_seed=47,
+            strategy="d_optimal",
+            d_optimal_pool_multiplier=4,
+            d_optimal_score_power=0.0,
+        )
+
+    assert len(posterior.prepared_calls) == 1
 
 
 def test_invalid_seed_selection_strategy_raises():

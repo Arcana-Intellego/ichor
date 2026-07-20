@@ -133,7 +133,43 @@ def directional_all_stencils(
     atoms: Atoms,
     direction_flat: np.ndarray,
     step: float,
+    *,
+    prepared: bool = False,
 ) -> DirectionalStencilBundle:
+    offsets, points = directional_stencil_points(
+        atoms,
+        direction_flat,
+        step,
+    )
+    step_f = float(step)
+    if bool(prepared) and hasattr(posterior, "prepare_points"):
+        prepared_batch = posterior.prepare_points(points)
+        return directional_stencils_from_prepared(
+            prepared_batch,
+            row_ids=prepared_batch.row_ids,
+            points=points,
+            step=step_f,
+        )
+    if hasattr(posterior, "means_and_covariance_matrix"):
+        means_raw, covariance_raw = posterior.means_and_covariance_matrix(points)
+    else:
+        means_raw = posterior.means(points)
+        covariance_raw = posterior.covariance_matrix(points)
+    return _directional_stencils_from_values(
+        offsets=offsets,
+        points=points,
+        means=means_raw,
+        covariance=covariance_raw,
+        step=step_f,
+    )
+
+
+def directional_stencil_points(
+    atoms: Atoms,
+    direction_flat: np.ndarray,
+    step: float,
+) -> tuple[np.ndarray, List[Atoms]]:
+    """Build the five geometries shared by all directional stencils."""
     step_f = float(step)
     if not np.isfinite(step_f) or step_f <= 0.0:
         raise ValueError("directional stencil step must be finite and positive")
@@ -142,13 +178,42 @@ def directional_all_stencils(
         displaced_geometry(atoms, direction_flat, float(offset) * step_f)
         for offset in offsets
     ]
-    if hasattr(posterior, "means_and_covariance_matrix"):
-        means_raw, covariance_raw = posterior.means_and_covariance_matrix(points)
-    else:
-        means_raw = posterior.means(points)
-        covariance_raw = posterior.covariance_matrix(points)
-    means = np.asarray(means_raw, dtype=float)
-    covariance = np.asarray(covariance_raw, dtype=float)
+    return offsets, points
+
+
+def directional_stencils_from_prepared(
+    prepared_batch,
+    *,
+    row_ids: Sequence[int],
+    points: Sequence[Atoms],
+    step: float,
+) -> DirectionalStencilBundle:
+    """Evaluate one five-point stencil from a reusable posterior batch."""
+    ids = np.asarray(row_ids, dtype=np.int64).reshape(-1)
+    if ids.shape != (5,) or len(points) != 5:
+        raise ValueError("directional prepared stencil requires five points")
+    return _directional_stencils_from_values(
+        offsets=np.asarray([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=float),
+        points=points,
+        means=prepared_batch.means_by_index(ids),
+        covariance=prepared_batch.cross_covariances_by_index(ids, ids),
+        step=step,
+    )
+
+
+def _directional_stencils_from_values(
+    *,
+    offsets: np.ndarray,
+    points: Sequence[Atoms],
+    means: np.ndarray,
+    covariance: np.ndarray,
+    step: float,
+) -> DirectionalStencilBundle:
+    step_f = float(step)
+    if not np.isfinite(step_f) or step_f <= 0.0:
+        raise ValueError("directional stencil step must be finite and positive")
+    means = np.asarray(means, dtype=float)
+    covariance = np.asarray(covariance, dtype=float)
 
     coeff_force = np.asarray([0.0, -1.0, 0.0, 1.0, 0.0], dtype=float) / (2.0 * step_f)
     coeff_curvature = np.asarray([0.0, 1.0, -2.0, 1.0, 0.0], dtype=float) / (step_f ** 2)
@@ -157,7 +222,7 @@ def directional_all_stencils(
 
     return DirectionalStencilBundle(
         offsets=offsets,
-        points=points,
+        points=list(points),
         means=means,
         covariance=covariance,
         force=_stencil_from_coeffs(offsets, coeff_force, points, means, covariance),

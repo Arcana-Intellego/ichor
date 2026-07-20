@@ -5,6 +5,8 @@ touches (kernel.k, r, lower_cholesky, predict, y, mean, x, ntrain, type, atom),
 with a genuine PSD kernel so the linear algebra is real. We then check that the
 vectorised diagonal matches the scalar path frame by frame, scaled and unscaled.
 """
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -14,6 +16,11 @@ from ichor.core.adversarial.posterior import (
     _check_variance_array,
     variance_clip_diagnostics,
 )
+from ichor.core.adversarial.acquisition import (
+    SeedLocalAdversarialAcquisition,
+    compute_reference_scales,
+)
+from ichor.core.adversarial.config import AcquisitionConfig
 from ichor.core.adversarial.stencils import directional_all_stencils
 from ichor.core.atoms import Atom, Atoms
 
@@ -377,6 +384,218 @@ def test_fused_stencils_use_batched_posterior_blocks():
     assert post.diagnostics["n_covariance_matrix_batched_calls"] >= 1
     assert post.diagnostics["n_means_scalar_fallbacks"] == 0
     assert post.diagnostics["n_covariance_matrix_scalar_fallbacks"] == 0
+
+
+@pytest.mark.parametrize("scaled", [False, True])
+def test_prepared_posterior_matches_existing_batch_contract(scaled):
+    post, rng = _make_posterior(scaled=scaled)
+    points = _points(rng, 7)
+    row_ids = [11, 13, 17, 19, 23, 29, 31]
+
+    prepared = post.prepare_points(points, row_ids=row_ids)
+
+    np.testing.assert_allclose(
+        prepared.means,
+        post.means(points),
+        atol=1.0e-10,
+        rtol=1.0e-9,
+    )
+    np.testing.assert_allclose(
+        prepared.variances,
+        post.variances(points),
+        atol=1.0e-10,
+        rtol=1.0e-9,
+    )
+    np.testing.assert_allclose(
+        prepared.covariance_matrix_by_index(row_ids),
+        post.covariance_matrix(points),
+        atol=1.0e-10,
+        rtol=1.0e-9,
+    )
+
+
+def test_prepared_posterior_spills_projections_to_memmap(tmp_path):
+    post, rng = _make_posterior(scaled=True)
+    points = _points(rng, 8)
+    features = [post._features(point) for point in points]
+    arrays = {
+        atom: post._stack_feature_rows(features, atom)
+        for atom in post._property_models
+    }
+
+    prepared = post.prepare_feature_batch(
+        arrays,
+        projection_directory=tmp_path / "projections",
+        max_resident_projection_bytes=1,
+    )
+
+    assert len(list((tmp_path / "projections").glob("projection-*.npy"))) == 3
+    assert all(
+        isinstance(values.base, np.memmap) or isinstance(values, np.memmap)
+        for values in prepared.projections.values()
+    )
+    np.testing.assert_allclose(
+        prepared.variances,
+        post.variances(points),
+        atol=1.0e-10,
+        rtol=1.0e-9,
+    )
+
+
+def test_prepared_projection_resume_reuses_completed_columns(tmp_path):
+    import gc
+
+    post, rng = _make_posterior(scaled=True)
+    points = _points(rng, 5)
+    features = [post._features(point) for point in points]
+    arrays = {
+        atom: post._stack_feature_rows(features, atom)
+        for atom in post._property_models
+    }
+    observed = []
+
+    def _interrupt(atom, start, stop):
+        observed.append((atom, start, stop))
+        raise RuntimeError("injected projection interruption")
+
+    with pytest.raises(RuntimeError, match="injected projection interruption"):
+        post.prepare_feature_batch(
+            arrays,
+            projection_directory=tmp_path / "projections",
+            max_resident_projection_bytes=1,
+            projection_progress_callback=_interrupt,
+        )
+    assert observed == [("O1", 0, 1)]
+    gc.collect()
+
+    resumed_blocks = []
+    resumed = post.prepare_feature_batch(
+        arrays,
+        projection_directory=tmp_path / "projections",
+        max_resident_projection_bytes=1,
+        projection_resume_columns={"O1": 1},
+        projection_progress_callback=lambda atom, start, stop: resumed_blocks.append(
+            (atom, start, stop)
+        ),
+    )
+
+    assert resumed_blocks[0] == ("O1", 1, 2)
+    np.testing.assert_allclose(
+        resumed.variances,
+        post.variances(points),
+        atol=1.0e-10,
+        rtol=1.0e-9,
+    )
+
+
+def test_prepared_five_point_stencil_matches_existing_path():
+    post, rng = _make_posterior(scaled=True)
+    atoms = _points(rng, 1)[0]
+    direction = np.zeros(len(atoms) * 3, dtype=float)
+    direction[2] = 1.0
+
+    existing = directional_all_stencils(post, atoms, direction, step=0.11)
+    prepared = directional_all_stencils(
+        post,
+        atoms,
+        direction,
+        step=0.11,
+        prepared=True,
+    )
+
+    np.testing.assert_allclose(prepared.means, existing.means, atol=1e-10, rtol=1e-9)
+    np.testing.assert_allclose(
+        prepared.covariance,
+        existing.covariance,
+        atol=1e-10,
+        rtol=1e-9,
+    )
+
+
+def test_prepared_reference_modes_match_legacy_and_solve_once_per_atom():
+    post, rng = _make_posterior(scaled=True)
+    atoms = _points(rng, 1)[0]
+    acquisition = SeedLocalAdversarialAcquisition.__new__(
+        SeedLocalAdversarialAcquisition
+    )
+    acquisition.posterior = post
+    acquisition.config = AcquisitionConfig()
+    acquisition.mode_directions = [
+        np.asarray([1.0, 0.0, 0.0] * len(atoms), dtype=float),
+        np.asarray([0.0, 1.0, 0.0] * len(atoms), dtype=float),
+    ]
+    acquisition.mode_steps = np.asarray([0.11, 0.13], dtype=float)
+
+    legacy = acquisition._compute_mode_evaluations(atoms)
+    before_solves = int(post.diagnostics["n_prepared_projection_solves"])
+    prepared, energy_variance = acquisition._compute_prepared_mode_evaluations(
+        atoms,
+        acquisition.mode_steps,
+    )
+
+    assert len(prepared) == len(legacy) == 2
+    for prepared_mode, legacy_mode in zip(prepared, legacy):
+        for field in prepared_mode.__dataclass_fields__:
+            assert getattr(prepared_mode, field) == pytest.approx(
+                getattr(legacy_mode, field),
+                rel=5.0e-8,
+                abs=1.0e-8,
+            )
+    assert energy_variance == pytest.approx(
+        post.variance(atoms),
+        rel=1.0e-9,
+        abs=1.0e-10,
+    )
+    assert (
+        int(post.diagnostics["n_prepared_projection_solves"]) - before_solves
+        == len(post._property_models)
+    )
+
+
+def test_complete_prepared_reference_scales_match_legacy_contract():
+    legacy_post, rng = _make_posterior(scaled=True)
+    trajectory = _points(rng, 9)
+    seed = trajectory[0]
+    config = AcquisitionConfig()
+    config = replace(
+        config,
+        stencils=replace(config.stencils, autotune_from_cubic=True),
+    )
+    legacy = compute_reference_scales(
+        models=legacy_post.models,
+        seed=seed,
+        trajectory=trajectory,
+        config=config,
+        seed_frame_id=0,
+        posterior_override=legacy_post,
+        use_prepared_reference_stencils=False,
+    )
+
+    prepared_post, _ = _make_posterior(scaled=True)
+    prepared = compute_reference_scales(
+        models=prepared_post.models,
+        seed=seed,
+        trajectory=trajectory,
+        config=config,
+        seed_frame_id=0,
+        posterior_override=prepared_post,
+        use_prepared_reference_stencils=True,
+    )
+
+    assert prepared.subspace_frame_ids == legacy.subspace_frame_ids
+    np.testing.assert_allclose(
+        prepared.tuned_mode_steps,
+        legacy.tuned_mode_steps,
+        rtol=5.0e-8,
+        atol=1.0e-10,
+    )
+    assert set(prepared.reference_scales) == set(legacy.reference_scales)
+    for key in legacy.reference_scales:
+        assert prepared.reference_scales[key] == pytest.approx(
+            legacy.reference_scales[key],
+            rel=5.0e-8,
+            abs=1.0e-10,
+        )
 
 
 def test_tolerated_negative_variances_are_clipped_and_reported():

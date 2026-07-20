@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import math
-from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from ichor.core.atoms import Atoms
@@ -22,6 +22,8 @@ from .geometry import (
 from .posterior import TotalEnergyPosterior
 from .stencils import (
     directional_all_stencils,
+    directional_stencil_points,
+    directional_stencils_from_prepared,
 )
 from .subspace import (
     LocalSubspace,
@@ -61,6 +63,34 @@ class ModeEvaluation:
     weak_mode_penalty: float = 0.0
     omega_low_threshold: float = 0.0
     omega_high_threshold: float = 0.0
+
+
+def compute_reference_scales(
+    models: Models,
+    seed: Union[str, Atoms],
+    trajectory: Union[str, Trajectory, Sequence[Atoms]],
+    config: AcquisitionConfig,
+    *,
+    seed_frame_id: Optional[int] = None,
+    posterior_override: Optional[TotalEnergyPosterior] = None,
+    preselected_neighbours: Optional[Sequence[object]] = None,
+    reference_progress: Optional[Callable[[Dict[str, object]], None]] = None,
+    use_prepared_reference_stencils: bool = False,
+) -> "SeedLocalAdversarialAcquisition":
+    """Build only the state required to evaluate iteration reference scales."""
+    return SeedLocalAdversarialAcquisition(
+        models=models,
+        seed=seed,
+        trajectory=trajectory,
+        config=config,
+        seed_frame_id=seed_frame_id,
+        external_reference_scales=None,
+        posterior_override=posterior_override,
+        preselected_neighbours=preselected_neighbours,
+        reference_progress=reference_progress,
+        use_prepared_reference_stencils=use_prepared_reference_stencils,
+        _reference_scales_only=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -212,6 +242,11 @@ class SeedLocalAdversarialAcquisition:
         external_reference_scales: Optional[Dict[str, float]] = None,
         error_calibration_model: Optional[Mapping[str, object]] = None,
         error_calibration_apply_strength: float = 0.0,
+        posterior_override: Optional[TotalEnergyPosterior] = None,
+        preselected_neighbours: Optional[Sequence[object]] = None,
+        reference_progress: Optional[Callable[[Dict[str, object]], None]] = None,
+        use_prepared_reference_stencils: bool = False,
+        _reference_scales_only: bool = False,
     ) -> None:
         """seed_frame_id is the stable trajectory pool position the seed
         was sampled from. Optional (defaults to None to preserve backward compatibility 
@@ -233,17 +268,39 @@ class SeedLocalAdversarialAcquisition:
             self.trajectory = trajectory  #TrajectoryPool-like; preserve identity
         else:
             self.trajectory = load_trajectory(trajectory)
-        self.posterior = TotalEnergyPosterior(
-            models=models,
-            property_name="iqa",
-            scaled=True,
+        self.posterior = (
+            posterior_override
+            if posterior_override is not None
+            else TotalEnergyPosterior(
+                models=models,
+                property_name="iqa",
+                scaled=True,
+            )
         )
-        neighbours = select_local_neighbours(
-            self.seed_atoms,
-            self.trajectory,
-            max_neighbours=self.config.subspace.neighbour_count,
-            deduplicate_rmsd=self.config.subspace.neighbour_deduplicate_rmsd,
+        self._reference_progress = reference_progress
+        self._use_prepared_reference_stencils = bool(
+            use_prepared_reference_stencils
         )
+        if preselected_neighbours is None:
+            def _neighbour_progress(completed: int, total: int) -> None:
+                if self._reference_progress is not None:
+                    self._reference_progress(
+                        {
+                            "stage": "reference_neighbours",
+                            "completed": int(completed),
+                            "total": int(total),
+                        }
+                    )
+
+            neighbours = select_local_neighbours(
+                self.seed_atoms,
+                self.trajectory,
+                max_neighbours=self.config.subspace.neighbour_count,
+                deduplicate_rmsd=self.config.subspace.neighbour_deduplicate_rmsd,
+                progress_callback=_neighbour_progress,
+            )
+        else:
+            neighbours = list(preselected_neighbours)
         if not neighbours:
             raise ValueError("No local neighbours could be selected around the seed geometry.")
         self.subspace = build_local_subspace(self.seed_atoms, neighbours, self.config.subspace)
@@ -256,12 +313,14 @@ class SeedLocalAdversarialAcquisition:
         )
         self._movement_band_cache: Optional[Dict[str, float]] = None
         self._movement_direction_cache: Optional[Tuple[np.ndarray, str]] = None
-        self.barrier_state = build_chemistry_barrier_state(
-            self.seed_atoms,
-            [item.atoms for item in neighbours],
-            self.posterior,
-            self.config.barrier,
-        )
+        self.barrier_state = None
+        if not bool(_reference_scales_only):
+            self.barrier_state = build_chemistry_barrier_state(
+                self.seed_atoms,
+                [item.atoms for item in neighbours],
+                self.posterior,
+                self.config.barrier,
+            )
         #Per-seed cache of autotuned FD step sizes per mode. None
         #until the first _mode_metrics call materialises them from the cubic
         #estimate; thereafter every subsequent call (including all ARIADNE
@@ -723,7 +782,7 @@ class SeedLocalAdversarialAcquisition:
             return cap_f
         return float(cap_f * (1.0 - np.exp(-value_f / cap_f)))
 
-    def _mode_metrics(self, atoms, mean_energy=None):
+    def _mode_metrics(self, atoms, mean_energy=None, *, reference_prepared=False):
         """Compute per-mode metrics. With autotune_from_cubic enabled, the
         first call refines the per-mode FD step from the cubic estimate
         and caches the tuned steps on self; subsequent calls reuse the
@@ -732,15 +791,29 @@ class SeedLocalAdversarialAcquisition:
         """
         autotune = bool(getattr(self.config.stencils, "autotune_from_cubic", False))
         if not autotune:
-            return self._compute_mode_evaluations(atoms, mean_energy)
+            return self._compute_mode_evaluations(
+                atoms,
+                mean_energy,
+                prepared=bool(reference_prepared),
+            )
         if self.tuned_mode_steps is None:
-            baseline = self._compute_mode_evaluations(atoms, mean_energy)
+            baseline = self._compute_mode_evaluations(
+                atoms,
+                mean_energy,
+                prepared=bool(reference_prepared),
+            )
             self.tuned_mode_steps = self._refine_steps_from_cubic(baseline)
             return self._compute_mode_evaluations(
-                atoms, mean_energy, override_steps=self.tuned_mode_steps,
+                atoms,
+                mean_energy,
+                override_steps=self.tuned_mode_steps,
+                prepared=bool(reference_prepared),
             )
         return self._compute_mode_evaluations(
-            atoms, mean_energy, override_steps=self.tuned_mode_steps,
+            atoms,
+            mean_energy,
+            override_steps=self.tuned_mode_steps,
+            prepared=bool(reference_prepared),
         )
 
     def _refine_steps_from_cubic(self, baseline_evaluations):
@@ -770,43 +843,169 @@ class SeedLocalAdversarialAcquisition:
             )))
         return np.asarray(tuned, dtype=float)
 
-    def _compute_mode_evaluations(self, atoms, mean_energy=None, override_steps=None):
+    def _compute_mode_evaluations(
+        self,
+        atoms,
+        mean_energy=None,
+        override_steps=None,
+        *,
+        prepared=False,
+    ):
         """Inner per-mode evaluation. Uses override_steps if provided
         (autotune path) or self.mode_steps (legacy / autotune-off path)."""
         steps = override_steps if override_steps is not None else self.mode_steps
         evaluations = []
         for idx, (direction, step) in enumerate(zip(self.mode_directions, steps)):
             step_f = float(step)
-            bundle = directional_all_stencils(self.posterior, atoms, direction, step_f)
-            force_eval = bundle.force
-            curvature_eval = bundle.curvature
-            cubic_eval = bundle.cubic
-            quartic_eval = bundle.quartic
-
-            k_hat = self._curvature_floor(curvature_eval.mean)
-            omega = float(np.sqrt(k_hat))
-            omega_std = float(curvature_eval.std / max(2.0 * omega, 1.0e-12))
-            anh = float((step_f * abs(cubic_eval.mean) + step_f * step_f * abs(quartic_eval.mean)) / max(k_hat, 1.0e-12))
-            anh_std = float((step_f * cubic_eval.std + step_f * step_f * quartic_eval.std) / max(k_hat, 1.0e-12))
-
-            evaluations.append(
-                ModeEvaluation(
-                    index=idx,
-                    force_mean=float(force_eval.mean),
-                    force_std=float(force_eval.std),
-                    curvature_mean=float(curvature_eval.mean),
-                    curvature_std=float(curvature_eval.std),
-                    omega=omega,
-                    omega_std=omega_std,
-                    cubic_mean=float(cubic_eval.mean),
-                    cubic_std=float(cubic_eval.std),
-                    quartic_mean=float(quartic_eval.mean),
-                    quartic_std=float(quartic_eval.std),
-                    anharmonicity=anh,
-                    anharmonicity_std=anh_std,
-                )
+            bundle = directional_all_stencils(
+                self.posterior,
+                atoms,
+                direction,
+                step_f,
+                prepared=bool(prepared),
             )
+            evaluations.append(self._mode_evaluation(idx, step_f, bundle))
         return tuple(evaluations)
+
+    def _mode_evaluation(self, index, step, bundle):
+        step_f = float(step)
+        force_eval = bundle.force
+        curvature_eval = bundle.curvature
+        cubic_eval = bundle.cubic
+        quartic_eval = bundle.quartic
+        k_hat = self._curvature_floor(curvature_eval.mean)
+        omega = float(np.sqrt(k_hat))
+        omega_std = float(curvature_eval.std / max(2.0 * omega, 1.0e-12))
+        anh = float(
+            (
+                step_f * abs(cubic_eval.mean)
+                + step_f * step_f * abs(quartic_eval.mean)
+            )
+            / max(k_hat, 1.0e-12)
+        )
+        anh_std = float(
+            (step_f * cubic_eval.std + step_f * step_f * quartic_eval.std)
+            / max(k_hat, 1.0e-12)
+        )
+        return ModeEvaluation(
+            index=int(index),
+            force_mean=float(force_eval.mean),
+            force_std=float(force_eval.std),
+            curvature_mean=float(curvature_eval.mean),
+            curvature_std=float(curvature_eval.std),
+            omega=omega,
+            omega_std=omega_std,
+            cubic_mean=float(cubic_eval.mean),
+            cubic_std=float(cubic_eval.std),
+            quartic_mean=float(quartic_eval.mean),
+            quartic_std=float(quartic_eval.std),
+            anharmonicity=anh,
+            anharmonicity_std=anh_std,
+        )
+
+    def _compute_prepared_mode_evaluations(
+        self,
+        atoms,
+        steps,
+        *,
+        progress_context: Optional[Mapping[str, object]] = None,
+    ):
+        """Prepare unique geometries once, then evaluate independent 5x5 blocks."""
+        unique_points = []
+        positions = {}
+        mode_records = []
+        for direction, step in zip(self.mode_directions, steps):
+            step_f = float(step)
+            _, points = directional_stencil_points(
+                atoms,
+                direction,
+                step_f,
+            )
+            row_ids = []
+            for point in points:
+                key = np.ascontiguousarray(
+                    point.coordinates,
+                    dtype=np.float64,
+                ).tobytes(order="C")
+                row_id = positions.get(key)
+                if row_id is None:
+                    row_id = len(unique_points)
+                    positions[key] = row_id
+                    unique_points.append(point)
+                row_ids.append(int(row_id))
+            mode_records.append((step_f, points, tuple(row_ids)))
+        if not unique_points:
+            return tuple(), float(self.posterior.variance(atoms))
+        progress = getattr(self, "_reference_progress", None)
+        if progress is not None and progress_context is not None:
+            progress(
+                {
+                    "stage": "reference_scales",
+                    **dict(progress_context),
+                }
+            )
+        prepared = self.posterior.prepare_points(
+            unique_points,
+            row_ids=np.arange(len(unique_points), dtype=np.int64),
+        )
+        evaluations = []
+        for index, (step_f, points, row_ids) in enumerate(mode_records):
+            bundle = directional_stencils_from_prepared(
+                prepared,
+                row_ids=row_ids,
+                points=points,
+                step=step_f,
+            )
+            evaluations.append(self._mode_evaluation(index, step_f, bundle))
+        centre_row = int(mode_records[0][2][2])
+        energy_variance = float(
+            prepared.variances_by_index([centre_row])[0]
+        )
+        return tuple(evaluations), energy_variance
+
+    def _reference_mode_metrics(
+        self,
+        atoms,
+        *,
+        sample_position: int,
+        sample_count: int,
+    ):
+        if not self._use_prepared_reference_stencils:
+            energy_variance = float(self.posterior.variance(atoms))
+            return self._mode_metrics(atoms), energy_variance
+        autotune = bool(
+            getattr(self.config.stencils, "autotune_from_cubic", False)
+        )
+        if not autotune:
+            return self._compute_prepared_mode_evaluations(
+                atoms,
+                self.mode_steps,
+                progress_context={
+                    "sample": int(sample_position),
+                    "samples": int(sample_count),
+                    "reference_pass": "fixed",
+                },
+            )
+        if self.tuned_mode_steps is None:
+            baseline, _ = self._compute_prepared_mode_evaluations(
+                atoms,
+                self.mode_steps,
+                progress_context={
+                    "sample": int(sample_position),
+                    "samples": int(sample_count),
+                    "reference_pass": "baseline",
+                },
+            )
+            self.tuned_mode_steps = self._refine_steps_from_cubic(baseline)
+        return self._compute_prepared_mode_evaluations(
+            atoms,
+            self.tuned_mode_steps,
+            progress_context={
+                "sample": int(sample_position),
+                "samples": int(sample_count),
+                "reference_pass": "tuned",
+            },
+        )
 
     def _build_reference_scales(self) -> Dict[str, float]:
         neighbours = [item.atoms for item in self.subspace.neighbours]
@@ -825,8 +1024,14 @@ class SeedLocalAdversarialAcquisition:
         residual_vals: List[float] = []
         rmsd_vals: List[float] = []
 
-        for atoms in sample_atoms:
-            energy_value = float(self.posterior.variance(atoms))
+        n_samples = int(len(sample_atoms))
+        n_modes = int(len(self.mode_directions))
+        for sample_position, atoms in enumerate(sample_atoms, start=1):
+            mode_evaluations, energy_value = self._reference_mode_metrics(
+                atoms,
+                sample_position=int(sample_position),
+                sample_count=int(n_samples),
+            )
             energy_value /= max(float(np.sqrt(max(1, len(atoms)))), 1.0e-12)
             energy_vars.append(energy_value)
             try:
@@ -837,12 +1042,27 @@ class SeedLocalAdversarialAcquisition:
                 rmsd_vals.append(aligned_mass_weighted_rmsd(self.seed_atoms, atoms))
             except Exception:
                 pass
-            for mode_eval in self._mode_metrics(atoms):
+            for mode_position, mode_eval in enumerate(mode_evaluations, start=1):
                 force_vals.append(mode_eval.force_std)
                 if float(mode_eval.curvature_mean) >= 0.0:
                     omega_vals.append(mode_eval.omega_std)
                     anh_vals.append(mode_eval.anharmonicity)
                     anh_std_vals.append(mode_eval.anharmonicity_std)
+                if self._reference_progress is not None:
+                    self._reference_progress(
+                        {
+                            "stage": "reference_scales",
+                            "sample": int(sample_position),
+                            "samples": int(n_samples),
+                            "mode": int(mode_position),
+                            "modes": int(n_modes),
+                            "reference_pass": None,
+                            "completed": int(
+                                (sample_position - 1) * n_modes + mode_position
+                            ),
+                            "total": int(n_samples * n_modes),
+                        }
+                    )
 
         floor = self.config.references.floor
 
