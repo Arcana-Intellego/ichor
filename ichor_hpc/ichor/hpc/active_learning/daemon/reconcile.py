@@ -282,6 +282,7 @@ class ReconciliationReport:
     last_phase_event_in_journal: Optional[str] = None
     last_phase_retryable: bool = False
     last_halt_event: Optional[Dict[str, Any]] = None
+    source_state_phase: Optional[str] = None
     script_inventory: Dict[str, Any] = field(default_factory=dict)
     scratch_inventory: List[Dict[str, Any]] = field(default_factory=list)
     reconcile_transactions: List[Dict[str, Any]] = field(default_factory=list)
@@ -2697,6 +2698,9 @@ def propose_recovery(
         last_phase_event_in_journal=last_phase_event,
         last_phase_retryable=last_phase_retryable,
         last_halt_event=last_halt_event,
+        source_state_phase=(
+            existing.phase.value if existing is not None else None
+        ),
         script_inventory=script_inventory,
         scratch_inventory=scratch_inventory,
         reconcile_transactions=reconcile_transactions,

@@ -2838,18 +2838,55 @@ def _sacct_row_summary(event: Dict[str, Any]) -> str:
     return " ".join(parts)
 
 
-def _journal_operator_summary(event: Dict[str, Any]) -> str:
+def _journal_operator_summary(
+    event: Dict[str, Any],
+    *,
+    previous_event: Optional[Dict[str, Any]] = None,
+) -> str:
     raw = str(event.get("event", ""))
     if raw in {"user_stop_requested", "user_stop_boundary_reached"}:
         from .daemon.stop_control import describe_stop_request
 
-        return describe_stop_request(
+        description = describe_stop_request(
             event,
             completed=raw == "user_stop_boundary_reached",
         )
+        resulting_phase = event.get("resulting_phase")
+        resulting_iteration = _event_int(event, "resulting_iteration")
+        if (
+            raw == "user_stop_boundary_reached"
+            and isinstance(resulting_phase, str)
+            and resulting_phase
+            and resulting_iteration is not None
+        ):
+            if str(event.get("mode") or "") == "after_iteration":
+                target = _event_int(event, "target_iteration")
+                if target is not None:
+                    description = "iteration " + str(target) + " completed"
+            return (
+                description
+                + "; campaign paused before "
+                + resulting_phase
+                + " iteration "
+                + str(resulting_iteration)
+            )
+        return description
     if raw in {"phase_pre_submit_intent", "phase_submitted", "sbatch"}:
         return "array submitted" if _journal_array_progress(event) else "job submitted"
     if raw == "phase_transition":
+        if (
+            isinstance(previous_event, dict)
+            and str(previous_event.get("event") or "")
+            == "user_stop_boundary_reached"
+            and str(previous_event.get("resulting_phase") or "")
+            == str(event.get("to_phase") or "")
+            and _event_int(previous_event, "resulting_iteration")
+            == _event_int(event, "iteration")
+        ):
+            return (
+                "next phase recorded for resume: "
+                + str(event.get("to_phase") or "unknown")
+            )
         return (
             "phase changed from "
             + str(event.get("from_phase") or "unknown")
@@ -3069,8 +3106,12 @@ def _format_journal_events(events: Sequence[Dict[str, Any]], *, verbose: bool) -
     if not events:
         return "Timeline\n  no matching events\n"
     rows: List[Tuple[Dict[str, Any], str, str, str, str, str]] = []
+    previous_event: Optional[Dict[str, Any]] = None
     for event in events:
-        summary = _journal_operator_summary(event) or _journal_event_label(event)
+        summary = _journal_operator_summary(
+            event,
+            previous_event=previous_event,
+        ) or _journal_event_label(event)
         phase = _event_phase(event)
         rows.append(
             (
@@ -3082,6 +3123,7 @@ def _format_journal_events(events: Sequence[Dict[str, Any]], *, verbose: bool) -
                 summary,
             )
         )
+        previous_event = event
     time_width = max(19, max(len(row[1]) for row in rows))
     iteration_width = max(6, max(len(row[2]) for row in rows))
     phase_width = max(18, max(len(row[3]) for row in rows))
@@ -6154,10 +6196,12 @@ def _reconcile_decision_payload(
         and revalidation.get("state") in {"eligible", "resumable"}
         and revalidation.get("eligible") is True
     )
+    intentionally_stopped = _is_intentionally_stopped_state(selected_state)
     runnable = (
         bool(contract_status.get("contract_ok"))
         and not blockers
         and not deep_pending
+        and not intentionally_stopped
         and selected_state.phase not in {
             CampaignPhase.HALTED,
             CampaignPhase.DONE,
@@ -6178,8 +6222,20 @@ def _reconcile_decision_payload(
         why_not_runnable.append(
             "selected phase is terminal: " + selected_state.phase.value
         )
+    if intentionally_stopped:
+        why_not_runnable.append(
+            "campaign is intentionally "
+            + _stopped_boundary_description(selected_state)
+        )
     if deep_pending:
         next_command = _reconcile_apply_command(campaign, report)
+    elif intentionally_stopped and (
+        cleanable
+        or _reconcile_has_only_explicit_cleanup_blockers(report, blockers)
+    ):
+        next_command = _reconcile_apply_command(campaign, report)
+    elif intentionally_stopped:
+        next_command = _campaign_command(campaign, "resume")
     elif runnable:
         next_command = _campaign_command(campaign, "resume")
     elif revalidation_ready or (cleanable and not blockers):
@@ -6301,6 +6357,22 @@ def _reconcile_human_reason(reason: Any) -> str:
     return mapping.get(text, text)
 
 
+def _reconcile_has_only_explicit_cleanup_blockers(
+    report: Any,
+    blockers: Sequence[str],
+) -> bool:
+    if not blockers:
+        return False
+    reasons = set(str(reason) for reason in getattr(report, "unsafe_reasons", []))
+    if ".DATA/STAGING is non-empty" not in reasons:
+        return False
+    staging_blockers = {
+        ".DATA/STAGING",
+        ".DATA/STAGING is non-empty unless --archive-staging is explicitly requested",
+    }
+    return all(str(blocker) in staging_blockers for blocker in blockers)
+
+
 def _reconcile_contract_status_label(
     state: Any,
     contract_status: Mapping[str, Any],
@@ -6325,7 +6397,10 @@ def _reconcile_result_label(
     cleanable = _reconcile_cleanable_reasons(report)
     blockers = _reconcile_hard_blockers(report, contract_status)
     phase = state.phase
-    if blockers:
+    if blockers and not _reconcile_has_only_explicit_cleanup_blockers(
+        report,
+        blockers,
+    ):
         return "blocked"
     revalidation = getattr(report, "aimall_quality_revalidation", None)
     if (
@@ -6343,6 +6418,62 @@ def _reconcile_result_label(
     if not bool(contract_status.get("contract_ok")):
         return "blocked"
     return "safe to apply"
+
+
+def _is_intentionally_stopped_state(state: Any) -> bool:
+    """Return whether *state* records a deliberate, resumable user stop."""
+    if not bool(getattr(state, "shutdown_requested", False)):
+        return False
+    phase = getattr(state, "phase", None)
+    if phase in {CampaignPhase.HALTED, CampaignPhase.DONE}:
+        return False
+    context = getattr(state, "lifecycle_context", None)
+    return bool(
+        isinstance(context, Mapping)
+        and str(context.get("disposition") or "") == "stopped"
+    )
+
+
+def _stopped_boundary_description(state: Any) -> str:
+    phase = getattr(getattr(state, "phase", None), "value", "unknown phase")
+    iteration = int(getattr(state, "iteration", 0))
+    context = getattr(state, "lifecycle_context", None)
+    details = context.get("details") if isinstance(context, Mapping) else None
+    if isinstance(details, Mapping):
+        mode = str(details.get("mode") or "")
+        target_iteration = details.get("target_iteration")
+        valid_iteration = bool(
+            isinstance(target_iteration, int)
+            and not isinstance(target_iteration, bool)
+            and target_iteration >= 0
+        )
+        if mode == "after_iteration" and valid_iteration:
+            return (
+                "paused after iteration "
+                + str(target_iteration)
+                + "; next phase is "
+                + str(phase)
+                + " iteration "
+                + str(iteration)
+            )
+        target_phase = details.get("target_phase")
+        if (
+            mode == "after_phase"
+            and isinstance(target_phase, str)
+            and target_phase
+            and valid_iteration
+        ):
+            return (
+                "paused after phase "
+                + target_phase
+                + " in iteration "
+                + str(target_iteration)
+                + "; next phase is "
+                + str(phase)
+                + " iteration "
+                + str(iteration)
+            )
+    return "paused at " + str(phase) + " iteration " + str(iteration)
 
 
 def _reconcile_apply_status(
@@ -6598,6 +6729,20 @@ def _print_reconcile_recovery_target(
     contract_status: Dict[str, Any],
 ) -> None:
     state = report.proposed_state
+    if _is_intentionally_stopped_state(state):
+        print("Paused Campaign")
+        _print_reconcile_key_values(
+            [
+                ("status", _stopped_boundary_description(state)),
+                (
+                    "next phase",
+                    state.phase.value + " iteration " + str(int(state.iteration)),
+                ),
+                ("apply", _reconcile_apply_status(report, contract_status)),
+            ]
+        )
+        print("")
+        return
     if state.phase is CampaignPhase.HALTED:
         decision = "stay HALTED"
     elif state.phase is CampaignPhase.DONE:
@@ -6668,11 +6813,22 @@ def _print_reconcile_current_position(
     print("")
 
 
-def _print_reconcile_last_failure_compact(report: Any) -> None:
+def _print_reconcile_last_failure_compact(
+    report: Any,
+    *,
+    verbose: bool = False,
+) -> None:
     event = getattr(report, "last_halt_event", None)
     if not isinstance(event, dict):
         return
-    print("Last Failure")
+    source_phase = str(getattr(report, "source_state_phase", "") or "")
+    historical = bool(
+        source_phase
+        and source_phase != CampaignPhase.HALTED.value
+    )
+    if historical and not verbose:
+        return
+    print("Resolved Historical Failure" if historical else "Last Failure")
     phase = str(event.get("from_phase") or event.get("phase") or "-")
     iteration = str(event.get("iteration", "-"))
     _print_reconcile_key_values(
@@ -6918,10 +7074,14 @@ def _print_reconcile_apply_plan_compact(
         and revalidation.get("state") in {"eligible", "resumable"}
         and revalidation.get("eligible") is True
     )
+    explicit_cleanup_available = _reconcile_has_only_explicit_cleanup_blockers(
+        report,
+        blockers,
+    )
     print("Apply Plan")
     if proposed_state_path is not None:
         print("  proposed state: " + _reconcile_relative_path(campaign, proposed_state_path))
-    if blockers:
+    if blockers and not explicit_cleanup_available:
         print("  apply: blocked")
         _print_reconcile_list("next action", ["inspect blockers before restarting"])
         print("")
@@ -6940,7 +7100,7 @@ def _print_reconcile_apply_plan_compact(
         print("    " + _reconcile_apply_command(campaign, report))
         print("")
         return
-    if cleanable:
+    if cleanable or explicit_cleanup_available:
         _print_reconcile_list(
             "if applied",
             cleanable
@@ -7040,7 +7200,7 @@ def _print_reconcile_operator_report(
         print("")
     _print_reconcile_recovery_target(report, contract_status)
     _print_reconcile_current_position(campaign, report, verbose=verbose)
-    _print_reconcile_last_failure_compact(report)
+    _print_reconcile_last_failure_compact(report, verbose=verbose)
     _print_reconcile_aimall_quality_revalidation(report)
     _print_reconcile_safety(campaign, report, contract_status)
     if verbose:
@@ -7094,6 +7254,7 @@ def _print_reconcile_applied_operator_report(
     archived: Sequence[str],
     archived_reference_data_staging: Sequence[str],
     restored_bootstrap_handoff: Sequence[str],
+    environment_transition_deferred: bool = False,
     verbose: bool = False,
 ) -> None:
     _print_reconcile_header(campaign, mode="apply", result="applied")
@@ -7127,7 +7288,27 @@ def _print_reconcile_applied_operator_report(
         )
     _print_reconcile_list("cleanup", cleanup_items)
     final_phase = report.proposed_state.phase
+    intentionally_stopped = _is_intentionally_stopped_state(
+        report.proposed_state
+    )
+    if environment_transition_deferred:
+        print("Environment Validation")
+        _print_reconcile_key_values(
+            [
+                (
+                    "status",
+                    "deferred until resume clears the completed stop",
+                )
+            ]
+        )
+        print("")
     if bool(contract_status.get("contract_ok")) and final_phase not in {CampaignPhase.HALTED, CampaignPhase.DONE}:
+        if intentionally_stopped:
+            print(
+                "Campaign remains "
+                + _stopped_boundary_description(report.proposed_state)
+                + "."
+            )
         _print_reconcile_list(
             "next",
             [_campaign_command(campaign, "resume")],
@@ -7167,6 +7348,50 @@ def _print_reconcile_apply_blocked(
         for action in next_actions:
             print("    - " + str(action), file=sys.stderr)
     print("", file=sys.stderr)
+
+
+def _advance_environment_after_reconcile(
+    campaign: Path,
+    state: CampaignState,
+    config: CampaignConfig,
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Advance environment identity, or defer it for an intentional stop."""
+    if _is_intentionally_stopped_state(state):
+        return None, True
+
+    from .execution_identity import (
+        advance_environment_generation,
+        execution_identity_path,
+        read_execution_identity,
+    )
+
+    if not execution_identity_path(campaign).is_file():
+        return None, False
+    identity = read_execution_identity(
+        campaign,
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+    live_preflight_ok = True
+    if str(identity["mode"]) == "live":
+        availability = check_backends()
+        preflight = evaluate_campaign_preflight(
+            campaign,
+            config=config,
+            avail=availability,
+        )
+        live_preflight_ok = bool(preflight.get("ready", False))
+        if not live_preflight_ok:
+            details = _preflight_failure_details(preflight)
+            raise ValueError(
+                "live backend preflight failed: " + "; ".join(details[:8])
+            )
+    transition = advance_environment_generation(
+        campaign,
+        config=config,
+        live_preflight_ok=live_preflight_ok,
+        scheduler_ownership_clear=True,
+    )
+    return transition, False
 
 
 def _scratch_intent_index(campaign: Path) -> Dict[str, Dict[str, Any]]:
@@ -8307,7 +8532,15 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         )
         return 9
 
-    cleanable_now = [_reconcile_human_reason(item) for item in _reconcile_cleanable_reasons(report)]
+    cleanable_now = [
+        _reconcile_human_reason(item)
+        for item in _reconcile_cleanable_reasons(report)
+    ]
+    if data_staging_archive_mode is not None:
+        cleanable_now = [
+            item for item in cleanable_now if not item.startswith(".DATA/STAGING")
+        ]
+        cleanable_now.append("archive .DATA/STAGING")
     if cleanable_now:
         print("Apply Plan")
         _print_reconcile_list(
@@ -8880,40 +9113,15 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 9
-    environment_transition = None
     try:
-        from .execution_identity import (
-            advance_environment_generation,
-            execution_identity_path,
-            read_execution_identity,
+        (
+            environment_transition,
+            environment_transition_deferred,
+        ) = _advance_environment_after_reconcile(
+            campaign,
+            report.proposed_state,
+            config,
         )
-
-        if execution_identity_path(campaign).is_file():
-            identity = read_execution_identity(
-                campaign,
-                expected_campaign_uid=str(report.proposed_state.campaign_uid),
-            )
-            live_preflight_ok = True
-            if str(identity["mode"]) == "live":
-                availability = check_backends()
-                preflight = evaluate_campaign_preflight(
-                    campaign,
-                    config=config,
-                    avail=availability,
-                )
-                live_preflight_ok = bool(preflight.get("ready", False))
-                if not live_preflight_ok:
-                    details = _preflight_failure_details(preflight)
-                    raise ValueError(
-                        "live backend preflight failed: "
-                        + "; ".join(details[:8])
-                    )
-            environment_transition = advance_environment_generation(
-                campaign,
-                config=config,
-                live_preflight_ok=live_preflight_ok,
-                scheduler_ownership_clear=True,
-            )
     except Exception as exc:
         print(
             "reconcile recovery was committed, but automatic environment "
@@ -8954,6 +9162,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         archived=archived,
         archived_reference_data_staging=archived_reference_data_staging,
         restored_bootstrap_handoff=restored_bootstrap_handoff,
+        environment_transition_deferred=environment_transition_deferred,
         verbose=bool(getattr(args, "verbose", False)),
     )
     return 0
@@ -9859,6 +10068,13 @@ def _preflight_payload(
     return payload
 
 
+def _preflight_reports_intentional_pause(payload: Mapping[str, Any]) -> bool:
+    state = payload.get("campaign_state")
+    if not isinstance(state, Mapping):
+        return False
+    return "campaign is intentionally paused" in str(state.get("error") or "")
+
+
 def _preflight_failure_details(payload: Dict[str, Any]) -> List[str]:
     details: List[str] = []
     missing = payload.get("missing_backends")
@@ -9909,10 +10125,19 @@ def _preflight_failure_details(payload: Dict[str, Any]) -> List[str]:
         )
     state = payload.get("campaign_state")
     if isinstance(state, dict) and not bool(state.get("ok", False)):
-        details.append(
-            "fix campaign state readiness: "
-            + str(state.get("error") or state.get("phase") or "state is not runnable")
-        )
+        if _preflight_reports_intentional_pause(payload):
+            details.append(
+                "resume the campaign to clear the completed stop"
+            )
+        else:
+            details.append(
+                "fix campaign state readiness: "
+                + str(
+                    state.get("error")
+                    or state.get("phase")
+                    or "state is not runnable"
+                )
+            )
     submitted_smoke = payload.get("submitted_environment_smoke")
     if isinstance(submitted_smoke, dict) and not bool(submitted_smoke.get("ok", False)):
         details.append(
@@ -10070,9 +10295,10 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
 
     lines.append("")
     lines.append("Campaign State")
+    intentionally_paused = _preflight_reports_intentional_pause(payload)
     lines.append(
         _preflight_check_line(
-            "runnable state",
+            "campaign pause" if intentionally_paused else "runnable state",
             state.get("ok"),
             state.get("error")
             or (
@@ -10080,6 +10306,7 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
                 + " iteration "
                 + str(state.get("iteration"))
             ),
+            warn=intentionally_paused,
         )
     )
     if state.get("contract_error"):
@@ -10136,9 +10363,13 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
         if command:
             lines.append("    " + str(command))
     else:
-        lines.append("  fix failed checks before live start")
+        lines.append("  " + str(payload.get("next_action")))
+        command = payload.get("_presentation_next_command")
+        if command:
+            lines.append("    " + str(command))
         for detail in _preflight_failure_details(payload)[:12]:
-            lines.append("  - " + detail)
+            if detail != str(payload.get("next_action")):
+                lines.append("  - " + detail)
     if verbose and not payload.get("ready") and not payload.get("all_backends_present"):
         lines.append("")
         lines.append("Backend Details")
@@ -10152,6 +10383,11 @@ def _preflight_launch_advice(
     payload: Dict[str, Any],
 ) -> Tuple[str, Optional[str]]:
     if not bool(payload.get("ready", False)):
+        if _preflight_reports_intentional_pause(payload):
+            return (
+                "resume the campaign to clear the completed stop",
+                _campaign_command(campaign, "resume"),
+            )
         return "fix failed checks before live start", None
     paths = _campaign_paths(campaign)
     lock = _probe_daemon_lock(paths["lock"])
@@ -10371,7 +10607,12 @@ def evaluate_campaign_preflight(
             if state.phase is CampaignPhase.DONE:
                 raise ValueError("campaign is DONE")
             if state.shutdown_requested:
-                raise ValueError("campaign has a user stop request")
+                if _is_intentionally_stopped_state(state):
+                    raise ValueError(
+                        "campaign is intentionally paused; resume clears the "
+                        "completed stop"
+                    )
+                raise ValueError("campaign has an invalid shutdown request")
             from .daemon.artifact_contracts import state_artifact_contract_status
 
             preflight_snapshot = build_committed_artifact_snapshot(

@@ -2779,6 +2779,209 @@ def test_journal_queue_lifecycle_names_scheduler_and_local_work_separately(
     assert cli_mod._journal_operator_summary(event) == expected
 
 
+def test_journal_completed_iteration_stop_describes_the_paused_boundary():
+    stop_event = {
+        "event": "user_stop_boundary_reached",
+        "mode": "after_iteration",
+        "target_iteration": 1,
+        "resulting_phase": CampaignPhase.SEED_SELECT.value,
+        "resulting_iteration": 2,
+    }
+    transition_event = {
+        "event": "phase_transition",
+        "from_phase": CampaignPhase.STOP_CHECK.value,
+        "to_phase": CampaignPhase.SEED_SELECT.value,
+        "iteration": 2,
+    }
+
+    output = cli_mod._format_journal_events(
+        [stop_event, transition_event],
+        verbose=False,
+    )
+
+    assert (
+        "iteration 1 completed; campaign paused before SEED_SELECT iteration 2"
+        in output
+    )
+    assert "next phase recorded for resume: SEED_SELECT" in output
+    assert "phase changed from STOP_CHECK" not in output
+
+
+def _intentionally_stopped_seed_select_state():
+    state = fresh_campaign_state(max_iterations=40)
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 2
+    state.shutdown_requested = True
+    state.lifecycle_context = make_lifecycle_context(
+        disposition="stopped",
+        reason_code="user_stop_boundary_reached",
+        message="stopped after iteration 1",
+        from_phase=CampaignPhase.STOP_CHECK,
+        iteration=2,
+        source="daemon_stop_control",
+        recovery_action="use resume to continue",
+        details={"mode": "after_iteration", "target_iteration": 1},
+    )
+    return state
+
+
+def test_reconcile_defers_environment_transition_for_completed_stop(
+    tmp_path,
+    monkeypatch,
+):
+    state = _intentionally_stopped_seed_select_state()
+
+    def unexpected_backend_check():
+        raise AssertionError("stopped reconcile must not run backend preflight")
+
+    monkeypatch.setattr(cli_mod, "check_backends", unexpected_backend_check)
+
+    transition, deferred = cli_mod._advance_environment_after_reconcile(
+        tmp_path,
+        state,
+        CampaignConfig(),
+    )
+
+    assert transition is None
+    assert deferred is True
+
+
+def test_reconcile_stopped_state_is_not_runnable_and_hides_resolved_halt(
+    tmp_path,
+    capsys,
+):
+    state = _intentionally_stopped_seed_select_state()
+    report = SimpleNamespace(
+        proposed_state=state,
+        source_state_phase=CampaignPhase.SEED_SELECT.value,
+        last_halt_event={
+            "event": "halt",
+            "from_phase": CampaignPhase.ALLOCATION_CHECK.value,
+            "iteration": 1,
+            "reason": "resolved allocation failure",
+        },
+        unsafe_reasons=[],
+        blocking_artifacts=[],
+        active_submission_intents=[],
+        decision="STOPPED: existing user stop request remains authoritative",
+    )
+    contract = {
+        "contract_ok": True,
+        "selected_phase": CampaignPhase.SEED_SELECT.value,
+        "missing_or_invalid_inputs": [],
+    }
+
+    payload = cli_mod._reconcile_decision_payload(tmp_path, report, contract)
+    cli_mod._print_reconcile_recovery_target(report, contract)
+    cli_mod._print_reconcile_last_failure_compact(report)
+    concise = capsys.readouterr().out
+
+    assert payload["runnable"] is False
+    assert payload["next_command"].startswith("ichor-al-daemon resume ")
+    assert "intentionally paused after iteration 1" in payload["why_not_runnable"][-1]
+    assert "Paused Campaign" in concise
+    assert "paused after iteration 1" in concise
+    assert "Last Failure" not in concise
+
+    cli_mod._print_reconcile_last_failure_compact(report, verbose=True)
+    verbose = capsys.readouterr().out
+    assert "Resolved Historical Failure" in verbose
+    assert "resolved allocation failure" in verbose
+
+
+def test_reconcile_applied_report_explains_deferred_environment_check(
+    tmp_path,
+    capsys,
+):
+    state = _intentionally_stopped_seed_select_state()
+    report = SimpleNamespace(
+        proposed_state=state,
+        unsafe_reasons=[],
+        blocking_artifacts=[],
+        active_submission_intents=[],
+        decision="STOPPED: existing user stop request remains authoritative",
+    )
+    contract = {
+        "contract_ok": True,
+        "selected_phase": CampaignPhase.SEED_SELECT.value,
+        "missing_or_invalid_inputs": [],
+    }
+
+    cli_mod._print_reconcile_applied_operator_report(
+        tmp_path,
+        report,
+        contract,
+        backup_path=None,
+        applied_proposal_path=None,
+        removed=[],
+        removed_model_staging=[],
+        archived_scripts=[],
+        archived=[str(tmp_path / ".DATA" / "STAGING.archived-test")],
+        archived_reference_data_staging=[],
+        restored_bootstrap_handoff=[],
+        environment_transition_deferred=True,
+    )
+    output = capsys.readouterr().out
+
+    assert "Recovery result: applied" in output
+    assert "deferred until resume clears the completed stop" in output
+    assert "Campaign remains paused after iteration 1" in output
+    assert "ichor-al-daemon resume" in output
+
+
+def test_reconcile_preview_offers_explicit_staging_archive_command(
+    tmp_path,
+    capsys,
+):
+    report = SimpleNamespace(
+        proposed_state=_intentionally_stopped_seed_select_state(),
+        unsafe_reasons=[".DATA/STAGING is non-empty"],
+        blocking_artifacts=[".DATA/STAGING"],
+        active_submission_intents=[],
+    )
+    contract = {
+        "contract_ok": True,
+        "selected_phase": CampaignPhase.SEED_SELECT.value,
+        "missing_or_invalid_inputs": [],
+    }
+
+    assert cli_mod._reconcile_result_label(report, contract) == "safe to apply"
+    cli_mod._print_reconcile_apply_plan_compact(
+        tmp_path,
+        report,
+        contract,
+        proposed_state_path=tmp_path / ".DATA" / "state.json.proposed",
+    )
+    output = capsys.readouterr().out
+
+    assert "--archive-staging --apply" in output
+    assert "inspect blockers before restarting" not in output
+
+
+def test_preflight_describes_completed_stop_as_pause_not_backend_failure(tmp_path):
+    payload = {
+        "ready": False,
+        "campaign_state": {
+            "ok": False,
+            "error": (
+                "ValueError: campaign is intentionally paused; resume clears "
+                "the completed stop"
+            ),
+        },
+    }
+
+    action, command = cli_mod._preflight_launch_advice(tmp_path, payload)
+    payload["next_action"] = action
+    payload["_presentation_next_command"] = command
+    output = cli_mod._format_preflight(payload)
+
+    assert action == "resume the campaign to clear the completed stop"
+    assert command is not None and "ichor-al-daemon resume" in command
+    assert cli_mod._preflight_failure_details(payload) == [action]
+    assert "[WARN] campaign pause" in output
+    assert "fix campaign state readiness" not in output
+
+
 def test_cli_journal_json_prints_filtered_events(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
