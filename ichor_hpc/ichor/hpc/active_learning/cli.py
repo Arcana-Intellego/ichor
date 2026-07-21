@@ -2180,6 +2180,28 @@ def _status_progress_rows(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
     return rows
 
 
+def _round_journal_seconds(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(seconds):
+        return None
+    if seconds >= 0.0:
+        return int(np.floor(seconds + 0.5))
+    return int(np.ceil(seconds - 0.5))
+
+
+def _format_journal_detail_value(key: str, value: Any) -> str:
+    if str(key).endswith("_seconds"):
+        rounded = _round_journal_seconds(value)
+        if rounded is not None:
+            return str(rounded)
+    return _format_value(value)
+
+
 def _format_seed_selection_progress(record: Dict[str, Any]) -> str:
     stage = str(record.get("stage") or "loading")
     completed = _event_int(record, "completed")
@@ -2190,12 +2212,8 @@ def _format_seed_selection_progress(record: Dict[str, Any]) -> str:
         else ""
     )
     details: List[str] = []
-    try:
-        elapsed = float(record.get("elapsed_seconds"))
-    except (TypeError, ValueError):
-        elapsed = -1.0
-    if np.isfinite(elapsed) and elapsed >= 1.0:
-        elapsed_seconds = int(elapsed)
+    elapsed_seconds = _round_journal_seconds(record.get("elapsed_seconds"))
+    if elapsed_seconds is not None and elapsed_seconds >= 1:
         hours, remainder = divmod(elapsed_seconds, 3600)
         minutes, seconds = divmod(remainder, 60)
         details.append(
@@ -2206,19 +2224,6 @@ def _format_seed_selection_progress(record: Dict[str, Any]) -> str:
             )
             + " elapsed"
         )
-    try:
-        throughput = float(record.get("throughput_per_second"))
-    except (TypeError, ValueError):
-        throughput = -1.0
-    if np.isfinite(throughput) and throughput > 0.0:
-        unit = {
-            "d_optimal": "seeds/s",
-            "random": "seeds/s",
-            "publishing": "seeds/s",
-            "reference_scales": "modes/s",
-            "loading": "items/s",
-        }.get(stage, "frames/s")
-        details.append(format(throughput, ".2f") + " " + unit)
     progress_suffix = " (" + ", ".join(details) + ")" if details else ""
 
     def _finish(message: str) -> str:
@@ -3305,6 +3310,28 @@ def _event_iteration(event: Dict[str, Any]) -> str:
 
 _CAMPAIGN_PHASE_VALUES = frozenset(phase.value for phase in CampaignPhase)
 
+_JOURNAL_CONTEXT_WIDTH = len(CampaignPhase.PHASE_A_DIVERSITY.value)
+_JOURNAL_PHASE_CONTEXT_ALIASES = {
+    CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN.value: "INIT_REPL_GAUSS",
+    CampaignPhase.INITIAL_REPLACEMENT_AIMALL.value: "INIT_REPL_AIMALL",
+    CampaignPhase.INITIAL_ALLOCATION_CHECK.value: "INIT_ALLOC_CHECK",
+    CampaignPhase.REPLACEMENT_GAUSSIAN.value: "REPL_GAUSSIAN",
+    CampaignPhase.REPLACEMENT_AIMALL.value: "REPL_AIMALL",
+}
+_JOURNAL_OVERWIDTH_PHASES = frozenset(
+    value
+    for value in _CAMPAIGN_PHASE_VALUES
+    if len(value) > _JOURNAL_CONTEXT_WIDTH
+)
+if set(_JOURNAL_PHASE_CONTEXT_ALIASES) != set(_JOURNAL_OVERWIDTH_PHASES):
+    raise RuntimeError("journal context aliases do not cover every long phase")
+_JOURNAL_RENDERED_CONTEXTS = frozenset(
+    _JOURNAL_PHASE_CONTEXT_ALIASES.get(value, value)
+    for value in _CAMPAIGN_PHASE_VALUES
+) | frozenset(JOURNAL_EVENT_CONTEXTS.values()) | {"UNCLASSIFIED"}
+if any(len(value) > _JOURNAL_CONTEXT_WIDTH for value in _JOURNAL_RENDERED_CONTEXTS):
+    raise RuntimeError("journal context exceeds the presentation width")
+
 
 def _event_context(event: Dict[str, Any]) -> str:
     raw = str(event.get("event") or "")
@@ -3312,7 +3339,7 @@ def _event_context(event: Dict[str, Any]) -> str:
         for key in ("phase", "to_phase", "from_phase"):
             value = event.get(key)
             if isinstance(value, str) and value in _CAMPAIGN_PHASE_VALUES:
-                return value
+                return _JOURNAL_PHASE_CONTEXT_ALIASES.get(value, value)
     return JOURNAL_EVENT_CONTEXTS.get(raw, "UNCLASSIFIED")
 
 
@@ -4022,6 +4049,11 @@ def _journal_operator_summary(
     return ""
 
 
+_JOURNAL_THROUGHPUT_FIELDS = frozenset(
+    {"throughput", "throughput_per_second", "throughput_per_s"}
+)
+
+
 def _compact_event_details(event: Dict[str, Any]) -> str:
     detail_keys = [
         ("job_id", "job"),
@@ -4040,7 +4072,6 @@ def _compact_event_details(event: Dict[str, Any]) -> str:
         ("shards_reused", "shards_reused"),
         ("shards_repaired", "shards_repaired"),
         ("elapsed_seconds", "elapsed_s"),
-        ("throughput", "throughput_per_s"),
         ("pool_n_frames", "pool"),
         ("required_pool_frames", "required"),
         ("action", "action"),
@@ -4056,7 +4087,7 @@ def _compact_event_details(event: Dict[str, Any]) -> str:
         if key in event and event.get(key) is not None:
             if label in seen_labels:
                 continue
-            value = _format_value(event.get(key))
+            value = _format_journal_detail_value(key, event.get(key))
             if key == "campaign_uid" and len(value) > 8:
                 value = value[:8]
             if key in {"reason", "error"} and len(value) > 90:
@@ -4110,9 +4141,9 @@ def _verbose_event_details(event: Dict[str, Any]) -> str:
     }
     parts = ["raw=" + raw]
     for key in sorted(event):
-        if key in skip:
+        if key in skip or key in _JOURNAL_THROUGHPUT_FIELDS:
             continue
-        value = _format_value(event[key])
+        value = _format_journal_detail_value(key, event[key])
         if len(value) > 60:
             value = value[:57] + "..."
         parts.append(str(key) + "=" + value)
@@ -4189,11 +4220,7 @@ def _format_journal_events(events: Sequence[Dict[str, Any]], *, verbose: bool) -
         previous_event = event
     time_width = max(19, max(len(row[1]) for row in rows))
     iteration_width = max(6, max(len(row[2]) for row in rows))
-    context_width = max(
-        len("UNCLASSIFIED"),
-        max(len(value) for value in _CAMPAIGN_PHASE_VALUES),
-        max(len(value) for value in JOURNAL_EVENT_CONTEXTS.values()),
-    )
+    context_width = _JOURNAL_CONTEXT_WIDTH
 
     lines: List[str] = ["Timeline"]
     for event, event_time, iteration, context, severity, summary in rows:

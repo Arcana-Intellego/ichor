@@ -3095,11 +3095,8 @@ def test_cli_journal_left_justifies_columns_for_long_events(tmp_path, capsys):
     assert lines[1].index("iter=0") == lines[2].index("iter=12")
     assert lines[1].index("PHASE_A_DIVERSITY") == lines[2].index("INITIAL_GAUSSIAN")
     assert lines[1].index("job submitted") == lines[2].index("waiting for accounting")
-    context_width = max(
-        max(len(phase.value) for phase in CampaignPhase),
-        max(len(value) for value in cli_mod.JOURNAL_EVENT_CONTEXTS.values()),
-        len("UNCLASSIFIED"),
-    )
+    context_width = len(CampaignPhase.PHASE_A_DIVERSITY.value)
+    assert cli_mod._JOURNAL_CONTEXT_WIDTH == context_width
     assert (
         lines[1].index("iter=0") - lines[1].index("PHASE_A_DIVERSITY")
         == context_width + 3
@@ -3115,6 +3112,103 @@ def test_cli_journal_left_justifies_columns_for_long_events(tmp_path, capsys):
     assert "Slurm job is still active" not in lines[2]
     assert "total=4 completed=- running=- pending=-" in lines[2]
     assert "missing=2" in lines[2]
+
+
+def test_journal_context_aliases_cover_every_overwidth_phase():
+    expected = {
+        "INITIAL_REPLACEMENT_GAUSSIAN": "INIT_REPL_GAUSS",
+        "INITIAL_REPLACEMENT_AIMALL": "INIT_REPL_AIMALL",
+        "INITIAL_ALLOCATION_CHECK": "INIT_ALLOC_CHECK",
+        "REPLACEMENT_GAUSSIAN": "REPL_GAUSSIAN",
+        "REPLACEMENT_AIMALL": "REPL_AIMALL",
+    }
+    assert cli_mod._JOURNAL_PHASE_CONTEXT_ALIASES == expected
+    assert set(expected) == {
+        phase.value
+        for phase in CampaignPhase
+        if len(phase.value) > cli_mod._JOURNAL_CONTEXT_WIDTH
+    }
+    assert max(len(value) for value in cli_mod._JOURNAL_RENDERED_CONTEXTS) == (
+        cli_mod._JOURNAL_CONTEXT_WIDTH
+    )
+
+
+@pytest.mark.parametrize(
+    ("phase", "alias"),
+    [
+        ("INITIAL_REPLACEMENT_GAUSSIAN", "INIT_REPL_GAUSS"),
+        ("INITIAL_REPLACEMENT_AIMALL", "INIT_REPL_AIMALL"),
+        ("INITIAL_ALLOCATION_CHECK", "INIT_ALLOC_CHECK"),
+        ("REPLACEMENT_GAUSSIAN", "REPL_GAUSSIAN"),
+        ("REPLACEMENT_AIMALL", "REPL_AIMALL"),
+    ],
+)
+def test_journal_renders_short_phase_context_aliases(phase, alias):
+    event = {
+        "event": "phase_activity_progress",
+        "phase": phase,
+        "iteration": 12,
+        "stage": "scheduler_wait",
+    }
+
+    assert cli_mod._event_context(event) == alias
+    line = cli_mod._format_journal_events([event], verbose=False).splitlines()[1]
+    assert alias in line
+    assert phase not in line
+    assert line.index("iter=12") - line.index(alias) == (
+        cli_mod._JOURNAL_CONTEXT_WIDTH + 3
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (12.49, 12),
+        (12.5, 13),
+        (12.99, 13),
+        (59.6, 60),
+        (3599.6, 3600),
+    ],
+)
+def test_journal_rounds_finite_seconds_half_up(value, expected):
+    assert cli_mod._round_journal_seconds(value) == expected
+
+
+def test_journal_rounds_time_details_and_hides_all_throughput():
+    event = {
+        "event": "phase_activity_progress",
+        "phase": "AIMALL",
+        "iteration": 2,
+        "stage": "scientific_quality",
+        "status": "running",
+        "elapsed_seconds": 59.6,
+        "stage_elapsed_seconds": 12.5,
+        "throughput": 0.5,
+        "throughput_per_second": 0.75,
+        "throughput_per_s": 0.25,
+    }
+
+    default = cli_mod._format_journal_events([event], verbose=False)
+    verbose = cli_mod._format_journal_events([event], verbose=True)
+
+    assert "elapsed_s=60" in default
+    assert "stage_elapsed_seconds=13" in verbose
+    assert "elapsed_seconds=60" in verbose
+    for output in (default, verbose):
+        assert "throughput" not in output
+        assert "frames/s" not in output
+        assert "modes/s" not in output
+        assert "seeds/s" not in output
+    assert event["elapsed_seconds"] == 59.6
+    assert event["stage_elapsed_seconds"] == 12.5
+    assert event["throughput"] == 0.5
+
+
+def test_journal_malformed_seconds_remain_safely_renderable():
+    assert (
+        cli_mod._format_journal_detail_value("elapsed_seconds", "unknown")
+        == "unknown"
+    )
 
 
 def test_journal_only_renders_exact_non_negative_iterations():
@@ -3224,24 +3318,34 @@ def test_cli_journal_aggregates_repetitive_seed_events_by_default(
     assert verbose_output.count("ARIADNE task salvaged") == 3
 
 
-def test_cli_journal_json_keeps_raw_event_names(tmp_path, capsys):
+@pytest.mark.parametrize("machine_flag", ["--json", "--raw"])
+def test_cli_journal_machine_output_keeps_raw_event_payload(
+    tmp_path,
+    capsys,
+    machine_flag,
+):
     campaign = _campaign_with_config(tmp_path)
     (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
     journal = campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson"
     append_event(
         journal,
         "sacct_rows_missing_but_squeue_active",
-        phase="INITIAL_GAUSSIAN",
+        phase="INITIAL_REPLACEMENT_GAUSSIAN",
         iteration=12,
         job_id="16175294",
+        elapsed_seconds=12.5,
+        throughput=0.75,
         ts="2026-06-27T14:42:55+00:00",
     )
 
-    rc = main(["journal", "--campaign-dir", str(campaign), "--json"])
+    rc = main(["journal", "--campaign-dir", str(campaign), machine_flag])
 
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["event"] == "sacct_rows_missing_but_squeue_active"
+    assert payload["phase"] == "INITIAL_REPLACEMENT_GAUSSIAN"
+    assert payload["elapsed_seconds"] == 12.5
+    assert payload["throughput"] == 0.75
 
 
 def test_cli_journal_unknown_event_gets_readable_fallback_label(tmp_path, capsys):

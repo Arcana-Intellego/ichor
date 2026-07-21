@@ -555,6 +555,19 @@ def test_status_uses_current_seed_selection_progress(tmp_path):
             "reference_pass": "tuned",
         }
     ) == "Computing reference scales: sample 14/24, tuned stencils."
+    assert cli._format_seed_selection_progress(
+        {
+            "stage": "d_optimal",
+            "completed": 73,
+            "total": 160,
+            "shortlist_size": 1280,
+            "elapsed_seconds": 59.6,
+            "throughput_per_second": 4.25,
+        }
+    ) == (
+        "Selecting D-optimal seeds 73/160 from 1280 shortlisted frames "
+        "(1m 00s elapsed)."
+    )
 
     reporter.finish(selection_published=True)
     completed = cli._load_seed_selection_progress_status(campaign, state, runtime)
