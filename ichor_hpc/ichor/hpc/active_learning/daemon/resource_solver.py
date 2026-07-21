@@ -571,17 +571,44 @@ def _phase_b_evidence_with_config(
         campaign_dir,
         active_iteration_dir(campaign_dir, int(iteration)),
     )
-    protocol = load_sampling_protocol(
-        campaign_dir,
-        config,
-        iteration=int(iteration),
-    )
-    payload, frames, records = ariadne_candidate_frames(
-        iter_dir,
-        expected_iteration=int(iteration),
-        expected_config_sha256=config_fingerprint(canonical_config(config)),
-        require_batch_decision=True,
-    )
+    results_path = ariadne_results_path(iter_dir)
+    decision_path = ariadne_batch_decision_path(iter_dir)
+    for label, control_path in (
+        ("ARIADNE results manifest", results_path),
+        ("ARIADNE batch decision", decision_path),
+    ):
+        if control_path.is_symlink():
+            raise ResourceEvidenceInvalid(
+                "PHASE_B_DIVERSITY",
+                label + " is a symlink: " + str(control_path),
+            )
+        if not control_path.is_file():
+            raise ResourceEvidenceUnavailable(
+                "PHASE_B_DIVERSITY",
+                label + " is not yet published: " + str(control_path),
+            )
+    try:
+        protocol = load_sampling_protocol(
+            campaign_dir,
+            config,
+            iteration=int(iteration),
+        )
+        payload, frames, records = ariadne_candidate_frames(
+            iter_dir,
+            expected_iteration=int(iteration),
+            expected_config_sha256=config_fingerprint(canonical_config(config)),
+            require_batch_decision=True,
+        )
+    except (ResourceEvidenceUnavailable, ResourceEvidenceInvalid):
+        raise
+    except FileNotFoundError as exc:
+        raise ResourceEvidenceInvalid(
+            "PHASE_B_DIVERSITY",
+            "published ARIADNE handoff is missing accepted evidence: "
+            + type(exc).__name__
+            + ": "
+            + str(exc),
+        ) from exc
     frames, records, safety_filter = _phase_b_landing_safety_filter(
         frames,
         records,
@@ -607,8 +634,8 @@ def _phase_b_evidence_with_config(
             protocol_files.append(_file_evidence(Path(path)))
     return {
         "source": "validated_phase_b_handoff",
-        "manifest": _file_evidence(ariadne_results_path(iter_dir)),
-        "batch_decision": _file_evidence(ariadne_batch_decision_path(iter_dir)),
+        "manifest": _file_evidence(results_path),
+        "batch_decision": _file_evidence(decision_path),
         "sampling_protocol_files": protocol_files,
         "accepted_result_files": result_files,
         "accepted_seed_ids": [int(record["seed_id"]) for record in records],

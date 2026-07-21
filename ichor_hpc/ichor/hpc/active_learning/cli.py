@@ -2195,6 +2195,10 @@ def _round_journal_seconds(value: Any) -> Optional[int]:
 
 
 def _format_journal_detail_value(key: str, value: Any) -> str:
+    if str(key) in {"reason", "error"} and (
+        "resource implementation ICHOR package tree has drifted" in str(value)
+    ):
+        return "ICHOR installation changed after this Slurm work was prepared"
     if str(key).endswith("_seconds"):
         rounded = _round_journal_seconds(value)
         if rounded is not None:
@@ -3931,6 +3935,29 @@ def _journal_operator_summary(
             + " cache "
             + str(event.get("cache_status") or "updated").replace("_", " ")
         )
+    if raw == "reconcile_applied":
+        accepted = _event_int(event, "ariadne_accepted_tasks")
+        rejected = _event_int(event, "ariadne_rejected_tasks")
+        resubmitted = _event_int(event, "ariadne_tasks_resubmitted")
+        if accepted is not None and rejected is not None and resubmitted is not None:
+            rejected_text = (
+                "no rejected tasks"
+                if rejected == 0
+                else str(rejected) + " rejected tasks excluded"
+            )
+            resubmitted_text = (
+                "no ARIADNE jobs resubmitted"
+                if resubmitted == 0
+                else str(resubmitted) + " ARIADNE tasks resubmitted"
+            )
+            return (
+                "reconcile applied; reusing "
+                + str(accepted)
+                + " accepted ARIADNE results, "
+                + rejected_text
+                + ", "
+                + resubmitted_text
+            )
     if raw in {"user_stop_requested", "user_stop_boundary_reached"}:
         from .daemon.stop_control import describe_stop_request
 
@@ -8489,6 +8516,29 @@ def _print_reconcile_partial_array(campaign: Path, report: Any) -> None:
     print("")
 
 
+def _print_reconcile_ariadne_reuse(report: Any) -> None:
+    summary = getattr(report, "ariadne_results_recovery", None)
+    if not isinstance(summary, Mapping) or not summary:
+        return
+    print("ARIADNE Handoff")
+    _print_reconcile_key_values(
+        [
+            ("accepted results", int(summary.get("accepted_tasks") or 0)),
+            (
+                "rejected tasks",
+                str(int(summary.get("rejected_tasks") or 0))
+                + " excluded from Phase B",
+            ),
+            (
+                "missing rejected outputs",
+                int(summary.get("missing_rejected_outputs") or 0),
+            ),
+            ("ARIADNE tasks to resubmit", 0),
+        ]
+    )
+    print("")
+
+
 def _print_reconcile_intent_repairs(report: Any) -> None:
     repairs = list(getattr(report, "receipt_backed_intent_repairs", []) or [])
     if not repairs:
@@ -8732,6 +8782,7 @@ def _print_reconcile_operator_report(
     _print_reconcile_current_position(campaign, report, verbose=verbose)
     _print_reconcile_last_failure_compact(report, verbose=verbose)
     _print_reconcile_aimall_quality_revalidation(report)
+    _print_reconcile_ariadne_reuse(report)
     _print_reconcile_safety(campaign, report, contract_status)
     if verbose:
         _print_reconcile_artefacts(campaign, report, contract_status, verbose=True)
@@ -8789,6 +8840,7 @@ def _print_reconcile_applied_operator_report(
 ) -> None:
     _print_reconcile_header(campaign, mode="apply", result="applied")
     _print_reconcile_recovery_target(report, contract_status)
+    _print_reconcile_ariadne_reuse(report)
     print("Applied Changes")
     cleanup_items: List[str] = []
     cleanup_items.extend("removed stale artefact: " + _reconcile_relative_path(campaign, item) for item in removed)
@@ -10598,6 +10650,28 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                     )
                 ),
             )
+        ariadne_recovery = getattr(report, "ariadne_results_recovery", None)
+        ariadne_event_fields = (
+            {
+                "ariadne_expected_tasks": int(
+                    ariadne_recovery.get("expected_tasks") or 0
+                ),
+                "ariadne_accepted_tasks": int(
+                    ariadne_recovery.get("accepted_tasks") or 0
+                ),
+                "ariadne_rejected_tasks": int(
+                    ariadne_recovery.get("rejected_tasks") or 0
+                ),
+                "ariadne_missing_rejected_outputs": int(
+                    ariadne_recovery.get("missing_rejected_outputs") or 0
+                ),
+                "ariadne_tasks_resubmitted": int(
+                    ariadne_recovery.get("tasks_resubmitted") or 0
+                ),
+            }
+            if isinstance(ariadne_recovery, Mapping)
+            else {}
+        )
         append_event(
             campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
             "reconcile_applied",
@@ -10626,6 +10700,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             ),
             recovery_selected_phase=report.proposed_state.phase.value,
             recovery_reason=str(report.decision or ""),
+            **ariadne_event_fields,
         )
     except Exception:
         pass

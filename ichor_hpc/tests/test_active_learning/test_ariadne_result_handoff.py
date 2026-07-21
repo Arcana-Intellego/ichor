@@ -92,7 +92,22 @@ def _result_payload(
     return payload
 
 
-def _selection_payload():
+def _selection_payload(*, include_missing_rejected=False):
+    seed_records = [{
+        "seed_id": 1,
+        "frame_id": 2,
+        "pool_row_index_zero_based": 2,
+        "selection_origin": "bulk",
+        "variance_at_selection": 0.1,
+    }]
+    if include_missing_rejected:
+        seed_records.append({
+            "seed_id": 2,
+            "frame_id": 3,
+            "pool_row_index_zero_based": 3,
+            "selection_origin": "bulk",
+            "variance_at_selection": 0.2,
+        })
     return build_seed_selection_manifest(
         campaign_uid=CAMPAIGN_UID,
         campaign_random_seed=0,
@@ -102,13 +117,7 @@ def _selection_payload():
         model_set_sha256=MODEL_SHA,
         trajectory_sha256=TRAJECTORY_SHA,
         selection_strategy="hybrid_variance",
-        seed_records=[{
-            "seed_id": 1,
-            "frame_id": 2,
-            "pool_row_index_zero_based": 2,
-            "selection_origin": "bulk",
-            "variance_at_selection": 0.1,
-        }],
+        seed_records=seed_records,
     )
 
 
@@ -118,9 +127,12 @@ def _write_canonical_handoff(
     result_trajectory_sha=TRAJECTORY_SHA,
     include_landing_safety=True,
     landing_safety_accepted=True,
+    include_missing_rejected=False,
 ):
     iter_dir = tmp_path / "iteration-000001"
-    selection = _selection_payload()
+    selection = _selection_payload(
+        include_missing_rejected=include_missing_rejected,
+    )
     selection_path = seeds_picked_path(iter_dir)
     selection_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(selection_path, selection)
@@ -187,6 +199,18 @@ def _write_canonical_handoff(
         "provenance_sha256": sha256_file(provenance_path),
         "output_manifest_sha256": sha256_file(output_manifest),
     }
+    rejected_records = []
+    if include_missing_rejected:
+        rejected_records.append({
+            "seed_id": 2,
+            "seed_uid": str(selection["seed_records"][1]["seed_uid"]),
+            "array_task_id": 1,
+            "seed_dir": "seeds/seed-000002",
+            "reason": (
+                "seed_output_invalid: FileNotFoundError: "
+                "ARIADNE output manifest unreadable"
+            ),
+        })
     write_ariadne_results_manifest(iter_dir, {
         "schema_version": ARIADNE_RESULTS_SCHEMA_VERSION,
         "campaign_uid": CAMPAIGN_UID,
@@ -196,11 +220,11 @@ def _write_canonical_handoff(
             "path": task_map_path.relative_to(ariadne_root).as_posix(),
             "sha256": sha256_file(task_map_path),
         },
-        "expected_n": 1,
+        "expected_n": len(selection["seed_records"]),
         "n_accepted": 1,
-        "n_rejected": 0,
+        "n_rejected": len(rejected_records),
         "accepted": [accepted_record],
-        "rejected": [],
+        "rejected": rejected_records,
     })
     write_ariadne_landing_audit(iter_dir, {
         "iteration": 1,
@@ -227,10 +251,10 @@ def _write_canonical_handoff(
         campaign_uid=CAMPAIGN_UID,
         iteration=1,
         config_sha256="test-config",
-        failure_threshold_fraction=0.0,
-        expected_n=1,
+        failure_threshold_fraction=0.5 if include_missing_rejected else 0.0,
+        expected_n=len(selection["seed_records"]),
         n_accepted=1,
-        n_rejected=0,
+        n_rejected=len(rejected_records),
         accepted=True,
         reasons=[],
     )
@@ -378,6 +402,67 @@ def test_read_ariadne_manifest_and_reconstruct_candidates(tmp_path):
     assert len(frames) == 1
     assert records[0]["seed_id"] == 1
     assert records[0]["landing_safety"]["accepted"] is True
+
+
+def test_rejected_ariadne_seed_directory_may_be_absent(tmp_path):
+    iter_dir, _, _ = _write_canonical_handoff(
+        tmp_path,
+        include_missing_rejected=True,
+    )
+
+    manifest = read_ariadne_results_manifest(iter_dir, expected_iteration=1)
+    _, frames, records = ariadne_candidate_frames(iter_dir, expected_iteration=1)
+
+    assert manifest["n_accepted"] == 1
+    assert manifest["n_rejected"] == 1
+    assert not Path(manifest["rejected"][0]["seed_dir"]).exists()
+    assert len(frames) == 1
+    assert [record["seed_id"] for record in records] == [1]
+
+
+def test_rejected_ariadne_seed_directory_must_remain_canonical(tmp_path):
+    iter_dir, _, _ = _write_canonical_handoff(
+        tmp_path,
+        include_missing_rejected=True,
+    )
+    results_path = active_ariadne_dir(iter_dir) / "RESULTS.json"
+    decision_path = active_ariadne_dir(iter_dir) / "ARIADNE_BATCH_DECISION.json"
+    results = json.loads(results_path.read_text(encoding="utf-8"))
+    results["rejected"][0]["seed_dir"] = "seeds/seed-000001"
+    decision_path.unlink()
+    atomic_write_json(results_path, results)
+
+    with pytest.raises(HandoffManifestError, match="canonical task path"):
+        read_ariadne_results_manifest(iter_dir, expected_iteration=1)
+
+
+def test_rejected_ariadne_existing_seed_path_must_be_directory(tmp_path):
+    iter_dir, _, _ = _write_canonical_handoff(
+        tmp_path,
+        include_missing_rejected=True,
+    )
+    rejected_path = ariadne_seed_dir(iter_dir, 2)
+    rejected_path.parent.mkdir(parents=True, exist_ok=True)
+    rejected_path.write_text("not a directory\n", encoding="utf-8")
+
+    with pytest.raises(HandoffManifestError, match="(not a directory|non-directory)"):
+        read_ariadne_results_manifest(iter_dir, expected_iteration=1)
+
+
+def test_rejected_ariadne_array_task_id_must_match_task_map(tmp_path):
+    iter_dir, _, _ = _write_canonical_handoff(
+        tmp_path,
+        include_missing_rejected=True,
+    )
+    results_path = active_ariadne_dir(iter_dir) / "RESULTS.json"
+    decision_path = active_ariadne_dir(iter_dir) / "ARIADNE_BATCH_DECISION.json"
+    results = json.loads(results_path.read_text(encoding="utf-8"))
+    results["rejected"][0]["array_task_id"] = 99
+    decision_path.unlink()
+    atomic_write_json(results_path, results)
+
+    with pytest.raises(HandoffManifestError, match="array_task_id mismatch"):
+        read_ariadne_results_manifest(iter_dir, expected_iteration=1)
 
 
 def test_ariadne_batch_decision_must_match_immutable_result_counts(tmp_path):

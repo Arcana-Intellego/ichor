@@ -489,6 +489,31 @@ def _halt_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecom
             ],
         )
     if "BACKEND_SUBMISSION_FAILED" in upper:
+        if "RESOURCE IMPLEMENTATION ICHOR PACKAGE TREE HAS DRIFTED" in upper:
+            return StatusRecommendation(
+                code="halted_backend_submission_failed",
+                severity="required",
+                primary=(
+                    "ensure all daemon and Slurm work is stopped, reinstall the "
+                    "current ICHOR checkout, then preview recovery"
+                ),
+                why=(
+                    "the editable ICHOR installation changed after this work was prepared"
+                ),
+                command=_reconcile_cmd(campaign),
+            )
+        if "RESOURCE EVIDENCE" in upper or "HANDOFF" in upper:
+            return StatusRecommendation(
+                code="halted_backend_submission_failed",
+                severity="required",
+                primary="preview recovery of the phase input evidence",
+                why=(
+                    "the phase stopped while validating its published input "
+                    "evidence: "
+                    + _short_error(reason)
+                ),
+                command=_reconcile_cmd(campaign),
+            )
         return StatusRecommendation(
             code="halted_backend_submission_failed",
             severity="required",

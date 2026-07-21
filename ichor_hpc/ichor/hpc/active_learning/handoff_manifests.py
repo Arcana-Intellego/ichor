@@ -454,6 +454,33 @@ def resolve_handoff_path(
     return resolved
 
 
+def _resolve_rejected_handoff_reference(
+    root: Any,
+    raw: Any,
+    *,
+    kind: str,
+    expected: Path,
+    directory: bool = False,
+) -> Path:
+    """Validate a rejected-task path without requiring rejected output."""
+    resolved = resolve_handoff_path(
+        root,
+        raw,
+        kind=kind,
+        must_exist=False,
+        directory=directory,
+    )
+    expected_resolved = Path(expected).resolve(strict=False)
+    if resolved != expected_resolved:
+        raise HandoffManifestError(kind + " does not match its canonical task path")
+    if resolved.exists():
+        if directory and not resolved.is_dir():
+            raise HandoffManifestError(kind + " is not a directory: " + str(resolved))
+        if not directory and not resolved.is_file():
+            raise HandoffManifestError(kind + " is not a regular file: " + str(resolved))
+    return resolved
+
+
 def build_seed_selection_manifest(
     *,
     campaign_uid: str,
@@ -1347,14 +1374,32 @@ def read_ariadne_results_manifest(
         task = tasks_by_seed_id[seed_id]
         if str(rec.get("seed_uid") or "") != str(task["seed_uid"]):
             raise HandoffManifestError("rejected ARIADNE seed_uid mismatch")
-        for key in ("seed_dir", "result_json", "provenance_json", "output_manifest"):
+        if rec.get("array_task_id") is not None and _required_int(
+            rec.get("array_task_id"),
+            "rejected ARIADNE array_task_id",
+        ) != int(task["array_task_id"]):
+            raise HandoffManifestError("rejected ARIADNE array_task_id mismatch")
+        expected_seed_dir = resolve_handoff_path(
+            path.parent,
+            str(task["seed_directory"]).removeprefix("ariadne/"),
+            kind="ARIADNE rejected task-map seed directory",
+            must_exist=False,
+            directory=True,
+        )
+        expected_paths = {
+            "seed_dir": expected_seed_dir,
+            "result_json": expected_seed_dir / SEED_RESULT_FILENAME,
+            "provenance_json": expected_seed_dir / PROVENANCE_FILENAME,
+            "output_manifest": expected_seed_dir / SEED_OUTPUT_MANIFEST_FILENAME,
+        }
+        for key in expected_paths:
             if key in out_rec and out_rec.get(key):
-                resolved = resolve_handoff_path(
+                resolved = _resolve_rejected_handoff_reference(
                     path.parent,
                     out_rec.get(key, ""),
                     kind="ARIADNE rejected " + key,
+                    expected=expected_paths[key],
                     directory=(key == "seed_dir"),
-                    must_exist=(key == "seed_dir"),
                 )
                 out_rec[key] = str(resolved)
         normalised_rejected.append(out_rec)

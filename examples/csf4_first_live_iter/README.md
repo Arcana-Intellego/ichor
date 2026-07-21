@@ -358,6 +358,12 @@ transition boundary. Active or scheduler-inconclusive jobs, active submission
 intents and incomplete publications block the transition with an explicit
 reason. Already-submitted work remains bound to its original generation.
 
+Do not pull, edit, or reinstall the editable ICHOR checkout while the daemon or
+any campaign Slurm job is active. Submitted tasks verify the package tree that
+was recorded when their resources were prepared and fail deliberately if it
+changes. Stop at a safe boundary and wait for all Slurm work to finish before
+updating the checkout.
+
 An automatic transition starts a new calibration eligibility window and
 invalidates active derived acquisition reference scales. FEREBUS row caches
 remain on disk and are reused only when their feature-contract and row-encoding

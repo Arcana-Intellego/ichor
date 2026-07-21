@@ -646,6 +646,13 @@ phase blocks the transition with the exact reason. No separate environment
 maintenance command is required. Normal status displays the recorded active
 generation without inspecting the current package installation.
 
+Do not pull, edit or reinstall the editable ICHOR checkout while the daemon or
+any campaign Slurm job is active. Submitted tasks bind the exact ICHOR package
+tree recorded when their resources were prepared; changing that tree while
+they run makes the affected tasks fail deliberately rather than mix software
+identities. Stop at a safe boundary and wait for all Slurm work to finish
+before updating the checkout.
+
 When :code:`state.json` is missing or malformed and campaign authority must be
 reconstructed solely from committed artefacts, reconcile reports that deep
 verification is required. It never starts that potentially long scan

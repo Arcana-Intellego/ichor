@@ -452,6 +452,131 @@ def _patch_ariadne_retry_transition(
     )
 
 
+def _patch_phase_b_transition(monkeypatch):
+    from ichor.hpc.active_learning.versioning.reference_data import (
+        ReferenceDataVersioning,
+    )
+    from ichor.hpc.active_learning.versioning.trained_models import (
+        TrainedModelVersioning,
+    )
+
+    monkeypatch.setattr(
+        ReferenceDataVersioning,
+        "current_version",
+        lambda _self: 0,
+    )
+    monkeypatch.setattr(
+        TrainedModelVersioning,
+        "current_version",
+        lambda _self: 0,
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.recovery_contracts."
+        "phase_recovery_contract_error",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.recovery_contracts."
+        "ariadne_results_recovery_summary",
+        lambda *_args, **_kwargs: {
+            "expected_tasks": 200,
+            "accepted_tasks": 193,
+            "rejected_tasks": 7,
+            "missing_rejected_outputs": 7,
+            "tasks_resubmitted": 0,
+        },
+    )
+
+
+def test_rebind_accepts_clean_phase_b_pre_submission_retry(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.PHASE_B_DIVERSITY
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
+    _patch_phase_b_transition(monkeypatch)
+
+    result = rebind_environment(
+        campaign,
+        config=config,
+        scheduler_ownership_clear=True,
+    )
+
+    assert result["changed"] is True
+    assert result["transition_kind"] == "phase_b_pre_submission_retry"
+    assert result["ariadne_accepted_tasks"] == 193
+    assert result["ariadne_rejected_tasks"] == 7
+    assert result["ariadne_tasks_resubmitted"] == 0
+
+
+def test_rebind_rejects_phase_b_partial_output(tmp_path, monkeypatch):
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.PHASE_B_DIVERSITY
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
+    _patch_phase_b_transition(monkeypatch)
+    phase_b = campaign / "ACTIVE_LEARNING" / "iteration-000001" / "phase_b"
+    phase_b.mkdir(parents=True)
+    (phase_b / "selected.xyz").write_text("partial\n", encoding="utf-8")
+
+    with pytest.raises(ExecutionIdentityError, match="partial Phase B output"):
+        rebind_environment(
+            campaign,
+            config=config,
+            scheduler_ownership_clear=True,
+        )
+
+
+def test_phase_b_transition_accepts_only_jobless_reconcile_retry_intent(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, _config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.PHASE_B_DIVERSITY
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    _patch_phase_b_transition(monkeypatch)
+    intent = {
+        "phase": CampaignPhase.PHASE_B_DIVERSITY.value,
+        "iteration": 1,
+        "status": "SUPERSEDED",
+        "reason": "reconcile_apply_retry",
+        "job_id": None,
+    }
+
+    result = execution_identity_module._validate_phase_b_transition_boundary(
+        campaign,
+        state,
+        intent_records=[intent],
+    )
+
+    assert result["transition_kind"] == "phase_b_pre_submission_retry"
+    intent["job_id"] = "12345"
+    with pytest.raises(ExecutionIdentityError, match="jobless"):
+        execution_identity_module._validate_phase_b_transition_boundary(
+            campaign,
+            state,
+            intent_records=[intent],
+        )
+
+
 def _write_full_ariadne_producer_intent(
     campaign,
     state,

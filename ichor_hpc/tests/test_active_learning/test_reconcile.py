@@ -342,7 +342,14 @@ def _write_seeds_picked(campaign, iteration, *, n=1):
     return iter_dir
 
 
-def _write_ariadne_handoff(campaign, iteration, *, n=2, include_safety=True):
+def _write_ariadne_handoff(
+    campaign,
+    iteration,
+    *,
+    n=2,
+    include_safety=True,
+    n_rejected=0,
+):
     from ichor.hpc.active_learning.ariadne_outputs import (
         write_optimisation_trajectory,
         write_seed_output_manifest,
@@ -359,10 +366,24 @@ def _write_ariadne_handoff(campaign, iteration, *, n=2, include_safety=True):
     )
     ariadne_root = active_ariadne_dir(iter_dir)
     accepted = []
+    rejected = []
+    accepted_limit = int(n) - int(n_rejected)
     for task in task_map["tasks"]:
         seed_id = int(task["seed_id"])
         array_task_id = int(task["array_task_id"])
         seed_uid = str(task["seed_uid"])
+        if array_task_id >= accepted_limit:
+            rejected.append({
+                "seed_id": seed_id,
+                "seed_uid": seed_uid,
+                "array_task_id": array_task_id,
+                "seed_dir": "seeds/seed-" + str(seed_id).zfill(6),
+                "reason": (
+                    "seed_output_invalid: ValueError: resource implementation "
+                    "ICHOR package tree has drifted"
+                ),
+            })
+            continue
         seed_dir = ariadne_seed_dir(iter_dir, seed_id)
         seed_dir.mkdir(parents=True, exist_ok=False)
         result = {
@@ -465,10 +486,10 @@ def _write_ariadne_handoff(campaign, iteration, *, n=2, include_safety=True):
             "sha256": sha256_file(ariadne_root / "TASK_MAP.json"),
         },
         "expected_n": int(n),
-        "n_accepted": int(n),
-        "n_rejected": 0,
+        "n_accepted": len(accepted),
+        "n_rejected": len(rejected),
         "accepted": accepted,
-        "rejected": [],
+        "rejected": rejected,
     })
     from ichor.hpc.active_learning.config import CampaignConfig
     from ichor.hpc.active_learning.daemon.config_lock import (
@@ -488,8 +509,8 @@ def _write_ariadne_handoff(campaign, iteration, *, n=2, include_safety=True):
         config_sha256=config_fingerprint(canonical_config(config)),
         failure_threshold_fraction=float(config.runtime.failure_threshold_fraction),
         expected_n=int(n),
-        n_accepted=int(n),
-        n_rejected=0,
+        n_accepted=len(accepted),
+        n_rejected=len(rejected),
         accepted=True,
         reasons=[],
     )
@@ -1665,6 +1686,59 @@ def test_recovery_cannot_advance_from_rejected_ariadne_batch(
 
     assert report.proposed_state.phase is CampaignPhase.ARIADNE_ARRAY
     assert "valid ARIADNE results handoff" not in report.decision
+
+
+def test_reconcile_reuses_accepted_ariadne_results_when_rejected_outputs_absent(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.config import CampaignConfig
+
+    _trust_marker_models(monkeypatch)
+    monkeypatch.setattr(
+        recovery_contracts_mod,
+        "verify_committed_model_version",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        reconcile_mod,
+        "_validate_recovered_state_contract",
+        lambda *a, **k: None,
+    )
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0])
+    CampaignConfig().to_yaml(campaign / "campaign.yaml")
+    state = fresh_campaign_state(max_iterations=3, campaign_uid="reconcile-test")
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    append_event(
+        data / "journal.ndjson",
+        "halt",
+        from_phase=CampaignPhase.PHASE_B_DIVERSITY.value,
+        iteration=1,
+        reason=(
+            "backend_submission_failed: resource evidence not yet produced for "
+            "PHASE_B_DIVERSITY"
+        ),
+    )
+    _write_ariadne_handoff(campaign, 1, n=10, n_rejected=1)
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.PHASE_B_DIVERSITY
+    assert "valid ARIADNE results handoff" in report.decision
+    assert report.ariadne_results_recovery == {
+        "expected_tasks": 10,
+        "accepted_tasks": 9,
+        "rejected_tasks": 1,
+        "missing_rejected_outputs": 1,
+        "tasks_resubmitted": 0,
+    }
+    assert not report.unsafe_reasons
 
 
 def test_reconcile_classifies_stale_ariadne_decision_as_cleanable(tmp_path, monkeypatch):

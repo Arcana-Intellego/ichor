@@ -46,6 +46,7 @@ from .filesystem import campaign_owned_path
 from .recovery_contracts import (
     RecoveryDecision,
     active_iteration_handoff_decisions,
+    ariadne_results_recovery_summary,
     select_recovery_phase,
     staging_handoff_decisions,
     validate_phase_recovery_contract,
@@ -298,6 +299,7 @@ class ReconciliationReport:
     recommended_actions: List[str] = field(default_factory=list)
     recovery_candidates: List[Dict[str, Any]] = field(default_factory=list)
     partial_array_recovery: Optional[Dict[str, Any]] = None
+    ariadne_results_recovery: Optional[Dict[str, Any]] = None
     ariadne_publication_recovery: Optional[Dict[str, Any]] = None
     ferebus_candidate_recovery: Optional[Dict[str, Any]] = None
     aimall_quality_revalidation: Optional[Dict[str, Any]] = None
@@ -2687,6 +2689,23 @@ def propose_recovery(
     else:
         recovered.lifecycle_context = None
 
+    ariadne_results_recovery: Optional[Dict[str, Any]] = None
+    if recovered.phase is CampaignPhase.PHASE_B_DIVERSITY:
+        try:
+            ariadne_results_recovery = ariadne_results_recovery_summary(
+                campaign,
+                int(recovered.iteration),
+                str(recovered.campaign_uid),
+                verification=verification_level,
+            )
+        except Exception as exc:
+            unsafe_reasons.append(
+                "ARIADNE recovery summary failed: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:180]
+            )
+
     return ReconciliationReport(
         proposed_state=recovered,
         committed_reference_data_versions=tv,
@@ -2720,6 +2739,7 @@ def propose_recovery(
             if isinstance(partial_array_recovery, dict)
             else None
         ),
+        ariadne_results_recovery=ariadne_results_recovery,
         ariadne_publication_recovery=(
             dict(ariadne_publication_recovery)
             if isinstance(ariadne_publication_recovery, dict)

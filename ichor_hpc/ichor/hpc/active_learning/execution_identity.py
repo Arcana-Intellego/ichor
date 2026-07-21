@@ -268,6 +268,137 @@ def _validate_ariadne_retry_transition_boundary(
     }
 
 
+def _validate_phase_b_transition_boundary(
+    campaign: Path,
+    state: Any,
+    *,
+    intent_records: Iterable[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Validate a clean Phase B retry that owns no scheduler work or output."""
+    from .daemon.recovery_contracts import (
+        ariadne_results_recovery_summary,
+        phase_recovery_contract_error,
+    )
+    from .layout import (
+        active_allocation_dir,
+        active_iteration_dir,
+        active_phase_b_dir,
+        qm_reference_data_dir,
+        trained_models_dir,
+    )
+    from .versioning.reference_data import ReferenceDataVersioning
+    from .versioning.trained_models import TrainedModelVersioning
+
+    phase = CampaignPhase(state.phase)
+    if phase is not CampaignPhase.PHASE_B_DIVERSITY:  # pragma: no cover
+        raise ExecutionIdentityError(
+            "invalid Phase B environment-transition phase"
+        )
+    iteration = int(state.iteration)
+    expected_version = iteration - 1
+    if iteration < 1 or (
+        int(state.reference_data_version),
+        int(state.models_version),
+    ) != (expected_version, expected_version):
+        raise ExecutionIdentityError(
+            "PHASE_B_DIVERSITY environment transition requires iteration N "
+            "with reference-data and model versions N-1"
+        )
+    reference_current = ReferenceDataVersioning(
+        qm_reference_data_dir(campaign)
+    ).current_version()
+    model_current = TrainedModelVersioning(
+        trained_models_dir(campaign)
+    ).current_version()
+    if (reference_current, model_current) != (
+        expected_version,
+        expected_version,
+    ):
+        raise ExecutionIdentityError(
+            "PHASE_B_DIVERSITY environment transition requires committed "
+            "reference-data and model pointers to match campaign state"
+        )
+    contract_error = phase_recovery_contract_error(
+        campaign,
+        state,
+        verification="authority",
+    )
+    if contract_error is not None:
+        raise ExecutionIdentityError(
+            "environment transition at PHASE_B_DIVERSITY failed its recovery "
+            "contract: "
+            + str(contract_error)
+        )
+
+    iteration_root = active_iteration_dir(campaign, iteration)
+    phase_b_root = active_phase_b_dir(iteration_root)
+    if phase_b_root.is_symlink():
+        raise ExecutionIdentityError(
+            "PHASE_B_DIVERSITY environment transition found a symlinked Phase B output root"
+        )
+    if phase_b_root.exists():
+        if not phase_b_root.is_dir():
+            raise ExecutionIdentityError(
+                "PHASE_B_DIVERSITY environment transition found an invalid Phase B output root"
+            )
+        entries = sorted(path.name for path in phase_b_root.iterdir())
+        if entries:
+            raise ExecutionIdentityError(
+                "PHASE_B_DIVERSITY environment transition refuses partial Phase B "
+                "output; inspect "
+                + str(phase_b_root)
+                + " (entries: "
+                + ", ".join(entries[:5])
+                + (", ..." if len(entries) > 5 else "")
+                + ")"
+            )
+    allocation_path = active_allocation_dir(iteration_root) / "POINT_ALLOCATION.json"
+    if allocation_path.exists() or allocation_path.is_symlink():
+        raise ExecutionIdentityError(
+            "PHASE_B_DIVERSITY environment transition refuses an existing active "
+            "point-allocation manifest: "
+            + str(allocation_path)
+        )
+
+    matching_intents = [
+        record
+        for record in intent_records
+        if str(record.get("phase") or "") == phase.value
+        and int(record.get("iteration", -1)) == iteration
+    ]
+    for intent in matching_intents:
+        status = str(intent.get("status") or "")
+        reason = str(intent.get("reason") or "")
+        if intent.get("job_id") not in (None, "", False):
+            raise ExecutionIdentityError(
+                "PHASE_B_DIVERSITY environment transition requires its historical "
+                "retry intent to be jobless"
+            )
+        if status == "FAILED":
+            continue
+        if status == "SUPERSEDED" and reason == "reconcile_apply_retry":
+            continue
+        raise ExecutionIdentityError(
+            "PHASE_B_DIVERSITY environment transition found an incompatible "
+            "historical intent status: "
+            + (status or "missing")
+        )
+
+    summary = ariadne_results_recovery_summary(
+        campaign,
+        iteration,
+        str(state.campaign_uid),
+        verification="authority",
+    )
+    return {
+        "transition_kind": "phase_b_pre_submission_retry",
+        "ariadne_expected_tasks": int(summary["expected_tasks"]),
+        "ariadne_accepted_tasks": int(summary["accepted_tasks"]),
+        "ariadne_rejected_tasks": int(summary["rejected_tasks"]),
+        "ariadne_tasks_resubmitted": 0,
+    }
+
+
 _ENVIRONMENT_FINGERPRINT_KEYS = (
     "python_executable",
     "python_version",
@@ -1241,6 +1372,7 @@ def advance_environment_generation(
     transition_context: Dict[str, Any] = {
         "transition_kind": "idle_boundary",
     }
+    phase_b_transition_pending = False
     if state.phase is CampaignPhase.REFERENCE_COMMIT:
         from .daemon.reference_commit import classify_reference_commit
 
@@ -1293,6 +1425,8 @@ def advance_environment_generation(
             campaign,
             state,
         )
+    elif state.phase is CampaignPhase.PHASE_B_DIVERSITY:
+        phase_b_transition_pending = True
     elif state.phase not in {
         CampaignPhase.SEED_SELECT,
         CampaignPhase.STOP_CHECK,
@@ -1303,7 +1437,8 @@ def advance_environment_generation(
             "boundary, "
             "a verified unpublished REFERENCE_COMMIT recovery transaction, or a "
             "clean pre-submission FEREBUS retry boundary, or a fully retryable "
-            "ARIADNE retry or postprocess-only recovery boundary"
+            "ARIADNE retry or postprocess-only recovery boundary, or a clean "
+            "pre-submission Phase B recovery boundary"
         )
     if any(value is not None for value in state.pending_jobs.values()):
         raise ExecutionIdentityError(
@@ -1368,10 +1503,34 @@ def advance_environment_generation(
         verification="authority",
         snapshot=snapshot,
     )
+    if phase_b_transition_pending:
+        transition_context = _validate_phase_b_transition_boundary(
+            campaign,
+            state,
+            intent_records=inventory["records"],
+        )
 
     generation_number = int(candidate["generation"])
     generations_root = environment_generations_dir(campaign)
     generations_root.mkdir(parents=True, exist_ok=True)
+    if phase_b_transition_pending:
+        refreshed_intents = inventory_intents(
+            campaign,
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        if refreshed_intents["errors"] or any(
+            str(record.get("status")) in ACTIVE_STATUSES
+            for record in refreshed_intents["records"]
+        ):
+            raise ExecutionIdentityError(
+                "PHASE_B_DIVERSITY environment transition found submission-intent "
+                "ownership after its safety check"
+            )
+        transition_context = _validate_phase_b_transition_boundary(
+            campaign,
+            state,
+            intent_records=refreshed_intents["records"],
+        )
     while True:
         generation_path = generations_root / (
             "generation-" + str(generation_number).zfill(6) + ".json"

@@ -1612,6 +1612,28 @@ def test_status_recommendations_cover_halted_reason_classes(tmp_path):
     ) == ["halted_config_changed"]
 
 
+def test_status_describes_phase_b_resource_handoff_failure_as_recovery(tmp_path):
+    campaign = _campaign_with_config(tmp_path)
+
+    result = build_status_recommendations(
+        campaign,
+        {
+            "phase": CampaignPhase.HALTED.value,
+            "latest_halt_event": {
+                "reason": (
+                    "backend_submission_failed: resource evidence not yet produced "
+                    "for PHASE_B_DIVERSITY: ARIADNE rejected seed_dir directory missing"
+                )
+            },
+        },
+    )[0]
+
+    assert result.code == "halted_backend_submission_failed"
+    assert result.primary == "preview recovery of the phase input evidence"
+    assert "backend or profile" not in result.primary
+    assert result.command and "reconcile" in result.command
+
+
 def test_status_recommends_repolling_preserved_scheduler_job(tmp_path):
     campaign = _campaign_with_config(tmp_path)
     phase = CampaignPhase.INITIAL_GAUSSIAN.value
@@ -2785,6 +2807,49 @@ def test_journal_queue_lifecycle_names_scheduler_and_local_work_separately(
     expected,
 ):
     assert cli_mod._journal_operator_summary(event) == expected
+
+
+def test_journal_reconcile_summary_reports_ariadne_reuse_without_resubmission():
+    event = {
+        "event": "reconcile_applied",
+        "phase": CampaignPhase.PHASE_B_DIVERSITY.value,
+        "iteration": 8,
+        "ariadne_expected_tasks": 200,
+        "ariadne_accepted_tasks": 193,
+        "ariadne_rejected_tasks": 7,
+        "ariadne_missing_rejected_outputs": 7,
+        "ariadne_tasks_resubmitted": 0,
+    }
+
+    output = cli_mod._format_journal_events([event], verbose=False)
+
+    assert "RECONCILE" in output
+    assert "iter=8" in output
+    assert (
+        "reconcile applied; reusing 193 accepted ARIADNE results, "
+        "7 rejected tasks excluded, no ARIADNE jobs resubmitted"
+    ) in output
+
+
+def test_reconcile_human_summary_reports_phase_b_ariadne_reuse(capsys):
+    report = SimpleNamespace(
+        ariadne_results_recovery={
+            "expected_tasks": 200,
+            "accepted_tasks": 193,
+            "rejected_tasks": 7,
+            "missing_rejected_outputs": 7,
+            "tasks_resubmitted": 0,
+        }
+    )
+
+    cli_mod._print_reconcile_ariadne_reuse(report)
+
+    output = capsys.readouterr().out
+    assert "ARIADNE Handoff" in output
+    assert re.search(r"accepted results\s+: 193", output)
+    assert re.search(r"rejected tasks\s+: 7 excluded from Phase B", output)
+    assert re.search(r"missing rejected outputs\s+: 7", output)
+    assert re.search(r"ARIADNE tasks to resubmit\s*: 0", output)
 
 
 def test_journal_completed_iteration_stop_describes_the_paused_boundary():

@@ -7,11 +7,12 @@ and out of the broad committed-version checks.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from ..strict_json import strict_json as json
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
+from ..strict_json import strict_json as json
 from ..acquisition.trajectory_pool import TrajectoryPool
 from ..versioning.reference_data import ReferenceDataVersioning
 from ..handoff_manifests import (
@@ -431,6 +432,24 @@ def _authority_json_object(path: Path, label: str) -> Dict[str, Any]:
     return dict(payload)
 
 
+def _authority_handoff_reference(
+    root: Path,
+    raw: Any,
+    label: str,
+) -> Path:
+    """Normalise a handoff reference lexically without inspecting its payload."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise RecoveryContractError(label + " path is missing")
+    base = Path(os.path.abspath(os.path.normpath(str(root))))
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = base / candidate
+    normalised = Path(os.path.abspath(os.path.normpath(str(candidate))))
+    if normalised != base and base not in normalised.parents:
+        raise RecoveryContractError(label + " path escapes its handoff root")
+    return normalised
+
+
 def _require_ariadne_results_authority(
     campaign: Path,
     iteration: int,
@@ -442,7 +461,12 @@ def _require_ariadne_results_authority(
         ariadne_results_path,
         read_ariadne_batch_decision,
     )
+    from ..ariadne_outputs import (
+        SEED_OUTPUT_MANIFEST_FILENAME,
+        SEED_RESULT_FILENAME,
+    )
     from ..seed_identity import read_ariadne_task_map
+    from ..versioning.provenance import PROVENANCE_FILENAME
 
     idir = iteration_dir(campaign, iteration)
     path = ariadne_results_path(idir)
@@ -492,6 +516,7 @@ def _require_ariadne_results_authority(
     task_by_seed = {
         int(task["seed_id"]): dict(task) for task in list(task_map.get("tasks") or [])
     }
+    ariadne_root = path.parent
     seen = set()
     for label, records in (("accepted", accepted), ("rejected", rejected)):
         for record in records:
@@ -510,6 +535,41 @@ def _require_ariadne_results_authority(
             seen.add(seed_id)
             if str(record.get("seed_uid") or "") != str(task.get("seed_uid") or ""):
                 raise RecoveryContractError(label + " ARIADNE seed UID mismatch")
+            if record.get("array_task_id") is not None and _authority_integer(
+                record.get("array_task_id"),
+                label + " ARIADNE array_task_id",
+                minimum=0,
+            ) != int(task.get("array_task_id", -1)):
+                raise RecoveryContractError(
+                    label + " ARIADNE array task ID mismatch"
+                )
+            expected_seed_dir = _authority_handoff_reference(
+                ariadne_root,
+                str(task.get("seed_directory") or "").removeprefix("ariadne/"),
+                label + " ARIADNE task-map seed directory",
+            )
+            expected_paths = {
+                "seed_dir": expected_seed_dir,
+                "result_json": expected_seed_dir / SEED_RESULT_FILENAME,
+                "provenance_json": expected_seed_dir / PROVENANCE_FILENAME,
+                "output_manifest": expected_seed_dir
+                / SEED_OUTPUT_MANIFEST_FILENAME,
+            }
+            for path_key, expected_path in expected_paths.items():
+                raw_path = record.get(path_key)
+                if label == "accepted" or raw_path not in (None, ""):
+                    observed_path = _authority_handoff_reference(
+                        ariadne_root,
+                        raw_path,
+                        label + " ARIADNE " + path_key,
+                    )
+                    if observed_path != expected_path:
+                        raise RecoveryContractError(
+                            label
+                            + " ARIADNE "
+                            + path_key
+                            + " does not match its canonical task path"
+                        )
             if label == "accepted":
                 safety = record.get("landing_safety")
                 if not isinstance(safety, dict) or safety.get("accepted") is not True:
@@ -534,19 +594,19 @@ def _require_ariadne_results(
     expected_campaign_uid: Optional[str] = None,
     *,
     verification: str = "metadata",
-) -> None:
+) -> Dict[str, Any]:
     from ..config import CampaignConfig
     from .config_lock import canonical_config, config_fingerprint
     from ..handoff_manifests import read_ariadne_batch_decision
 
     if verification == "authority":
-        _require_ariadne_results_authority(
+        payload = _require_ariadne_results_authority(
             campaign,
             int(iteration),
             expected_campaign_uid,
         )
     else:
-        read_ariadne_results_manifest(
+        payload = read_ariadne_results_manifest(
             iteration_dir(campaign, iteration),
             expected_iteration=int(iteration),
             require_nonempty=True,
@@ -559,6 +619,45 @@ def _require_ariadne_results(
         expected_config_sha256=config_fingerprint(canonical_config(config)),
         require_accepted=True,
     )
+    return payload
+
+
+def ariadne_results_recovery_summary(
+    campaign_dir: Union[str, Path],
+    iteration: int,
+    expected_campaign_uid: Optional[str] = None,
+    *,
+    verification: str = "authority",
+) -> Dict[str, Any]:
+    """Return bounded recovery counts for an accepted ARIADNE handoff."""
+    campaign = Path(campaign_dir)
+    payload = _require_ariadne_results(
+        campaign,
+        int(iteration),
+        expected_campaign_uid,
+        verification=verification,
+    )
+    root = iteration_dir(campaign, int(iteration)) / "ariadne"
+    missing_rejected_outputs = 0
+    for record in list(payload.get("rejected") or []):
+        raw_seed_dir = record.get("seed_dir") if isinstance(record, dict) else None
+        if raw_seed_dir in (None, ""):
+            missing_rejected_outputs += 1
+            continue
+        seed_dir = _authority_handoff_reference(
+            root,
+            raw_seed_dir,
+            "rejected ARIADNE seed_dir",
+        )
+        if not seed_dir.exists():
+            missing_rejected_outputs += 1
+    return {
+        "expected_tasks": int(payload["expected_n"]),
+        "accepted_tasks": int(payload["n_accepted"]),
+        "rejected_tasks": int(payload["n_rejected"]),
+        "missing_rejected_outputs": int(missing_rejected_outputs),
+        "tasks_resubmitted": 0,
+    }
 
 
 def _count_xyz_frames(path: Path) -> int:

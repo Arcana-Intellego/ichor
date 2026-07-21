@@ -264,6 +264,40 @@ def test_live_resource_resolution_rejects_missing_backend_evidence(
         )
 
 
+def test_phase_b_published_handoff_missing_accepted_output_is_invalid(
+    tmp_path,
+    monkeypatch,
+):
+    iteration_dir = tmp_path / "ACTIVE_LEARNING" / "iteration-000001"
+    ariadne_dir = iteration_dir / "ariadne"
+    ariadne_dir.mkdir(parents=True)
+    (ariadne_dir / "RESULTS.json").write_text("{}\n", encoding="utf-8")
+    (ariadne_dir / "ARIADNE_BATCH_DECISION.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.sampling_protocol.load_sampling_protocol",
+        lambda *_args, **_kwargs: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.handoff_manifests.ariadne_candidate_frames",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            FileNotFoundError("accepted result.json missing")
+        ),
+    )
+
+    with pytest.raises(
+        resource_solver.ResourceEvidenceInvalid,
+        match="missing accepted evidence",
+    ):
+        resource_solver._phase_b_evidence_with_config(
+            tmp_path,
+            1,
+            CampaignConfig(),
+        )
+
+
 def test_ariadne_adds_memory_only_cpus_without_more_workers(
     monkeypatch,
     resource_profile,
