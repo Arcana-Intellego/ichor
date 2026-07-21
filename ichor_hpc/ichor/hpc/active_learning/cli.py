@@ -3170,6 +3170,20 @@ def _format_status(
                 ],
             )
         )
+    try:
+        from .daemon.staging_retirement import retained_staging_inventory
+
+        retained_staging = retained_staging_inventory(campaign)
+    except Exception:
+        retained_staging = []
+    if retained_staging:
+        lines.append("")
+        lines.extend(
+            _section(
+                "Retained Staging Diagnostics",
+                [("bucket", path) for path in retained_staging],
+            )
+        )
     lines.append("")
     lines.extend(
         _section(
@@ -7276,6 +7290,15 @@ def _perform_reconcile_apply_mutations(
         "archived_reference_data_staging": [],
         "archived_reentry_staging": [],
         "archived_ariadne_publication": [],
+        "retired_completed_staging": {
+            "retired": [],
+            "deleted": [],
+            "preserved": [],
+            "warnings": [],
+            "n_retired": 0,
+            "n_deleted": 0,
+            "n_preserved": 0,
+        },
     }
     publication = getattr(report, "ariadne_publication_recovery", None)
     archive_for_replay = bool(
@@ -7346,6 +7369,35 @@ def _perform_reconcile_apply_mutations(
         paths = archive_scripts_for_reconcile(campaign)
         result["archived_scripts"] = paths
         transaction.record_paths("archive_scripts", paths)
+
+    retirement_plan = getattr(report, "completed_staging_retirement", None)
+    retirement_eligible = (
+        list(retirement_plan.get("eligible") or [])
+        if isinstance(retirement_plan, Mapping)
+        else []
+    )
+    retirement_tombstones = (
+        list(retirement_plan.get("pending_tombstones") or [])
+        if isinstance(retirement_plan, Mapping)
+        else []
+    )
+    if retirement_eligible or retirement_tombstones:
+        from .daemon.staging_retirement import retire_completed_staging_buckets
+
+        retirement = retire_completed_staging_buckets(
+            campaign,
+            classification={
+                "eligible": retirement_eligible,
+                "ambiguous": [],
+                "noncanonical": [],
+                "pending_tombstones": retirement_tombstones,
+            },
+        )
+        result["retired_completed_staging"] = retirement
+        transaction.record_paths(
+            "retire_completed_staging",
+            list(retirement["retired"]) + list(retirement["preserved"]),
+        )
 
     if ".DATA/STAGING is non-empty" in report.unsafe_reasons:
         if data_staging_archive_mode == "ferebus_reentry":
@@ -7646,6 +7698,18 @@ def _reconcile_cleanable_reasons(report: Any) -> List[str]:
         )
     if "stale ARIADNE publication" in reasons:
         cleanable.append("stale ARIADNE publication")
+    retirement = getattr(report, "completed_staging_retirement", None)
+    if isinstance(retirement, Mapping):
+        for record in retirement.get("eligible") or []:
+            action = str(record.get("action") or "")
+            cleanable.append(
+                "completed staging for iteration "
+                + str(int(record.get("iteration", 0)))
+                + " will be "
+                + ("deleted" if action == "delete" else "preserved for diagnostics")
+            )
+        if retirement.get("pending_tombstones"):
+            cleanable.append("incomplete completed-staging deletion will be retried")
     return cleanable
 
 
@@ -8215,6 +8279,14 @@ def _reconcile_staging_summary(
         return "protected: " + "; ".join(protected)
     if ".DATA/STAGING is non-empty" in list(getattr(report, "unsafe_reasons", [])):
         return "non-empty, user review required"
+    retirement = getattr(report, "completed_staging_retirement", None)
+    if isinstance(retirement, Mapping) and retirement.get("eligible"):
+        return (
+            str(len(retirement["eligible"]))
+            + " completed bucket(s), routine retirement on apply"
+        )
+    if isinstance(retirement, Mapping) and retirement.get("pending_tombstones"):
+        return "interrupted completed-staging deletion, retry on apply"
     return "none"
 
 
@@ -8351,6 +8423,35 @@ def _print_reconcile_aimall_quality_revalidation(report: Any) -> None:
             ("scheduler work", "none; no Slurm jobs will be submitted"),
         ]
     )
+    print("")
+
+
+def _print_reconcile_completed_staging(report: Any) -> None:
+    retirement = getattr(report, "completed_staging_retirement", None)
+    if not isinstance(retirement, Mapping):
+        return
+    records = list(retirement.get("eligible") or [])
+    tombstones = list(retirement.get("pending_tombstones") or [])
+    if not records and not tombstones:
+        return
+    print("Completed Staging")
+    if records:
+        _print_reconcile_list(
+            "retire on apply",
+            [
+                ("bootstrap" if str(record.get("context")) == "bootstrap" else "iteration " + str(int(record.get("iteration", 0))))
+                + ": "
+                + (
+                    "delete duplicate-only residue"
+                    if str(record.get("action")) == "delete"
+                    else "preserve diagnostic residue outside active staging"
+                )
+                for record in records
+            ],
+        )
+    if tombstones:
+        print("  interrupted deletions to retry: " + str(len(tombstones)))
+    print("  Slurm work submitted: none")
     print("")
 
 
@@ -8783,6 +8884,7 @@ def _print_reconcile_operator_report(
     _print_reconcile_last_failure_compact(report, verbose=verbose)
     _print_reconcile_aimall_quality_revalidation(report)
     _print_reconcile_ariadne_reuse(report)
+    _print_reconcile_completed_staging(report)
     _print_reconcile_safety(campaign, report, contract_status)
     if verbose:
         _print_reconcile_artefacts(campaign, report, contract_status, verbose=True)
@@ -8835,6 +8937,7 @@ def _print_reconcile_applied_operator_report(
     archived: Sequence[str],
     archived_reference_data_staging: Sequence[str],
     restored_bootstrap_handoff: Sequence[str],
+    retired_completed_staging: Optional[Mapping[str, Any]] = None,
     environment_transition_deferred: bool = False,
     verbose: bool = False,
 ) -> None:
@@ -8848,6 +8951,19 @@ def _print_reconcile_applied_operator_report(
     cleanup_items.extend("archived stale scripts: " + _reconcile_relative_path(campaign, item) for item in archived_scripts)
     cleanup_items.extend("archived staging: " + _reconcile_relative_path(campaign, item) for item in archived)
     cleanup_items.extend("archived reference-data staging: " + _reconcile_relative_path(campaign, item) for item in archived_reference_data_staging)
+    retirement = retired_completed_staging or {}
+    cleanup_items.extend(
+        "retired completed staging: " + _reconcile_relative_path(campaign, item)
+        for item in retirement.get("retired") or []
+    )
+    cleanup_items.extend(
+        "preserved diagnostic staging: " + _reconcile_relative_path(campaign, item)
+        for item in retirement.get("preserved") or []
+    )
+    cleanup_items.extend(
+        "staging retirement warning: " + str(item)
+        for item in retirement.get("warnings") or []
+    )
     cleanup_items.extend("restored bootstrap staging: " + _reconcile_relative_path(campaign, item) for item in restored_bootstrap_handoff)
     if verbose:
         _print_reconcile_key_values(
@@ -10145,6 +10261,18 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         "update_config_lock",
         "publish_intent_transitions",
     ]
+    completed_staging_records = list(
+        (getattr(report, "completed_staging_retirement", {}) or {}).get(
+            "eligible", []
+        )
+    )
+    completed_staging_tombstones = list(
+        (getattr(report, "completed_staging_retirement", {}) or {}).get(
+            "pending_tombstones", []
+        )
+    )
+    if completed_staging_records or completed_staging_tombstones:
+        planned_operations.insert(0, "retire_completed_staging")
     if cleanable_now or retrain_ferebus or force_resubmit_array:
         planned_operations.insert(0, "archive_reconcile_evidence")
     try:
@@ -10198,6 +10326,15 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     archived_ariadne_publication = list(
         mutation_result["archived_ariadne_publication"]
     )
+    retired_completed_staging = dict(
+        mutation_result["retired_completed_staging"]
+    )
+    if retired_completed_staging.get("retired"):
+        print("Retired completed staging:")
+        for path in retired_completed_staging["retired"]:
+            print("  - " + str(path))
+        for warning in retired_completed_staging.get("warnings") or []:
+            print("  warning: " + str(warning))
     if archived_ariadne_publication:
         print("Archived stale ARIADNE batch publication:")
         for path in archived_ariadne_publication:
@@ -10230,6 +10367,8 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         + list(ferebus_retrain_archive)
         + list(removed)
         + list(archived_ariadne_publication)
+        + list(retired_completed_staging.get("retired") or [])
+        + list(retired_completed_staging.get("preserved") or [])
     )
 
     if original_report.proposed_state.phase is CampaignPhase.HALTED:
@@ -10682,6 +10821,18 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             ),
             n_removed_stale_paths=len(removed) + len(removed_model_staging),
             n_archived_staging_paths=len(archived) + len(archived_reference_data_staging),
+            n_retired_completed_staging=int(
+                retired_completed_staging.get("n_retired") or 0
+            ),
+            n_deleted_completed_staging=int(
+                retired_completed_staging.get("n_deleted") or 0
+            ),
+            n_preserved_completed_staging=int(
+                retired_completed_staging.get("n_preserved") or 0
+            ),
+            retired_completed_staging_paths=list(
+                retired_completed_staging.get("retired") or []
+            ),
             archived_staging_path=(archived[0] if archived else None),
             archived_reference_data_staging_paths=archived_reference_data_staging,
             n_archived_scripts_paths=len(archived_scripts),
@@ -10766,6 +10917,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         archived_scripts=archived_scripts,
         archived=archived,
         archived_reference_data_staging=archived_reference_data_staging,
+        retired_completed_staging=retired_completed_staging,
         restored_bootstrap_handoff=restored_bootstrap_handoff,
         environment_transition_deferred=environment_transition_deferred,
         verbose=bool(getattr(args, "verbose", False)),

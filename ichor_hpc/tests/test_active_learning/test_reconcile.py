@@ -643,7 +643,7 @@ def _commit_reference_versions(campaign, versions):
             context=context,
             iteration=iteration,
         )
-        shutil.rmtree(pointdir.parent)
+        shutil.rmtree(pointdir.parent, ignore_errors=True)
 
 
 def _commit_training_and_model_versions(training, models, versions):
@@ -664,6 +664,33 @@ def test_propose_recovery_on_empty_campaign_returns_init(tmp_path):
     assert report.committed_reference_data_versions == []
     assert report.committed_model_versions == []
     assert report.existing_state_loaded is False
+
+
+def test_propose_recovery_treats_completed_staging_as_routine_cleanup(
+    tmp_path,
+    monkeypatch,
+):
+    _trust_marker_models(monkeypatch)
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0])
+    state = fresh_campaign_state(max_iterations=3)
+    state.campaign_uid = _FIXTURE_CAMPAIGN_UID
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    historical = campaign / ".DATA" / "STAGING" / "initial"
+    historical.mkdir(parents=True)
+
+    report = propose_recovery(campaign)
+
+    retirement = report.completed_staging_retirement
+    assert [record["iteration"] for record in retirement["eligible"]] == [0]
+    assert retirement["eligible"][0]["action"] == "delete"
+    assert ".DATA/STAGING is non-empty" not in report.unsafe_reasons
+    assert ".DATA/STAGING" not in report.blocking_artifacts
 
 
 def test_script_inventory_accepts_submission_intent_records(tmp_path):

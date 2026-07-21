@@ -633,6 +633,12 @@ def _finish_existing(
         versioning.resolve(int(current), verification="index")
     ledger = _read_ledger(ledger_path)
     _write_ledger(ledger_path, ledger, status="complete")
+    from .staging_retirement import retire_completed_staging_buckets
+
+    retire_completed_staging_buckets(
+        campaign,
+        through_version=int(version),
+    )
     names = [
         entry.pointdir_name
         for entry in view.entries
@@ -881,6 +887,12 @@ def commit_reference_data_delta(
     _write_ledger(ledger_path, ledger, status="published")
     versioning.update_current(version)
     _write_ledger(ledger_path, ledger, status="complete")
+    from .staging_retirement import retire_completed_staging_buckets
+
+    retirement = retire_completed_staging_buckets(
+        campaign,
+        through_version=int(version),
+    )
     _emit(
         progress_callback,
         "reference_commit_published",
@@ -889,6 +901,10 @@ def commit_reference_data_delta(
         moved_bytes=int(ledger["moved_bytes"]),
         shards_reused=int(ledger["shards_reused"]),
         shards_repaired=int(ledger["shards_repaired"]),
+        staging_buckets_retired=int(retirement["n_retired"]),
+        staging_buckets_deleted=int(retirement["n_deleted"]),
+        staging_buckets_preserved=int(retirement["n_preserved"]),
+        staging_retirement_warnings=list(retirement["warnings"]),
         elapsed_seconds=float(time.monotonic() - started),
     )
     all_entries = tuple(parent_view.entries if parent_view is not None else ()) + tuple(entries)

@@ -1585,10 +1585,20 @@ class DryRunPhaseExecutor:
             str(state.campaign_uid),
         )
         self.artefact_log.append(str(iteration_manifest))
+        from .staging_retirement import retire_completed_staging_buckets
+
+        retirement = retire_completed_staging_buckets(
+            self.campaign_dir,
+            through_version=iteration,
+        )
         self._journal_event(
             "active_iteration_finalised",
             iteration=iteration,
             manifest=str(iteration_manifest),
+            staging_buckets_retired=int(retirement["n_retired"]),
+            staging_buckets_deleted=int(retirement["n_deleted"]),
+            staging_buckets_preserved=int(retirement["n_preserved"]),
+            staging_retirement_warnings=list(retirement["warnings"]),
         )
         stop = self.config.stop
         self._report_runtime_progress("stopping_criteria")

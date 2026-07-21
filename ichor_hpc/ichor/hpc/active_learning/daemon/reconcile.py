@@ -288,6 +288,7 @@ class ReconciliationReport:
     scratch_inventory: List[Dict[str, Any]] = field(default_factory=list)
     reconcile_transactions: List[Dict[str, Any]] = field(default_factory=list)
     reference_commit_transactions: List[Dict[str, Any]] = field(default_factory=list)
+    completed_staging_retirement: Dict[str, Any] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
     existing_state_loaded: bool = False
     unsafe_reasons: List[str] = field(default_factory=list)
@@ -1504,6 +1505,19 @@ def propose_recovery(
         if p.name not in (".", "..")
     ]
     unexpected_staging_children = list(staging_children)
+    from .staging_retirement import classify_completed_staging_buckets
+
+    completed_staging_retirement = classify_completed_staging_buckets(campaign)
+    completed_staging_paths = {
+        str(Path(record["bucket"]).resolve(strict=False))
+        for record in completed_staging_retirement.get("eligible", [])
+    }
+    if completed_staging_paths:
+        unexpected_staging_children = [
+            path
+            for path in unexpected_staging_children
+            if str(path.resolve(strict=False)) not in completed_staging_paths
+        ]
     valid_live_bootstrap_handoff = (
         isinstance(bootstrap_handoff, dict)
         and not bool(bootstrap_handoff.get("archived"))
@@ -2724,6 +2738,7 @@ def propose_recovery(
         scratch_inventory=scratch_inventory,
         reconcile_transactions=reconcile_transactions,
         reference_commit_transactions=reference_commit_transactions,
+        completed_staging_retirement=completed_staging_retirement,
         notes=notes,
         existing_state_loaded=existing_loaded,
         unsafe_reasons=unsafe_reasons,

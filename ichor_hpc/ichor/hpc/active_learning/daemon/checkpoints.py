@@ -42,6 +42,7 @@ _EXCLUDED_OPERATIONAL_PREFIXES = (
     (".DATA", "SCRATCH"),
     (".DATA", "SCRATCH_CLEANUP"),
     (".DATA", "STAGING"),
+    (".DATA", "STAGING_RETIRED"),
 )
 _EXCLUDED_FILE_NAMES = {
     "daemon.lock",

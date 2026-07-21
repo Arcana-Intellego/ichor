@@ -284,7 +284,10 @@ def _commit_training_and_model_versions(campaign: Path, versions):
 
     shutil.rmtree(campaign / "TRAINED_MODELS" / "iteration-staging")
     shutil.rmtree(campaign / ".DATA" / "SCRIPTS")
-    shutil.rmtree(campaign / ".DATA" / "STAGING" / "initial")
+    shutil.rmtree(
+        campaign / ".DATA" / "STAGING" / "initial",
+        ignore_errors=True,
+    )
 
 
 def _write_valid_ariadne_results(campaign: Path, iteration: int = 1):
@@ -3031,6 +3034,46 @@ def test_reconcile_preview_offers_explicit_staging_archive_command(
     assert "inspect blockers before restarting" not in output
 
 
+def test_reconcile_preview_retires_completed_staging_without_archive_flag(
+    tmp_path,
+    capsys,
+):
+    report = SimpleNamespace(
+        proposed_state=_intentionally_stopped_seed_select_state(),
+        unsafe_reasons=[],
+        blocking_artifacts=[],
+        active_submission_intents=[],
+        completed_staging_retirement={
+            "eligible": [
+                {
+                    "context": "active",
+                    "iteration": 8,
+                    "action": "delete",
+                }
+            ]
+        },
+    )
+    contract = {
+        "contract_ok": True,
+        "selected_phase": CampaignPhase.SEED_SELECT.value,
+        "missing_or_invalid_inputs": [],
+    }
+
+    cli_mod._print_reconcile_completed_staging(report)
+    cli_mod._print_reconcile_apply_plan_compact(
+        tmp_path,
+        report,
+        contract,
+        proposed_state_path=tmp_path / ".DATA" / "state.json.proposed",
+    )
+    output = capsys.readouterr().out
+
+    assert "iteration 8: delete duplicate-only residue" in output
+    assert "Slurm work submitted: none" in output
+    assert "--archive-staging" not in output
+    assert "--apply" in output
+
+
 def test_preflight_describes_completed_stop_as_pause_not_backend_failure(tmp_path):
     payload = {
         "ready": False,
@@ -3812,6 +3855,8 @@ def test_cli_reconcile_apply_prints_final_recomputed_phase(
         CampaignConfig.from_yaml(campaign / "campaign.yaml"),
         campaign_uid=state.campaign_uid,
     )
+    completed_staging = campaign / ".DATA" / "STAGING" / "initial"
+    completed_staging.mkdir(parents=True)
     append_event(
         campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
         "halt",
@@ -3836,6 +3881,8 @@ def test_cli_reconcile_apply_prints_final_recomputed_phase(
     assert "recovered state" in out
     assert "written and verified" in out
     assert "final data check: passed" in out
+    assert "retired completed staging" in out
+    assert not completed_staging.exists()
     assert "Recovery Contract" not in out
     assert "RESULTS.json" not in out
     assert "ichor-al-daemon resume --campaign-dir " in out

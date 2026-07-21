@@ -86,6 +86,9 @@ def _idle_campaign(tmp_path: Path, monkeypatch) -> Path:
     staging = campaign / ".DATA" / "STAGING"
     staging.mkdir(parents=True)
     (staging / "incomplete.bin").write_bytes(b"staging")
+    retired = campaign / ".DATA" / "STAGING_RETIRED" / "diagnostic"
+    retired.mkdir(parents=True)
+    (retired / "rejected.bin").write_bytes(b"rejected staging")
     monkeypatch.setattr(
         checkpoints,
         "verify_state_referenced_artifacts",
@@ -117,6 +120,9 @@ def test_checkpoint_deduplicates_verifies_and_restores(tmp_path, monkeypatch):
     )
     assert not any(path.startswith(".DATA/SCRATCH/") for path in relative_paths)
     assert not any(path.startswith(".DATA/STAGING/") for path in relative_paths)
+    assert not any(
+        path.startswith(".DATA/STAGING_RETIRED/") for path in relative_paths
+    )
     object_paths = list((Path(created["store"]) / "objects").iterdir())
     assert len(object_paths) == len({item["sha256"] for item in manifest["files"]})
 

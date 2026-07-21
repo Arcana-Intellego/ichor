@@ -111,6 +111,34 @@ def test_status_running_ariadne_matches_the_agreed_human_contract():
         assert retired_label not in output
 
 
+def test_retained_staging_diagnostics_are_verbose_only(tmp_path):
+    retained = (
+        tmp_path
+        / ".DATA"
+        / "STAGING_RETIRED"
+        / "active-iteration-000008-transaction"
+    )
+    retained.mkdir(parents=True)
+    payload = _active_ariadne_payload()
+
+    concise = cli._format_status(
+        payload,
+        verbose=False,
+        campaign=tmp_path,
+        journal_events=[],
+    )
+    verbose = cli._format_status(
+        payload,
+        verbose=True,
+        campaign=tmp_path,
+        journal_events=[],
+    )
+
+    assert "Retained Staging Diagnostics" not in concise
+    assert "Retained Staging Diagnostics" in verbose
+    assert str(retained) in verbose
+
+
 def test_status_phase_policies_cover_every_campaign_phase():
     expected = {phase.value for phase in CampaignPhase}
 

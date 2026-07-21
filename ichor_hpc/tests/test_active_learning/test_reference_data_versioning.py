@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from ichor.hpc.active_learning.config import CampaignConfig
+from ichor.hpc.active_learning.daemon.dry_run_executor import DryRunPhaseExecutor
 from ichor.hpc.active_learning.daemon.input_staging import (
     accepted_allocation_pointdirs,
     commit_reference_data_delta,
@@ -18,6 +20,13 @@ from ichor.hpc.active_learning.daemon.reference_commit import (
     classify_reference_commit,
     prepare_reference_data_delta,
 )
+from ichor.hpc.active_learning.daemon.staging_retirement import (
+    StagingRetirementError,
+    classify_completed_staging_buckets,
+    retire_completed_staging_buckets,
+    retired_staging_root,
+)
+from ichor.hpc.active_learning.daemon.state import fresh_campaign_state
 from ichor.hpc.active_learning.point_allocation import (
     accepted_attempts,
     create_point_allocation,
@@ -1126,3 +1135,333 @@ def test_mixed_legacy_and_canonical_model_roots_are_rejected(tmp_path):
 
     with pytest.raises(RuntimeError, match="alongside"):
         reject_legacy_campaign_layout(campaign)
+
+
+def test_reference_commit_retires_duplicate_only_staging(tmp_path):
+    campaign = tmp_path / "campaign"
+    _complete_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        first_frame_id=0,
+    )
+
+    commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
+
+    assert not (campaign / ".DATA" / "STAGING" / "initial").exists()
+    retired = retired_staging_root(campaign)
+    assert not retired.exists() or not list(retired.iterdir())
+
+
+def test_completed_staging_with_rejected_payload_is_preserved(tmp_path):
+    campaign = tmp_path / "campaign"
+    _complete_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        first_frame_id=0,
+    )
+    commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
+    bucket = campaign / ".DATA" / "STAGING" / "initial"
+    rejected = bucket / "POINT_9999.pointdir"
+    rejected.mkdir(parents=True)
+    failure = rejected / "failure.txt"
+    failure.write_text("diagnostic\n", encoding="utf-8")
+    unexpected = bucket / "unexpected.bin"
+    unexpected.write_bytes(b"diagnostic payload")
+    failure.chmod(0o400)
+    unexpected.chmod(0o400)
+    rejected.chmod(0o500)
+    bucket.chmod(0o500)
+
+    classification = classify_completed_staging_buckets(campaign)
+
+    assert len(classification["eligible"]) == 1
+    assert classification["eligible"][0]["action"] == "preserve"
+    result = retire_completed_staging_buckets(
+        campaign,
+        classification=classification,
+    )
+    assert result["n_preserved"] == 1
+    assert not bucket.exists()
+    preserved = Path(result["preserved"][0])
+    assert (preserved / "POINT_9999.pointdir" / "failure.txt").read_text(
+        encoding="utf-8"
+    ) == "diagnostic\n"
+    assert (preserved / "unexpected.bin").read_bytes() == b"diagnostic payload"
+    assert stat.S_IMODE(preserved.stat().st_mode) & stat.S_IWUSR
+    assert stat.S_IMODE((preserved / "POINT_9999.pointdir").stat().st_mode) & stat.S_IWUSR
+    assert stat.S_IMODE(
+        (preserved / "POINT_9999.pointdir" / "failure.txt").stat().st_mode
+    ) & stat.S_IWUSR
+    assert stat.S_IMODE((preserved / "unexpected.bin").stat().st_mode) & stat.S_IWUSR
+
+
+def test_changed_quality_residue_is_not_deleted(tmp_path, monkeypatch):
+    from ichor.hpc.active_learning.daemon import staging_retirement as retirement_mod
+
+    campaign = tmp_path / "campaign"
+    _complete_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        first_frame_id=0,
+    )
+    monkeypatch.setattr(
+        retirement_mod,
+        "retire_completed_staging_buckets",
+        lambda *_args, **_kwargs: {
+            "n_retired": 0,
+            "n_deleted": 0,
+            "n_preserved": 0,
+            "warnings": [],
+        },
+    )
+    commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
+    quality = campaign / ".DATA" / "STAGING" / "initial" / "quantum_quality.json"
+    payload = json.loads(quality.read_text(encoding="utf-8"))
+    quality.write_text(json.dumps(payload, indent=4) + "\n", encoding="utf-8")
+
+    classification = classify_completed_staging_buckets(campaign)
+
+    assert classification["eligible"] == []
+    assert len(classification["ambiguous"]) == 1
+    assert "differs from committed authority" in classification["ambiguous"][0]["reason"]
+
+
+def test_malformed_known_staging_metadata_remains_ambiguous(tmp_path):
+    campaign = tmp_path / "campaign"
+    _complete_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        first_frame_id=0,
+    )
+    commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
+    bucket = campaign / ".DATA" / "STAGING" / "initial"
+    bucket.mkdir(parents=True)
+    (bucket / "accepted_pointdirs.json").write_text("{}\n", encoding="utf-8")
+
+    classification = classify_completed_staging_buckets(campaign)
+
+    assert classification["eligible"] == []
+    assert len(classification["ambiguous"]) == 1
+    with pytest.raises(StagingRetirementError, match="ambiguous"):
+        retire_completed_staging_buckets(
+            campaign,
+            classification=classification,
+        )
+    assert bucket.is_dir()
+
+
+def test_retirement_deletion_interruption_leaves_retryable_tombstone(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import staging_retirement as retirement_mod
+
+    campaign = tmp_path / "campaign"
+    _complete_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        first_frame_id=0,
+    )
+    commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
+    bucket = campaign / ".DATA" / "STAGING" / "initial"
+    bucket.mkdir(parents=True)
+    classification = classify_completed_staging_buckets(campaign)
+    original_rmtree = retirement_mod.shutil.rmtree
+
+    def fail_delete(_path):
+        raise OSError("injected deletion failure")
+
+    monkeypatch.setattr(retirement_mod.shutil, "rmtree", fail_delete)
+    result = retire_completed_staging_buckets(
+        campaign,
+        classification=classification,
+    )
+
+    assert result["n_deleted"] == 1
+    assert result["warnings"]
+    assert not bucket.exists()
+    tombstones = list(retired_staging_root(campaign).glob(".deleting-*"))
+    assert len(tombstones) == 1
+    interrupted = classify_completed_staging_buckets(campaign)
+    assert interrupted["pending_tombstones"] == [str(tombstones[0])]
+
+    monkeypatch.setattr(retirement_mod.shutil, "rmtree", original_rmtree)
+    replay = retire_completed_staging_buckets(campaign)
+    assert replay["warnings"] == []
+    assert not tombstones[0].exists()
+
+
+def test_retirement_rename_failure_leaves_source_untouched(tmp_path, monkeypatch):
+    from ichor.hpc.active_learning.daemon import staging_retirement as retirement_mod
+
+    campaign = tmp_path / "campaign"
+    _complete_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        first_frame_id=0,
+    )
+    commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
+    bucket = campaign / ".DATA" / "STAGING" / "initial"
+    bucket.mkdir(parents=True)
+    classification = classify_completed_staging_buckets(campaign)
+    original_replace = retirement_mod.os.replace
+
+    def fail_rename(_source, _destination):
+        raise OSError("injected rename failure")
+
+    monkeypatch.setattr(retirement_mod.os, "replace", fail_rename)
+    with pytest.raises(OSError, match="injected rename failure"):
+        retire_completed_staging_buckets(
+            campaign,
+            classification=classification,
+        )
+    assert bucket.is_dir()
+    assert not Path(classification["eligible"][0]["destination"]).exists()
+
+    monkeypatch.setattr(retirement_mod.os, "replace", original_replace)
+    result = retire_completed_staging_buckets(campaign)
+    assert result["n_deleted"] == 1
+    assert not bucket.exists()
+
+
+def test_retirement_refuses_existing_source_and_destination(tmp_path):
+    campaign = tmp_path / "campaign"
+    _complete_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        first_frame_id=0,
+    )
+    commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
+    bucket = campaign / ".DATA" / "STAGING" / "initial"
+    bucket.mkdir(parents=True)
+    classification = classify_completed_staging_buckets(campaign)
+    destination = Path(classification["eligible"][0]["destination"])
+    destination.mkdir(parents=True)
+
+    with pytest.raises(
+        StagingRetirementError,
+        match="source and retirement destination both exist",
+    ):
+        retire_completed_staging_buckets(
+            campaign,
+            classification=classification,
+        )
+
+    assert bucket.is_dir()
+    assert destination.is_dir()
+
+
+def test_reconcile_style_retirement_ignores_incomplete_future_bucket(tmp_path):
+    campaign = tmp_path / "campaign"
+    _complete_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        first_frame_id=0,
+    )
+    commit_reference_data_delta(
+        campaign,
+        reference_data_version=0,
+        context="bootstrap",
+        iteration=0,
+    )
+    completed = campaign / ".DATA" / "STAGING" / "initial"
+    completed.mkdir(parents=True)
+    active = campaign / ".DATA" / "STAGING" / "iter_1"
+    (active / "POINT_0000.pointdir").mkdir(parents=True)
+    classification = classify_completed_staging_buckets(campaign)
+
+    assert [record["iteration"] for record in classification["eligible"]] == [0]
+    assert [record["iteration"] for record in classification["ambiguous"]] == [1]
+    result = retire_completed_staging_buckets(
+        campaign,
+        classification={
+            "eligible": classification["eligible"],
+            "ambiguous": [],
+            "noncanonical": [],
+        },
+    )
+
+    assert result["n_deleted"] == 1
+    assert not completed.exists()
+    assert active.is_dir()
+
+
+def test_stop_check_catches_up_completed_staging(tmp_path, monkeypatch):
+    from ichor.hpc.active_learning.versioning import sampling_iterations
+
+    campaign = tmp_path / "campaign"
+    for context, iteration, frame_id in (
+        ("bootstrap", 0, 0),
+        ("active", 1, 10),
+    ):
+        _complete_allocation(
+            campaign,
+            context=context,
+            iteration=iteration,
+            first_frame_id=frame_id,
+        )
+        commit_reference_data_delta(
+            campaign,
+            reference_data_version=iteration,
+            context=context,
+            iteration=iteration,
+        )
+    residue = campaign / ".DATA" / "STAGING" / "iter_1"
+    residue.mkdir(parents=True)
+    monkeypatch.setattr(
+        sampling_iterations,
+        "finalise_active_iteration",
+        lambda *_args, **_kwargs: campaign / "ITERATION_MANIFEST.json",
+    )
+    state = fresh_campaign_state(max_iterations=3)
+    state.campaign_uid = "campaign-uid"
+    state.iteration = 1
+    state.reference_data_version = 1
+    state.models_version = 1
+
+    DryRunPhaseExecutor(campaign, CampaignConfig())._inline_stop_check(state)
+
+    assert not residue.exists()
