@@ -60,6 +60,7 @@ from .phase_executor import (
     PostprocessRetryDisposition,
     SBATCH_PHASES,
 )
+from .phase_progress import PhaseProgressReporter
 from .reconcile import stateful_campaign_artifacts
 from .state import (
     CampaignPhase,
@@ -330,6 +331,21 @@ class Daemon:
     _last_environment_binding: Optional[Dict[str, Any]] = field(
         default=None, init=False, repr=False
     )
+    _journal_phase_snapshot: Optional[str] = field(
+        default=None, init=False, repr=False
+    )
+    _journal_iteration_snapshot: Optional[int] = field(
+        default=None, init=False, repr=False
+    )
+    _journal_replacement_round_snapshot: Optional[int] = field(
+        default=None, init=False, repr=False
+    )
+    _active_phase_progress_reporter: Optional[PhaseProgressReporter] = field(
+        default=None, init=False, repr=False
+    )
+    _scheduler_progress_reporters: Dict[str, PhaseProgressReporter] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         self.campaign_dir = Path(self.campaign_dir)
@@ -557,6 +573,7 @@ class Daemon:
         if not lease.is_dir() or token is None:
             return
         if state is not None:
+            self._set_journal_state(state)
             self._lease_state_snapshot = {
                 "phase": state.phase.value,
                 "iteration": int(state.iteration),
@@ -673,6 +690,7 @@ class Daemon:
             state = fresh_campaign_state(
                 max_iterations=self.config.campaign.max_iterations
             )
+            self._set_journal_state(state)
             from .config_lock import ensure_config_lock
 
             ensure_config_lock(
@@ -689,6 +707,7 @@ class Daemon:
             self._repair_provenance_index_best_effort()
             return state
         state = read_state(sp)
+        self._set_journal_state(state)
         self._repair_provenance_index_best_effort()
         return state
 
@@ -711,7 +730,28 @@ class Daemon:
                 error=type(exc).__name__ + ": " + str(exc)[:180],
             )
 
+    def _set_journal_state(self, state: CampaignState) -> None:
+        self._journal_phase_snapshot = state.phase.value
+        self._journal_iteration_snapshot = int(state.iteration)
+        self._journal_replacement_round_snapshot = int(
+            getattr(state, "replacement_round", 0)
+        )
+
     def _journal(self, event_type: str, **payload: Any) -> None:
+        if "phase" not in payload and self._journal_phase_snapshot is not None:
+            payload["phase"] = self._journal_phase_snapshot
+        if (
+            "iteration" not in payload
+            and self._journal_iteration_snapshot is not None
+        ):
+            payload["iteration"] = self._journal_iteration_snapshot
+        if (
+            "replacement_round" not in payload
+            and self._journal_replacement_round_snapshot not in {None, 0}
+        ):
+            payload["replacement_round"] = (
+                self._journal_replacement_round_snapshot
+            )
         try:
             append_event(
                 self.journal_path(),
@@ -726,6 +766,116 @@ class Daemon:
         except Exception:
             # Journal writes are best-effort; never let logging crash the daemon.
             pass
+
+    def _phase_progress_reporter(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+        *,
+        producer_kind: str = "local",
+        job_id: Optional[str] = None,
+    ) -> PhaseProgressReporter:
+        identity: Dict[str, Any] = {"daemon_pid": int(os.getpid())}
+        launch_id = str(os.environ.get("ICHOR_DAEMON_LAUNCH_ID") or "").strip()
+        if launch_id:
+            identity["daemon_start_id"] = launch_id
+        if job_id:
+            identity["job_id"] = str(job_id)
+        self._close_phase_progress_reporter()
+        reporter = PhaseProgressReporter(
+            self.campaign_dir,
+            campaign_uid=str(state.campaign_uid),
+            phase=phase.value,
+            iteration=int(state.iteration),
+            replacement_round=int(state.replacement_round),
+            producer_kind=producer_kind,
+            identity=identity,
+            journal_callback=lambda event, payload: self._journal(
+                event, **dict(payload)
+            ),
+        )
+        self._active_phase_progress_reporter = reporter
+        return reporter
+
+    def _close_phase_progress_reporter(self) -> None:
+        reporter = self._active_phase_progress_reporter
+        if reporter is not None:
+            reporter.close()
+        self._active_phase_progress_reporter = None
+
+    def _scheduler_progress_reporter(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+        job_id: str,
+        *,
+        expected_tasks: Optional[int],
+    ) -> PhaseProgressReporter:
+        key = phase.value + ":" + str(job_id)
+        reporter = self._scheduler_progress_reporters.get(key)
+        if reporter is not None:
+            return reporter
+        identity: Dict[str, Any] = {
+            "daemon_pid": int(os.getpid()),
+            "job_id": str(job_id),
+        }
+        launch_id = str(os.environ.get("ICHOR_DAEMON_LAUNCH_ID") or "").strip()
+        if launch_id:
+            identity["daemon_start_id"] = launch_id
+        reporter = PhaseProgressReporter(
+            self.campaign_dir,
+            campaign_uid=str(state.campaign_uid),
+            phase=phase.value,
+            iteration=int(state.iteration),
+            replacement_round=int(state.replacement_round),
+            producer_kind="scheduler",
+            identity=identity,
+            journal_callback=lambda event, payload: self._journal(
+                event, **dict(payload)
+            ),
+        )
+        reporter.start(
+            "scheduler_wait",
+            completed=0,
+            total=expected_tasks,
+            unit="tasks",
+        )
+        self._scheduler_progress_reporters[key] = reporter
+        return reporter
+
+    def _finish_scheduler_progress(
+        self,
+        phase: CampaignPhase,
+        job_id: str,
+        *,
+        failed: Optional[int] = None,
+    ) -> None:
+        key = phase.value + ":" + str(job_id)
+        reporter = self._scheduler_progress_reporters.pop(key, None)
+        if reporter is not None:
+            if int(failed or 0) > 0:
+                reporter.fail(
+                    "Slurm reported " + str(int(failed or 0)) + " failed task(s)",
+                    stage="scheduler_wait",
+                )
+            else:
+                reporter.complete(stage="scheduler_wait")
+
+    def _close_scheduler_progress_reporters(self) -> None:
+        for reporter in list(self._scheduler_progress_reporters.values()):
+            reporter.close()
+        self._scheduler_progress_reporters.clear()
+
+    def _bind_executor_progress(
+        self,
+        reporter: Optional[PhaseProgressReporter],
+    ) -> None:
+        binder = getattr(self.executor, "_bind_runtime_progress_reporter", None)
+        if callable(binder):
+            try:
+                binder(reporter)
+            except Exception:
+                pass
 
     def _write_last_exception(self, exc: Exception) -> None:
         from datetime import datetime, timezone
@@ -1406,6 +1556,12 @@ class Daemon:
         frequency = int(retention.checkpoint_every_iterations)
         if completed_iteration != 0 and completed_iteration % frequency != 0:
             return None
+        checkpoint_reporter = self._phase_progress_reporter(
+            state,
+            state.phase,
+            producer_kind="checkpoint",
+        )
+        checkpoint_reporter.start("checkpoint_copy")
         try:
             from .checkpoints import create_checkpoint
 
@@ -1417,6 +1573,7 @@ class Daemon:
                     retention.checkpoint_verify_after_write
                 ),
                 allow_active_lease=True,
+                progress_callback=checkpoint_reporter.update,
             )
         except Exception as exc:
             reason = (
@@ -1433,6 +1590,7 @@ class Daemon:
                 required=bool(retention.checkpoint_required),
                 error=reason,
             )
+            checkpoint_reporter.fail(reason)
             if bool(retention.checkpoint_required):
                 return self._halt(state, state.phase, reason)
             return None
@@ -1444,6 +1602,7 @@ class Daemon:
             checkpoint=str(result.get("checkpoint") or ""),
             manifest_sha256=str(result.get("manifest_sha256") or ""),
         )
+        checkpoint_reporter.complete(stage="checkpoint_verification")
         return None
 
     def _on_phase_entry(self, state: CampaignState, phase: CampaignPhase) -> str:
@@ -1741,10 +1900,29 @@ class Daemon:
                     "submission_intent_write_failed: "
                     + type(exc).__name__ + ": " + str(exc)[:160],
                 )
+        phase_reporter: Optional[PhaseProgressReporter] = None
+        if phase not in {CampaignPhase.SEED_SELECT, CampaignPhase.REFERENCE_COMMIT}:
+            phase_reporter = self._phase_progress_reporter(state, phase)
+            phase_reporter.start(
+                "input_staging" if phase_name in SBATCH_PHASES else "phase_entry"
+            )
+        self._bind_executor_progress(phase_reporter)
         try:
-            result = self.executor.submit_or_run(state, phase)
-            result.validate(stage="submit", phase_name=phase_name)
+            try:
+                result = self.executor.submit_or_run(state, phase)
+                result.validate(stage="submit", phase_name=phase_name)
+            finally:
+                self._bind_executor_progress(None)
         except BackendSubmissionError as exc:
+            if phase_reporter is not None:
+                phase_reporter.fail(
+                    "BackendSubmissionError: " + str(exc),
+                    stage=(
+                        "slurm_submission"
+                        if phase_name in SBATCH_PHASES
+                        else "phase_entry"
+                    ),
+                )
             #a backend submission (sbatch) failed outright. halt cleanly so an
             # user can look, instead of letting it bubble up and take the
             #whole daemon down mid-campaign.
@@ -1759,6 +1937,8 @@ class Daemon:
                 state, phase, "backend_submission_failed: " + str(exc)[:200]
             )
         except Exception as exc:
+            if phase_reporter is not None:
+                phase_reporter.fail(type(exc).__name__ + ": " + str(exc))
             if intent_written:
                 try:
                     _submission_intent.mark_failed(
@@ -1818,12 +1998,20 @@ class Daemon:
                     else None
                 ),
             )
+            if phase_reporter is not None:
+                phase_reporter.complete(
+                    stage="slurm_submission",
+                    job_id=str(result.submitted_job_id),
+                    expected_tasks=result.expected_tasks,
+                )
             return TickStatus.SUBMITTED
         if result.is_complete:
             # Inline phase, postprocess-only recovery, or an executor that
             # decided no submission was needed.  This path must honour the
             # same failure contract as ordinary terminal-job postprocessing.
             if result.failure_reason:
+                if phase_reporter is not None:
+                    phase_reporter.fail(str(result.failure_reason))
                 if intent_written and phase_name in SBATCH_PHASES:
                     try:
                         _submission_intent.mark_failed(
@@ -1843,6 +2031,8 @@ class Daemon:
                 next_phase_override=result.next_phase_override,
             )
             if not advanced:
+                if phase_reporter is not None:
+                    phase_reporter.fail("phase advancement was refused")
                 return TickStatus.HALTED
             if intent_written and phase_name in SBATCH_PHASES:
                 self._complete_intent_after_advance(
@@ -1851,8 +2041,12 @@ class Daemon:
                     state.last_completion_receipt,
                     completed_without_submission=True,
                 )
+            if phase_reporter is not None:
+                phase_reporter.complete()
             return TickStatus.ADVANCED
         #defensive: executor returned neither a JobID nor completion.
+        if phase_reporter is not None:
+            phase_reporter.fail("executor returned no terminal result")
         raise RuntimeError(
             "executor returned no submitted_job_id and is_complete=False for "
             + phase.value
@@ -2111,6 +2305,12 @@ class Daemon:
                 + " job_id="
                 + str(job_id),
             )
+        scheduler_reporter = self._scheduler_progress_reporter(
+            state,
+            phase,
+            str(job_id),
+            expected_tasks=expected_tasks,
+        )
         try:
             observations = self._poll_sacct(
                 job_id,
@@ -2169,6 +2369,41 @@ class Daemon:
                 phase.value
             ),
             strict_parent_job_id=(self.scheduler_identity_kind == "slurm"),
+        )
+        running_states = {"RUNNING", "COMPLETING", "STAGE_OUT"}
+        pending_states = {
+            "PENDING",
+            "CONFIGURING",
+            "REQUEUED",
+            "RESIZING",
+            "SUSPENDED",
+            "EXPEDITING",
+            "POWER_UP_NODE",
+            "REQUEUE_FED",
+            "REQUEUE_HOLD",
+            "RESV_DEL_HOLD",
+            "SIGNALING",
+            "UPDATE_DB",
+            "SPECIAL_EXIT",
+            "STOPPED",
+        }
+        status_values = [
+            str(getattr(observation.status, "value", observation.status)).upper()
+            for observation in summary.observations
+        ]
+        scheduler_reporter.update(
+            stage="scheduler_wait",
+            completed=int(getattr(summary, "n_completed", 0)),
+            total=(
+                int(expected_tasks)
+                if expected_tasks is not None
+                else int(getattr(summary, "n_tasks", 0)) or None
+            ),
+            unit="tasks",
+            running=sum(value in running_states for value in status_values),
+            pending=sum(value in pending_states for value in status_values),
+            failed=int(getattr(summary, "n_failed", 0)),
+            missing=int(getattr(summary, "n_missing", 0)),
         )
         if observations:
             first_status = getattr(observations[0].status, "value", observations[0].status)
@@ -2351,6 +2586,12 @@ class Daemon:
 
         if not summary.is_terminal:
             return TickStatus.POLLING
+
+        self._finish_scheduler_progress(
+            phase,
+            str(job_id),
+            failed=int(getattr(summary, "n_failed", 0)),
+        )
 
         self._record_queue_lifecycle(
             state,
@@ -2742,8 +2983,27 @@ class Daemon:
             n_observed=int(getattr(summary, "n_observed", 0)),
             n_missing=int(getattr(summary, "n_missing", 0)),
         )
+        postprocess_reporter = self._phase_progress_reporter(
+            state,
+            phase,
+            job_id=str(summary.parent_job_id),
+        )
+        postprocess_reporter.start(
+            "output_visibility",
+            completed=0,
+            total=getattr(summary, "n_expected", None),
+            unit="tasks",
+        )
+        self._bind_executor_progress(postprocess_reporter)
         for attempt in range(attempts):
             try:
+                postprocess_reporter.update(
+                    stage="structural_parsing",
+                    completed=0,
+                    total=getattr(summary, "n_expected", None),
+                    unit="tasks",
+                    attempt=int(attempt + 1),
+                )
                 result = self.executor.postprocess(state, phase, observations)
                 result.validate(stage="postprocess", phase_name=phase.value)
             except Exception as exc:
@@ -2773,6 +3033,8 @@ class Daemon:
                     n_observed=int(getattr(summary, "n_observed", 0)),
                     n_missing=int(getattr(summary, "n_missing", 0)),
                 )
+                postprocess_reporter.fail(reason)
+                self._bind_executor_progress(None)
                 return self._halt(state, phase, reason)
             if (
                 result.failure_reason
@@ -2792,6 +3054,7 @@ class Daemon:
                     self.sleep_fn(float(settle_seconds))
                 continue
             break
+        self._bind_executor_progress(None)
         if result is None:
             self._record_queue_lifecycle(
                 state,
@@ -2803,6 +3066,7 @@ class Daemon:
                 n_observed=int(getattr(summary, "n_observed", 0)),
                 n_missing=int(getattr(summary, "n_missing", 0)),
             )
+            postprocess_reporter.fail("postprocess failed without a result")
             return self._halt(state, phase, "postprocess_failed_without_result")
         if result.failure_reason:
             self._record_queue_lifecycle(
@@ -2815,6 +3079,7 @@ class Daemon:
                 n_observed=int(getattr(summary, "n_observed", 0)),
                 n_missing=int(getattr(summary, "n_missing", 0)),
             )
+            postprocess_reporter.fail(str(result.failure_reason))
             return self._halt(state, phase, result.failure_reason)
         self._clear_sacct_streaks(state, str(summary.parent_job_id))
         contract_error = self._transition_output_contract_error(
@@ -2839,6 +3104,9 @@ class Daemon:
                 phase=phase.value,
                 iteration=state.iteration,
                 reason=contract_error,
+            )
+            postprocess_reporter.fail(
+                "phase output contract invalid: " + str(contract_error)
             )
             return self._halt(
                 state,
@@ -2870,6 +3138,7 @@ class Daemon:
             expected_tasks=getattr(summary, "n_expected", None),
         )
         if not advanced:
+            postprocess_reporter.fail("phase advancement was refused")
             return TickStatus.HALTED
         if phase.value in SBATCH_PHASES:
             self._complete_intent_after_advance(
@@ -2886,6 +3155,11 @@ class Daemon:
                 if isinstance(state.last_completion_receipt, dict)
                 else None
             ),
+        )
+        postprocess_reporter.complete(
+            stage="acceptance_publication",
+            accepted=int(getattr(summary, "n_completed", 0)),
+            failed=int(getattr(summary, "n_failed", 0)),
         )
         return TickStatus.ADVANCED
 
@@ -4295,6 +4569,7 @@ class Daemon:
             if on_disk is not None and bool(on_disk.shutdown_requested):
                 state.shutdown_requested = True
         write_state(self.state_path(), state)
+        self._set_journal_state(state)
 
     # --- public lifecycle ----------------------------------------------
 
@@ -4379,15 +4654,38 @@ class Daemon:
                             file=sys.stderr,
                         )
                         return 2
+                    for startup_stage in (
+                        "campaign_validation",
+                        "lock_acquisition",
+                        "lease_acquisition",
+                        "state_loading",
+                    ):
+                        self._journal(
+                            "daemon_startup_progress",
+                            stage=startup_stage,
+                            status="completed",
+                        )
                     notify_startup(
                         "ownership_acquired",
                         "environment_transition",
                     )
+                    self._journal(
+                        "daemon_startup_progress",
+                        stage="environment_transition",
+                        status="running",
+                    )
                     try:
                         state = read_state(self.state_path())
+                        self._set_journal_state(state)
                         self._repair_completed_unsubmitted_intents(state)
                         self._prepare_environment_generation(state)
                     except Exception as exc:
+                        self._journal(
+                            "daemon_startup_progress",
+                            stage="environment_transition",
+                            status="failed",
+                            error=type(exc).__name__ + ": " + str(exc)[:160],
+                        )
                         notify_startup(
                             "failed",
                             "environment_transition",
@@ -4401,7 +4699,17 @@ class Daemon:
                             file=sys.stderr,
                         )
                         return 13
+                    self._journal(
+                        "daemon_startup_progress",
+                        stage="environment_transition",
+                        status="completed",
+                    )
                     self._journal("daemon_started", pid=os.getpid())
+                    self._journal(
+                        "daemon_startup_progress",
+                        stage="ready",
+                        status="completed",
+                    )
                     notify_startup("ready", "run_loop")
                     try:
                         return self._run_loop(max_ticks=max_ticks)
@@ -4411,6 +4719,13 @@ class Daemon:
                         self._journal("daemon_interrupted")
                         return 130
                     finally:
+                        self._close_phase_progress_reporter()
+                        self._close_scheduler_progress_reporters()
+                        self._journal(
+                            "daemon_startup_progress",
+                            stage="shutdown",
+                            status="completed",
+                        )
                         self._journal("daemon_stopped", pid=os.getpid())
                         notify_startup("stopped", "shutdown")
         except DaemonAlreadyRunningError as exc:
@@ -4454,8 +4769,11 @@ class Daemon:
                 return 0
 
             try:
-                status = self.tick()
-                self._assert_lease_healthy()
+                try:
+                    status = self.tick()
+                    self._assert_lease_healthy()
+                finally:
+                    self._close_phase_progress_reporter()
             except (StateSchemaError, json.JSONDecodeError) as exc:
                 self._journal("state_corrupt", error=str(exc)[:200])
                 print(

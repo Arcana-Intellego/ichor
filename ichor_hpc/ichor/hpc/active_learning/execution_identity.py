@@ -1430,6 +1430,8 @@ def advance_environment_generation(
             generation=generation_number,
             previous_generation_digest_sha256=str(active_generation["digest_sha256"]),
             generation_digest_sha256=str(candidate["digest_sha256"]),
+            phase=state.phase.value,
+            iteration=int(state.iteration),
             changed_fields=[
                 key
                 for key in _ENVIRONMENT_FINGERPRINT_KEYS

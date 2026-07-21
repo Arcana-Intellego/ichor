@@ -601,8 +601,13 @@ def test_stage_aimall_inputs_writes_resolved_naat_metadata(tmp_path):
         logical_task_id=0,
     )
 
+    progress = []
     staged_dir, n_points = stg.stage_aimall_inputs(
-        campaign, cfg, "INITIAL_AIMALL", 0,
+        campaign,
+        cfg,
+        "INITIAL_AIMALL",
+        0,
+        progress_callback=lambda **payload: progress.append(payload),
     )
 
     assert staged_dir == staging
@@ -632,6 +637,13 @@ def test_stage_aimall_inputs_writes_resolved_naat_metadata(tmp_path):
     )
     assert resolved.extra["aimall_task_naat"] == [3]
     assert resolved.extra["evidence"]["aimall_task_naat"] == [3]
+    assert [record["stage"] for record in progress] == [
+        "aimall_input_validation",
+        "aimall_input_validation",
+        "aimall_task_staging",
+        "aimall_task_staging",
+    ]
+    assert [record["completed"] for record in progress] == [0, 1, 0, 1]
 
 
 def test_aimall_parser_only_consumes_gaussian_accepted_pointdirs(tmp_path):

@@ -32,6 +32,9 @@ __all__ = [
     "JOURNAL_LINE_LIMIT_BYTES",
     "EventTooLargeError",
     "JournalCorruptionError",
+    "JOURNAL_EVENT_CONTEXTS",
+    "JOURNAL_EVENT_ITERATION_POLICIES",
+    "JOURNAL_PHASE_FIRST_EVENTS",
     "KNOWN_EVENT_TYPES",
     "append_event",
     "iter_events",
@@ -188,8 +191,10 @@ KNOWN_EVENT_TYPES = (
     "sampling_protocol_resolved",
     "initial_training_existing_without_bootstrap_handoff",
     "phase_b_novelty_threshold_relaxed",
+    "phase_b_geometry_novelty_relaxed",
     "pool_feasibility_checked",
     "quantum_quality_summary",
+    "quantum_quality_rejected",
     "seed_posterior_fallback",
     "point_allocation_complete",
     "point_allocation_replacement_prepared",
@@ -203,7 +208,264 @@ KNOWN_EVENT_TYPES = (
     "active_iteration_finalised",
     "ariadne_task_rejected_invalid_output",
     "dry_run_trajectory_pool_created",
+    "daemon_startup_progress",
+    "phase_activity_started",
+    "phase_activity_progress",
+    "phase_activity_completed",
+    "phase_activity_failed",
+    "scheduler_progress",
+    "checkpoint_progress",
 )
+if len(KNOWN_EVENT_TYPES) != len(set(KNOWN_EVENT_TYPES)):
+    raise RuntimeError("journal event catalogue contains duplicate event types")
+
+
+def _build_event_context_registry() -> Tuple[Dict[str, str], frozenset[str]]:
+    """Build the explicit event presentation registry.
+
+    Grouping is declarative rather than name-based: adding an event to
+    ``KNOWN_EVENT_TYPES`` requires assigning it exactly one fallback context.
+    Phase-first events use their recorded FSM phase when one is available.
+    """
+
+    fixed_groups = {
+        "CAMPAIGN": (
+            "campaign_started",
+            "campaign_completed",
+            "campaign_reopened",
+            "scientific_convergence_reached",
+            "phase_transition",
+            "active_iteration_finalised",
+        ),
+        "DAEMON": (
+            "daemon_started",
+            "daemon_stopped",
+            "daemon_interrupted",
+            "tick_error",
+            "tick_exception_halted",
+            "daemon_lease_conflict",
+            "daemon_lease_stale_recovered",
+            "daemon_lease_cleanup_failed",
+            "daemon_lease_heartbeat_failed",
+            "daemon_lease_heartbeat_recovered",
+            "daemon_startup_progress",
+        ),
+        "STOP CONTROL": (
+            "shutdown_requested",
+            "user_cancelled_jobs",
+            "user_stop_requested",
+            "user_stop_boundary_reached",
+            "user_stop_control_invalid",
+            "user_stop_request_cancelled",
+            "user_stop_resumed",
+            "stop_request_completion_deferred",
+        ),
+        "CONFIG": (
+            "effective_config_diff",
+            "autotune_applied",
+        ),
+        "ENVIRONMENT": (
+            "environment_drift_halted",
+            "environment_rebound",
+            "environment_generation_advanced",
+        ),
+        "STATE": ("state_corrupt",),
+        "RECONCILE": (
+            "reconcile_applied",
+            "reconcile_resolved_terminal_intent",
+            "staging_archived",
+            "staging_restored_from_archive",
+        ),
+        "CHECKPOINT": (
+            "checkpoint_failed",
+            "checkpoint_verified",
+            "checkpoint_progress",
+        ),
+    }
+    phase_groups = {
+        "CAMPAIGN": (
+            "phase_succeeded",
+            "phase_succeeded_live",
+            "failure_action",
+            "halt",
+            "live_postprocess_refused",
+            "phase_output_contract_invalid",
+            "required_phase_output_missing_after_failure",
+            "phase_completion_replayed",
+            "phase_activity_started",
+            "phase_activity_progress",
+            "phase_activity_completed",
+            "phase_activity_failed",
+        ),
+        "SCHEDULER": (
+            "sbatch",
+            "sacct_error",
+            "sacct_error_timeout",
+            "sacct_empty_timeout",
+            "sacct_unknown_timeout",
+            "sacct_missing_timeout",
+            "sacct_empty_but_squeue_active",
+            "sacct_rows_missing_but_squeue_active",
+            "squeue_liveness_inconclusive",
+            "scheduler_uncertain_resumed",
+            "job_adopt_check_failed",
+            "adopted_accounted_job",
+            "adopted_inflight_job",
+            "expected_tasks_inference_failed",
+            "submission_intent_expected_tasks_invalid",
+            "submission_intent_update_failed",
+            "submission_intent_read_failed",
+            "submission_intent_completion_deferred",
+            "submission_intent_retired_without_submission",
+            "phase_pre_submit_intent",
+            "phase_submitted",
+            "queue_lifecycle_update",
+            "scheduler_usage_recorded",
+            "scheduler_usage_warning",
+            "scheduler_progress",
+        ),
+        "BOOTSTRAP": (
+            "trajectory_pool_imported",
+            "bootstrap_inputs_confirmed",
+            "model_bootstrap_staged",
+            "model_bootstrap_committed",
+            "initial_training_existing_without_bootstrap_handoff",
+            "pool_feasibility_checked",
+            "dry_run_trajectory_pool_created",
+        ),
+        "REFERENCE COMMIT": (
+            "reference_data_committed",
+            "reference_commit_started",
+            "reference_commit_move_progress",
+            "reference_commit_shard_progress",
+            "reference_commit_shards_resolved",
+            "reference_commit_cache_complete",
+            "reference_commit_published",
+        ),
+        "SEED SELECT": (
+            "seed_selection_started",
+            "seed_selection_progress",
+            "seed_selection_cache",
+            "seed_selected",
+            "reference_scales_computed",
+            "seed_posterior_fallback",
+            "sampling_protocol_resolved",
+        ),
+        "ARIADNE": (
+            "subspace_built",
+            "anti_overlap_flagged",
+            "ariadne_landing_rejected",
+            "ariadne_landing_summary",
+            "ariadne_optional_diagnostics_warning",
+            "ariadne_legacy_missing_trajectory_sha256",
+            "ariadne_provenance_reconstructed",
+            "ariadne_seed_provenance_repaired",
+            "ariadne_seed_provenance_staged",
+            "ariadne_stale_outputs_quarantined",
+            "ariadne_publication_archived",
+            "ariadne_task_rejected_missing_result",
+            "ariadne_task_rejected_malformed_result",
+            "ariadne_task_rejected_unusable_result",
+            "ariadne_task_rejected_unsafe_landing",
+            "ariadne_task_salvaged_from_nonzero_exit",
+            "ariadne_sampling_protocol_replay_failed",
+            "ariadne_task_rejected_invalid_output",
+        ),
+        "DIVERSITY": (
+            "geometry_novelty_scale_precomputed",
+            "phase_b_novelty_threshold_relaxed",
+            "phase_b_geometry_novelty_relaxed",
+        ),
+        "QM": (
+            "quantum_output_rejected",
+            "quantum_quality_summary",
+            "quantum_quality_rejected",
+            "aimall_skipped_no_gaussian_acceptances",
+            "aimall_quality_revalidated",
+            "committed_artifact_settle_retry",
+            "postprocess_settle_retry",
+        ),
+        "POINT ALLOCATION": (
+            "point_allocation_complete",
+            "point_allocation_replacement_prepared",
+            "point_allocation_quantum_recorded",
+        ),
+        "FEREBUS": (
+            "models_committed",
+            "ferebus_candidate_rejected",
+            "ferebus_quality_measurement_incomplete",
+            "ferebus_candidate_recovery_prepared",
+            "ferebus_candidate_recovery_materialised",
+            "ferebus_candidate_reprocessed",
+            "ferebus_quality_summary",
+        ),
+        "CALIBRATION": (
+            "error_calibration_summary",
+            "error_calibration_failed",
+        ),
+        "RESOURCES": ("resolved_phase_resources",),
+        "PROVENANCE": (
+            "provenance_index_repaired",
+            "provenance_index_repair_failed",
+        ),
+        "RECOVERY": (
+            "transient_phase_retry",
+            "transient_retry_ledger_invalid",
+            "partial_array_recovery_postprocess_only",
+            "partial_array_recovery_prepared",
+            "legacy_sampling_protocol_repreview",
+        ),
+    }
+
+    contexts: Dict[str, str] = {}
+    phase_first: set[str] = set()
+    for context, events in fixed_groups.items():
+        for event in events:
+            if event in contexts:
+                raise RuntimeError("duplicate journal context specification: " + event)
+            contexts[event] = context
+    for context, events in phase_groups.items():
+        for event in events:
+            if event in contexts:
+                raise RuntimeError("duplicate journal context specification: " + event)
+            contexts[event] = context
+            phase_first.add(event)
+    known = set(KNOWN_EVENT_TYPES)
+    specified = set(contexts)
+    if known != specified:
+        raise RuntimeError(
+            "journal context registry mismatch: missing="
+            + repr(sorted(known - specified))
+            + " extra="
+            + repr(sorted(specified - known))
+        )
+    return contexts, frozenset(phase_first)
+
+
+JOURNAL_EVENT_CONTEXTS, JOURNAL_PHASE_FIRST_EVENTS = (
+    _build_event_context_registry()
+)
+
+
+_STATE_UNAVAILABLE_ITERATION_EVENTS = frozenset(
+    {
+        "daemon_lease_conflict",
+        "daemon_lease_stale_recovered",
+        "daemon_lease_cleanup_failed",
+        "state_corrupt",
+        "user_cancelled_jobs",
+    }
+)
+JOURNAL_EVENT_ITERATION_POLICIES: Dict[str, str] = {
+    event: (
+        "state_unavailable_allowed"
+        if event in _STATE_UNAVAILABLE_ITERATION_EVENTS
+        else "required"
+    )
+    for event in KNOWN_EVENT_TYPES
+}
+if set(JOURNAL_EVENT_ITERATION_POLICIES) != set(KNOWN_EVENT_TYPES):
+    raise RuntimeError("journal iteration-policy registry mismatch")
 
 
 # Keep individual diagnostic records compact. Cross-process safety comes from

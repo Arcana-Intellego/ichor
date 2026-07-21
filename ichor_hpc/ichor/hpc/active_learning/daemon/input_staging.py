@@ -24,7 +24,17 @@ import re
 import shutil
 import hashlib
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import numpy as np
 import pandas as pd
@@ -1120,6 +1130,7 @@ def stage_gaussian_inputs(
     sample_xyz,
     *,
     campaign_uid: Optional[str] = None,
+    progress_callback: Optional[Callable[..., None]] = None,
 ) -> Tuple[Path, int]:
     """Write one POINT_<k>.pointdir/input.gjf per frame in sample_xyz, plus
     POINTS.txt. Returns (staging_dir, n_points)."""
@@ -1127,6 +1138,19 @@ def stage_gaussian_inputs(
 
     frames = _load_frames(sample_xyz)
     supplied_campaign_uid = str(campaign_uid or "").strip()
+
+    def report(completed: int) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(
+                stage="gaussian_input_staging",
+                completed=int(completed),
+                total=int(len(frames)),
+                unit="point directories",
+            )
+        except Exception:
+            return
 
     def expected_campaign_uid() -> str:
         if supplied_campaign_uid:
@@ -1341,6 +1365,7 @@ def stage_gaussian_inputs(
     keywords += normalise_gaussian_route_keywords(g.extra_route_keywords)
 
     pointdirs: List[Path] = []
+    report(0)
     for k, atoms in enumerate(frames):
         pd = staging / expected_pointdir_names[k]
         campaign_owned_path(campaign_dir, pd)
@@ -1471,6 +1496,8 @@ def stage_gaussian_inputs(
                 allocation_slot_assignment_sha256=allocation_assignment_hash,
             )
         pointdirs.append(pd)
+        if len(pointdirs) == len(frames) or len(pointdirs) % 16 == 0:
+            report(len(pointdirs))
 
     write_points_file(staging, pointdirs)
     return staging, len(pointdirs)
@@ -1485,6 +1512,7 @@ def stage_aimall_inputs(
     partition_override: Optional[str] = None,
     staging_override: Optional[Path] = None,
     expected_gaussian_phase: Optional[str] = None,
+    progress_callback: Optional[Callable[..., None]] = None,
 ) -> Tuple[Path, int]:
     """AIMAll runs on the .wfn files Gaussian produced in the same bucket. The
     pointdirs already exist; rewrite POINTS.txt over the Gaussian-accepted
@@ -1505,7 +1533,22 @@ def stage_aimall_inputs(
         require_nonempty=False,
         require_points_file_membership=True,
     )
+
+    def report(stage: str, completed: int) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(
+                stage=str(stage),
+                completed=int(completed),
+                total=int(len(pointdirs)),
+                unit="point directories",
+            )
+        except Exception:
+            return
+
     if not pointdirs:
+        report("aimall_input_validation", 0)
         write_points_file(staging, [])
         return staging, 0
     from .ferebus_row_cache import ensure_feature_contract, feature_contract_path
@@ -1519,6 +1562,7 @@ def stage_aimall_inputs(
     gaussian_task_names = _points_file_names(staging)
     acceptance_sha256 = sha256_file(staging / QUANTUM_ACCEPTANCE_MANIFEST)
     dimensions = []
+    report("aimall_input_validation", 0)
     for task_index, pointdir in enumerate(pointdirs):
         wfn = pointdir / "input.wfn"
         if wfn.is_symlink() or not wfn.is_file():
@@ -1573,6 +1617,9 @@ def stage_aimall_inputs(
                 gaussian_receipt_path,
             )
         )
+        completed = task_index + 1
+        if completed == len(pointdirs) or completed % 16 == 0:
+            report("aimall_input_validation", completed)
     write_points_file(staging, pointdirs)
     aimall_resources = resolve_phase_resources(
         phase_name=str(phase_name),
@@ -1593,6 +1640,7 @@ def stage_aimall_inputs(
         raise ValueError(
             "AIMAll resource resolution does not cover every staged task"
         )
+    report("aimall_task_staging", 0)
     for task_index, (
         pointdir,
         atom_count,
@@ -1655,6 +1703,9 @@ def stage_aimall_inputs(
                 },
             },
         )
+        completed = task_index + 1
+        if completed == len(dimensions) or completed % 16 == 0:
+            report("aimall_task_staging", completed)
     return staging, len(pointdirs)
 
 
@@ -2160,6 +2211,7 @@ def stage_ferebus_inputs(
     campaign_dir,
     config,
     reference_data_version,
+    progress_callback: Optional[Callable[..., None]] = None,
 ) -> Tuple[Path, int]:
     """Stage pyferebus/FEREBUS inputs and return (staging_dir, n_tasks).
 
@@ -2182,6 +2234,16 @@ def stage_ferebus_inputs(
 
     campaign = Path(campaign_dir)
     version = int(reference_data_version)
+
+    def report(stage: str, **payload: Any) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(stage=str(stage), **payload)
+        except Exception:
+            return
+
+    report("row_cache_validation")
     reference_data = ReferenceDataVersioning(campaign / "QM_REFERENCE_DATA")
     view = reference_data.resolve(version, verification="index")
     if not view.entries:
@@ -2225,6 +2287,12 @@ def stage_ferebus_inputs(
     ]
     if observed_cache_identities != expected_cache_identities:
         raise ValueError("FEREBUS row-cache order differs from reference-data view")
+    report(
+        "row_cache_validation",
+        completed=int(len(observed_cache_identities)),
+        total=int(len(expected_cache_identities)),
+        unit="rows",
+    )
 
     staging = trained_models_dir(campaign) / "iteration-staging"
     # iteration-staging is ONE shared scratch dir reused every iteration, so wipe it first.
@@ -2266,7 +2334,9 @@ def stage_ferebus_inputs(
 
     feature_csvs = []
     row_headers = [str(value) for value in feature_contract["row_headers"]]
-    for atom in feature_contract["atom_names"]:
+    atom_names = list(feature_contract["atom_names"])
+    report("csv_construction", completed=0, total=len(atom_names), unit="atoms")
+    for atom_index, atom in enumerate(atom_names, start=1):
         matrix = np.asarray(cumulative_rows[str(atom)], dtype=np.float64)
         if matrix.shape != (len(pointdir_names), len(row_headers)):
             raise ValueError("FEREBUS cumulative row-cache dimensions are invalid")
@@ -2283,6 +2353,12 @@ def stage_ferebus_inputs(
         os.replace(temporary, target)
         _fsync_parent_dir(target)
         feature_csvs.append(target)
+        report(
+            "csv_construction",
+            completed=int(atom_index),
+            total=int(len(atom_names)),
+            unit="atoms",
+        )
     if not feature_csvs:
         raise ValueError("FEREBUS row cache produced no *_train.csv files")
 
@@ -2319,6 +2395,7 @@ def stage_ferebus_inputs(
         else int(model_bootstrap["model"].get("training_count", 0))
     )
 
+    report("split_ledger")
     split_ledger = ensure_split_assignments(
         campaign,
         pointdir_names,
@@ -2330,6 +2407,12 @@ def stage_ferebus_inputs(
         forced_splits=forced_ferebus_splits,
         allocation_manifest_sha256=allocation_hash,
         historical_training_rows=historical_training_rows,
+    )
+    report(
+        "split_ledger",
+        completed=int(len(pointdir_names)),
+        total=int(len(pointdir_names)),
+        unit="rows",
     )
     ledger_row_ids = dict(split_ledger["row_ids"])
     from ..versioning.reference_data import canonical_json_sha256
@@ -2538,6 +2621,8 @@ def stage_ferebus_inputs(
         raise ValueError("FEREBUS properties contain a case-insensitive collision")
     if len({str(atom).casefold() for atom in atom_labels}) != len(atom_labels):
         raise ValueError("FEREBUS atom labels contain a case-insensitive collision")
+    expected_task_total = int(len(properties) * len(atom_labels))
+    report("task_staging", completed=0, total=expected_task_total, unit="tasks")
     for prop in properties:
         for atom in atom_labels:
             output_dir = staging / prop / atom
@@ -2613,6 +2698,12 @@ def stage_ferebus_inputs(
                 }
             )
             task_index += 1
+            report(
+                "task_staging",
+                completed=int(len(tasks)),
+                total=expected_task_total,
+                unit="tasks",
+            )
 
     if model_bootstrap is not None:
         copied_model_manifest = staging / "MODEL_BOOTSTRAP.json"

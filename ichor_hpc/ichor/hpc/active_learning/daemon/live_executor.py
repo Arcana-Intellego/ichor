@@ -1627,7 +1627,19 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
     def _array_size_after_staging(self, phase_name, state):
         """Stage this phase's per-point inputs and return the SLURM array size.
         None for single-job phases (FEREBUS / diversity) so no --array is emitted."""
+        import inspect
+
         from . import input_staging as _stg
+
+        def progress_kwargs(staging_callable: Callable[..., Any]) -> Dict[str, Any]:
+            try:
+                parameters = inspect.signature(staging_callable).parameters
+            except (TypeError, ValueError):
+                return {}
+            if "progress_callback" not in parameters:
+                return {}
+            return {"progress_callback": self._report_runtime_progress}
+
         camp = Path(self.campaign_dir)
         it = int(state.iteration)
         effective_partition = (
@@ -1662,6 +1674,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 it,
                 sample,
                 campaign_uid=str(getattr(state, "campaign_uid", "")),
+                **progress_kwargs(_stg.stage_gaussian_inputs),
             )
             return n
         if "AIMALL" in phase_name:
@@ -1692,6 +1705,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 partition_override=effective_partition,
                 staging_override=staging_override,
                 expected_gaussian_phase=expected_gaussian_phase,
+                **progress_kwargs(_stg.stage_aimall_inputs),
             )
             return n
         if phase_name == "ARIADNE_ARRAY":
@@ -1841,10 +1855,24 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     scheduler_jobs_submitted=0,
                 )
                 return result
+            import inspect
+
+            try:
+                stage_parameters = inspect.signature(
+                    _stg.stage_ferebus_inputs
+                ).parameters
+            except (TypeError, ValueError):
+                stage_parameters = {}
+            stage_kwargs = (
+                {"progress_callback": self._report_runtime_progress}
+                if "progress_callback" in stage_parameters
+                else {}
+            )
             staging, n_tasks = _stg.stage_ferebus_inputs(
                 self.campaign_dir,
                 self.config,
                 tv,
+                **stage_kwargs,
             )
             if int(n_tasks) <= 0:
                 raise BackendSubmissionError("nothing to submit for " + phase_name + ": staged 0 tasks")
@@ -2496,7 +2524,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
     def submit_or_run(self, state, phase) -> PhaseResult:
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
+        self._set_journal_state(state, phase_name)
         if phase_name in ("INITIAL_FEREBUS", "FEREBUS"):
+            self._report_runtime_progress("row_cache_validation")
             return self._submit_ferebus_phase(state, phase_name)
         if phase_name not in SBATCH_PHASES:
             if phase_name in INLINE_PHASES:
@@ -2514,7 +2544,15 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 "phase " + phase_name + " classified as neither INLINE nor SBATCH"
             )
         try:
+            self._report_runtime_progress("handoff_validation")
+            self._report_runtime_progress("input_staging")
             array_size = self._array_size_after_staging(phase_name, state)
+            self._report_runtime_progress(
+                "input_staging",
+                completed=(int(array_size) if array_size is not None else 1),
+                total=(int(array_size) if array_size is not None else 1),
+                unit="tasks",
+            )
             if array_size is not None and array_size <= 0:
                 if "AIMALL" in phase_name:
                     return self._complete_empty_aimall_phase(state, phase_name)
@@ -2606,6 +2644,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         retained=int(len(removed)),
                         sample=[str(p) for p in removed[:5]],
                     )
+            self._report_runtime_progress(
+                "script_rendering",
+                completed=0,
+                total=(int(array_size) if array_size is not None else 1),
+                unit="tasks",
+            )
             script = self._write_real_script(
                 phase_name,
                 state,
@@ -2659,6 +2703,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             raise BackendSubmissionError(
                 "final submitted script has no immutable binding"
             )
+        self._report_runtime_progress(
+            "slurm_submission",
+            completed=0,
+            total=(int(array_size) if array_size is not None else 1),
+            unit="tasks",
+        )
         result = run_scheduler_command(
             self.sbatch_runner,
             [
@@ -2697,6 +2747,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             ) from exc
         self.artefact_log.append(str(script))
         expected_tasks = int(array_size) if array_size is not None else 1
+        self._report_runtime_progress(
+            "slurm_submission",
+            completed=expected_tasks,
+            total=expected_tasks,
+            unit="tasks",
+        )
         return PhaseResult(
             is_complete=False,
             submitted_job_id=job_id,
@@ -2750,6 +2806,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             )
         except ValueError as exc:
             raise BackendSubmissionError(str(exc)) from exc
+        self._report_runtime_progress("resource_resolution")
         resolved = resolve_phase_resources(
             phase_name=phase_name,
             config=self.config,
@@ -2771,6 +2828,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             submitted_task_ids=submitted_task_ids,
             require_evidence=True,
         )
+        self._report_runtime_progress("script_rendering")
         try:
             bundle = prepare_attempt_bundle(
                 self.campaign_dir,
@@ -2935,7 +2993,15 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         children = sorted(staging_root.iterdir()) if allowed is None else [
             staging_root / name for name in sorted(allowed)
         ]
-        for child in children:
+        total_children = len(children)
+        for child_index, child in enumerate(children, start=1):
+            if child_index == 1 or (child_index - 1) % 16 == 0:
+                self._report_runtime_progress(
+                    "structural_parsing",
+                    completed=int(child_index - 1),
+                    total=int(total_children),
+                    unit="point directories",
+                )
             if allowed is not None and not child.exists():
                 rejected.append((child.name, "submitted_pointdir_missing"))
                 continue
@@ -2952,10 +3018,25 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 kept.append(pdir)
             else:
                 rejected.append((child.name, failure_reason))
+            if child_index == total_children or child_index % 16 == 0:
+                self._report_runtime_progress(
+                    "structural_parsing",
+                    completed=int(child_index),
+                    total=int(total_children),
+                    unit="point directories",
+                )
+        if total_children:
+            self._report_runtime_progress(
+                "structural_parsing",
+                completed=int(total_children),
+                total=int(total_children),
+                unit="point directories",
+            )
         return kept, rejected
 
     def postprocess(self, state, phase, observations: Sequence[Any]) -> PhaseResult:
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
+        self._set_journal_state(state, phase_name)
         if phase_name == CampaignPhase.ARIADNE_ARRAY.value:
             archived = archive_stale_ariadne_publication(
                 self.campaign_dir,
@@ -2974,6 +3055,16 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 )
         handler = self._live_postprocess_handlers().get(phase_name)
         if handler is not None:
+            stage = (
+                "model_parsing"
+                if "FEREBUS" in phase_name
+                else "result_parsing"
+                if phase_name == "ARIADNE_ARRAY"
+                else "descriptor_construction"
+                if "DIVERSITY" in phase_name
+                else "structural_parsing"
+            )
+            self._report_runtime_progress(stage)
             #handlers take (state, phase, observations) so the shared
             #handler can dispatch by phase name to the right validator.
             return handler(state, phase, observations)
@@ -3105,7 +3196,14 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         def publish_task_receipts(candidates):
             from .quantum_task_receipts import write_quantum_task_receipt
 
-            for candidate in candidates:
+            total_candidates = len(candidates)
+            self._report_runtime_progress(
+                "receipt_publication",
+                completed=0,
+                total=int(total_candidates),
+                unit="task receipts",
+            )
+            for candidate_index, candidate in enumerate(candidates, start=1):
                 candidate_path = Path(getattr(candidate, "path", candidate))
                 if candidate_path.name not in task_id_by_name:
                     raise ValueError(
@@ -3118,6 +3216,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     iteration=int(state.iteration),
                     logical_task_id=task_id_by_name[candidate_path.name],
                 )
+                if candidate_index == total_candidates or candidate_index % 16 == 0:
+                    self._report_runtime_progress(
+                        "receipt_publication",
+                        completed=int(candidate_index),
+                        total=int(total_candidates),
+                        unit="task receipts",
+                    )
 
         if "AIMALL" in phase_name:
             from ichor.core.files.point_directory import PointDirectory
@@ -3154,10 +3259,24 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     ),
                 )
             unsettled = []
-            for candidate in gaussian_accepted:
+            total_accepted = len(gaussian_accepted)
+            self._report_runtime_progress(
+                "output_visibility",
+                completed=0,
+                total=int(total_accepted),
+                unit="point directories",
+            )
+            for candidate_index, candidate in enumerate(gaussian_accepted, start=1):
                 issue = _aimall_visibility_issue(Path(candidate))
                 if issue is not None:
                     unsettled.append(Path(candidate).name + ":" + issue)
+                if candidate_index == total_accepted or candidate_index % 16 == 0:
+                    self._report_runtime_progress(
+                        "output_visibility",
+                        completed=int(candidate_index),
+                        total=int(total_accepted),
+                        unit="point directories",
+                    )
             if unsettled:
                 return PhaseResult(
                     is_complete=True,
@@ -3173,7 +3292,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             structurally_complete = []
             structural_failures = {}
             pointdirs = []
-            for candidate in gaussian_accepted:
+            self._report_runtime_progress(
+                "structural_parsing",
+                completed=0,
+                total=int(total_accepted),
+                unit="point directories",
+            )
+            for candidate_index, candidate in enumerate(gaussian_accepted, start=1):
                 pdir = PointDirectory(candidate)
                 pointdirs.append(pdir)
                 failure_reason = None
@@ -3186,6 +3311,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     structurally_complete.append(pdir)
                 else:
                     structural_failures[Path(candidate).name] = str(failure_reason)
+                if candidate_index == total_accepted or candidate_index % 16 == 0:
+                    self._report_runtime_progress(
+                        "structural_parsing",
+                        completed=int(candidate_index),
+                        total=int(total_accepted),
+                        unit="point directories",
+                    )
 
             quality_records = []
             quality_kept = []
@@ -3202,7 +3334,14 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         + str(exc)[:180]
                     ),
                 )
-            for pdir in pointdirs:
+            total_pointdirs = len(pointdirs)
+            self._report_runtime_progress(
+                "scientific_quality",
+                completed=0,
+                total=int(total_pointdirs),
+                unit="point directories",
+            )
+            for point_index, pdir in enumerate(pointdirs, start=1):
                 record = evaluate_aimall_pointdir(
                     pdir,
                     getattr(self.config, "quality_gates", None),
@@ -3227,6 +3366,15 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                             str(record.get("pointdir", Path(getattr(pdir, "path", pdir)).name)),
                             ";".join(record.get("reasons") or ["quantum_quality_rejected"]),
                         )
+                    )
+                if point_index == total_pointdirs or point_index % 16 == 0:
+                    self._report_runtime_progress(
+                        "scientific_quality",
+                        completed=int(point_index),
+                        total=int(total_pointdirs),
+                        unit="point directories",
+                        accepted=int(len(quality_kept)),
+                        rejected=int(len(quality_rejected)),
                     )
             kept = quality_kept
             rejected = quality_rejected
@@ -3254,7 +3402,14 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     for record in quality_records
                     if bool(record.get("accepted"))
                 }
-                for pdir in kept:
+                total_kept = len(kept)
+                self._report_runtime_progress(
+                    "acceptance_publication",
+                    completed=0,
+                    total=int(total_kept),
+                    unit="point directories",
+                )
+                for kept_index, pdir in enumerate(kept, start=1):
                     pointdir_path = Path(getattr(pdir, "path", pdir))
                     write_quantum_acceptance_receipt(
                         self.campaign_dir,
@@ -3264,6 +3419,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         quality_manifest=quality_path,
                         quality_record=quality_by_name[pointdir_path.name],
                     )
+                    if kept_index == total_kept or kept_index % 16 == 0:
+                        self._report_runtime_progress(
+                            "acceptance_publication",
+                            completed=int(kept_index),
+                            total=int(total_kept),
+                            unit="point directories",
+                        )
             except Exception as exc:
                 return PhaseResult(
                     is_complete=True,
@@ -3319,9 +3481,16 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             accepted=kept,
             rejected=rejected,
         )
+        self._report_runtime_progress(
+            "acceptance_publication",
+            completed=int(len(kept) + len(rejected)),
+            total=int(len(kept) + len(rejected)),
+            unit="point directories",
+        )
 
         allocation_payload = None
         if "AIMALL" in phase_name:
+            self._report_runtime_progress("allocation_join")
             context = "bootstrap" if phase_name.startswith("INITIAL_") else "active"
             gaussian_phase = (
                 "INITIAL_REPLACEMENT_GAUSSIAN"
@@ -3359,10 +3528,17 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 iteration=int(state.iteration),
                 summary=dict(allocation_payload.get("summary") or {}),
             )
+            allocation_slots = list(allocation_payload.get("slots") or [])
+            self._report_runtime_progress(
+                "allocation_join",
+                completed=int(len(allocation_slots)),
+                total=int(len(allocation_slots)),
+                unit="slots",
+            )
             if phase_name in ("AIMALL", "REPLACEMENT_AIMALL"):
                 joined_names = {
                     Path(str(attempt.get("pointdir") or "")).name
-                    for slot in list(allocation_payload.get("slots") or [])
+                    for slot in allocation_slots
                     if isinstance(slot, dict)
                     for attempt in list(slot.get("attempts") or [])
                     if isinstance(attempt, dict)
@@ -3382,6 +3558,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         ),
                     )
                 try:
+                    self._report_runtime_progress(
+                        "calibration",
+                        completed=0,
+                        total=int(len(calibration_pointdirs)),
+                        unit="point directories",
+                    )
                     from .error_calibration import (
                         ERROR_CALIBRATION_MODEL_FILENAME,
                         audit_path as error_calibration_audit_path,
@@ -3419,6 +3601,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         usable_for_acquisition=bool(
                             audit.get("usable_for_acquisition", False)
                         ),
+                    )
+                    self._report_runtime_progress(
+                        "calibration",
+                        completed=int(len(calibration_pointdirs)),
+                        total=int(len(calibration_pointdirs)),
+                        unit="point directories",
                     )
                 except Exception as exc:
                     try:
@@ -3894,6 +4082,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         from .phase_executor import PhaseResult
 
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
+        self._report_runtime_progress("model_parsing")
         staging = self._models_staging_path()
         v_models = self._versioning("models")
         committed = v_models.list_committed_versions()
@@ -4013,9 +4202,23 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             )
             from .config_lock import canonical_config, config_fingerprint
 
+            self._report_runtime_progress("quality_metrics")
             quality = evaluate_ferebus_quality(
                 staging,
                 getattr(self.config, "quality_gates", None),
+            )
+            quality_summary = dict(quality.get("summary") or {})
+            measured_models = int(quality_summary.get("n_measured") or 0)
+            total_models = int(
+                quality_summary.get("n_total")
+                or quality_summary.get("n_tasks")
+                or measured_models
+            )
+            self._report_runtime_progress(
+                "quality_metrics",
+                completed=measured_models,
+                total=total_models,
+                unit="models",
             )
             if quality.get("measurement_complete") is not True:
                 from .ferebus_candidate_recovery import (
@@ -4070,6 +4273,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 )
             quality_path = write_ferebus_quality_manifest(staging, quality)
             config_sha = config_fingerprint(canonical_config(self.config))
+            self._report_runtime_progress("incumbent_comparison")
             decision_path = write_ferebus_quality_decision(
                 staging,
                 config_sha256=config_sha,
@@ -4081,6 +4285,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 require_accepted=False,
             )
             current_decision = dict(decision.get("current_evaluation") or {})
+            self._report_runtime_progress(
+                "promotion_decision",
+                completed=int(current_decision.get("n_tasks") or 0),
+                total=int(current_decision.get("n_tasks") or 0),
+                unit="models",
+            )
             self._journal_event(
                 "ferebus_quality_summary",
                 phase=phase_name,
@@ -4153,6 +4363,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 },
             )
 
+        self._report_runtime_progress("model_commit")
         v_models.recover_dangling_staging()
         next_version = int(expected_next)
         try:
@@ -4263,6 +4474,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 trained_model_set=committed_model_set,
             )
             v_models.update_current(next_version)
+            self._report_runtime_progress(
+                "model_commit",
+                completed=int(len(manifest.get("tasks") or [])),
+                total=int(len(manifest.get("tasks") or [])),
+                unit="models",
+            )
         except Exception as exc:
             self._journal_event(
                 "quantum_output_rejected",
@@ -4356,6 +4573,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         from ..sampling_protocol import preview_sampling_protocol
 
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
+        self._report_runtime_progress("handoff_validation")
         iter_dir = self._iter_dir(state.iteration)
         ariadne_root = active_ariadne_dir(iter_dir)
         seeds_root = ariadne_seeds_dir(iter_dir)
@@ -4606,7 +4824,25 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 failure_reason="ariadne_seeds_directory_missing: " + str(seeds_root),
             )
 
-        for task, seed_record in zip(task_records, seed_records):
+        self._report_runtime_progress(
+            "result_parsing",
+            completed=0,
+            total=int(expected_n),
+            unit="seed results",
+        )
+        for result_index, (task, seed_record) in enumerate(
+            zip(task_records, seed_records),
+            start=1,
+        ):
+            if result_index == 1 or result_index % 8 == 0:
+                self._report_runtime_progress(
+                    "result_parsing",
+                    completed=int(result_index - 1),
+                    total=int(expected_n),
+                    unit="seed results",
+                    accepted=int(len(accepted)),
+                    rejected=int(len(rejected)),
+                )
             seed_id = int(task["seed_id"])
             seed_uid = str(task["seed_uid"])
             array_task_id = int(task["array_task_id"])
@@ -5244,6 +5480,15 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 "output_manifest_sha256": sha256_file(output_manifest_path),
             })
 
+        self._report_runtime_progress(
+            "result_parsing",
+            completed=int(expected_n),
+            total=int(expected_n),
+            unit="seed results",
+            accepted=int(len(accepted)),
+            rejected=int(len(rejected)),
+        )
+        self._report_runtime_progress("landing_classification")
         n_kept = len(accepted)
         n_rejected = len(rejected)
         rejection_counts: Dict[str, int] = {}
@@ -5258,6 +5503,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             )[:8]
         ]
         audit_summary = _ariadne_landing_audit_summary(landing_audit_records)
+        self._report_runtime_progress(
+            "audit_publication",
+            completed=0,
+            total=3,
+            unit="manifests",
+        )
         audit_path = write_ariadne_landing_audit(iter_dir, {
             "iteration": int(state.iteration),
             "summary": audit_summary,
@@ -5288,6 +5539,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             "rejected": rejected,
         })
         self.artefact_log.append(str(manifest_path))
+        self._report_runtime_progress(
+            "audit_publication",
+            completed=3,
+            total=3,
+            unit="manifests",
+        )
         self._journal_event(
             "ariadne_landing_summary",
             iteration=int(state.iteration),
@@ -5312,11 +5569,18 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             decision_reasons.append(
                 "too_many_seeds_failed: " + str(n_rejected) + "/" + str(expected_n)
             )
+        self._report_runtime_progress("batch_publication")
         publish_batch_decision(
             n_accepted=n_kept,
             n_rejected=n_rejected,
             accepted_batch=not bool(decision_reasons),
             reasons=decision_reasons,
+        )
+        self._report_runtime_progress(
+            "batch_publication",
+            completed=int(expected_n),
+            total=int(expected_n),
+            unit="seed results",
         )
 
         if n_kept == 0:

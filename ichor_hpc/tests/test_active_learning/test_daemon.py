@@ -139,6 +139,20 @@ def test_run_handles_malformed_state_json_without_traceback(tmp_path):
     assert any(e.get("event") == "state_corrupt" for e in events)
 
 
+def test_daemon_journal_enriches_global_events_from_cached_state(tmp_path):
+    d = _make_daemon(tmp_path)
+    state = fresh_campaign_state(max_iterations=4)
+    state.phase = CampaignPhase.AIMALL
+    state.iteration = 3
+    d._set_journal_state(state)
+
+    d._journal("daemon_started", pid=123)
+
+    event = list(iter_events(d.data_dir() / "journal.ndjson"))[-1]
+    assert event["phase"] == CampaignPhase.AIMALL.value
+    assert event["iteration"] == 3
+
+
 def test_run_acknowledges_ownership_before_environment_transition(
     tmp_path,
     monkeypatch,

@@ -158,13 +158,23 @@ def test_stage_ferebus_inputs_orchestration(tmp_path, monkeypatch):
     cfg.system_name = "WATER"
     cfg.ferebus.properties = ["iqa", "q00"]
     _prepare_bootstrap_training(campaign, cfg)
+    progress_updates = []
     staging, n_tasks = stg.stage_ferebus_inputs(
         campaign,
         cfg,
         reference_data_version=0,
+        progress_callback=lambda **payload: progress_updates.append(dict(payload)),
     )
 
     assert n_tasks == 6
+    assert {
+        "row_cache_validation",
+        "csv_construction",
+        "split_ledger",
+        "task_staging",
+    } <= {update["stage"] for update in progress_updates}
+    assert progress_updates[-1]["completed"] == 6
+    assert progress_updates[-1]["total"] == 6
     assert set((staging / "ATOMS.txt").read_text(encoding="utf-8").split()) == {"O1", "H2", "H3"}
     assert b"\r" not in (staging / "ATOMS.txt").read_bytes()
     assert (staging / "PROPERTIES.txt").read_text(encoding="utf-8").split() == ["iqa", "q00"]

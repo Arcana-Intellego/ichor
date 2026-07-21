@@ -3043,7 +3043,7 @@ def test_cli_journal_default_prints_readable_events(tmp_path, capsys):
     assert "[INFO]" in lines[1]
     assert "[INFO]" in lines[2]
     assert "iter=1" in lines[1]
-    assert "iter=-" in lines[2]
+    assert "iter=n/a" in lines[2]
     assert lines[1].count("iter=1") == 1
     assert all(not line.startswith("  raw_event:") for line in lines)
     assert not out.lstrip().startswith("{")
@@ -3087,6 +3087,18 @@ def test_cli_journal_left_justifies_columns_for_long_events(tmp_path, capsys):
     assert lines[1].index("iter=0") == lines[2].index("iter=12")
     assert lines[1].index("PHASE_A_DIVERSITY") == lines[2].index("INITIAL_GAUSSIAN")
     assert lines[1].index("job submitted") == lines[2].index("waiting for accounting")
+    context_width = max(
+        max(len(phase.value) for phase in CampaignPhase),
+        max(len(value) for value in cli_mod.JOURNAL_EVENT_CONTEXTS.values()),
+        len("UNCLASSIFIED"),
+    )
+    assert (
+        lines[1].index("iter=0") - lines[1].index("PHASE_A_DIVERSITY")
+        == context_width + 3
+    )
+    description_start = lines[2].index("waiting for accounting")
+    iteration_end = lines[2].index("iter=12") + len("iter=12")
+    assert lines[2][iteration_end:description_start] == " " * 6
     assert "[RUN]" in lines[1]
     assert "[WAIT]" in lines[2]
     assert "job=16175189" in lines[1]
@@ -3095,6 +3107,13 @@ def test_cli_journal_left_justifies_columns_for_long_events(tmp_path, capsys):
     assert "Slurm job is still active" not in lines[2]
     assert "total=4 completed=- running=- pending=-" in lines[2]
     assert "missing=2" in lines[2]
+
+
+def test_journal_only_renders_exact_non_negative_iterations():
+    assert cli_mod._event_iteration({"iteration": 0}) == "iter=0"
+    assert cli_mod._event_iteration({"iteration": "2"}) == "iter=n/a"
+    assert cli_mod._event_iteration({"iteration": True}) == "iter=n/a"
+    assert cli_mod._event_iteration({"iteration": -1}) == "iter=n/a"
 
 
 def test_cli_journal_formats_array_progress_tuple_with_squeue_counts(tmp_path, capsys):

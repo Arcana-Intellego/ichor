@@ -162,6 +162,27 @@ def test_checkpoint_deduplicates_verifies_and_restores(tmp_path, monkeypatch):
         assert checkpoints._sha256_file(restored_path) == record["sha256"]
 
 
+def test_checkpoint_reports_copy_and_verification_progress(tmp_path, monkeypatch):
+    campaign = _idle_campaign(tmp_path, monkeypatch)
+    destination = tmp_path / "checkpoint-store"
+    destination.mkdir()
+    updates = []
+
+    checkpoints.create_checkpoint(
+        campaign,
+        destination,
+        progress_callback=lambda **payload: updates.append(dict(payload)),
+    )
+
+    assert updates[0]["stage"] == "checkpoint_copy"
+    assert any(
+        update["stage"] == "checkpoint_copy" and update.get("total")
+        for update in updates
+    )
+    assert updates[-1]["stage"] == "checkpoint_verification"
+    assert updates[-1]["completed"] == updates[-1]["total"]
+
+
 def test_checkpoint_restore_rebuilds_excluded_ferebus_row_cache(
     tmp_path,
     monkeypatch,

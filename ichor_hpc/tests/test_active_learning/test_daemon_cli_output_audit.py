@@ -5,7 +5,11 @@ from __future__ import annotations
 import pytest
 
 from ichor.hpc.active_learning import cli
-from ichor.hpc.active_learning.daemon.journal import KNOWN_EVENT_TYPES
+from ichor.hpc.active_learning.daemon.journal import (
+    JOURNAL_EVENT_CONTEXTS,
+    JOURNAL_EVENT_ITERATION_POLICIES,
+    KNOWN_EVENT_TYPES,
+)
 from ichor.hpc.active_learning.daemon.state import CampaignPhase
 
 
@@ -135,6 +139,7 @@ def test_all_daemon_cli_output_findings_have_one_regression_owner():
 
 def test_every_known_journal_event_has_one_human_disposition():
     known = set(KNOWN_EVENT_TYPES)
+    assert len(KNOWN_EVENT_TYPES) == len(known)
     assert set(cli.JOURNAL_EVENT_LABELS) == known
     groups = [
         cli._JOURNAL_OK_EVENTS,
@@ -150,6 +155,32 @@ def test_every_known_journal_event_has_one_human_disposition():
         assert not (seen & set(group))
         seen.update(group)
     assert seen == known
+
+
+def test_every_known_journal_event_has_context_and_iteration_policy():
+    known = set(KNOWN_EVENT_TYPES)
+    assert set(JOURNAL_EVENT_CONTEXTS) == known
+    assert set(JOURNAL_EVENT_ITERATION_POLICIES) == known
+    assert all(
+        context and context != "UNCLASSIFIED"
+        for context in JOURNAL_EVENT_CONTEXTS.values()
+    )
+    assert set(JOURNAL_EVENT_ITERATION_POLICIES.values()) == {
+        "required",
+        "state_unavailable_allowed",
+    }
+
+
+def test_every_known_journal_event_renders_a_classified_context():
+    for event_type in KNOWN_EVENT_TYPES:
+        context = cli._event_context(
+            {
+                "event": event_type,
+                "phase": CampaignPhase.SEED_SELECT.value,
+                "iteration": 2,
+            }
+        )
+        assert context not in {"", "-", "UNCLASSIFIED"}, event_type
 
 
 def test_every_campaign_phase_has_stable_purpose_text():

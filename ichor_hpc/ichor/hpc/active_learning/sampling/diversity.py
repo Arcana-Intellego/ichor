@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from numbers import Integral
 import os
 import shutil
@@ -131,10 +131,24 @@ def fps_select(
     n_select: int,
     seed_index: Optional[int] = None,
     descriptor_name: str = "unknown",
+    progress_callback: Optional[Callable[..., None]] = None,
 ) -> FPSResult:
     from .descriptors import CondensedDistanceStore
 
     requested = _exact_non_negative_integer(n_select, "n_select")
+
+    def report(stage: str, completed: int, total: int, unit: str) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(
+                stage=str(stage),
+                completed=int(completed),
+                total=int(total),
+                unit=str(unit),
+            )
+        except Exception:
+            return
 
     if isinstance(distance_matrix, CondensedDistanceStore):
         D = distance_matrix
@@ -175,9 +189,11 @@ def fps_select(
         raise ValueError(f"n_select {requested} > n {n}")
 
     if seed_index is None:
+        report("medoid_selection", 0, 1, "medoids")
         sums = row_sums()
         ranked = np.round(sums / FPS_TIE_QUANTISATION) * FPS_TIE_QUANTISATION
         seed = int(np.lexsort((np.arange(n, dtype=int), ranked))[0])
+        report("medoid_selection", 1, 1, "medoids")
     else:
         seed = _exact_non_negative_integer(seed_index, "seed_index")
         if seed >= n:
@@ -189,8 +205,9 @@ def fps_select(
     min_dists = np.asarray(row(seed), dtype=float).copy()
     min_dists[seed] = 0.0
     diversities: List[float] = [0.0]
+    report("farthest_point_sampling", 1, requested, "ranked frames")
 
-    for _ in range(1, requested):
+    for selection_index in range(1, requested):
         candidates = np.flatnonzero(~selected_mask)
         if candidates.size == 0:
             break
@@ -204,6 +221,14 @@ def fps_select(
         new_dists = np.asarray(row(nxt), dtype=float)
         min_dists = np.minimum(min_dists, new_dists)
         min_dists[nxt] = 0.0
+        completed = int(selection_index + 1)
+        if completed == requested or completed % 8 == 0:
+            report(
+                "farthest_point_sampling",
+                completed,
+                requested,
+                "ranked frames",
+            )
 
     return FPSResult(
         indices=selected,
@@ -555,6 +580,7 @@ def _run_phase_a(
     campaign_uid: Optional[str] = None,
     workers: int = 1,
     distance_store_path: Optional[Path] = None,
+    progress_reporter: Any = None,
 ):
     """Select a diverse bootstrap subset from the imported trajectory pool.
 
@@ -577,6 +603,13 @@ def _run_phase_a(
         return 3
 
     frames = pool.to_atoms_list()
+    if progress_reporter is not None:
+        progress_reporter.update(
+            stage="handoff_validation",
+            completed=int(len(frames)),
+            total=int(len(frames)),
+            unit="pool frames",
+        )
     if not frames:
         print("trajectory pool is empty", file=_sys.stderr)
         return 3
@@ -628,13 +661,36 @@ def _run_phase_a(
     diversities: List[float] = []
     if pool_select > 0:
         candidate_frames = [frames[i] for i in candidate_pool_ids]
+        if progress_reporter is not None:
+            progress_reporter.update(
+                stage="descriptor_construction",
+                completed=0,
+                total=int(len(candidate_frames)),
+                unit="frames",
+            )
         matrix = _runtime_distance_store(
             descriptor,
             candidate_frames,
             workers=int(workers),
             distance_store_path=distance_store_path,
         )
-        sel = fps_select(matrix, len(candidate_frames), descriptor_name=descriptor.name)
+        sel = fps_select(
+            matrix,
+            len(candidate_frames),
+            descriptor_name=descriptor.name,
+            progress_callback=(
+                None
+                if progress_reporter is None
+                else lambda **payload: progress_reporter.update(**payload)
+            ),
+        )
+        if progress_reporter is not None:
+            progress_reporter.update(
+                stage="farthest_point_sampling",
+                completed=int(len(candidate_frames)),
+                total=int(len(candidate_frames)),
+                unit="ranked frames",
+            )
         ordered_pool_indices = [int(candidate_pool_ids[i]) for i in sel.indices]
         selected_pool_indices = ordered_pool_indices[:pool_select]
         reserve_pool_indices = ordered_pool_indices[pool_select:]
@@ -678,6 +734,8 @@ def _run_phase_a(
     _write_xyz_file(selected_frames, sample_path)
     _write_index_file(selected_indices, index_path)
     try:
+        if progress_reporter is not None:
+            progress_reporter.update(stage="allocation_join")
         from ..daemon.state import DEFAULT_STATE_FILENAME, read_state
         from ..point_allocation import (
             create_point_allocation,
@@ -840,6 +898,13 @@ def _run_phase_a(
             campaign.resolve()
         ).as_posix(),
     })
+    if progress_reporter is not None:
+        progress_reporter.update(
+            stage="split_publication",
+            completed=int(n_select),
+            total=int(n_select),
+            unit="frames",
+        )
 
     print(
         "Phase A: wrote " + str(n_select) + " frames to "
@@ -848,7 +913,7 @@ def _run_phase_a(
     return 0
 
 
-def _run_phase_b(args, campaign, config):
+def _run_phase_b(args, campaign, config, *, progress_reporter: Any = None):
     """Select an exact diverse subset from safe ARIADNE landings.
 
     Two outputs are always written under ``phase_b/``:
@@ -920,12 +985,28 @@ def _run_phase_b(args, campaign, config):
         )
         return 3
 
+    if progress_reporter is not None:
+        progress_reporter.update(
+            stage="handoff_validation",
+            completed=int(len(candidate_frames)),
+            total=int(len(candidate_frames)),
+            unit="ARIADNE candidates",
+        )
+
     if not candidate_frames:
         print("ARIADNE results manifest has no accepted candidates", file=_sys.stderr)
         return 3
     all_ariadne_candidate_records = [dict(record) for record in candidate_records]
+    safety_input_count = int(len(candidate_frames))
 
     try:
+        if progress_reporter is not None:
+            progress_reporter.update(
+                stage="safety_filter",
+                completed=0,
+                total=int(len(candidate_frames)),
+                unit="candidates",
+            )
         candidate_frames, candidate_records, safety_filter = (
             _phase_b_landing_safety_filter(
                 candidate_frames,
@@ -941,6 +1022,15 @@ def _run_phase_b(args, campaign, config):
             file=_sys.stderr,
         )
         return 3
+    if progress_reporter is not None:
+        progress_reporter.update(
+            stage="safety_filter",
+            completed=safety_input_count,
+            total=safety_input_count,
+            unit="candidates",
+            accepted=int(len(candidate_frames)),
+            rejected=int(safety_filter.get("n_dropped", 0)),
+        )
     if not candidate_frames:
         print(
             "Phase B landing safety filter removed every candidate",
@@ -949,6 +1039,14 @@ def _run_phase_b(args, campaign, config):
         return 3
 
     descriptor = build_descriptor_from_config(effective_config)
+    descriptor_input_count = int(len(candidate_frames))
+    if progress_reporter is not None:
+        progress_reporter.update(
+            stage="descriptor_construction",
+            completed=0,
+            total=int(len(candidate_frames)),
+            unit="candidates",
+        )
     descriptor_indices, descriptor_rejections = partition_descriptor_frames(
         descriptor,
         candidate_frames,
@@ -1015,6 +1113,15 @@ def _run_phase_b(args, campaign, config):
             file=_sys.stderr,
         )
         return 3
+    if progress_reporter is not None:
+        progress_reporter.update(
+            stage="descriptor_construction",
+            completed=descriptor_input_count,
+            total=descriptor_input_count,
+            unit="candidates",
+            accepted=int(len(candidate_frames)),
+            rejected=int(len(descriptor_rejections)),
+        )
     geometry_scale_payload = dict(resolved_protocol.geometry_scale_payload)
     min_sep, threshold_mode = phase_b_min_separation_from_resolved(
         resolved_protocol
@@ -1040,7 +1147,19 @@ def _run_phase_b(args, campaign, config):
         matrix,
         len(candidate_frames),
         descriptor_name=descriptor.name,
+        progress_callback=(
+            None
+            if progress_reporter is None
+            else lambda **payload: progress_reporter.update(**payload)
+        ),
     )
+    if progress_reporter is not None:
+        progress_reporter.update(
+            stage="novelty_filter",
+            completed=0,
+            total=int(len(candidate_frames)),
+            unit="ranked candidates",
+        )
     (
         selected_candidate_indices,
         selected_frames,
@@ -1070,6 +1189,15 @@ def _run_phase_b(args, campaign, config):
             target_size=int(n_select),
         )
         relaxation["effective_min_separation_angstrom"] = float(min_sep)
+    if progress_reporter is not None:
+        progress_reporter.update(
+            stage="novelty_filter",
+            completed=int(len(selected_candidate_indices)),
+            total=int(len(candidate_frames)),
+            unit="ranked candidates",
+            accepted=int(report.n_kept),
+            rejected=int(report.n_dropped),
+        )
 
     scale_angstrom = (
         geometry_scale_payload.get("scale_angstrom")
@@ -1139,6 +1267,7 @@ def _run_phase_b(args, campaign, config):
         _append_phase_b_journal_event(
             campaign,
             "phase_b_geometry_novelty_relaxed",
+            phase="PHASE_B_DIVERSITY",
             iteration=int(args.iteration),
             reason=str(relaxation.get("reason", "")),
             n_admitted=int(relaxation.get("n_admitted", 0)),
@@ -1233,6 +1362,8 @@ def _run_phase_b(args, campaign, config):
         min_separation=min_sep,
     )
     try:
+        if progress_reporter is not None:
+            progress_reporter.update(stage="allocation_join")
         import hashlib
 
         from ..daemon.state import DEFAULT_STATE_FILENAME, read_state
@@ -1464,6 +1595,13 @@ def _run_phase_b(args, campaign, config):
         iter_dir,
         _phase_b_json_safe(phase_b_manifest),
     )
+    if progress_reporter is not None:
+        progress_reporter.update(
+            stage="split_publication",
+            completed=int(len(final_records)),
+            total=int(len(final_records)),
+            unit="frames",
+        )
 
     print(
         "Phase B: kept " + str(report.n_kept) + "/"
@@ -1570,19 +1708,93 @@ def main(argv=None) -> int:
         print("--workers must be a positive integer", file=_sys.stderr)
         return 2
 
-    if int(args.iteration) == 0:
-        return _run_phase_a(
-            campaign,
-            config,
-            workers=int(args.workers),
-            distance_store_path=(
-                None if args.distance_store is None else _Path(args.distance_store)
-            ),
+    progress_reporter = None
+    try:
+        from ..daemon.journal import append_event
+        from ..daemon.phase_progress import PhaseProgressReporter
+        from ..daemon.state import DEFAULT_STATE_FILENAME, read_state
+
+        state = read_state(
+            campaign / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
         )
-    if int(args.iteration) < 0:
-        print("iteration must be >= 0", file=_sys.stderr)
-        return 2
-    return _run_phase_b(args, campaign, config)
+        phase_name = (
+            "PHASE_A_DIVERSITY"
+            if int(args.iteration) == 0
+            else "PHASE_B_DIVERSITY"
+        )
+        journal_path = (
+            campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson"
+        )
+
+        def journal_progress(event_type, payload):
+            append_event(
+                journal_path,
+                str(event_type),
+                max_bytes=int(config.runtime.journal_max_bytes),
+                retained_files=int(config.runtime.journal_retained_files),
+                lock_timeout_seconds=int(
+                    config.runtime.ledger_lock_timeout_seconds
+                ),
+                **dict(payload),
+            )
+
+        progress_reporter = PhaseProgressReporter(
+            campaign,
+            campaign_uid=str(state.campaign_uid),
+            phase=phase_name,
+            iteration=int(args.iteration),
+            replacement_round=int(getattr(state, "replacement_round", 0)),
+            producer_kind="worker",
+            identity={
+                "job_id": str(os.environ.get("SLURM_JOB_ID") or ""),
+                "attempt_id": str(
+                    os.environ.get("ICHOR_SUBMISSION_IDENTITY") or ""
+                ),
+            },
+            journal_callback=journal_progress,
+        )
+        progress_reporter.start("handoff_validation")
+    except Exception:
+        progress_reporter = None
+
+    try:
+        if int(args.iteration) == 0:
+            result = _run_phase_a(
+                campaign,
+                config,
+                workers=int(args.workers),
+                distance_store_path=(
+                    None
+                    if args.distance_store is None
+                    else _Path(args.distance_store)
+                ),
+                progress_reporter=progress_reporter,
+            )
+        elif int(args.iteration) < 0:
+            print("iteration must be >= 0", file=_sys.stderr)
+            result = 2
+        else:
+            result = _run_phase_b(
+                args,
+                campaign,
+                config,
+                progress_reporter=progress_reporter,
+            )
+        if progress_reporter is not None:
+            if int(result) == 0:
+                progress_reporter.complete(stage="split_publication")
+            else:
+                progress_reporter.fail(
+                    "diversity worker exited with status " + str(int(result))
+                )
+    except Exception as exc:
+        if progress_reporter is not None:
+            progress_reporter.fail(type(exc).__name__ + ": " + str(exc))
+        raise
+    finally:
+        if progress_reporter is not None:
+            progress_reporter.close()
+    return int(result)
 
 
 if __name__ == "__main__":

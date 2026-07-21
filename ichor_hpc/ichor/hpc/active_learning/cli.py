@@ -63,6 +63,8 @@ from .daemon.background_startup import (
     update_background_startup,
 )
 from .daemon.journal import (
+    JOURNAL_EVENT_CONTEXTS,
+    JOURNAL_PHASE_FIRST_EVENTS,
     KNOWN_EVENT_TYPES,
     JournalCorruptionError,
     read_events,
@@ -1893,6 +1895,131 @@ def _seed_selection_progress_record(payload: Dict[str, Any]) -> Optional[Dict[st
     return dict(record) if isinstance(record, dict) else None
 
 
+def _runtime_progress_record(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    progress = payload.get("runtime_progress")
+    if not isinstance(progress, dict) or progress.get("state") != "current":
+        return None
+    record = progress.get("record")
+    return dict(record) if isinstance(record, dict) else None
+
+
+def _format_elapsed_seconds(value: Any) -> Optional[str]:
+    try:
+        elapsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(elapsed) or elapsed < 0.0:
+        return None
+    seconds = int(elapsed)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return str(hours) + "h " + str(minutes).zfill(2) + "m"
+    if minutes:
+        return str(minutes) + "m " + str(seconds).zfill(2) + "s"
+    return str(seconds) + "s"
+
+
+def _format_generic_progress_activity(record: Mapping[str, Any]) -> str:
+    from .daemon.phase_progress import format_progress_stage
+
+    activity = format_progress_stage(record.get("stage"))
+    status = str(record.get("status") or "running").lower()
+    if status == "completed":
+        return "Finished " + activity[:1].lower() + activity[1:] + "."
+    if status == "failed":
+        return "Failed while " + activity.lower() + "."
+    return activity + "."
+
+
+def _format_generic_progress_count(record: Mapping[str, Any]) -> Optional[str]:
+    counters = record.get("counters")
+    if not isinstance(counters, Mapping):
+        return None
+    completed = _event_int(dict(counters), "completed")
+    total = _event_int(dict(counters), "total")
+    unit = str(counters.get("unit") or "items")
+    details = record.get("details")
+    if record.get("producer_kind") == "scheduler" and isinstance(details, Mapping):
+        parts: List[str] = []
+        for key in ("completed", "running", "pending", "failed", "missing"):
+            value = completed if key == "completed" else _event_int(dict(details), key)
+            if value is not None and (value > 0 or key == "completed"):
+                parts.append(str(value) + " " + key)
+        if parts:
+            return ", ".join(parts)
+    detail_suffix = ""
+    if isinstance(details, Mapping):
+        detail_parts = []
+        for key in ("accepted", "rejected"):
+            value = _event_int(dict(details), key)
+            if value is not None:
+                detail_parts.append(str(value) + " " + key)
+        if detail_parts:
+            detail_suffix = " (" + ", ".join(detail_parts) + ")"
+    if completed is not None and total is not None:
+        return str(completed) + "/" + str(total) + " " + unit + detail_suffix
+    if completed is not None:
+        return str(completed) + " " + unit + detail_suffix
+    return None
+
+
+def _status_progress_rows(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
+    runtime = payload.get("runtime_progress")
+    seed_record = (
+        _seed_selection_progress_record(payload)
+        if str(payload.get("phase") or "") == CampaignPhase.SEED_SELECT.value
+        else None
+    )
+    if seed_record is not None:
+        elapsed = _format_elapsed_seconds(seed_record.get("elapsed_seconds"))
+        rows: List[Tuple[str, str]] = []
+        completed = _event_int(seed_record, "completed")
+        total = _event_int(seed_record, "total")
+        if completed is not None and total is not None and total > 0:
+            rows.append(("progress", str(completed) + "/" + str(total)))
+        if elapsed:
+            rows.append(("elapsed", elapsed))
+        progress = payload.get("seed_selection_progress")
+        if isinstance(progress, Mapping) and progress.get("age_seconds") is not None:
+            age = _format_elapsed_seconds(progress.get("age_seconds"))
+            if age:
+                rows.append(("last update", age + " ago"))
+        return rows
+    record = _runtime_progress_record(payload)
+    if record is None:
+        return []
+    rows = []
+    count = _format_generic_progress_count(record)
+    if count:
+        rows.append(("progress", count))
+    elapsed = _format_elapsed_seconds(record.get("elapsed_seconds"))
+    if elapsed:
+        rows.append(("elapsed", elapsed))
+    try:
+        throughput = float(record.get("throughput"))
+    except (TypeError, ValueError):
+        throughput = 0.0
+    if np.isfinite(throughput) and throughput > 0.0:
+        counters = record.get("counters")
+        unit = (
+            str(counters.get("unit") or "items")
+            if isinstance(counters, Mapping)
+            else "items"
+        )
+        rows.append(
+            (
+                "throughput",
+                format(throughput, ".2f") + " " + unit + "/s",
+            )
+        )
+    if isinstance(runtime, Mapping) and runtime.get("age_seconds") is not None:
+        age = _format_elapsed_seconds(runtime.get("age_seconds"))
+        if age:
+            rows.append(("last update", age + " ago"))
+    return rows
+
+
 def _format_seed_selection_progress(record: Dict[str, Any]) -> str:
     stage = str(record.get("stage") or "loading")
     completed = _event_int(record, "completed")
@@ -2002,6 +2129,7 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
     daemon_active = _status_daemon_active(payload)
     active_jobs = _status_active_job_count(payload)
     scheduler_intents, local_intents = _status_intent_counts(payload)
+    runtime_progress = _runtime_progress_record(payload)
     progress = _seed_selection_progress_record(payload)
     if str(payload.get("background_startup_state") or "") in {
         "prepared",
@@ -2010,6 +2138,10 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
     } and payload.get("background_pid_alive") is True:
         stage = str(payload.get("background_startup_stage") or "initial checks")
         return "The background process is still starting (" + stage + ")."
+    if phase == CampaignPhase.SEED_SELECT.value and progress is not None:
+        return _format_seed_selection_progress(progress)
+    if runtime_progress is not None:
+        return _format_generic_progress_activity(runtime_progress)
     if active_jobs or scheduler_intents:
         count = max(active_jobs, scheduler_intents)
         if daemon_active:
@@ -2025,12 +2157,6 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
             + " recorded Slurm job"
             + (" still needs monitoring or postprocessing." if count == 1 else "s still need monitoring or postprocessing.")
         )
-    if (
-        phase == CampaignPhase.SEED_SELECT.value
-        and daemon_active
-        and progress is not None
-    ):
-        return _format_seed_selection_progress(progress)
     if local_intents:
         intents = payload.get("active_submission_intents")
         local_phase = phase
@@ -2219,7 +2345,27 @@ def _format_runtime_status(payload: Dict[str, Any], *, verbose: bool) -> List[st
                 )
             if progress.get("reason"):
                 rows.append(("seed-selection progress detail", progress.get("reason")))
-    return _section("Runtime", rows)
+        runtime_progress = payload.get("runtime_progress")
+        if isinstance(runtime_progress, dict):
+            rows.append(("phase progress", runtime_progress.get("state")))
+            if runtime_progress.get("age_seconds") is not None:
+                rows.append(
+                    (
+                        "phase progress age",
+                        str(round(float(runtime_progress["age_seconds"]), 1)) + "s",
+                    )
+                )
+            if runtime_progress.get("reason"):
+                rows.append(("phase progress detail", runtime_progress.get("reason")))
+            ignored_errors = runtime_progress.get("ignored_errors")
+            if isinstance(ignored_errors, list) and ignored_errors:
+                rows.append(
+                    (
+                        "ignored progress records",
+                        "; ".join(str(item) for item in ignored_errors[:4]),
+                    )
+                )
+        return _section("Runtime", rows)
 
 
 def _format_lifecycle_status(payload: Dict[str, Any]) -> List[str]:
@@ -2282,6 +2428,7 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
             [
                 ("daemon", _daemon_activity_status(payload)),
                 ("activity", _status_current_activity(payload)),
+                *_status_progress_rows(payload),
             ],
         )
     )
@@ -2465,17 +2612,22 @@ def _event_time(event: Dict[str, Any]) -> str:
 
 def _event_iteration(event: Dict[str, Any]) -> str:
     value = event.get("iteration")
-    if value is None:
-        return "iter=-"
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return "iter=n/a"
     return "iter=" + str(value)
 
 
-def _event_phase(event: Dict[str, Any]) -> str:
-    for key in ("phase", "to_phase", "from_phase"):
-        value = event.get(key)
-        if value is not None:
-            return str(value)
-    return "-"
+_CAMPAIGN_PHASE_VALUES = frozenset(phase.value for phase in CampaignPhase)
+
+
+def _event_context(event: Dict[str, Any]) -> str:
+    raw = str(event.get("event") or "")
+    if raw in JOURNAL_PHASE_FIRST_EVENTS:
+        for key in ("phase", "to_phase", "from_phase"):
+            value = event.get(key)
+            if isinstance(value, str) and value in _CAMPAIGN_PHASE_VALUES:
+                return value
+    return JOURNAL_EVENT_CONTEXTS.get(raw, "UNCLASSIFIED")
 
 
 JOURNAL_EVENT_LABELS: Dict[str, str] = {
@@ -2522,6 +2674,7 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "model_bootstrap_committed": "imported models committed",
     "quantum_output_rejected": "QM output rejected",
     "quantum_quality_summary": "QM quality summarised",
+    "quantum_quality_rejected": "QM quality rejected",
     "ferebus_quality_summary": "FEREBUS quality summarised",
     "ferebus_quality_measurement_incomplete": (
         "FEREBUS quality measurement incomplete"
@@ -2610,6 +2763,7 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "geometry_novelty_scale_precomputed": "novelty scale computed",
     "sampling_protocol_resolved": "sampling protocol resolved",
     "phase_b_novelty_threshold_relaxed": "Phase B novelty relaxed",
+    "phase_b_geometry_novelty_relaxed": "Phase B geometry novelty relaxed",
     "pool_feasibility_checked": "pool feasibility checked",
     "seed_posterior_fallback": "seed posterior fallback",
     "initial_training_existing_without_bootstrap_handoff": "bootstrap handoff missing",
@@ -2622,6 +2776,13 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "point_allocation_quantum_recorded": "QM allocation result recorded",
     "point_allocation_replacement_prepared": "replacement allocation prepared",
     "dry_run_trajectory_pool_created": "dry-run trajectory pool created",
+    "daemon_startup_progress": "daemon startup progress",
+    "phase_activity_started": "phase activity started",
+    "phase_activity_progress": "phase activity progress",
+    "phase_activity_completed": "phase activity completed",
+    "phase_activity_failed": "phase activity failed",
+    "scheduler_progress": "Slurm progress",
+    "checkpoint_progress": "checkpoint progress",
 }
 
 
@@ -2735,6 +2896,8 @@ _JOURNAL_WARN_EVENTS = {
     "ariadne_landing_rejected",
     "ariadne_optional_diagnostics_warning",
     "phase_b_novelty_threshold_relaxed",
+    "phase_b_geometry_novelty_relaxed",
+    "quantum_quality_rejected",
     "daemon_lease_stale_recovered",
     "daemon_interrupted",
     "daemon_lease_cleanup_failed",
@@ -2796,6 +2959,13 @@ _JOURNAL_DYNAMIC_EVENTS = {
     "quantum_quality_summary",
     "queue_lifecycle_update",
     "user_cancelled_jobs",
+    "daemon_startup_progress",
+    "phase_activity_started",
+    "phase_activity_progress",
+    "phase_activity_completed",
+    "phase_activity_failed",
+    "scheduler_progress",
+    "checkpoint_progress",
 }
 
 _SQUEUE_RUNNING_STATES = {"R", "RUNNING", "CG", "COMPLETING"}
@@ -2804,6 +2974,23 @@ _SQUEUE_PENDING_STATES = {"PD", "PENDING", "CF", "CONFIGURING"}
 
 def _journal_event_severity(event: Dict[str, Any]) -> str:
     raw = str(event.get("event", ""))
+    if raw in {
+        "daemon_startup_progress",
+        "phase_activity_started",
+        "phase_activity_progress",
+        "phase_activity_completed",
+        "phase_activity_failed",
+        "scheduler_progress",
+        "checkpoint_progress",
+    }:
+        status = str(event.get("status") or "running").lower()
+        if status in {"failed", "error", "blocked"}:
+            return "FAIL"
+        if status in {"completed", "verified", "published"}:
+            return "OK"
+        if status in {"waiting", "pending"}:
+            return "WAIT"
+        return "RUN"
     if raw == "ferebus_candidate_reprocessed":
         outcome = str(event.get("outcome") or "")
         if outcome == "accepted":
@@ -2982,6 +3169,45 @@ def _journal_operator_summary(
     previous_event: Optional[Dict[str, Any]] = None,
 ) -> str:
     raw = str(event.get("event", ""))
+    if raw in {
+        "daemon_startup_progress",
+        "phase_activity_started",
+        "phase_activity_progress",
+        "phase_activity_completed",
+        "phase_activity_failed",
+        "scheduler_progress",
+        "checkpoint_progress",
+    }:
+        from .daemon.phase_progress import format_progress_stage
+
+        message = format_progress_stage(event.get("stage"))
+        completed = _event_int(event, "completed")
+        total = _event_int(event, "total")
+        unit = str(event.get("unit") or "items")
+        if raw == "scheduler_progress":
+            counts: List[str] = []
+            if completed is not None:
+                counts.append(
+                    str(completed)
+                    + ("/" + str(total) if total is not None else "")
+                    + " completed"
+                )
+            for key in ("running", "pending", "failed", "missing"):
+                value = _event_int(event, key)
+                if value is not None and (value > 0 or key in {"running", "pending"}):
+                    counts.append(str(value) + " " + key)
+            if counts:
+                message += ": " + ", ".join(counts) + " " + unit
+        elif completed is not None and total is not None:
+            message += ": " + str(completed) + "/" + str(total) + " " + unit
+        elif completed is not None:
+            message += ": " + str(completed) + " " + unit
+        progress_status = str(event.get("status") or "running").lower()
+        if progress_status == "completed":
+            message = "Finished " + message[:1].lower() + message[1:]
+        elif progress_status == "failed":
+            message = "Failed while " + message.lower()
+        return message
     if raw == "seed_selection_started":
         return "seed selection started"
     if raw == "seed_selection_progress":
@@ -3128,6 +3354,7 @@ def _compact_event_details(event: Dict[str, Any]) -> str:
         ("shards_reused", "shards_reused"),
         ("shards_repaired", "shards_repaired"),
         ("elapsed_seconds", "elapsed_s"),
+        ("throughput", "throughput_per_s"),
         ("pool_n_frames", "pool"),
         ("required_pool_frames", "required"),
         ("action", "action"),
@@ -3262,13 +3489,13 @@ def _format_journal_events(events: Sequence[Dict[str, Any]], *, verbose: bool) -
             event,
             previous_event=previous_event,
         ) or _journal_event_label(event)
-        phase = _event_phase(event)
+        context = _event_context(event)
         rows.append(
             (
                 event,
                 _event_time(event),
                 _event_iteration(event),
-                phase,
+                context,
                 _journal_event_severity(event),
                 summary,
             )
@@ -3276,20 +3503,24 @@ def _format_journal_events(events: Sequence[Dict[str, Any]], *, verbose: bool) -
         previous_event = event
     time_width = max(19, max(len(row[1]) for row in rows))
     iteration_width = max(6, max(len(row[2]) for row in rows))
-    phase_width = max(18, max(len(row[3]) for row in rows))
+    context_width = max(
+        len("UNCLASSIFIED"),
+        max(len(value) for value in _CAMPAIGN_PHASE_VALUES),
+        max(len(value) for value in JOURNAL_EVENT_CONTEXTS.values()),
+    )
 
     lines: List[str] = ["Timeline"]
-    for event, event_time, iteration, phase, severity, summary in rows:
+    for event, event_time, iteration, context, severity, summary in rows:
         line = (
             "  "
             + event_time.ljust(time_width)
             + "  "
             + ("[" + severity + "]").ljust(7)
             + "  "
-            + phase.ljust(phase_width)
-            + "  "
+            + context.ljust(context_width)
+            + "   "
             + iteration.ljust(iteration_width)
-            + "  "
+            + "      "
             + summary
         )
         details = _compact_event_details(event)
@@ -3530,6 +3761,16 @@ def cmd_start(args: argparse.Namespace) -> int:
         journal_path.parent.mkdir(parents=True, exist_ok=True)
         append_event(
             journal_path, "effective_config_diff",
+            phase=(
+                state_for_lock.phase.value
+                if state_for_lock is not None
+                else CampaignPhase.INIT.value
+            ),
+            iteration=(
+                int(state_for_lock.iteration)
+                if state_for_lock is not None
+                else 0
+            ),
             n_non_default=len(non_default_paths),
             # Truncate the paths list to stay well below PIPE_BUF.
             non_default_paths=non_default_paths[:50],
@@ -4107,13 +4348,24 @@ def _mark_cancelled_intents_without_state(
                 pass
 
 
-def _journal_cancel_jobs_summary(journal_path: Path, summary: Dict[str, Any]) -> None:
+def _journal_cancel_jobs_summary(
+    journal_path: Path,
+    summary: Dict[str, Any],
+    *,
+    state: Any = None,
+) -> None:
     try:
         from .daemon.journal import append_event
 
+        context: Dict[str, Any] = {}
+        if state is not None and getattr(state, "phase", None) is not None:
+            phase = getattr(state, "phase")
+            context["phase"] = phase.value if hasattr(phase, "value") else str(phase)
+            context["iteration"] = int(getattr(state, "iteration", 0))
         append_event(
             journal_path,
             "user_cancelled_jobs",
+            **context,
             n_cancelled=len(summary.get("cancelled") or []),
             n_skipped=len(summary.get("skipped") or []),
             n_failed=len(summary.get("failed") or []),
@@ -4434,7 +4686,9 @@ def cmd_stop(args: argparse.Namespace) -> int:
         if updated is not None:
             request = updated
     if cancel_summary is not None:
-        _journal_cancel_jobs_summary(paths["journal"], cancel_summary)
+        _journal_cancel_jobs_summary(
+            paths["journal"], cancel_summary, state=state
+        )
     print(describe_stop_request(request))
     stop_verbose = bool(getattr(args, "verbose", False))
     if stop_verbose:
@@ -4852,6 +5106,257 @@ def _load_seed_selection_progress_status(
         }
 
 
+def _load_runtime_progress_status(
+    campaign: Path,
+    state: CampaignState,
+    runtime_payload: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    from datetime import datetime, timezone
+    from .daemon.phase_progress import (
+        newest_matching_progress,
+        read_phase_progress_records,
+    )
+
+    progress_errors: List[str] = []
+    records = read_phase_progress_records(
+        campaign,
+        phase=state.phase.value,
+        expected_campaign_uid=str(state.campaign_uid),
+        errors=progress_errors,
+    )
+    if not records:
+        if progress_errors:
+            return {
+                "state": "malformed",
+                "record": None,
+                "reason": progress_errors[0],
+                "ignored_errors": progress_errors,
+            }
+        return None
+    active_pid: Optional[int] = None
+    if runtime_payload.get("background_pid_alive") is True:
+        try:
+            active_pid = int(runtime_payload.get("background_pid"))
+        except (TypeError, ValueError):
+            active_pid = None
+    heartbeat = runtime_payload.get("lease_heartbeat")
+    if active_pid is None and isinstance(heartbeat, Mapping):
+        try:
+            if _lease_is_fresh(
+                heartbeat,
+                stale_seconds=int(runtime_payload.get("lease_stale_seconds") or 900),
+                clock_skew_tolerance_seconds=int(
+                    runtime_payload.get("clock_skew_tolerance_seconds") or 60
+                ),
+            ):
+                active_pid = int(heartbeat.get("pid"))
+        except (TypeError, ValueError):
+            active_pid = None
+    active_start_id: Optional[str] = None
+    startup_payload = runtime_payload.get("background_startup_payload")
+    if isinstance(startup_payload, Mapping):
+        launch_id = str(startup_payload.get("launch_id") or "").strip()
+        if launch_id:
+            active_start_id = launch_id
+    job_ids = {
+        str(job_id)
+        for job_id in dict(state.pending_jobs).values()
+        if job_id
+    }
+    intents = runtime_payload.get("active_submission_intents")
+    if isinstance(intents, list):
+        job_ids.update(
+            str(intent.get("job_id"))
+            for intent in intents
+            if isinstance(intent, Mapping) and intent.get("job_id")
+        )
+    if job_ids:
+        job_bound_records = [
+            record
+            for record in records
+            if str(record.get("job_id") or "") in job_ids
+            and str(record.get("producer_kind") or "")
+            in {"local", "scheduler", "worker"}
+        ]
+        if job_bound_records:
+            priority_groups = (
+                [
+                    record
+                    for record in job_bound_records
+                    if str(record.get("producer_kind") or "") == "local"
+                    and str(record.get("status") or "") == "running"
+                ],
+                [
+                    record
+                    for record in job_bound_records
+                    if str(record.get("producer_kind") or "") == "worker"
+                    and str(record.get("status") or "") == "running"
+                ],
+                [
+                    record
+                    for record in job_bound_records
+                    if str(record.get("producer_kind") or "") == "scheduler"
+                ],
+                job_bound_records,
+            )
+            records = next(group for group in priority_groups if group)
+        else:
+            return {
+                "state": "stale",
+                "record": None,
+                "reason": "awaiting_job_progress",
+                "ignored_errors": progress_errors,
+            }
+    record = newest_matching_progress(
+        records,
+        campaign_uid=str(state.campaign_uid),
+        phase=state.phase.value,
+        iteration=int(state.iteration),
+        replacement_round=int(state.replacement_round),
+        daemon_pid=active_pid,
+        daemon_start_id=active_start_id,
+        job_ids=job_ids,
+    )
+    if record is None:
+        return {
+            "state": "stale",
+            "record": None,
+            "reason": "identity_or_state_mismatch",
+        }
+    producer_kind = str(record.get("producer_kind") or "")
+    ownership_active = _status_daemon_active(dict(runtime_payload))
+    if producer_kind == "checkpoint":
+        current = _pid_is_alive(record.get("daemon_pid"))
+    elif producer_kind == "local" and not ownership_active:
+        current = False
+    elif producer_kind in {"scheduler", "worker"} and record.get("job_id"):
+        current = str(record.get("job_id")) in job_ids
+    else:
+        current = ownership_active or bool(job_ids)
+    try:
+        updated = datetime.fromisoformat(
+            str(record.get("updated_at_iso") or "").replace("Z", "+00:00")
+        )
+        if updated.tzinfo is None or updated.utcoffset() is None:
+            raise ValueError("progress update time has no timezone")
+        age = max(
+            0.0,
+            (datetime.now(timezone.utc) - updated.astimezone(timezone.utc)).total_seconds(),
+        )
+    except (TypeError, ValueError):
+        return {
+            "state": "malformed",
+            "record": None,
+            "reason": "updated_at_invalid",
+        }
+    return {
+        "state": "current" if current else "stale",
+        "record": record if current else None,
+        "age_seconds": float(age),
+        "reason": None if current else "producer_not_active",
+        "ignored_errors": progress_errors,
+    }
+
+
+def _reference_commit_runtime_progress(
+    payload: Mapping[str, Any],
+    state: CampaignState,
+) -> Optional[Dict[str, Any]]:
+    from datetime import datetime, timezone
+
+    if state.phase is not CampaignPhase.REFERENCE_COMMIT:
+        return None
+    transactions = payload.get("reference_commit_transactions")
+    if not isinstance(transactions, list):
+        return None
+    matching: List[Mapping[str, Any]] = []
+    for record in transactions:
+        if not isinstance(record, Mapping):
+            continue
+        ledger = record.get("ledger")
+        if isinstance(ledger, Mapping) and ledger.get("iteration") == int(
+            state.iteration
+        ):
+            matching.append(record)
+    if not matching:
+        return None
+    transaction = matching[-1]
+    ledger = dict(transaction.get("ledger") or {})
+    transaction_state = str(transaction.get("state") or "invalid")
+    stage_by_state = {
+        "prepared": "reference_commit_move",
+        "partially_moved": "reference_commit_move",
+        "cache_incomplete": "reference_commit_cache",
+        "publication_incomplete": "reference_commit_publication",
+        "published": "reference_commit_pointer",
+        "pointer_incomplete": "reference_commit_pointer",
+        "complete": "reference_commit_complete",
+        "invalid": "reference_commit_validation",
+    }
+    total = int(len(ledger.get("point_bindings") or []))
+    moved = int(ledger.get("moved_points") or 0)
+    now = datetime.now(timezone.utc)
+    updated_text = str(ledger.get("updated_at_iso") or "")
+    created_text = str(ledger.get("created_at_iso") or updated_text)
+    try:
+        updated = datetime.fromisoformat(updated_text.replace("Z", "+00:00"))
+        created = datetime.fromisoformat(created_text.replace("Z", "+00:00"))
+        if (
+            updated.tzinfo is None
+            or updated.utcoffset() is None
+            or created.tzinfo is None
+            or created.utcoffset() is None
+        ):
+            raise ValueError("reference transaction timestamp has no timezone")
+        age = max(0.0, (now - updated.astimezone(timezone.utc)).total_seconds())
+        elapsed = max(
+            0.0,
+            (now - created.astimezone(timezone.utc)).total_seconds(),
+        )
+    except (TypeError, ValueError):
+        age = 0.0
+        elapsed = 0.0
+    record: Dict[str, Any] = {
+        "schema_version": 1,
+        "campaign_uid": str(state.campaign_uid),
+        "phase": state.phase.value,
+        "iteration": int(state.iteration),
+        "replacement_round": int(state.replacement_round),
+        "producer_kind": "local",
+        "stage": stage_by_state.get(
+            transaction_state, "reference_commit_validation"
+        ),
+        "status": (
+            "failed"
+            if transaction_state == "invalid"
+            else "completed"
+            if transaction_state == "complete"
+            else "running"
+        ),
+        "counters": {
+            "completed": moved,
+            "total": total,
+            "unit": "point directories",
+        },
+        "elapsed_seconds": float(elapsed),
+        "throughput": None,
+        "started_at_iso": created_text,
+        "updated_at_iso": updated_text,
+        "details": {
+            "moved_bytes": int(ledger.get("moved_bytes") or 0),
+            "shards_reused": int(ledger.get("shards_reused") or 0),
+            "shards_repaired": int(ledger.get("shards_repaired") or 0),
+        },
+    }
+    daemon_active = _status_daemon_active(dict(payload))
+    return {
+        "state": "current" if daemon_active else "stale",
+        "record": record if daemon_active else None,
+        "age_seconds": float(age),
+        "reason": None if daemon_active else "producer_not_active",
+    }
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     campaign = resolve_campaign_dir(
         args.campaign_dir,
@@ -4874,6 +5379,11 @@ def cmd_status(args: argparse.Namespace) -> int:
             "state_path": str(paths["state"]),
             "campaign_dir": str(campaign),
             "stop_request_path": str(paths["stop_request"]),
+            "runtime_progress": {
+                "state": "unavailable",
+                "record": None,
+                "reason": "state_missing",
+            },
         }
         payload.update(_stop_control_status(campaign))
         payload["ariadne_retry_quarantine"] = quarantine_status
@@ -4910,6 +5420,11 @@ def cmd_status(args: argparse.Namespace) -> int:
             "state_path": str(paths["state"]),
             "campaign_dir": str(campaign),
             "stop_request_path": str(paths["stop_request"]),
+            "runtime_progress": {
+                "state": "unavailable",
+                "record": None,
+                "reason": "state_unreadable",
+            },
         }
         payload.update(_stop_control_status(campaign))
         payload["ariadne_retry_quarantine"] = quarantine_status
@@ -4992,6 +5507,17 @@ def cmd_status(args: argparse.Namespace) -> int:
     )
     if intent_errors:
         payload["submission_intent_errors"] = intent_errors
+    runtime_progress_status = _load_runtime_progress_status(
+        campaign,
+        state,
+        payload,
+    )
+    if runtime_progress_status is not None:
+        payload["runtime_progress"] = runtime_progress_status
+    elif progress_status is not None:
+        # Preserve the established SEED_SELECT sidecar while exposing it
+        # through the additive generic status contract.
+        payload["runtime_progress"] = dict(progress_status)
     try:
         from .point_allocation import point_allocation_path, read_point_allocation
 
@@ -5024,6 +5550,20 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "error": type(exc).__name__ + ": " + str(exc),
             }
         ]
+    existing_runtime_progress = payload.get("runtime_progress")
+    if not (
+        isinstance(existing_runtime_progress, Mapping)
+        and existing_runtime_progress.get("state") == "current"
+    ):
+        reference_progress = _reference_commit_runtime_progress(payload, state)
+        if reference_progress is not None:
+            payload["runtime_progress"] = reference_progress
+    if "runtime_progress" not in payload:
+        payload["runtime_progress"] = {
+            "state": "absent",
+            "record": None,
+            "reason": "no_progress_record",
+        }
     try:
         from .daemon.ferebus_candidate_recovery import read_recovery_request
 
@@ -5470,6 +6010,8 @@ def cmd_resume(args: argparse.Namespace) -> int:
                 append_event(
                     paths["journal"],
                     event_type,
+                    phase=state.phase.value,
+                    iteration=int(state.iteration),
                     request_id=str(archived_request.get("request_id")),
                     mode=str(archived_request.get("mode")),
                     prior_status=str(archived_request.get("status")),
@@ -5566,6 +6108,8 @@ def cmd_resume(args: argparse.Namespace) -> int:
                 append_event(
                     _campaign_paths(campaign)["journal"],
                     "campaign_reopened",
+                    phase=state.phase.value,
+                    iteration=int(state.iteration),
                     completed_iteration=completed_iteration,
                     next_iteration=int(state.iteration),
                     max_iterations=configured_max,
@@ -5627,6 +6171,8 @@ def cmd_resume(args: argparse.Namespace) -> int:
                         if cancelling_stop
                         else "user_stop_resumed"
                     ),
+                    phase=state.phase.value,
+                    iteration=int(state.iteration),
                     resume_transaction_history=str(resume_history),
                 )
             except Exception:
@@ -9728,6 +10274,8 @@ def _import_pool_impl(args: argparse.Namespace, campaign: Path, source: Path) ->
         journal_path.parent.mkdir(parents=True, exist_ok=True)
         append_event(
             journal_path, "trajectory_pool_imported",
+            phase=CampaignPhase.INIT.value,
+            iteration=0,
             n_imported=int(pool.n_frames()),
         )
     except Exception:
@@ -10081,6 +10629,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         append_event(
             campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
             "bootstrap_inputs_confirmed",
+            phase=state.phase.value,
+            iteration=int(state.iteration),
             custom_bootstrap=bool(config.campaign.custom_bootstrap),
             plan_identity_sha256=str(
                 bootstrap_manifest.get("plan_identity_sha256") or ""
@@ -11052,6 +11602,7 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
     """Create a verified checkpoint from the current idle boundary."""
     from .daemon.checkpoints import create_checkpoint
 
+    progress_reporter = None
     try:
         campaign = resolve_campaign_dir(args.campaign_dir)
         config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
@@ -11059,20 +11610,63 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
             config,
             getattr(args, "destination", None),
         )
+        try:
+            from .daemon.journal import append_event
+            from .daemon.phase_progress import PhaseProgressReporter
+
+            checkpoint_state = read_state(_campaign_paths(campaign)["state"])
+
+            def journal_progress(event_type: str, payload: Mapping[str, Any]) -> None:
+                append_event(
+                    _campaign_paths(campaign)["journal"],
+                    str(event_type),
+                    max_bytes=int(config.runtime.journal_max_bytes),
+                    retained_files=int(config.runtime.journal_retained_files),
+                    lock_timeout_seconds=int(
+                        config.runtime.ledger_lock_timeout_seconds
+                    ),
+                    **dict(payload),
+                )
+
+            progress_reporter = PhaseProgressReporter(
+                campaign,
+                campaign_uid=str(checkpoint_state.campaign_uid),
+                phase=checkpoint_state.phase.value,
+                iteration=int(checkpoint_state.iteration),
+                replacement_round=int(checkpoint_state.replacement_round),
+                producer_kind="checkpoint",
+                identity={"daemon_pid": int(os.getpid())},
+                journal_callback=journal_progress,
+            )
+            progress_reporter.start("checkpoint_copy")
+        except Exception:
+            progress_reporter = None
         with _exclusive_operator_lock(campaign):
             payload = create_checkpoint(
                 campaign,
                 destination,
                 verify_after_write=True,
                 allow_active_lease=False,
+                progress_callback=(
+                    progress_reporter.update
+                    if progress_reporter is not None
+                    else None
+                ),
             )
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        if progress_reporter is not None:
+            progress_reporter.fail(type(exc).__name__ + ": " + str(exc))
         print("Checkpoint was not created: " + str(exc), file=sys.stderr)
         print(
             "Check the destination and campaign status, then run checkpoint-status.",
             file=sys.stderr,
         )
         return 2
+    finally:
+        if progress_reporter is not None:
+            progress_reporter.close()
+    if progress_reporter is not None:
+        progress_reporter.complete(stage="checkpoint_verification")
     if bool(getattr(args, "json", False)):
         print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
     else:

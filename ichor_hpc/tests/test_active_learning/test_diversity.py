@@ -44,6 +44,51 @@ def test_fps_select_picks_endpoints_first_on_line():
     assert out.indices[2] == 2
 
 
+def test_fps_progress_is_best_effort_and_does_not_change_selection():
+    distances = _line_distance_matrix(12)
+    updates = []
+
+    observed = fps_select(
+        distances,
+        10,
+        seed_index=0,
+        progress_callback=lambda **payload: updates.append(dict(payload)),
+    )
+    baseline = fps_select(distances, 10, seed_index=0)
+    failed_reporting = fps_select(
+        distances,
+        10,
+        seed_index=0,
+        progress_callback=lambda **_payload: (_ for _ in ()).throw(
+            OSError("injected progress failure")
+        ),
+    )
+
+    assert observed.indices == baseline.indices == failed_reporting.indices
+    assert updates[0]["completed"] == 1
+    assert updates[-1]["completed"] == 10
+    assert {update["stage"] for update in updates} == {
+        "farthest_point_sampling"
+    }
+
+
+def test_fps_reports_medoid_as_a_distinct_stage():
+    updates = []
+
+    fps_select(
+        _line_distance_matrix(5),
+        3,
+        progress_callback=lambda **payload: updates.append(dict(payload)),
+    )
+
+    assert [update["stage"] for update in updates[:3]] == [
+        "medoid_selection",
+        "medoid_selection",
+        "farthest_point_sampling",
+    ]
+    assert [update["completed"] for update in updates[:3]] == [0, 1, 1]
+
+
 def test_phase_b_refill_uses_safe_reserve_before_underfill():
     frames = [_h2(1.0), _h2(2.0), _h2(3.0)]
     records = [{"seed_index": i} for i in range(3)]

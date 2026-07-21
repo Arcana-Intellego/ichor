@@ -140,6 +140,40 @@ def test_changed_gjf_removes_stale_quantum_outputs(tmp_path):
     assert not (pointdir / "input.wfn").exists()
 
 
+def test_gaussian_staging_reports_bounded_progress_without_affecting_work(tmp_path):
+    campaign, sample = _phase_a_campaign(tmp_path)
+    progress = []
+
+    staging, count = stage_gaussian_inputs(
+        campaign,
+        CampaignConfig(),
+        "INITIAL_GAUSSIAN",
+        0,
+        sample,
+        progress_callback=lambda **payload: progress.append(payload),
+    )
+
+    assert count == 1
+    assert (staging / "POINT_0000.pointdir" / "input.gjf").is_file()
+    assert [record["completed"] for record in progress] == [0, 1]
+    assert {record["stage"] for record in progress} == {
+        "gaussian_input_staging"
+    }
+
+    def reporting_failure(**_payload):
+        raise OSError("reporting unavailable")
+
+    _staging, repeated_count = stage_gaussian_inputs(
+        campaign,
+        CampaignConfig(),
+        "INITIAL_GAUSSIAN",
+        0,
+        sample,
+        progress_callback=reporting_failure,
+    )
+    assert repeated_count == 1
+
+
 def test_extra_pointdirs_force_exact_staging_rebuild(tmp_path):
     campaign, sample = _phase_a_campaign(tmp_path)
     config = CampaignConfig()

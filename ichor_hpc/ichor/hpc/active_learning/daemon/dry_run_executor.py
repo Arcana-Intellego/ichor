@@ -128,6 +128,16 @@ class DryRunPhaseExecutor:
     scheduler_identity_kind: str = "synthetic"
     scripts_dir: Path = field(init=False)
     artefact_log: List[str] = field(default_factory=list)
+    _journal_phase_snapshot: Optional[str] = field(
+        default=None, init=False, repr=False
+    )
+    _journal_iteration_snapshot: Optional[int] = field(
+        default=None, init=False, repr=False
+    )
+    _journal_replacement_round_snapshot: Optional[int] = field(
+        default=None, init=False, repr=False
+    )
+    _runtime_progress_reporter: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         from ..layout import reject_legacy_campaign_layout
@@ -147,8 +157,16 @@ class DryRunPhaseExecutor:
 
     def submit_or_run(self, state, phase) -> PhaseResult:
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
+        self._set_journal_state(state, phase_name)
         if phase_name in SBATCH_PHASES:
+            self._report_runtime_progress("handoff_validation")
             expected_tasks = self._prepare_dry_submission(state, phase_name)
+            self._report_runtime_progress(
+                "script_rendering",
+                completed=0,
+                total=int(expected_tasks),
+                unit="tasks",
+            )
             self._write_stub_script(
                 phase_name,
                 state.iteration,
@@ -158,12 +176,19 @@ class DryRunPhaseExecutor:
             job_id = (
                 DRYRUN_JOB_PREFIX + phase_name + "-" + str(state.iteration)
             )
+            self._report_runtime_progress(
+                "slurm_submission",
+                completed=int(expected_tasks),
+                total=int(expected_tasks),
+                unit="tasks",
+            )
             return PhaseResult(
                 is_complete=False,
                 submitted_job_id=job_id,
                 expected_tasks=int(expected_tasks),
             )
         # inline phases produce their artefacts synchronously.
+        self._report_runtime_progress("phase_entry")
         inline_result = self._run_inline(state, phase_name)
         if isinstance(inline_result, PhaseResult):
             return inline_result
@@ -171,6 +196,7 @@ class DryRunPhaseExecutor:
 
     def postprocess(self, state, phase, observations: Sequence[Any]) -> PhaseResult:
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
+        self._set_journal_state(state, phase_name)
         postprocess_result = self._postprocess_phase(state, phase_name)
         if isinstance(postprocess_result, PhaseResult):
             return postprocess_result
@@ -215,6 +241,7 @@ class DryRunPhaseExecutor:
                 iteration,
                 sample,
                 campaign_uid=str(getattr(state, "campaign_uid", "")),
+                progress_callback=self._report_runtime_progress,
             )
         elif "AIMALL" in phase_name:
             staging_override = None
@@ -246,6 +273,7 @@ class DryRunPhaseExecutor:
                 ),
                 staging_override=staging_override,
                 expected_gaussian_phase=expected_gaussian_phase,
+                progress_callback=self._report_runtime_progress,
             )
         elif phase_name == "ARIADNE_ARRAY":
             from ..seed_identity import read_ariadne_task_map
@@ -260,6 +288,7 @@ class DryRunPhaseExecutor:
                 self.campaign_dir,
                 self.config,
                 int(getattr(state, "reference_data_version", 0)),
+                progress_callback=self._report_runtime_progress,
             )
         else:
             raise BackendSubmissionError(
@@ -1297,8 +1326,15 @@ class DryRunPhaseExecutor:
             context=str(context),
             iteration=int(iteration),
         )
+        self._report_runtime_progress("allocation_loading")
         allocation = read_point_allocation(path)
         summary = dict(allocation.get("summary") or {})
+        self._report_runtime_progress(
+            "completeness_check",
+            completed=int(summary.get("accepted_total", 0)),
+            total=int(len(allocation.get("slots") or [])),
+            unit="slots",
+        )
         if bool(allocation.get("mandatory_custom_failed", False)):
             raise BackendSubmissionError(
                 "mandatory_custom_bootstrap_failed: supplied slots cannot be replaced"
@@ -1335,6 +1371,12 @@ class DryRunPhaseExecutor:
                 ]
                 + [0]
             ) + 1
+        self._report_runtime_progress(
+            "replacement_selection",
+            completed=0,
+            total=int(len(pending)),
+            unit="points",
+        )
         try:
             replacement = prepare_replacement_round(
                 self.campaign_dir,
@@ -1362,6 +1404,12 @@ class DryRunPhaseExecutor:
             n_candidates=int(replacement.get("n_candidates", 0)),
             reserve_available=int(summary.get("reserve_available", 0)),
         )
+        self._report_runtime_progress(
+            "replacement_selection",
+            completed=int(replacement.get("n_candidates", 0)),
+            total=int(replacement.get("n_candidates", 0)),
+            unit="points",
+        )
         return PhaseResult(
             is_complete=True,
             state_updates={"replacement_round": int(replacement_round)},
@@ -1387,7 +1435,14 @@ class DryRunPhaseExecutor:
             context="active",
             iteration=int(state.iteration),
         )
+        self._report_runtime_progress("allocation_loading")
         allocation = read_point_allocation(allocation_path)
+        self._report_runtime_progress(
+            "split_ledger",
+            completed=0,
+            total=int(len(allocation.get("slots") or [])),
+            unit="slots",
+        )
         slots = [
             {
                 "slot_id": int(slot["slot_id"]),
@@ -1407,6 +1462,12 @@ class DryRunPhaseExecutor:
             "targets": dict(allocation["targets"]),
             "slots": slots,
         }
+        self._report_runtime_progress(
+            "split_publication",
+            completed=int(len(slots)),
+            total=int(len(slots)),
+            unit="slots",
+        )
         split_path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_json(split_path, payload)
         self.artefact_log.append(str(split_path))
@@ -1517,6 +1578,7 @@ class DryRunPhaseExecutor:
             )
         from ..versioning.sampling_iterations import finalise_active_iteration
 
+        self._report_runtime_progress("iteration_finalisation")
         iteration_manifest = finalise_active_iteration(
             self.campaign_dir,
             iteration,
@@ -1529,6 +1591,7 @@ class DryRunPhaseExecutor:
             manifest=str(iteration_manifest),
         )
         stop = self.config.stop
+        self._report_runtime_progress("stopping_criteria")
         history = list(getattr(state, "alpha_history", None) or [])
         latest = getattr(state, "last_acquisition_alpha0", None)
         if latest is not None:
@@ -1584,6 +1647,7 @@ class DryRunPhaseExecutor:
                 reason=str(reason),
                 history_tail=[float(x) for x in history[-min(len(history), 8):]],
             )
+        self._report_runtime_progress("next_iteration")
         return updates
 
     def _iter_dir(self, iteration: int) -> Path:
@@ -2597,6 +2661,30 @@ class DryRunPhaseExecutor:
         event_payload["iteration"] = int(iteration)
         self._journal_event(str(event_type), **event_payload)
 
+    def _set_journal_state(self, state: Any, phase: Any = None) -> None:
+        phase_value = phase
+        if phase_value is None:
+            phase_value = getattr(state, "phase", None)
+        self._journal_phase_snapshot = (
+            phase_value.value if hasattr(phase_value, "value") else str(phase_value)
+        )
+        self._journal_iteration_snapshot = int(getattr(state, "iteration", 0))
+        self._journal_replacement_round_snapshot = int(
+            getattr(state, "replacement_round", 0)
+        )
+
+    def _bind_runtime_progress_reporter(self, reporter: Any) -> None:
+        self._runtime_progress_reporter = reporter
+
+    def _report_runtime_progress(self, stage: str, **payload: Any) -> None:
+        reporter = self._runtime_progress_reporter
+        if reporter is None:
+            return
+        try:
+            reporter.update(stage=str(stage), **payload)
+        except Exception:
+            return
+
     def _journal_event(self, event_type: str, **payload) -> None:
         """Robust append to the daemon journal. The journal path is
         derived from the campaign_dir; failures are silently swallowed --
@@ -2608,6 +2696,21 @@ class DryRunPhaseExecutor:
             return
         try:
             from .filesystem import operational_path
+
+            if "phase" not in payload and self._journal_phase_snapshot is not None:
+                payload["phase"] = self._journal_phase_snapshot
+            if (
+                "iteration" not in payload
+                and self._journal_iteration_snapshot is not None
+            ):
+                payload["iteration"] = self._journal_iteration_snapshot
+            if (
+                "replacement_round" not in payload
+                and self._journal_replacement_round_snapshot not in {None, 0}
+            ):
+                payload["replacement_round"] = (
+                    self._journal_replacement_round_snapshot
+                )
 
             journal_path = operational_path(self.campaign_dir, "journal.ndjson")
             append_event(

@@ -13,7 +13,7 @@ import stat
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 from ..config import CONFIG_SCHEMA_VERSION
 from ..strict_json import strict_json as json
@@ -290,6 +290,7 @@ def create_checkpoint(
     iteration: Optional[int] = None,
     verify_after_write: bool = True,
     allow_active_lease: bool = False,
+    progress_callback: Optional[Callable[..., None]] = None,
 ) -> Dict[str, Any]:
     """Create or verify one immutable checkpoint at an idle campaign boundary."""
     campaign = lexical_absolute_path(campaign_dir)
@@ -324,12 +325,23 @@ def create_checkpoint(
         )
         return verified
 
+    def report(stage: str, **payload: Any) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(stage=str(stage), **payload)
+        except Exception:
+            return
+
+    report("checkpoint_copy", completed=0, unit="files")
     files = _campaign_files(campaign)
     records: List[Dict[str, Any]] = []
     missing_bytes = 0
-    for source in files:
+    hashed_bytes = 0
+    for source_index, source in enumerate(files, start=1):
         digest = _sha256_file(source)
         size = source.stat().st_size
+        hashed_bytes += int(size)
         relative = source.relative_to(campaign).as_posix()
         mode = stat.S_IMODE(source.stat().st_mode)
         record = {
@@ -341,6 +353,14 @@ def create_checkpoint(
         records.append(record)
         if not _object_path(store, digest).exists():
             missing_bytes += int(size)
+        if source_index == len(files) or source_index % 16 == 0:
+            report(
+                "checkpoint_copy",
+                completed=int(source_index),
+                total=int(len(files)),
+                unit="files hashed",
+                bytes_processed=int(hashed_bytes),
+            )
     store.mkdir(parents=True, exist_ok=True)
     reject_symlink_components(store)
     free_bytes = shutil.disk_usage(store).free
@@ -351,16 +371,39 @@ def create_checkpoint(
             + " free="
             + str(free_bytes)
         )
-    for source, record in zip(files, records):
+    copied_bytes = 0
+    for copy_index, (source, record) in enumerate(zip(files, records), start=1):
         _copy_object(
             source,
             _object_path(store, str(record["sha256"])),
             digest=str(record["sha256"]),
             size=int(record["size"]),
         )
-    for source, record in zip(files, records):
+        copied_bytes += int(record["size"])
+        if copy_index == len(files) or copy_index % 16 == 0:
+            report(
+                "checkpoint_copy",
+                completed=int(copy_index),
+                total=int(len(files)),
+                unit="files copied",
+                bytes_processed=int(copied_bytes),
+            )
+    report(
+        "checkpoint_verification",
+        completed=0,
+        total=int(len(files)),
+        unit="files",
+    )
+    for verify_index, (source, record) in enumerate(zip(files, records), start=1):
         if source.stat().st_size != int(record["size"]) or _sha256_file(source) != str(record["sha256"]):
             raise ValueError("checkpoint source changed before publication: " + str(source))
+        if verify_index == len(files) or verify_index % 16 == 0:
+            report(
+                "checkpoint_verification",
+                completed=int(verify_index),
+                total=int(len(files)),
+                unit="files",
+            )
 
     manifest: Dict[str, Any] = {
         "schema_version": CHECKPOINT_MANIFEST_SCHEMA_VERSION,
