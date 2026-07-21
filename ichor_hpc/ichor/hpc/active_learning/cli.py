@@ -24,6 +24,7 @@ import argparse
 import hashlib
 import inspect
 import os
+import re
 import shlex
 import signal
 from .strict_json import strict_json as json
@@ -34,7 +35,7 @@ import time
 import numpy as np
 from collections import deque
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -1367,17 +1368,6 @@ def _lock_summary(lock_held: Any) -> str:
     return "unknown"
 
 
-def _latest_journal_event(journal_path: Path, event_type: str) -> Optional[Dict[str, Any]]:
-    if not journal_path.exists():
-        return None
-    from .daemon.journal import tail_events
-
-    for event in reversed(tail_events(journal_path, max_records=4096)):
-        if event.get("event") == event_type:
-            return event
-    return None
-
-
 def _format_contract_status(contract: Any) -> Optional[str]:
     if not isinstance(contract, dict):
         return None
@@ -1429,7 +1419,7 @@ _PHASE_MEANINGS: Dict[str, str] = {
     CampaignPhase.REFERENCE_COMMIT.value: "publish accepted QM data for model training",
     CampaignPhase.INITIAL_FEREBUS.value: "train the first FEREBUS model set",
     CampaignPhase.SEED_SELECT.value: "choose trajectory frames for adversarial sampling",
-    CampaignPhase.ARIADNE_ARRAY.value: "run adversarial ARIADNE landings from selected seeds",
+    CampaignPhase.ARIADNE_ARRAY.value: "generate adversarial geometries from selected seeds",
     CampaignPhase.PHASE_B_DIVERSITY.value: "select a safe, diverse set of ARIADNE results",
     CampaignPhase.SPLIT.value: "assign selected geometries to the next QM batch",
     CampaignPhase.GAUSSIAN.value: "calculate Gaussian wavefunctions for the active-learning batch",
@@ -1441,6 +1431,116 @@ _PHASE_MEANINGS: Dict[str, str] = {
     CampaignPhase.STOP_CHECK.value: "decide whether another active-learning iteration is required",
     CampaignPhase.DONE.value: "campaign is complete",
     CampaignPhase.HALTED.value: "campaign is halted and needs user review",
+}
+
+
+_PHASE_AUTOMATIC_OUTCOMES: Dict[str, str] = {
+    CampaignPhase.INIT.value: (
+        "the daemon will select a diverse bootstrap set from the trajectory pool"
+    ),
+    CampaignPhase.PHASE_A_DIVERSITY.value: (
+        "after bootstrap diversity selection, the daemon will submit the initial "
+        "Gaussian calculations"
+    ),
+    CampaignPhase.INITIAL_GAUSSIAN.value: (
+        "after Gaussian finishes, the daemon will submit AIMAll analysis for the "
+        "bootstrap points"
+    ),
+    CampaignPhase.INITIAL_AIMALL.value: (
+        "after AIMAll finishes, the daemon will validate the bootstrap results and "
+        "check whether replacements are needed"
+    ),
+    CampaignPhase.INITIAL_ALLOCATION_CHECK.value: (
+        "the daemon will publish the bootstrap QM data when every slot is complete, "
+        "or allocate replacements for missing slots"
+    ),
+    CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN.value: (
+        "after replacement Gaussian calculations finish, the daemon will submit "
+        "replacement AIMAll analysis"
+    ),
+    CampaignPhase.INITIAL_REPLACEMENT_AIMALL.value: (
+        "after replacement AIMAll analysis, the daemon will check the bootstrap "
+        "allocation again"
+    ),
+    CampaignPhase.REFERENCE_COMMIT.value: (
+        "after publishing the accepted QM data, the daemon will train the next "
+        "FEREBUS model"
+    ),
+    CampaignPhase.INITIAL_FEREBUS.value: (
+        "after the initial model passes its quality checks, the daemon will begin "
+        "iteration 1 seed selection"
+    ),
+    CampaignPhase.SEED_SELECT.value: (
+        "after seed selection, the daemon will submit ARIADNE landing calculations"
+    ),
+    CampaignPhase.ARIADNE_ARRAY.value: (
+        "after ARIADNE finishes, the daemon will validate the results and begin "
+        "Phase B diversity selection"
+    ),
+    CampaignPhase.PHASE_B_DIVERSITY.value: (
+        "after Phase B selection, the daemon will allocate the next QM batch"
+    ),
+    CampaignPhase.SPLIT.value: (
+        "after allocating the QM batch, the daemon will submit Gaussian calculations"
+    ),
+    CampaignPhase.GAUSSIAN.value: (
+        "after Gaussian finishes, the daemon will submit AIMAll analysis for the "
+        "active-learning batch"
+    ),
+    CampaignPhase.AIMALL.value: (
+        "after AIMAll finishes, the daemon will validate the batch and check whether "
+        "replacements are needed"
+    ),
+    CampaignPhase.ALLOCATION_CHECK.value: (
+        "the daemon will publish the iteration's QM data when every slot is complete, "
+        "or allocate replacements for missing slots"
+    ),
+    CampaignPhase.REPLACEMENT_GAUSSIAN.value: (
+        "after replacement Gaussian calculations finish, the daemon will submit "
+        "replacement AIMAll analysis"
+    ),
+    CampaignPhase.REPLACEMENT_AIMALL.value: (
+        "after replacement AIMAll analysis, the daemon will check the iteration's "
+        "allocation again"
+    ),
+    CampaignPhase.FEREBUS.value: (
+        "after the updated model passes its quality checks, the daemon will finalise "
+        "the iteration"
+    ),
+    CampaignPhase.STOP_CHECK.value: (
+        "the daemon will finalise the iteration, then either begin the next iteration "
+        "or complete the campaign"
+    ),
+    CampaignPhase.DONE.value: "no further daemon work is scheduled",
+    CampaignPhase.HALTED.value: "no further work will run until the halt is reviewed",
+}
+
+
+_PHASE_WORK_NAMES: Dict[str, str] = {
+    CampaignPhase.PHASE_A_DIVERSITY.value: "bootstrap diversity",
+    CampaignPhase.INITIAL_GAUSSIAN.value: "Gaussian",
+    CampaignPhase.INITIAL_AIMALL.value: "AIMAll",
+    CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN.value: "replacement Gaussian",
+    CampaignPhase.INITIAL_REPLACEMENT_AIMALL.value: "replacement AIMAll",
+    CampaignPhase.INITIAL_FEREBUS.value: "FEREBUS",
+    CampaignPhase.ARIADNE_ARRAY.value: "ARIADNE",
+    CampaignPhase.PHASE_B_DIVERSITY.value: "Phase B diversity",
+    CampaignPhase.GAUSSIAN.value: "Gaussian",
+    CampaignPhase.AIMALL.value: "AIMAll",
+    CampaignPhase.REPLACEMENT_GAUSSIAN.value: "replacement Gaussian",
+    CampaignPhase.REPLACEMENT_AIMALL.value: "replacement AIMAll",
+    CampaignPhase.FEREBUS.value: "FEREBUS",
+}
+
+
+_BOOTSTRAP_COLLECTION_PHASES = {
+    CampaignPhase.INIT.value,
+    CampaignPhase.PHASE_A_DIVERSITY.value,
+    CampaignPhase.INITIAL_GAUSSIAN.value,
+    CampaignPhase.INITIAL_AIMALL.value,
+    CampaignPhase.INITIAL_ALLOCATION_CHECK.value,
+    CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN.value,
+    CampaignPhase.INITIAL_REPLACEMENT_AIMALL.value,
 }
 
 _BOOTSTRAP_NOT_READY_PHASES = {
@@ -1750,36 +1850,90 @@ def _first_recommendation(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _format_recommendations(
-    payload: Dict[str, Any],
-    *,
-    verbose: bool = False,
-) -> List[str]:
-    first = _first_recommendation(payload)
-    rows: List[tuple[str, Any]] = [
-        ("severity", first.get("severity")),
-        ("primary", first.get("primary")),
-        ("why", first.get("why")),
-    ]
-    if first.get("command"):
-        rows.append(("command", first.get("command")))
-    details = first.get("details")
-    if verbose and isinstance(details, list):
-        for detail in details[:5]:
-            rows.append(("detail", detail))
-    recommendations = payload.get("recommendations")
-    if verbose and isinstance(recommendations, list) and len(recommendations) > 1:
-        for recommendation in recommendations[1:4]:
-            if isinstance(recommendation, dict):
-                rows.append(
-                    (
-                        "secondary",
-                        str(recommendation.get("code"))
-                        + ": "
-                        + str(recommendation.get("primary")),
-                    )
-                )
-    return _section("Action", rows)
+_STATUS_BLOCKED_RECOMMENDATIONS = frozenset(
+    {
+        "runtime_probe_failed",
+        "state_unreadable",
+        "pool_feasibility_failed",
+        "halted_mandatory_custom_bootstrap_failed",
+        "halted_replacement_reserve_exhausted",
+        "halted_scheduler_hard_failure",
+        "halted_seed_pool_exhausted",
+    }
+)
+
+
+_STATUS_REVIEW_RECOMMENDATIONS = frozenset(
+    {
+        "campaign_completed_scientific_convergence",
+        "campaign_completed_max_iterations",
+        "campaign_done",
+    }
+)
+
+
+_STATUS_PRESENTATION_RECOMMENDATIONS = frozenset(
+    {
+        "recommendation_unavailable",
+        "stale_background_pid",
+        "runtime_probe_failed",
+        "daemon_running",
+        "pending_state_job",
+        "active_submission_intent",
+        "local_submission_intent",
+        "halted_scheduler_uncertain",
+        "halted_mandatory_custom_bootstrap_failed",
+        "halted_replacement_reserve_exhausted",
+        "halted_ferebus_quality_failed",
+        "halted_seed_pool_exhausted",
+        "halted_backend_submission_failed",
+        "halted_scheduler_transient",
+        "halted_scheduler_hard_failure",
+        "halted_contract_failure",
+        "halted_config_changed",
+        "halted_unknown",
+        "initial_ferebus_bootstrap_contract_problem",
+        "stop_check_no_committed_pair",
+        "version_skew",
+        "reference_data_missing",
+        "models_missing",
+        "state_artifact_contract_invalid",
+        "committed_artifact_invalid",
+        "campaign_completed_scientific_convergence",
+        "campaign_completed_max_iterations",
+        "campaign_done",
+        "execution_identity_unavailable",
+        "phase_unknown",
+        "campaign_config_invalid",
+        "partial_array_recovery_invalid",
+        "journal_corrupt",
+        "submission_intent_invalid",
+        "stop_control_invalid",
+        "pool_feasibility_failed",
+        "state_missing_fresh_init",
+        "campaign_missing",
+        "state_missing",
+        "state_schema_invalid",
+        "state_unreadable",
+        "user_stop_cancellation_incomplete",
+        "user_stop_draining",
+        "shutdown_requested",
+    }
+    | {
+        "phase_" + phase.value.lower() + "_ready"
+        for phase in CampaignPhase
+        if phase.value in _PHASE_AUTOMATIC_OUTCOMES
+        and phase not in {CampaignPhase.DONE, CampaignPhase.HALTED}
+    }
+)
+
+
+@dataclass(frozen=True)
+class _StatusPresentation:
+    campaign: Tuple[Tuple[str, Any], ...]
+    current_status: Tuple[Tuple[str, Any], ...]
+    progress_so_far: Tuple[Tuple[str, Any], ...]
+    what_happens_next: Tuple[Tuple[str, Any], ...]
 
 
 def _format_pool_feasibility_status(feasibility: Any) -> List[str]:
@@ -1992,7 +2146,13 @@ def _status_progress_rows(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
     rows = []
     count = _format_generic_progress_count(record)
     if count:
-        rows.append(("progress", count))
+        progress_label = "progress"
+        if (
+            str(record.get("producer_kind") or "") == "scheduler"
+            and not _status_daemon_active(payload)
+        ):
+            progress_label = "last recorded Slurm progress"
+        rows.append((progress_label, count))
     elapsed = _format_elapsed_seconds(record.get("elapsed_seconds"))
     if elapsed:
         rows.append(("elapsed", elapsed))
@@ -2141,15 +2301,43 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
     if phase == CampaignPhase.SEED_SELECT.value and progress is not None:
         return _format_seed_selection_progress(progress)
     if runtime_progress is not None:
+        if str(runtime_progress.get("producer_kind") or "") == "scheduler":
+            count = max(active_jobs, scheduler_intents, 1)
+            work_name = _PHASE_WORK_NAMES.get(phase, title)
+            kind = _status_slurm_work_kind(payload)
+            if daemon_active:
+                return (
+                    "waiting for "
+                    + str(count)
+                    + " "
+                    + work_name
+                    + " Slurm "
+                    + kind
+                    + ("" if count == 1 else "s")
+                )
+            return (
+                "The daemon is stopped; "
+                + str(count)
+                + " "
+                + work_name
+                + " Slurm "
+                + kind
+                + (" remains recorded." if count == 1 else "s remain recorded.")
+            )
         return _format_generic_progress_activity(runtime_progress)
     if active_jobs or scheduler_intents:
         count = max(active_jobs, scheduler_intents)
+        work_name = _PHASE_WORK_NAMES.get(phase, title)
+        kind = _status_slurm_work_kind(payload)
         if daemon_active:
             return (
-                "The daemon is monitoring "
+                "waiting for "
                 + str(count)
-                + " recorded Slurm job"
-                + ("." if count == 1 else "s.")
+                + " "
+                + work_name
+                + " Slurm "
+                + kind
+                + ("" if count == 1 else "s")
             )
         return (
             "The daemon is stopped; "
@@ -2180,46 +2368,117 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
     return "The daemon is stopped; " + title + " is the next campaign step."
 
 
-def _status_health_rows(payload: Dict[str, Any]) -> List[Tuple[str, Any]]:
-    phase = str(payload.get("phase") or "")
-    first = _first_recommendation(payload)
-    severity = str(first.get("severity") or "watch")
-    condition = {
-        "info": "healthy",
-        "watch": "waiting or in progress",
-        "required": "user action required",
-        "blocked": "blocked",
-    }.get(severity, severity)
-    if phase == CampaignPhase.DONE.value:
-        condition = "complete"
-    elif phase == CampaignPhase.HALTED.value:
-        condition = "halted; user review required"
-    rows: List[Tuple[str, Any]] = [("condition", condition)]
+def _status_slurm_work_kind(payload: Mapping[str, Any]) -> str:
+    intents = payload.get("active_submission_intents")
+    if isinstance(intents, list):
+        for intent in intents:
+            if not isinstance(intent, Mapping) or not intent.get("job_id"):
+                continue
+            try:
+                if int(intent.get("expected_tasks") or 0) > 1:
+                    return "array"
+            except (TypeError, ValueError):
+                continue
+    return "job"
+
+
+def _status_ownership_uncertain(payload: Mapping[str, Any]) -> bool:
+    return bool(
+        payload.get("lock_probe_error")
+        or payload.get("lease_probe_error")
+        or ("lock_held" in payload and payload.get("lock_held") is None)
+    )
+
+
+def _status_artifact_problem(payload: Mapping[str, Any]) -> bool:
+    contract = payload.get("state_artifact_contract_status")
+    if isinstance(contract, Mapping) and contract.get("ok") is False:
+        return True
     products = payload.get("artifact_manifest_status")
-    if isinstance(products, dict):
-        reference = products.get("reference_data")
-        models = products.get("models")
-        if isinstance(reference, dict):
-            rows.append(
-                ("QM reference data", _reference_data_product_status(phase, reference))
-            )
-        if isinstance(models, dict):
-            rows.append(("FEREBUS models", _models_product_status(phase, models)))
-        if products.get("error"):
-            rows.append(("campaign data", "problem - " + str(products.get("error"))))
-    contract = _format_contract_status(payload.get("state_artifact_contract_status"))
-    if contract not in {None, "ok"}:
-        rows.append(("current data check", contract))
+    if not isinstance(products, Mapping):
+        return False
+    if products.get("error"):
+        return True
+    return any(
+        isinstance(products.get(label), Mapping)
+        and products[label].get("ok") is False
+        for label in ("reference_data", "models")
+    )
+
+
+def _status_control_problem(payload: Mapping[str, Any]) -> bool:
+    config = payload.get("campaign_config_status")
+    feasibility = payload.get("pool_feasibility")
+    progress = _runtime_progress_record(dict(payload))
+    return bool(
+        (isinstance(config, Mapping) and config.get("ok") is False)
+        or payload.get("partial_array_recovery_error")
+        or payload.get("journal_error")
+        or payload.get("submission_intent_errors")
+        or payload.get("stop_control_error")
+        or (
+            isinstance(feasibility, Mapping)
+            and feasibility.get("ok") is False
+            and "FileNotFoundError" not in str(feasibility.get("error") or "")
+        )
+        or (
+            isinstance(progress, Mapping)
+            and str(progress.get("status") or "").lower() == "failed"
+        )
+    )
+
+
+def _status_overall(payload: Dict[str, Any]) -> str:
+    phase = str(payload.get("phase") or "")
+    code = str(_first_recommendation(payload).get("code") or "")
+    if _status_ownership_uncertain(payload):
+        return "cannot determine safely"
+    if _status_control_problem(payload) or _status_artifact_problem(payload):
+        return "blocked" if code in _STATUS_BLOCKED_RECOMMENDATIONS else "needs attention"
     if phase == CampaignPhase.HALTED.value:
-        halt = payload.get("latest_halt_event")
+        return "halted"
+    if phase == CampaignPhase.DONE.value:
+        return "complete"
+    stop_request = payload.get("stop_request")
+    if isinstance(stop_request, Mapping):
+        if str(stop_request.get("status") or "") == "completed":
+            return "stopped by request"
+        return (
+            "stopping as requested"
+            if _status_daemon_active(payload)
+            else "stopped with a pending stop request"
+        )
+    if payload.get("shutdown_requested"):
         context = payload.get("lifecycle_context")
-        reason = "unknown"
-        if isinstance(context, dict) and context.get("message"):
-            reason = str(context.get("message"))
-        elif isinstance(halt, dict) and halt.get("reason"):
-            reason = str(halt.get("reason"))
-        rows.append(("reason", reason))
-    return rows
+        if isinstance(context, Mapping) and str(
+            context.get("disposition") or ""
+        ) == "stopped":
+            return "stopped by request"
+        return "needs attention"
+    if (
+        payload.get("background_pid_alive") is True
+        and str(payload.get("background_startup_state") or "")
+        in BACKGROUND_STARTUP_ACTIVE_STATES
+    ):
+        return "starting"
+    if _status_daemon_active(payload):
+        return "running normally"
+    scheduler_intents, local_intents = _status_intent_counts(payload)
+    if _status_active_job_count(payload) or scheduler_intents or local_intents:
+        return "stopped with unfinished work"
+    return "stopped and ready to continue"
+
+
+def _status_daemon_label(payload: Dict[str, Any]) -> str:
+    if _status_ownership_uncertain(payload):
+        return "ownership uncertain"
+    if (
+        payload.get("background_pid_alive") is True
+        and str(payload.get("background_startup_state") or "")
+        in BACKGROUND_STARTUP_ACTIVE_STATES
+    ):
+        return "starting"
+    return "running" if _status_daemon_active(payload) else "not running"
 
 
 def _format_runtime_status(payload: Dict[str, Any], *, verbose: bool) -> List[str]:
@@ -2389,55 +2648,450 @@ def _format_lifecycle_status(payload: Dict[str, Any]) -> List[str]:
 
 
 def _iteration_summary(payload: Dict[str, Any]) -> str:
+    if int(payload.get("iteration") or 0) == 0:
+        return (
+            "bootstrap ("
+            + str(payload.get("max_iterations"))
+            + " active iterations planned)"
+        )
     return (
         str(payload.get("iteration"))
         + " of "
         + str(payload.get("max_iterations"))
-        + " active iterations planned"
     )
 
 
-def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path) -> str:
-    del journal_path  # the guarded status payload already contains journal evidence
-    lines: List[str] = []
-    lines.extend(
-        _section(
-            "Campaign",
-            (
-                [
-                    ("phase", _phase_title(payload.get("phase"))),
-                    ("purpose", _phase_meaning(payload.get("phase"))),
-                    ("iteration", _iteration_summary(payload)),
-                ]
-                + (
-                    [
-                        ("internal phase", payload.get("phase")),
-                        ("uid", payload.get("campaign_uid")),
-                        ("initialised", payload.get("campaign_started_iso")),
-                    ]
-                    if verbose
-                    else []
-                )
-            ),
+def _status_event_age(event: Mapping[str, Any]) -> Optional[str]:
+    from datetime import datetime, timezone
+
+    try:
+        updated = datetime.fromisoformat(
+            str(event.get("ts") or "").replace("Z", "+00:00")
         )
+        if updated.tzinfo is None or updated.utcoffset() is None:
+            return None
+        seconds = max(
+            0.0,
+            (datetime.now(timezone.utc) - updated.astimezone(timezone.utc)).total_seconds(),
+        )
+    except (TypeError, ValueError):
+        return None
+    elapsed = _format_elapsed_seconds(seconds)
+    return elapsed + " ago" if elapsed else None
+
+
+def _latest_status_journal_activity(
+    payload: Mapping[str, Any],
+    events: Sequence[Mapping[str, Any]],
+) -> Optional[Tuple[str, Optional[str]]]:
+    phase = str(payload.get("phase") or "")
+    try:
+        iteration = int(payload.get("iteration"))
+    except (TypeError, ValueError):
+        return None
+    candidates: List[Tuple[int, Dict[str, Any]]] = []
+    for index, raw in enumerate(events):
+        event = dict(raw)
+        if _event_int(event, "iteration") != iteration:
+            continue
+        phase_values = {
+            str(event.get(key) or "")
+            for key in ("phase", "to_phase", "from_phase")
+            if event.get(key)
+        }
+        if phase_values and phase not in phase_values:
+            continue
+        if (
+            not phase_values
+            and str(event.get("event") or "") not in JOURNAL_PHASE_FIRST_EVENTS
+        ):
+            continue
+        candidates.append((index, event))
+    if not candidates:
+        return None
+    index, event = candidates[-1]
+    previous = dict(events[index - 1]) if index > 0 else None
+    summary = _journal_operator_summary(
+        event,
+        previous_event=previous,
+    ) or _journal_event_label(event)
+    return summary, _status_event_age(event)
+
+
+def _status_version_scope(version: int) -> str:
+    return "bootstrap" if version == 0 else "iteration " + str(version)
+
+
+def _status_product_description(
+    *,
+    version: int,
+    ok: Optional[bool],
+    product: str,
+) -> str:
+    if version < 0:
+        return "not produced yet"
+    scope = _status_version_scope(version)
+    if ok is False:
+        return "recorded through " + scope + ", but validation failed"
+    if product == "model":
+        return "FEREBUS model trained through " + scope
+    return "committed through " + scope
+
+
+def _status_progress_so_far_rows(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
+    phase = str(payload.get("phase") or "")
+    iteration = int(payload.get("iteration") or 0)
+    reference_version = int(payload.get("reference_data_version", -1))
+    model_version = int(payload.get("models_version", -1))
+    products = payload.get("artifact_manifest_status")
+    reference_ok: Optional[bool] = None
+    model_ok: Optional[bool] = None
+    if isinstance(products, Mapping):
+        reference = products.get("reference_data")
+        models = products.get("models")
+        if isinstance(reference, Mapping):
+            reference_ok = reference.get("ok")
+        if isinstance(models, Mapping):
+            model_ok = models.get("ok")
+    rows = [
+        (
+            "QM data",
+            _status_product_description(
+                version=reference_version,
+                ok=reference_ok,
+                product="reference",
+            ),
+        ),
+        (
+            "model",
+            _status_product_description(
+                version=model_version,
+                ok=model_ok,
+                product="model",
+            ),
+        ),
+    ]
+    if _status_artifact_problem(payload):
+        readiness = "the committed data or model needs attention before processing can continue"
+    elif phase == CampaignPhase.HALTED.value:
+        readiness = (
+            "the last committed data and model remain available, but the campaign is halted"
+            if reference_version >= 0 or model_version >= 0
+            else "no committed QM data or model is currently available"
+        )
+    elif phase == CampaignPhase.DONE.value:
+        readiness = (
+            "final data and model are committed through "
+            + _status_version_scope(min(reference_version, model_version))
+            if min(reference_version, model_version) >= 0
+            else "the campaign is complete, but no committed data/model pair is available"
+        )
+    elif phase in _BOOTSTRAP_COLLECTION_PHASES:
+        readiness = (
+            "bootstrap data collection is still in progress"
+            if _status_daemon_active(payload)
+            else "bootstrap data collection has not finished"
+        )
+    elif phase == CampaignPhase.REFERENCE_COMMIT.value:
+        activity = "being published" if _status_daemon_active(payload) else "ready to be published"
+        readiness = (
+            "bootstrap QM data is " + activity + "; initial model training follows"
+            if iteration == 0
+            else "QM data for iteration "
+            + str(iteration)
+            + " is "
+            + activity
+            + "; the model update follows"
+        )
+    elif phase == CampaignPhase.INITIAL_FEREBUS.value:
+        readiness = (
+            "bootstrap QM data is ready; initial model training is "
+            + ("in progress" if _status_daemon_active(payload) else "pending")
+        )
+    elif phase == CampaignPhase.FEREBUS.value:
+        readiness = (
+            "QM data includes iteration "
+            + str(iteration)
+            + "; the model update for iteration "
+            + str(iteration)
+            + " is "
+            + ("in progress" if _status_daemon_active(payload) else "pending")
+        )
+    elif phase == CampaignPhase.STOP_CHECK.value:
+        readiness = (
+            "data and model include completed iteration " + str(iteration)
+            if reference_version == model_version == iteration
+            else "the completed iteration's data/model pair needs attention"
+        )
+    elif iteration >= 1 and reference_version == model_version == iteration - 1:
+        readiness = "data and model are up to date for iteration " + str(iteration)
+    elif reference_version == model_version and reference_version >= 0:
+        readiness = (
+            "data and model are aligned through "
+            + _status_version_scope(reference_version)
+        )
+    else:
+        readiness = "data and model do not match the expected position for this phase"
+    rows.append(("readiness", readiness))
+    return rows
+
+
+def _status_phase_outcome(payload: Dict[str, Any]) -> str:
+    phase = str(payload.get("phase") or "")
+    iteration = int(payload.get("iteration") or 0)
+    if phase == CampaignPhase.REFERENCE_COMMIT.value and iteration == 0:
+        return (
+            "after publishing the bootstrap QM data, the daemon will train the "
+            "initial FEREBUS model"
+        )
+    if phase == CampaignPhase.STOP_CHECK.value:
+        if iteration >= int(payload.get("max_iterations") or 0):
+            return "after final checks, the daemon will mark the campaign complete"
+        return (
+            "the daemon will finalise iteration "
+            + str(iteration)
+            + " and begin iteration "
+            + str(iteration + 1)
+            + " unless a stopping criterion has been reached"
+        )
+    return _PHASE_AUTOMATIC_OUTCOMES.get(
+        phase,
+        "the daemon cannot determine the next phase safely",
     )
+
+
+def _status_plain_reason(payload: Dict[str, Any], code: str) -> Optional[str]:
+    def _lifecycle_detail() -> Optional[str]:
+        context = payload.get("lifecycle_context")
+        if not isinstance(context, Mapping):
+            return None
+        text = str(context.get("message") or "").strip().replace("\n", " ")
+        for _ in range(3):
+            simplified = re.sub(r"^[a-z][a-z0-9_]*:\s*", "", text)
+            if simplified == text:
+                break
+            text = simplified
+        text = re.sub(
+            r"\b[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception):\s*",
+            "",
+            text,
+        ).strip()
+        if not text:
+            return None
+        return text if len(text) <= 240 else text[:237] + "..."
+
+    if code in {"campaign_config_invalid", "pool_feasibility_failed"}:
+        return "the campaign configuration or trajectory-pool plan is not currently valid"
+    if code in {
+        "runtime_probe_failed",
+        "state_missing",
+        "state_schema_invalid",
+        "state_unreadable",
+    }:
+        return "status cannot establish a safe campaign state from the control files"
+    if code in {
+        "reference_data_missing",
+        "models_missing",
+        "version_skew",
+        "state_artifact_contract_invalid",
+        "committed_artifact_invalid",
+        "initial_ferebus_bootstrap_contract_problem",
+        "stop_check_no_committed_pair",
+    }:
+        return "the recorded state and committed data/model evidence do not agree"
+    if code.startswith("halted_") or str(payload.get("phase") or "") == CampaignPhase.HALTED.value:
+        context = payload.get("lifecycle_context")
+        detail = _lifecycle_detail()
+        if isinstance(context, Mapping) and context.get("from_phase"):
+            reason = "the campaign halted during " + _phase_title(
+                context.get("from_phase")
+            )
+        else:
+            reason = "the campaign is halted and requires review"
+        if detail:
+            reason += ": " + detail
+        if code == "journal_corrupt":
+            reason += "; the journal also needs attention"
+        return reason
+    if code in {
+        "submission_intent_invalid",
+        "partial_array_recovery_invalid",
+        "stop_control_invalid",
+        "journal_corrupt",
+    }:
+        return "one or more campaign control records could not be validated"
+    return None
+
+
+def _status_next_rows(
+    payload: Dict[str, Any],
+    *,
+    campaign: Path,
+) -> List[Tuple[str, str]]:
+    phase = str(payload.get("phase") or "")
+    overall = _status_overall(payload)
+    first = _first_recommendation(payload)
+    code = str(first.get("code") or "recommendation_unavailable")
+    daemon_active = _status_daemon_active(payload)
+    stop_request = payload.get("stop_request")
+    review = code in _STATUS_REVIEW_RECOMMENDATIONS or (
+        phase == CampaignPhase.DONE.value and overall == "complete"
+    )
+    no_action = bool(
+        review
+        or overall in {"running normally", "starting"}
+        or (overall == "stopping as requested" and daemon_active)
+    )
+    if review:
+        automatic = "no further daemon work is scheduled"
+    elif isinstance(stop_request, Mapping):
+        if daemon_active and str(stop_request.get("status") or "") != "completed":
+            from .daemon.stop_control import describe_stop_request
+
+            automatic = "the daemon will honour this request: " + describe_stop_request(
+                dict(stop_request)
+            )
+        else:
+            automatic = "nothing further will run until the stopped campaign is resumed"
+    elif overall in {"cannot determine safely", "needs attention", "blocked", "halted"}:
+        automatic = "no further work can be relied upon until this condition is reviewed"
+    elif overall == "stopped with unfinished work":
+        scheduler_intents, local_intents = _status_intent_counts(payload)
+        if _status_active_job_count(payload) or scheduler_intents:
+            automatic = (
+                "recorded Slurm work may continue, but the daemon will not monitor or "
+                "postprocess it until resumed"
+            )
+        elif local_intents:
+            automatic = "prepared local work will remain paused until the daemon is resumed"
+        else:
+            automatic = "unfinished campaign work will remain paused until the daemon is resumed"
+    elif overall == "starting":
+        automatic = (
+            "after startup checks finish, " + _status_phase_outcome(payload)
+        )
+    elif overall == "stopped and ready to continue":
+        verb = "started" if phase == CampaignPhase.INIT.value else "resumed"
+        automatic = (
+            "nothing will run until the daemon is "
+            + verb
+            + "; after that, "
+            + _status_phase_outcome(payload)
+        )
+    else:
+        automatic = _status_phase_outcome(payload)
+
+    if no_action:
+        user_action = "nothing"
+        command_label = "review" if review else "follow progress"
+    else:
+        user_action = str(first.get("primary") or "inspect the campaign status")
+        command_label = "run"
+    command = str(first.get("command") or "").strip()
+    if not command:
+        command = (
+            "ichor-al-daemon journal --campaign-dir "
+            + shlex.quote(str(campaign))
+            + " --last-n 40"
+            if no_action
+            else "ichor-al-daemon status --campaign-dir "
+            + shlex.quote(str(campaign))
+            + " --verbose"
+        )
+    rows: List[Tuple[str, str]] = [
+        ("automatic", automatic),
+        ("you need to do", user_action),
+    ]
+    reason = _status_plain_reason(payload, code)
+    if reason and not no_action:
+        rows.append(("because", reason))
+    rows.append((command_label, command))
+    return rows
+
+
+def _build_status_presentation(
+    payload: Dict[str, Any],
+    *,
+    campaign: Path,
+    journal_events: Sequence[Mapping[str, Any]],
+) -> _StatusPresentation:
+    campaign_rows: List[Tuple[str, Any]] = [
+        ("phase", _phase_title(payload.get("phase"))),
+        ("purpose", _phase_meaning(payload.get("phase"))),
+        ("iteration", _iteration_summary(payload)),
+    ]
+    replacement_round = int(payload.get("replacement_round") or 0)
+    if replacement_round > 0:
+        campaign_rows.append(("replacement round", replacement_round))
+    current_rows: List[Tuple[str, Any]] = [
+        ("overall", _status_overall(payload)),
+        ("daemon", _status_daemon_label(payload)),
+        ("current work", _status_current_activity(payload)),
+    ]
+    stop_request = payload.get("stop_request")
+    if isinstance(stop_request, Mapping):
+        from .daemon.stop_control import describe_stop_request
+
+        current_rows.append(
+            ("stop request", describe_stop_request(dict(stop_request)))
+        )
+    elif payload.get("stop_control_error"):
+        current_rows.append(("stop request", "could not be read safely"))
+    elif payload.get("shutdown_requested"):
+        current_rows.append(("stop request", "shutdown is recorded in campaign state"))
+    progress_rows = _status_progress_rows(payload)
+    current_rows.extend(progress_rows)
+    if not progress_rows:
+        latest = _latest_status_journal_activity(payload, journal_events)
+        if latest is not None:
+            summary, age = latest
+            current_rows.append(("last recorded activity", summary))
+            if age:
+                current_rows.append(("last update", age))
+    return _StatusPresentation(
+        campaign=tuple(campaign_rows),
+        current_status=tuple(current_rows),
+        progress_so_far=tuple(_status_progress_so_far_rows(payload)),
+        what_happens_next=tuple(
+            _status_next_rows(payload, campaign=campaign)
+        ),
+    )
+
+
+def _format_status(
+    payload: Dict[str, Any],
+    *,
+    verbose: bool,
+    campaign: Path,
+    journal_events: Sequence[Mapping[str, Any]],
+) -> str:
+    presentation = _build_status_presentation(
+        payload,
+        campaign=campaign,
+        journal_events=journal_events,
+    )
+    lines: List[str] = []
+    lines.extend(_section("Campaign", presentation.campaign))
+    lines.append("")
+    lines.extend(_section("Current status", presentation.current_status))
+    lines.append("")
+    lines.extend(_section("Progress so far", presentation.progress_so_far))
+    lines.append("")
+    lines.extend(_section("What happens next", presentation.what_happens_next))
+    if not verbose:
+        return "\n".join(lines) + "\n"
+
     lines.append("")
     lines.extend(
         _section(
-            "Now",
+            "Campaign diagnostics",
             [
-                ("daemon", _daemon_activity_status(payload)),
-                ("activity", _status_current_activity(payload)),
-                *_status_progress_rows(payload),
+                ("internal phase", payload.get("phase")),
+                ("uid", payload.get("campaign_uid")),
+                ("initialised", payload.get("campaign_started_iso")),
             ],
         )
     )
-    lines.append("")
-    lines.extend(_section("Health", _status_health_rows(payload)))
-    lines.append("")
-    lines.extend(_format_recommendations(payload, verbose=verbose))
-    if not verbose:
-        return "\n".join(lines) + "\n"
 
     pool_lines = _format_pool_feasibility_status(payload.get("pool_feasibility"))
     if pool_lines:
@@ -2527,58 +3181,90 @@ def _format_status(payload: Dict[str, Any], *, verbose: bool, journal_path: Path
     return "\n".join(lines) + "\n"
 
 
-def _format_status_unavailable(payload: Dict[str, Any]) -> str:
+def _format_status_unavailable(
+    payload: Dict[str, Any],
+    *,
+    verbose: bool,
+) -> str:
+    first = _first_recommendation(payload)
+    code = str(first.get("code") or "recommendation_unavailable")
+    fresh = code in {"state_missing_fresh_init", "campaign_missing"}
+    state_label = {
+        "state_missing": "campaign state is missing",
+        "state_schema_invalid": "campaign state is invalid",
+        "state_unreadable": "campaign state cannot be read",
+    }.get(str(payload.get("status_error") or ""), "campaign state is unavailable")
+    if fresh:
+        state_label = "campaign setup has not been completed"
+    command = str(first.get("command") or "").strip()
     lines: List[str] = []
-    campaign_rows = [
-        ("phase", "unknown"),
-        ("state", payload.get("status_error")),
+    campaign_rows: List[Tuple[str, Any]] = [
+        ("phase", "unavailable"),
+        ("purpose", "establish a valid campaign state before processing"),
+        ("iteration", "unavailable"),
     ]
     if "campaign_yaml_exists" in payload:
-        campaign_rows.append(("campaign.yaml", "present" if payload.get("campaign_yaml_exists") else "missing"))
-    if "stateful_artifacts_count" in payload:
-        campaign_rows.append(("stateful artefacts", payload.get("stateful_artifacts_count")))
-    if "fresh_init_safe" in payload:
-        campaign_rows.append(("fresh init safe", bool(payload.get("fresh_init_safe"))))
-    feasibility = payload.get("pool_feasibility")
-    if isinstance(feasibility, dict):
         campaign_rows.append(
             (
-                "pool feasibility",
-                "ok" if feasibility.get("ok") else "failed",
+                "campaign file",
+                "campaign.yaml is present"
+                if payload.get("campaign_yaml_exists")
+                else "campaign.yaml is missing",
             )
         )
+    lines.extend(_section("Campaign", campaign_rows))
+    lines.append("")
     lines.extend(
         _section(
-            "Campaign",
-            campaign_rows,
+            "Current status",
+            [
+                ("overall", "setup required" if fresh else "cannot determine safely"),
+                ("daemon", "not checked"),
+                ("current work", state_label),
+            ],
         )
     )
-    if payload.get("state_error"):
+    lines.append("")
+    lines.extend(
+        _section(
+            "Progress so far",
+            [
+                ("QM data", "not checked"),
+                ("model", "not checked"),
+                (
+                    "readiness",
+                    "committed campaign progress cannot be established without valid state",
+                ),
+            ],
+        )
+    )
+    lines.append("")
+    next_rows: List[Tuple[str, Any]] = [
+        ("automatic", "no daemon work will start until campaign state is available"),
+        ("you need to do", first.get("primary")),
+    ]
+    reason = _status_plain_reason(payload, code)
+    if reason:
+        next_rows.append(("because", reason))
+    if command:
+        next_rows.append(("run", command))
+    lines.extend(_section("What happens next", next_rows))
+    if verbose:
         lines.append("")
-        lines.extend(_section("State", [("error", payload.get("state_error"))]))
-    if payload.get("stop_request") or payload.get("stop_control_error"):
-        from .daemon.stop_control import describe_stop_request
-
-        lines.append("")
-        stop_request = payload.get("stop_request")
         lines.extend(
             _section(
-                "User Stop Control",
+                "State diagnostics",
                 [
-                    (
-                        "request",
-                        (
-                            describe_stop_request(stop_request)
-                            if isinstance(stop_request, dict)
-                            else "invalid"
-                        ),
-                    ),
-                    ("error", payload.get("stop_control_error")),
+                    ("status", payload.get("status_error")),
+                    ("state path", payload.get("state_path")),
+                    ("error", payload.get("state_error")),
+                    ("campaign.yaml present", payload.get("campaign_yaml_exists")),
+                    ("stateful artefacts", payload.get("stateful_artifacts_count")),
+                    ("fresh init safe", payload.get("fresh_init_safe")),
+                    ("stop-control error", payload.get("stop_control_error")),
                 ],
             )
         )
-    lines.append("")
-    lines.extend(_format_recommendations(payload))
     return "\n".join(lines) + "\n"
 
 
@@ -5404,7 +6090,13 @@ def cmd_status(args: argparse.Namespace) -> int:
         if bool(getattr(args, "json", False)):
             print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
         else:
-            print(_format_status_unavailable(payload), end="")
+            print(
+                _format_status_unavailable(
+                    payload,
+                    verbose=bool(getattr(args, "verbose", False)),
+                ),
+                end="",
+            )
             print("no state.json at " + str(paths["state"]), file=sys.stderr)
         return 4
     try:
@@ -5435,7 +6127,13 @@ def cmd_status(args: argparse.Namespace) -> int:
         if bool(getattr(args, "json", False)):
             print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
         else:
-            print(_format_status_unavailable(payload), end="")
+            print(
+                _format_status_unavailable(
+                    payload,
+                    verbose=bool(getattr(args, "verbose", False)),
+                ),
+                end="",
+            )
             print("state.json invalid: " + str(exc), file=sys.stderr)
         return 5
     payload = state.to_dict()
@@ -5472,16 +6170,22 @@ def cmd_status(args: argparse.Namespace) -> int:
     )
     if progress_status is not None:
         payload["seed_selection_progress"] = progress_status
+    status_journal_events: List[Dict[str, Any]] = []
+    try:
+        from .daemon.journal import tail_events
+
+        status_journal_events = tail_events(paths["journal"], max_records=4096)
+    except Exception as exc:
+        payload["journal_error"] = type(exc).__name__ + ": " + str(exc)
     try:
         from .execution_identity import read_active_environment_generation
-        from .daemon.journal import tail_events
 
         active_environment = read_active_environment_generation(
             campaign,
             expected_campaign_uid=str(state.campaign_uid),
         )["generation"]
         transition = None
-        for event in reversed(tail_events(paths["journal"], max_records=1024)):
+        for event in reversed(status_journal_events):
             if str(event.get("event") or "") in {
                 "environment_generation_advanced",
                 "environment_rebound",
@@ -5576,12 +6280,14 @@ def cmd_status(args: argparse.Namespace) -> int:
             "status": "invalid",
             "error": type(exc).__name__ + ": " + str(exc),
         }
-    try:
-        payload["latest_halt_event"] = _latest_journal_event(
-            paths["journal"], "halt"
-        )
-    except Exception as exc:
-        payload["journal_error"] = type(exc).__name__ + ": " + str(exc)
+    payload["latest_halt_event"] = next(
+        (
+            dict(event)
+            for event in reversed(status_journal_events)
+            if str(event.get("event") or "") == "halt"
+        ),
+        None,
+    )
     try:
         if supports_partial_array_recovery(state.phase):
             ledger = read_array_ledger(campaign, state.phase, int(state.iteration))
@@ -5675,7 +6381,8 @@ def cmd_status(args: argparse.Namespace) -> int:
             _format_status(
                 payload,
                 verbose=bool(getattr(args, "verbose", False)),
-                journal_path=paths["journal"],
+                campaign=campaign,
+                journal_events=status_journal_events,
             ),
             end="",
         )

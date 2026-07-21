@@ -220,7 +220,10 @@ def _stale_pid_recommendation(campaign: Path, payload: Dict[str, Any]) -> List[S
     ]
 
 
-def _runtime_blockers(campaign: Path, payload: Dict[str, Any]) -> List[StatusRecommendation]:
+def _ownership_blockers(
+    campaign: Path,
+    payload: Dict[str, Any],
+) -> List[StatusRecommendation]:
     probe_errors: List[str] = []
     if (
         payload.get("lock_probe_error")
@@ -243,24 +246,29 @@ def _runtime_blockers(campaign: Path, payload: Dict[str, Any]) -> List[StatusRec
                 details=probe_errors,
             )
         ]
-    if _daemon_is_active(payload):
-        evidence: List[str] = []
-        if payload.get("lock_held") is True:
-            evidence.append("campaign lock held")
-        if _lease_is_fresh(payload):
-            evidence.append("recent daemon heartbeat")
-        if payload.get("background_pid_alive") is True:
-            evidence.append("background process is alive")
-        return [
-            StatusRecommendation(
-                code="daemon_running",
-                severity="watch",
-                primary="the daemon is running; monitor it instead of starting another",
-                why=", ".join(evidence),
-                command=_journal_cmd(campaign) + " --last-n 40",
-            )
-        ]
     return []
+
+
+def _daemon_running_recommendation(
+    campaign: Path,
+    payload: Dict[str, Any],
+) -> Optional[StatusRecommendation]:
+    if not _daemon_is_active(payload):
+        return None
+    evidence: List[str] = []
+    if payload.get("lock_held") is True:
+        evidence.append("campaign lock held")
+    if _lease_is_fresh(payload):
+        evidence.append("recent daemon heartbeat")
+    if payload.get("background_pid_alive") is True:
+        evidence.append("background process is alive")
+    return StatusRecommendation(
+        code="daemon_running",
+        severity="watch",
+        primary="the daemon is running; monitor it instead of starting another",
+        why=", ".join(evidence),
+        command=_journal_cmd(campaign) + " --last-n 40",
+    )
 
 
 def _job_recommendations(campaign: Path, payload: Dict[str, Any]) -> List[StatusRecommendation]:
@@ -781,6 +789,41 @@ def build_status_recommendations(
     """Return ordered user recommendations for a status payload."""
     del journal_path  # reserved for future journal-dependent detail expansion
     campaign = Path(campaign_dir)
+    status_error = str(payload.get("status_error") or "")
+    if (
+        status_error == "state_missing"
+        and payload.get("campaign_yaml_exists") is False
+    ):
+        return [
+            StatusRecommendation(
+                code="campaign_missing",
+                severity="required",
+                primary="initialise the campaign before starting the daemon",
+                why="campaign.yaml and state.json are both missing",
+                command=_cmd(campaign, "init"),
+            )
+        ]
+    if status_error == "state_schema_invalid":
+        return [
+            StatusRecommendation(
+                code="state_schema_invalid",
+                severity="required",
+                primary="run reconcile; do not restart until state.json is repaired",
+                why=_short_error(payload.get("state_error")),
+                command=_reconcile_cmd(campaign),
+            )
+        ]
+    if status_error == "state_unreadable":
+        return [
+            StatusRecommendation(
+                code="state_unreadable",
+                severity="blocked",
+                primary="check that state.json is readable, then preview recovery",
+                why=_short_error(payload.get("state_error")),
+                command=_reconcile_cmd(campaign),
+                details=[_cmd(campaign, "status") + " --verbose"],
+            )
+        ]
     config_status = payload.get("campaign_config_status")
     if isinstance(config_status, dict) and config_status.get("ok") is False:
         return [
@@ -862,7 +905,6 @@ def build_status_recommendations(
             )
         ]
 
-    status_error = str(payload.get("status_error") or "")
     if status_error == "state_missing":
         if bool(payload.get("fresh_init_safe", False)):
             if bool(payload.get("campaign_yaml_exists", False)):
@@ -899,31 +941,9 @@ def build_status_recommendations(
                 command=_reconcile_cmd(campaign),
             )
         ]
-    if status_error == "state_schema_invalid":
-        return [
-            StatusRecommendation(
-                code="state_schema_invalid",
-                severity="required",
-                primary="run reconcile; do not restart until state.json is repaired",
-                why=_short_error(payload.get("state_error")),
-                command=_reconcile_cmd(campaign),
-            )
-        ]
-    if status_error == "state_unreadable":
-        return [
-            StatusRecommendation(
-                code="state_unreadable",
-                severity="blocked",
-                primary="check that state.json is readable, then preview recovery",
-                why=_short_error(payload.get("state_error")),
-                command=_reconcile_cmd(campaign),
-                details=[_cmd(campaign, "status") + " --verbose"],
-            )
-        ]
-
-    runtime = _runtime_blockers(campaign, payload)
-    if runtime:
-        return runtime
+    ownership = _ownership_blockers(campaign, payload)
+    if ownership:
+        return ownership
 
     stop_request = payload.get("stop_request")
     if isinstance(stop_request, dict) and not payload.get("shutdown_requested"):
@@ -968,7 +988,7 @@ def build_status_recommendations(
                 command=(
                     _cmd(campaign, "resume")
                     if request_completed or not daemon_active
-                    else _journal_cmd(campaign)
+                    else _journal_cmd(campaign) + " --last-n 40"
                 ),
                 details=[
                     "request_id=" + str(stop_request.get("request_id")),
@@ -1013,10 +1033,6 @@ def build_status_recommendations(
     if scheduler_uncertain is not None:
         return [scheduler_uncertain] + stale_pid
 
-    jobs = _job_recommendations(campaign, payload)
-    if jobs:
-        return jobs + stale_pid
-
     if _phase(payload) == CampaignPhase.HALTED.value:
         return [_halt_recommendation(campaign, payload)] + stale_pid
 
@@ -1025,5 +1041,13 @@ def build_status_recommendations(
 
     if _artifact_problem(payload):
         return [_artifact_recommendation(campaign, payload)] + stale_pid
+
+    daemon_running = _daemon_running_recommendation(campaign, payload)
+    if daemon_running is not None:
+        return [daemon_running] + stale_pid
+
+    jobs = _job_recommendations(campaign, payload)
+    if jobs:
+        return jobs + stale_pid
 
     return [_phase_recommendation(campaign, payload)] + stale_pid

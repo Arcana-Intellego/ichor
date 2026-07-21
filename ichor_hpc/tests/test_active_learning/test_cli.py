@@ -1156,13 +1156,14 @@ def test_cli_status_init_hides_not_due_committed_artifact_errors(tmp_path, capsy
     assert "Campaign\n" in out
     assert "  phase: Campaign setup" in out
     assert "  purpose: prepare the campaign before its first run" in out
-    assert "Now\n" in out
-    assert "  activity: The daemon is stopped; campaign setup is the next campaign step." in out
-    assert "Health\n" in out
-    assert "  QM reference data: not produced yet" in out
-    assert "  FEREBUS models: not produced yet" in out
-    assert "Action\n" in out
-    assert "  command: ichor-al-daemon start" in out
+    assert "Current status\n" in out
+    assert "  overall: stopped and ready to continue" in out
+    assert "  current work: The daemon is stopped; campaign setup is the next campaign step." in out
+    assert "Progress so far\n" in out
+    assert "  QM data: not produced yet" in out
+    assert "  model: not produced yet" in out
+    assert "What happens next\n" in out
+    assert "  run: ichor-al-daemon start" in out
     assert " --mode live" in out
     assert "CommittedArtifactError" not in out
     assert "training status: problem" not in out
@@ -1182,18 +1183,18 @@ def test_cli_status_default_prints_operator_friendly_summary(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "Campaign\n" in out
     assert "  phase: Iteration completion check" in out
-    assert "  iteration: 3 of 5 active iterations planned" in out
-    assert "Health\n" in out
-    assert "  current data check: problem - CommittedArtifactError:" in out
-    assert "  QM reference data: not produced yet" in out
-    assert "  FEREBUS models: not produced yet" in out
-    assert "Now\n" in out
+    assert "  iteration: 3 of 5" in out
+    assert "Current status\n" in out
+    assert "  overall: needs attention" in out
     assert "  daemon: not running" in out
-    assert "Action\n" in out
-    assert "  severity: required" in out
-    assert "  primary: run reconcile; STOP_CHECK needs the latest coherent committed reference-data/model pair" in out
-    assert "  why: CommittedArtifactError:" in out
-    assert "  command: ichor-al-daemon reconcile --campaign-dir " in out
+    assert "Progress so far\n" in out
+    assert "  QM data: not produced yet" in out
+    assert "  model: not produced yet" in out
+    assert "What happens next\n" in out
+    assert "  you need to do: run reconcile; STOP_CHECK needs the latest coherent committed reference-data/model pair" in out
+    assert "  because: the recorded state and committed data/model evidence do not agree" in out
+    assert "  run: ichor-al-daemon reconcile --campaign-dir " in out
+    assert "CommittedArtifactError" not in out
     assert "training v0: problem" not in out
     assert "background_pid" not in out
     assert "shutdown_requested" not in out
@@ -1217,11 +1218,15 @@ def test_cli_status_reports_initial_ferebus_bootstrap_contract_problem(tmp_path,
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "Health\n" in out
-    assert "  current data check: problem - CommittedArtifactError:" in out
-    assert "initial_ferebus_point_allocation_invalid" in out
-    assert "  QM reference data: not produced yet" in out
-    assert "  FEREBUS models: not produced yet" in out
+    assert "Current status\n" in out
+    assert "  overall: needs attention" in out
+    assert "Progress so far\n" in out
+    assert "  QM data: not produced yet" in out
+    assert "  model: not produced yet" in out
+    assert "  readiness: the committed data or model needs attention" in out
+    assert "What happens next\n" in out
+    assert "initial_ferebus_point_allocation_invalid" not in out
+    assert "CommittedArtifactError" not in out
     assert "being produced" not in out
 
 
@@ -1423,9 +1428,12 @@ def test_cli_status_returns_4_when_state_missing(tmp_path, capsys):
     rc = main(["status", "--campaign-dir", str(campaign)])
     out = capsys.readouterr().out
     assert rc == 4
-    assert "Action" in out
+    assert "Campaign\n  phase: unavailable" in out
+    assert "Current status\n  overall: setup required" in out
+    assert "Progress so far\n" in out
+    assert "What happens next\n" in out
     assert "bootstrap the fresh campaign" in out
-    assert "fresh init safe: true" in out
+    assert "fresh init safe" not in out
 
 
 def test_cli_status_returns_json_recommendation_when_state_missing(tmp_path, capsys):

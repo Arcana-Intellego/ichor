@@ -47,7 +47,7 @@ def test_status_remains_available_without_campaign_yaml(tmp_path, monkeypatch, c
     assert cli.main(["status"]) == 4
 
     captured = capsys.readouterr()
-    assert "campaign.yaml: missing" in captured.out
+    assert "campaign file: campaign.yaml is missing" in captured.out
     assert "state.json" in captured.err
 
 
