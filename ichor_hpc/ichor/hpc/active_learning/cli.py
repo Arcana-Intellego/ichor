@@ -954,10 +954,13 @@ def _rename_existing_timestamped(path: Path, marker: str) -> Optional[Path]:
 def _print_cleanup_already_happened(paths: Sequence[str]) -> None:
     if not paths:
         return
-    print("Some cleanup/archive operations already happened:", file=sys.stderr)
+    print("Apply result: partially completed", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Completed before the interruption", file=sys.stderr)
     for path in paths:
         print("  - " + str(path), file=sys.stderr)
-    print("State/config lock was not applied.", file=sys.stderr)
+    print("  campaign state: previous authoritative state retained", file=sys.stderr)
+    print("  config lock: unchanged", file=sys.stderr)
 
 
 def _atomic_write_background_pid(pid_path: Path, payload: Dict[str, Any]) -> None:
@@ -8149,6 +8152,500 @@ def _reconcile_wrap_line(prefix: str, text: str, *, width: int = 100) -> List[st
     ) or [prefix]
 
 
+@dataclass(frozen=True)
+class _ReconcilePresentation:
+    """One coherent human view of an existing reconciliation decision."""
+
+    result: str
+    campaign_state: Tuple[Tuple[str, str], ...]
+    planned_changes: Tuple[Tuple[str, str], ...]
+    data_safety: Tuple[Tuple[str, str], ...]
+    after_apply: Tuple[Tuple[str, str], ...]
+    blockers: Tuple[str, ...]
+    warnings: Tuple[str, ...]
+    preserved_diagnostics: Tuple[str, ...]
+    next_label: str
+    next_command: str
+    next_effect: str
+
+
+def _reconcile_plain_text(value: Any) -> str:
+    """Remove implementation exception names from concise human output."""
+
+    text = str(value or "").strip()
+    text = re.sub(
+        r"(^|[;:])\s*[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception):\s*",
+        r"\1 ",
+        text,
+    ).strip()
+    return " ".join(text.split()) or "the campaign evidence could not be validated"
+
+
+def _reconcile_join_phrases(items: Sequence[str]) -> str:
+    values = [str(item).strip() for item in items if str(item).strip()]
+    if not values:
+        return "no reconcile changes are required"
+    if len(values) == 1:
+        return values[0]
+    if len(values) == 2:
+        return values[0] + " and " + values[1]
+    return ", ".join(values[:-1]) + ", and " + values[-1]
+
+
+def _reconcile_phase_display(
+    phase: Any,
+    iteration: Any,
+    *,
+    replacement_round: int = 0,
+) -> str:
+    raw = getattr(phase, "value", phase)
+    title = _PHASE_TITLES.get(str(raw), str(raw).replace("_", " ").title())
+    if len(title) < 2 or not title[:2].isupper():
+        title = title[:1].lower() + title[1:]
+    try:
+        number = int(iteration)
+    except (TypeError, ValueError):
+        return title
+    text = title + ", iteration " + str(number)
+    if int(replacement_round or 0) > 0:
+        text += ", replacement round " + str(int(replacement_round))
+    return text
+
+
+def _reconcile_config_label(path: Any) -> str:
+    leaf = str(path or "configuration").rsplit(".", 1)[-1]
+    return leaf.replace("_", " ")
+
+
+def _reconcile_config_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return repr(value)
+
+
+def _reconcile_load_current_state(
+    campaign: Path,
+) -> Tuple[Optional[CampaignState], Optional[str]]:
+    path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+    if not path.is_file():
+        return None, "campaign state is missing"
+    try:
+        return read_state(path), None
+    except Exception as exc:
+        return None, "campaign state is unreadable: " + _reconcile_plain_text(exc)
+
+
+def _reconcile_state_summary(
+    state: Optional[CampaignState],
+    error: Optional[str],
+) -> str:
+    if state is None:
+        return str(error or "campaign state is unavailable")
+    if _is_intentionally_stopped_state(state):
+        context = state.lifecycle_context if isinstance(state.lifecycle_context, Mapping) else {}
+        details = context.get("details") if isinstance(context, Mapping) else None
+        if isinstance(details, Mapping):
+            target_iteration = details.get("target_iteration")
+            if str(details.get("mode") or "") == "after_iteration" and isinstance(
+                target_iteration, int
+            ):
+                return "paused after iteration " + str(target_iteration)
+            target_phase = details.get("target_phase")
+            if str(details.get("mode") or "") == "after_phase" and target_phase:
+                return (
+                    "paused after "
+                    + _reconcile_phase_display(target_phase, target_iteration)
+                )
+        return "paused at " + _reconcile_phase_display(
+            state.phase,
+            state.iteration,
+            replacement_round=int(state.replacement_round),
+        )
+    if state.phase is CampaignPhase.DONE:
+        return "complete after iteration " + str(int(state.iteration))
+    if state.phase is CampaignPhase.HALTED:
+        return "halted at iteration " + str(int(state.iteration))
+    return _reconcile_phase_display(
+        state.phase,
+        state.iteration,
+        replacement_round=int(state.replacement_round),
+    )
+
+
+def _reconcile_state_differs(
+    current: Optional[CampaignState],
+    proposed: CampaignState,
+) -> bool:
+    if current is None:
+        return True
+    return asdict(current) != asdict(proposed)
+
+
+def _reconcile_display_target(report: Any) -> Tuple[Any, int, int]:
+    proposed = report.proposed_state
+    if proposed.phase is CampaignPhase.HALTED:
+        candidates = list(getattr(report, "recovery_candidates", []) or [])
+        if candidates and isinstance(candidates[0], Mapping):
+            candidate = candidates[0]
+            try:
+                return (
+                    CampaignPhase(str(candidate.get("phase"))),
+                    int(candidate.get("iteration")),
+                    int(candidate.get("replacement_round") or 0),
+                )
+            except (TypeError, ValueError):
+                pass
+    return proposed.phase, int(proposed.iteration), int(proposed.replacement_round)
+
+
+def _reconcile_active_work(
+    current: Optional[CampaignState],
+    report: Any,
+    runtime_status: Optional[Mapping[str, Any]],
+) -> str:
+    runtime_blockers = list(
+        (runtime_status or {}).get("reconcile_apply_blockers") or []
+    )
+    if runtime_blockers:
+        return "campaign ownership is active or cannot be confirmed safely"
+    intents = list(getattr(report, "active_submission_intents", []) or [])
+    scheduler_jobs = {
+        str(item.get("job_id"))
+        for item in intents
+        if isinstance(item, Mapping) and item.get("job_id")
+    }
+    if current is not None:
+        scheduler_jobs.update(
+            str(job_id)
+            for job_id in (current.pending_jobs or {}).values()
+            if job_id
+        )
+    if scheduler_jobs:
+        count = len(scheduler_jobs)
+        return str(count) + " recorded Slurm job" + ("" if count == 1 else "s")
+    local = [
+        item
+        for item in intents
+        if isinstance(item, Mapping) and not item.get("job_id")
+    ]
+    if local:
+        return "local recovery work is prepared"
+    return "none"
+
+
+def _reconcile_cleanup_rows(
+    report: Any,
+) -> Tuple[List[Tuple[str, str]], List[str], List[str], List[str]]:
+    rows: List[Tuple[str, str]] = []
+    reasons: List[str] = []
+    warnings: List[str] = []
+    preserved: List[str] = []
+    raw_reasons = set(str(item) for item in getattr(report, "unsafe_reasons", []) or [])
+    retirement = getattr(report, "completed_staging_retirement", None)
+    if isinstance(retirement, Mapping):
+        for record in retirement.get("eligible") or []:
+            iteration = int(record.get("iteration") or 0)
+            context = "bootstrap" if str(record.get("context")) == "bootstrap" else "iteration-" + str(iteration)
+            if str(record.get("action")) == "delete":
+                rows.append(
+                    (
+                        "staging",
+                        "delete temporary "
+                        + context
+                        + " data already committed to QM reference data",
+                    )
+                )
+            else:
+                rows.append(
+                    (
+                        "staging",
+                        "move " + context + " diagnostic data outside active staging",
+                    )
+                )
+                preserved.append(
+                    context + " rejected or unrecognised diagnostic data will be retained"
+                )
+        if retirement.get("eligible"):
+            reasons.append("completed temporary staging remains")
+        if retirement.get("pending_tombstones"):
+            rows.append(("staging", "finish an interrupted temporary-data deletion"))
+            reasons.append("an earlier staging deletion is incomplete")
+        warnings.extend(str(item) for item in retirement.get("warnings") or [])
+    if "dangling model staging directories exist" in raw_reasons:
+        rows.append(("model staging", "remove unfinished temporary model output"))
+        reasons.append("unfinished temporary model output remains")
+    if "dangling reference-data staging directories exist" in raw_reasons:
+        rows.append(("QM staging", "archive unfinished temporary QM publication data"))
+        reasons.append("unfinished QM publication data remains")
+    if ".DATA/SCRIPTS contains sbatch scripts" in raw_reasons:
+        rows.append(("submission scripts", "archive stale temporary Slurm scripts"))
+        reasons.append("stale submission scripts remain")
+    if ".DATA/STAGING is non-empty" in raw_reasons:
+        rows.append(("staging", "archive unclassified temporary staging for review"))
+        reasons.append("unclassified temporary staging remains")
+    if "stale ARIADNE publication" in raw_reasons:
+        rows.append(("ARIADNE publication", "archive stale derived batch files"))
+        reasons.append("a stale ARIADNE publication remains")
+    return rows, reasons, warnings, preserved
+
+
+def _reconcile_presentation(
+    campaign: Path,
+    report: Any,
+    contract_status: Dict[str, Any],
+    *,
+    config_review: Any = None,
+    runtime_status: Optional[Dict[str, Any]] = None,
+) -> _ReconcilePresentation:
+    current, current_error = _reconcile_load_current_state(campaign)
+    proposed = report.proposed_state
+    target_phase, target_iteration, target_round = _reconcile_display_target(report)
+    raw_blockers = _reconcile_hard_blockers(report, contract_status)
+    explicit_staging_cleanup = _reconcile_has_only_explicit_cleanup_blockers(
+        report,
+        raw_blockers,
+    )
+    blockers = [] if explicit_staging_cleanup else list(raw_blockers)
+    blockers.extend(
+        str(item)
+        for item in (runtime_status or {}).get("reconcile_apply_blockers", []) or []
+    )
+    blocked_changes = list(getattr(config_review, "blocked_changes", []) or [])
+    blockers.extend(
+        "configuration change is locked: " + str(change.path)
+        for change in blocked_changes
+    )
+    snapshot = getattr(report, "artifact_snapshot", None)
+    deep_pending = bool(
+        getattr(report, "deep_verification_required", False)
+        and (
+            snapshot is None
+            or str(getattr(snapshot, "verification_level", "authority")) != "deep"
+        )
+    )
+    if deep_pending:
+        blockers.append("deep verification is required before authority can be recovered")
+    blockers = list(dict.fromkeys(_reconcile_plain_text(item) for item in blockers))
+
+    cleanup_rows, reason_parts, warnings, preserved = _reconcile_cleanup_rows(report)
+    planned: List[Tuple[str, str]] = list(cleanup_rows)
+    allowed_changes = list(getattr(config_review, "allowed_changes", []) or [])
+    for change in allowed_changes:
+        planned.append(
+            (
+                "configuration",
+                _reconcile_config_label(change.path)
+                + " "
+                + _reconcile_config_value(change.old)
+                + " -> "
+                + _reconcile_config_value(change.new),
+            )
+        )
+    if allowed_changes:
+        reason_parts.insert(0, "configuration changed")
+        planned.append(
+            (
+                "config takes effect",
+                _reconcile_phase_display(
+                    target_phase,
+                    target_iteration,
+                    replacement_round=target_round,
+                ),
+            )
+        )
+
+    revalidation = getattr(report, "aimall_quality_revalidation", None)
+    if isinstance(revalidation, Mapping) and revalidation.get("state") in {
+        "eligible",
+        "resumable",
+    } and revalidation.get("eligible") is True:
+        count = int(revalidation.get("candidate_count") or 0)
+        planned.append(
+            ("AIMAll results", "revalidate " + str(count) + " existing point" + ("" if count == 1 else "s"))
+        )
+        reason_parts.append("existing AIMAll results can be corrected without rerunning them")
+
+    partial = getattr(report, "partial_array_recovery", None)
+    if isinstance(partial, Mapping) and partial:
+        reuse = int(partial.get("n_reuse") or partial.get("n_complete") or 0)
+        retry = int(partial.get("n_retry") or 0)
+        planned.append(
+            (
+                "array recovery",
+                "reuse " + str(reuse) + " completed task" + ("" if reuse == 1 else "s")
+                + " and prepare " + str(retry) + " for retry",
+            )
+        )
+        reason_parts.append("an interrupted array has recoverable task results")
+
+    ariadne = getattr(report, "ariadne_results_recovery", None)
+    if isinstance(ariadne, Mapping) and ariadne:
+        accepted = int(ariadne.get("accepted_tasks") or 0)
+        rejected = int(ariadne.get("rejected_tasks") or 0)
+        planned.append(
+            (
+                "ARIADNE results",
+                "reuse " + str(accepted) + " accepted result" + ("" if accepted == 1 else "s")
+                + "; exclude " + str(rejected) + " rejected task" + ("" if rejected == 1 else "s"),
+            )
+        )
+
+    repairs = list(getattr(report, "receipt_backed_intent_repairs", []) or [])
+    if repairs:
+        planned.append(
+            (
+                "submission records",
+                "retire " + str(len(repairs)) + " completed local record" + ("" if len(repairs) == 1 else "s"),
+            )
+        )
+        reason_parts.append("completed submission bookkeeping needs to be retired")
+
+    candidate = getattr(report, "ferebus_candidate_recovery", None)
+    if isinstance(candidate, Mapping) and candidate:
+        planned.append(("FEREBUS", "prepare the validated existing model candidate for recovery"))
+        reason_parts.append("a completed FEREBUS candidate can be recovered")
+
+    state_differs = _reconcile_state_differs(current, proposed)
+    if (
+        state_differs
+        and proposed.phase not in {CampaignPhase.HALTED, CampaignPhase.DONE}
+    ) or (
+        proposed.phase is CampaignPhase.HALTED
+        and target_phase is not CampaignPhase.HALTED
+    ):
+        planned.insert(
+            0,
+            (
+                "campaign state",
+                "recover to "
+                + _reconcile_phase_display(
+                    target_phase,
+                    target_iteration,
+                    replacement_round=target_round,
+                ),
+            ),
+        )
+        reason_parts.append("campaign state needs recovery")
+
+    has_changes = bool(planned)
+    if blockers:
+        result = "blocked"
+        reason = blockers[0]
+    elif proposed.phase is CampaignPhase.DONE:
+        result = "no recovery needed"
+        reason = "the completed campaign and its committed data are coherent"
+    elif has_changes:
+        result = "ready to apply"
+        reason = _reconcile_join_phrases(reason_parts)
+    elif proposed.phase is CampaignPhase.HALTED:
+        result = "blocked"
+        reason = _reconcile_plain_text(_reconcile_latest_human_reason(report))
+    else:
+        result = "no reconcile changes needed"
+        reason = (
+            "the deliberate pause remains valid"
+            if _is_intentionally_stopped_state(proposed)
+            else "campaign state, configuration and authority records already agree"
+        )
+
+    state_rows: List[Tuple[str, str]] = [
+        ("status", _reconcile_state_summary(current, current_error)),
+    ]
+    if result == "ready to apply" or (
+        result == "blocked" and proposed.phase is not CampaignPhase.HALTED
+    ):
+        state_rows.append(
+            (
+                "continue from" if _is_intentionally_stopped_state(proposed) else "recovery target",
+                _reconcile_phase_display(
+                    target_phase,
+                    target_iteration,
+                    replacement_round=target_round,
+                ),
+            )
+        )
+    state_rows.extend(
+        [
+            ("reason", reason),
+            ("active work", _reconcile_active_work(current, report, runtime_status)),
+        ]
+    )
+
+    if result == "ready to apply":
+        planned.append(("Slurm work", "none; reconcile will not start jobs"))
+
+    protected = list(contract_status.get("protected_artifacts", []) or [])
+    safety = [
+        ("committed QM data", "unchanged"),
+        ("committed models", "unchanged"),
+        (
+            "protected evidence affected",
+            "none" if not protected else "none; listed evidence remains protected",
+        ),
+    ]
+    after: List[Tuple[str, str]] = []
+    if result == "ready to apply":
+        after = [
+            (
+                "campaign state",
+                _reconcile_phase_display(
+                    target_phase,
+                    target_iteration,
+                    replacement_round=target_round,
+                ),
+            ),
+            ("daemon", "remains stopped"),
+            ("automatic campaign work", "none"),
+        ]
+
+    if result == "ready to apply":
+        next_label = "run"
+        next_command = _reconcile_apply_command(campaign, report)
+        next_effect = "apply the listed changes; no daemon or Slurm job will start"
+    elif result == "no reconcile changes needed":
+        next_label = "run"
+        next_command = _campaign_command(campaign, "resume")
+        next_effect = "continue the campaign from " + _reconcile_phase_display(
+            target_phase,
+            target_iteration,
+            replacement_round=target_round,
+        )
+    elif result == "no recovery needed":
+        next_label = "review"
+        next_command = _campaign_command(campaign, "status")
+        next_effect = "review the completed campaign and its final data products"
+    elif deep_pending:
+        next_label = "run"
+        next_command = _campaign_command(campaign, "reconcile", " --deep-verify")
+        next_effect = "perform the required scientific-payload verification before reviewing apply"
+    elif blocked_changes:
+        next_label = "run"
+        next_command = _campaign_command(campaign, "config-check", " --human")
+        next_effect = "review the configuration changes that cannot be applied here"
+    elif (runtime_status or {}).get("reconcile_apply_blockers"):
+        next_label = "run"
+        next_command = _campaign_command(campaign, "status")
+        next_effect = "review active ownership before attempting recovery"
+    else:
+        next_label = "run"
+        next_command = _campaign_command(campaign, "reconcile", " --verbose")
+        next_effect = "review the technical evidence behind the blocker"
+
+    return _ReconcilePresentation(
+        result=result,
+        campaign_state=tuple(state_rows),
+        planned_changes=tuple(planned),
+        data_safety=tuple(safety),
+        after_apply=tuple(after),
+        blockers=tuple(blockers),
+        warnings=tuple(dict.fromkeys(_reconcile_plain_text(item) for item in warnings)),
+        preserved_diagnostics=tuple(dict.fromkeys(preserved)),
+        next_label=next_label,
+        next_command=next_command,
+        next_effect=next_effect,
+    )
+
+
 def _print_reconcile_key_values(items: Sequence[Tuple[str, Any]]) -> None:
     width = max((len(label) for label, _value in items), default=0)
     for label, value in items:
@@ -8343,13 +8840,14 @@ def _reconcile_reference_commit_summary(report: Any) -> str:
 def _print_reconcile_header(campaign: Path, *, mode: str, result: str) -> None:
     print("ICHOR Reconcile")
     print("Campaign: " + str(campaign))
-    print("Mode: " + mode)
-    if mode == "apply":
-        print("Recovery result: " + result)
+    if mode.endswith("-apply") or mode == "apply":
+        print("Apply result: " + str(result).lower())
     elif mode == "restore-config":
-        print("Configuration recovery: " + result)
+        print("Proposal result: " + str(result).lower())
+    elif mode == "restore-lock":
+        print("Restore result: " + str(result).lower())
     else:
-        print("Recovery preview: " + result)
+        print("Preview result: " + str(result).lower())
     print("")
 
 
@@ -8833,6 +9331,122 @@ def _print_reconcile_inspect_compact(
     print("")
 
 
+def _print_reconcile_presentation(
+    campaign: Path,
+    presentation: _ReconcilePresentation,
+    *,
+    result_label: str = "Preview result",
+) -> None:
+    print("ICHOR Reconcile")
+    print("Campaign: " + str(campaign))
+    print(result_label + ": " + presentation.result)
+    print("")
+
+    print("Campaign state")
+    _print_reconcile_key_values(presentation.campaign_state)
+    print("")
+
+    if presentation.result == "blocked":
+        print("Manual review required")
+        problem = presentation.blockers[0] if presentation.blockers else dict(
+            presentation.campaign_state
+        ).get("reason", "campaign recovery is blocked")
+        _print_reconcile_key_values(
+            [
+                ("problem", problem),
+                ("effect", "reconcile cannot safely change campaign state"),
+                ("changes made", "none"),
+            ]
+        )
+        if len(presentation.blockers) > 1:
+            _print_reconcile_list("other blockers", presentation.blockers[1:])
+        print("")
+    elif presentation.result == "ready to apply" and presentation.planned_changes:
+        print("Planned changes")
+        _print_reconcile_key_values(presentation.planned_changes)
+        print("")
+
+    if presentation.preserved_diagnostics:
+        print("Preserved diagnostics")
+        _print_reconcile_list("evidence retained", presentation.preserved_diagnostics)
+        print("")
+    if presentation.warnings:
+        print("Warnings")
+        _print_reconcile_list("review", presentation.warnings)
+        print("")
+
+    print("Data safety")
+    _print_reconcile_key_values(presentation.data_safety)
+    print("")
+
+    if presentation.after_apply:
+        print("After apply")
+        _print_reconcile_key_values(presentation.after_apply)
+        print("")
+
+    print("Next step")
+    _print_reconcile_key_values(
+        [
+            (presentation.next_label, presentation.next_command),
+            ("effect", presentation.next_effect),
+        ]
+    )
+    print("")
+
+
+def _print_reconcile_technical_details(
+    campaign: Path,
+    report: Any,
+    contract_status: Dict[str, Any],
+    *,
+    proposed_state_path: Optional[Path],
+    config_review: Any,
+) -> None:
+    print("Technical details")
+    snapshot = getattr(report, "artifact_snapshot", None)
+    verification_rows: List[Tuple[str, Any]] = []
+    if snapshot is None:
+        verification_rows.append(("verification", "incomplete"))
+    else:
+        deep_required = bool(getattr(report, "deep_verification_required", False))
+        verification_rows.extend(
+            [
+                (
+                    "verification",
+                    "deep verified"
+                    if snapshot.verification_level == "deep"
+                    else "deep verification required"
+                    if deep_required
+                    else "authority verified",
+                ),
+                ("files inspected", int(snapshot.files_inspected)),
+                (
+                    "payload hashed",
+                    str(int(snapshot.payload_files_hashed))
+                    + " files / "
+                    + str(int(snapshot.payload_bytes_hashed))
+                    + " bytes",
+                ),
+                ("authority anchor", str(snapshot.anchor_sha256)),
+            ]
+        )
+    if proposed_state_path is not None:
+        verification_rows.append(
+            ("proposal", _reconcile_relative_path(campaign, proposed_state_path))
+        )
+    verification_rows.append(("raw decision", str(getattr(report, "decision", "") or "-")))
+    _print_reconcile_key_values(verification_rows)
+    print("")
+    _print_reconcile_last_failure_compact(report, verbose=True)
+    _print_reconcile_artefacts(campaign, report, contract_status, verbose=True)
+    _print_reconcile_aimall_quality_revalidation(report)
+    _print_reconcile_ariadne_reuse(report)
+    _print_reconcile_partial_array(campaign, report)
+    _print_reconcile_intent_repairs(report)
+    _print_reconcile_config_changes(config_review, verbose=True)
+    _print_reconcile_contract_compact(campaign, report, contract_status)
+
+
 def _print_reconcile_operator_report(
     campaign: Path,
     report: Any,
@@ -8844,83 +9458,21 @@ def _print_reconcile_operator_report(
     runtime_status: Optional[Dict[str, Any]] = None,
     verbose: bool = False,
 ) -> None:
-    result = _reconcile_result_label(report, contract_status)
-    _print_reconcile_header(campaign, mode=mode, result=result)
-    if verbose:
-        snapshot = getattr(report, "artifact_snapshot", None)
-        print("Verification")
-        if snapshot is None:
-            _print_reconcile_key_values(
-                [("status", "verification incomplete")]
-            )
-        else:
-            deep_required = bool(
-                getattr(report, "deep_verification_required", False)
-            )
-            status = (
-                "deep verified"
-                if snapshot.verification_level == "deep"
-                else "deep verification required"
-                if deep_required
-                else "authority verified"
-            )
-            _print_reconcile_key_values(
-                [
-                    ("status", status),
-                    ("files inspected", str(int(snapshot.files_inspected))),
-                    (
-                        "payload hashed",
-                        str(int(snapshot.payload_files_hashed))
-                        + " files / "
-                        + str(int(snapshot.payload_bytes_hashed))
-                        + " bytes",
-                    ),
-                    ("anchor", str(snapshot.anchor_sha256)),
-                ]
-            )
-        print("")
-    _print_reconcile_recovery_target(report, contract_status)
-    _print_reconcile_current_position(campaign, report, verbose=verbose)
-    _print_reconcile_last_failure_compact(report, verbose=verbose)
-    _print_reconcile_aimall_quality_revalidation(report)
-    _print_reconcile_ariadne_reuse(report)
-    _print_reconcile_completed_staging(report)
-    _print_reconcile_safety(campaign, report, contract_status)
-    if verbose:
-        _print_reconcile_artefacts(campaign, report, contract_status, verbose=True)
-        _print_reconcile_intent_repairs(report)
-    _print_reconcile_partial_array(campaign, report)
-    _print_reconcile_config_changes(config_review, verbose=verbose)
-    if verbose:
-        _print_reconcile_contract_compact(campaign, report, contract_status)
-    if runtime_status and runtime_status.get("reconcile_apply_blockers"):
-        print("Runtime")
-        _print_reconcile_list(
-            "apply blockers",
-            [str(item) for item in runtime_status.get("reconcile_apply_blockers", [])],
-        )
-        print("")
-    if verbose and getattr(report, "recommended_actions", []):
-        _print_reconcile_list(
-            "Recommended Actions",
-            [str(item) for item in report.recommended_actions],
-            indent="",
-        )
-        print("")
-    _print_reconcile_apply_plan_compact(
+    presentation = _reconcile_presentation(
         campaign,
         report,
         contract_status,
-        proposed_state_path=proposed_state_path,
+        config_review=config_review,
+        runtime_status=runtime_status,
     )
-    blockers = _reconcile_hard_blockers(report, contract_status)
-    if verbose or blockers:
-        _print_reconcile_inspect_compact(
+    _print_reconcile_presentation(campaign, presentation)
+    if verbose:
+        _print_reconcile_technical_details(
             campaign,
-            include_staging=(
-                ".DATA/STAGING is non-empty"
-                in list(getattr(report, "unsafe_reasons", []))
-            ),
+            report,
+            contract_status,
+            proposed_state_path=proposed_state_path,
+            config_review=config_review,
         )
 
 
@@ -8938,86 +9490,169 @@ def _print_reconcile_applied_operator_report(
     archived_reference_data_staging: Sequence[str],
     restored_bootstrap_handoff: Sequence[str],
     retired_completed_staging: Optional[Mapping[str, Any]] = None,
+    archived_ariadne_publication: Sequence[str] = (),
+    ferebus_retrain_archive: Sequence[str] = (),
+    archived_array_outputs: Sequence[str] = (),
+    refreshed_array_ledger: Optional[Mapping[str, Any]] = None,
+    config_review: Any = None,
+    resolved_intents: Sequence[Mapping[str, Any]] = (),
+    environment_transition: Optional[Mapping[str, Any]] = None,
     environment_transition_deferred: bool = False,
     verbose: bool = False,
 ) -> None:
-    _print_reconcile_header(campaign, mode="apply", result="applied")
-    _print_reconcile_recovery_target(report, contract_status)
-    _print_reconcile_ariadne_reuse(report)
-    print("Applied Changes")
-    cleanup_items: List[str] = []
-    cleanup_items.extend("removed stale artefact: " + _reconcile_relative_path(campaign, item) for item in removed)
-    cleanup_items.extend("removed model staging: " + _reconcile_relative_path(campaign, item) for item in removed_model_staging)
-    cleanup_items.extend("archived stale scripts: " + _reconcile_relative_path(campaign, item) for item in archived_scripts)
-    cleanup_items.extend("archived staging: " + _reconcile_relative_path(campaign, item) for item in archived)
-    cleanup_items.extend("archived reference-data staging: " + _reconcile_relative_path(campaign, item) for item in archived_reference_data_staging)
+    print("ICHOR Reconcile")
+    print("Campaign: " + str(campaign))
+    print("Apply result: completed")
+    print("")
+    print("Applied changes")
+    applied_rows: List[Tuple[str, str]] = [("campaign state", "written and verified")]
+    applied_rows.extend(("stale artefact", "removed " + _reconcile_relative_path(campaign, item)) for item in removed)
+    applied_rows.extend(("model staging", "removed " + _reconcile_relative_path(campaign, item)) for item in removed_model_staging)
+    applied_rows.extend(("submission scripts", "archived " + _reconcile_relative_path(campaign, item)) for item in archived_scripts)
+    applied_rows.extend(("staging", "archived " + _reconcile_relative_path(campaign, item)) for item in archived)
+    applied_rows.extend(("QM staging", "archived " + _reconcile_relative_path(campaign, item)) for item in archived_reference_data_staging)
     retirement = retired_completed_staging or {}
-    cleanup_items.extend(
-        "retired completed staging: " + _reconcile_relative_path(campaign, item)
+    applied_rows.extend(
+        ("completed staging", "retired " + _reconcile_relative_path(campaign, item))
         for item in retirement.get("retired") or []
     )
-    cleanup_items.extend(
-        "preserved diagnostic staging: " + _reconcile_relative_path(campaign, item)
+    applied_rows.extend(
+        ("diagnostic staging", "preserved " + _reconcile_relative_path(campaign, item))
         for item in retirement.get("preserved") or []
     )
-    cleanup_items.extend(
-        "staging retirement warning: " + str(item)
-        for item in retirement.get("warnings") or []
+    applied_rows.extend(
+        ("bootstrap staging", "restored " + _reconcile_relative_path(campaign, item))
+        for item in restored_bootstrap_handoff
     )
-    cleanup_items.extend("restored bootstrap staging: " + _reconcile_relative_path(campaign, item) for item in restored_bootstrap_handoff)
-    if verbose:
-        _print_reconcile_key_values(
-            [
-                ("state written", _reconcile_relative_path(campaign, campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME)),
-                ("previous state backup", _reconcile_relative_path(campaign, backup_path) if backup_path is not None else "none"),
-                ("applied proposal archive", _reconcile_relative_path(campaign, applied_proposal_path) if applied_proposal_path is not None else "none"),
-                ("final contract", "ok" if contract_status.get("contract_ok") else "invalid"),
-            ]
+    applied_rows.extend(
+        ("ARIADNE publication", "archived " + _reconcile_relative_path(campaign, item))
+        for item in archived_ariadne_publication
+    )
+    applied_rows.extend(
+        ("FEREBUS output", "archived " + _reconcile_relative_path(campaign, item))
+        for item in ferebus_retrain_archive
+    )
+    if refreshed_array_ledger is not None:
+        applied_rows.append(
+            (
+                "array recovery",
+                "prepared "
+                + str(int(refreshed_array_ledger.get("n_retry") or 0))
+                + " task(s) for resubmission after resume",
+            )
         )
-    else:
-        _print_reconcile_key_values(
-            [
-                ("recovered state", "written and verified"),
-                (
-                    "final data check",
-                    "passed" if contract_status.get("contract_ok") else "failed",
-                ),
-            ]
+    applied_rows.extend(("array output", "archived " + _reconcile_relative_path(campaign, item)) for item in archived_array_outputs)
+    for change in list(getattr(config_review, "allowed_changes", []) or []):
+        applied_rows.append(
+            (
+                "configuration",
+                _reconcile_config_label(change.path)
+                + " "
+                + _reconcile_config_value(change.old)
+                + " -> "
+                + _reconcile_config_value(change.new),
+            )
         )
-    _print_reconcile_list("cleanup", cleanup_items)
+    if resolved_intents:
+        applied_rows.append(
+            (
+                "submission records",
+                "retired " + str(len(resolved_intents)) + " completed record(s)",
+            )
+        )
+    if isinstance(environment_transition, Mapping) and environment_transition.get("changed"):
+        applied_rows.append(
+            (
+                "software environment",
+                "recorded generation " + str(environment_transition.get("generation")),
+            )
+        )
+    _print_reconcile_key_values(applied_rows)
+    print("")
+
+    warnings = [str(item) for item in retirement.get("warnings") or []]
+    if warnings:
+        print("Warnings")
+        _print_reconcile_list("review", warnings)
+        print("")
+
     final_phase = report.proposed_state.phase
     intentionally_stopped = _is_intentionally_stopped_state(
         report.proposed_state
     )
     if environment_transition_deferred:
-        print("Environment Validation")
+        applied_rows = [("software environment", "will be checked when resume clears the completed stop")]
+        print("Deferred check")
+        _print_reconcile_key_values(applied_rows)
+        print("")
+
+    print("Data safety")
+    _print_reconcile_key_values(
+        [
+            ("committed QM data", "unchanged"),
+            ("committed models", "unchanged"),
+            ("final authority check", "passed" if contract_status.get("contract_ok") else "failed"),
+        ]
+    )
+    print("")
+
+    print("Campaign state")
+    _print_reconcile_key_values(
+        [
+            ("now", _reconcile_state_summary(report.proposed_state, None)),
+            ("daemon", "not running"),
+            ("Slurm jobs submitted", "none"),
+        ]
+    )
+    print("")
+
+    print("Next step")
+    if bool(contract_status.get("contract_ok")) and final_phase not in {
+        CampaignPhase.HALTED,
+        CampaignPhase.DONE,
+    }:
         _print_reconcile_key_values(
             [
+                ("run", _campaign_command(campaign, "resume")),
                 (
-                    "status",
-                    "deferred until resume clears the completed stop",
-                )
+                    "effect",
+                    (
+                        "clear the completed pause and continue from "
+                        if intentionally_stopped
+                        else "continue the campaign from "
+                    )
+                    + _reconcile_phase_display(
+                        report.proposed_state.phase,
+                        report.proposed_state.iteration,
+                        replacement_round=int(report.proposed_state.replacement_round),
+                    ),
+                ),
             ]
         )
-        print("")
-    if bool(contract_status.get("contract_ok")) and final_phase not in {CampaignPhase.HALTED, CampaignPhase.DONE}:
-        if intentionally_stopped:
-            print(
-                "Campaign remains "
-                + _stopped_boundary_description(report.proposed_state)
-                + "."
-            )
-        _print_reconcile_list(
-            "next",
-            [_campaign_command(campaign, "resume")],
-        )
     else:
-        _print_reconcile_list(
-            "next",
-            ["Campaign remains " + final_phase.value + "; do not start the daemon yet."],
+        _print_reconcile_key_values(
+            [
+                ("run", _campaign_command(campaign, "reconcile", " --verbose")),
+                ("effect", "review why the recovered campaign cannot continue yet"),
+            ]
         )
     print("")
     if verbose:
+        print("Technical details")
+        _print_reconcile_key_values(
+            [
+                (
+                    "state written",
+                    _reconcile_relative_path(
+                        campaign,
+                        campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME,
+                    ),
+                ),
+                ("previous state backup", _reconcile_relative_path(campaign, backup_path) if backup_path is not None else "none"),
+                ("applied proposal archive", _reconcile_relative_path(campaign, applied_proposal_path) if applied_proposal_path is not None else "none"),
+            ]
+        )
+        print("")
         _print_reconcile_contract_compact(campaign, report, contract_status)
 
 
@@ -9030,21 +9665,62 @@ def _print_reconcile_apply_blocked(
 ) -> None:
     print("ICHOR Reconcile", file=sys.stderr)
     print("Campaign: " + str(campaign), file=sys.stderr)
-    print("Mode: apply", file=sys.stderr)
-    print("Recovery result: blocked", file=sys.stderr)
+    print("Apply result: blocked", file=sys.stderr)
     print("", file=sys.stderr)
-    print(title, file=sys.stderr)
-    if reasons:
-        print("  blockers:", file=sys.stderr)
-        for reason in reasons:
-            print("    - " + str(reason), file=sys.stderr)
-    else:
-        print("  blockers:", file=sys.stderr)
-        print("    - unknown", file=sys.stderr)
+    print("Manual review required", file=sys.stderr)
+    problem = _reconcile_plain_text(reasons[0]) if reasons else "the apply safety check failed"
+    rows = [
+        ("area", title),
+        ("problem", problem),
+        ("effect", "reconcile cannot safely change campaign state"),
+        ("changes made", "none"),
+    ]
+    width = max(len(label) for label, _value in rows)
+    for label, value in rows:
+        print("  " + label.ljust(width) + ": " + str(value), file=sys.stderr)
+    if len(reasons) > 1:
+        print("  other blockers:", file=sys.stderr)
+        for reason in reasons[1:]:
+            print("    - " + _reconcile_plain_text(reason), file=sys.stderr)
+    print("", file=sys.stderr)
     if next_actions:
-        print("  next:", file=sys.stderr)
-        for action in next_actions:
-            print("    - " + str(action), file=sys.stderr)
+        print("Next step", file=sys.stderr)
+        action = str(next_actions[0])
+        label = "run" if action.startswith("ichor-al-daemon ") else "review"
+        print("  " + label + ": " + action, file=sys.stderr)
+        print("  effect: resolve or inspect the blocker before retrying apply", file=sys.stderr)
+        print("", file=sys.stderr)
+
+
+def _print_reconcile_follow_up_required(
+    campaign: Path,
+    state: CampaignState,
+    *,
+    problem: Any,
+    next_command: str,
+    next_effect: str,
+    verbose_detail: Optional[str] = None,
+) -> None:
+    print("ICHOR Reconcile", file=sys.stderr)
+    print("Campaign: " + str(campaign), file=sys.stderr)
+    print("Apply result: recovery applied; follow-up required", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Campaign state", file=sys.stderr)
+    print("  now: " + _reconcile_state_summary(state, None), file=sys.stderr)
+    print("  daemon: not running", file=sys.stderr)
+    print("  Slurm jobs submitted: none", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Follow-up required", file=sys.stderr)
+    print("  problem: " + _reconcile_plain_text(problem), file=sys.stderr)
+    print("  recovery state: already committed", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Next step", file=sys.stderr)
+    print("  run: " + next_command, file=sys.stderr)
+    print("  effect: " + next_effect, file=sys.stderr)
+    if verbose_detail:
+        print("", file=sys.stderr)
+        print("Technical detail", file=sys.stderr)
+        print("  " + str(verbose_detail), file=sys.stderr)
     print("", file=sys.stderr)
 
 
@@ -9723,10 +10399,8 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         )
         return 9
 
-    inspection_stream = (
-        sys.stderr if bool(getattr(args, "json", False)) else sys.stdout
-    )
-    print("ICHOR Reconcile", file=inspection_stream, flush=True)
+    inspection_stream = sys.stderr
+    print("Checking campaign recovery...", file=inspection_stream, flush=True)
     if bool(getattr(args, "verbose", False)) or deep_verify or bool(
         getattr(args, "json", False)
     ):
@@ -9746,8 +10420,6 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             file=inspection_stream,
             flush=True,
         )
-    else:
-        print("Checking campaign recovery...", file=inspection_stream, flush=True)
     try:
         artifact_snapshot = build_committed_artifact_snapshot(
             campaign,
@@ -9756,10 +10428,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         )
     except Exception as exc:
         print(
-            "committed artefact verification failed: "
-            + type(exc).__name__
-            + ": "
-            + str(exc),
+            "committed artefact verification failed: " + _reconcile_plain_text(exc),
             file=sys.stderr,
         )
         return 9
@@ -9828,16 +10497,16 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         and report.deep_verification_required
         and verification_level != "deep"
     ):
-        print(
-            "deep verification is required before campaign authority can be "
-            "reconstructed from committed artefacts",
-            file=sys.stderr,
-        )
-        print(
-            "ichor-al-daemon reconcile --campaign-dir "
-            + str(campaign)
-            + " --deep-verify --apply",
-            file=sys.stderr,
+        _print_reconcile_apply_blocked(
+            campaign,
+            title="Deep Verification Safety",
+            reasons=[
+                "deep verification is required before campaign authority can be "
+                "reconstructed from committed artefacts"
+            ],
+            next_actions=[
+                _campaign_command(campaign, "reconcile", " --deep-verify")
+            ],
         )
         return 10
     revalidation = getattr(report, "aimall_quality_revalidation", None)
@@ -9903,10 +10572,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             except Exception as journal_exc:
                 print(
                     "AIMAll quality revalidation completed, but its journal event "
-                    "could not be written: "
-                    + type(journal_exc).__name__
-                    + ": "
-                    + str(journal_exc),
+                    "could not be written: " + _reconcile_plain_text(journal_exc),
                     file=sys.stderr,
                 )
             artifact_snapshot = build_committed_artifact_snapshot(
@@ -9934,9 +10600,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         except Exception as exc:
             print(
                 "AIMAll quality revalidation did not complete: "
-                + type(exc).__name__
-                + ": "
-                + str(exc),
+                + _reconcile_plain_text(exc),
                 file=sys.stderr,
             )
             print(
@@ -10064,18 +10728,11 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             )
             return 9
         if resolved_intents:
-            print("Resolved terminal submission intents:")
-            for item in resolved_intents:
-                print(
-                    "  - "
-                    + str(item.get("phase"))
-                    + "@"
-                    + str(item.get("iteration"))
-                    + " job_id="
-                    + str(item.get("job_id"))
-                    + " terminal_state="
-                    + str(item.get("terminal_state"))
-                )
+            print(
+                "Applying reconcile plan: retiring completed submission records...",
+                file=sys.stderr,
+                flush=True,
+            )
             report.active_submission_intents = []
             report.unsafe_reasons = [
                 reason
@@ -10240,16 +10897,11 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         ]
         cleanable_now.append("archive .DATA/STAGING")
     if cleanable_now:
-        print("Apply Plan")
-        _print_reconcile_list(
-            "cleanup before recovery",
-            cleanable_now
-            + [
-                "recompute recovery",
-                "validate the final state/artefact contract",
-            ],
+        print(
+            "Applying reconcile plan: cleaning reviewed temporary data...",
+            file=sys.stderr,
+            flush=True,
         )
-        print("")
 
     original_report = report
     transaction: Optional[ReconcileTransaction] = None
@@ -10306,9 +10958,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         )
         print(
             "could not archive reconcile evidence losslessly: "
-            + type(exc).__name__
-            + ": "
-            + str(exc),
+            + _reconcile_plain_text(exc),
             file=sys.stderr,
         )
         return 9
@@ -10329,35 +10979,19 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     retired_completed_staging = dict(
         mutation_result["retired_completed_staging"]
     )
-    if retired_completed_staging.get("retired"):
-        print("Retired completed staging:")
-        for path in retired_completed_staging["retired"]:
-            print("  - " + str(path))
-        for warning in retired_completed_staging.get("warnings") or []:
-            print("  warning: " + str(warning))
-    if archived_ariadne_publication:
-        print("Archived stale ARIADNE batch publication:")
-        for path in archived_ariadne_publication:
-            print("  - " + str(path))
-    if ferebus_retrain_archive:
-        print("Archived FEREBUS output for explicit retraining:")
-        for path in ferebus_retrain_archive:
-            print("  - " + str(path))
-    if refreshed is not None:
-        print(
-            "Marked current array for full resubmission: "
-            + str(force_array_phase.value)
-            + "@"
-            + str(int(force_array_iteration))
-            + " retry_tasks="
-            + str(int(refreshed.get("n_retry") or 0))
+    if any(
+        (
+            retired_completed_staging.get("retired"),
+            archived_ariadne_publication,
+            ferebus_retrain_archive,
+            refreshed,
         )
-        if archived_array_outputs:
-            print("Archived existing array task outputs:")
-            for path in archived_array_outputs[:8]:
-                print("  - " + str(path))
-            if len(archived_array_outputs) > 8:
-                print("  - ... " + str(len(archived_array_outputs) - 8) + " more")
+    ):
+        print(
+            "Applying reconcile plan: reviewed temporary data updated...",
+            file=sys.stderr,
+            flush=True,
+        )
     cleanup_paths_already_done = (
         list(archived_scripts)
         + list(archived_array_outputs)
@@ -10396,9 +11030,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             )
             print(
                 "post-archive recovery inspection failed: "
-                + type(exc).__name__
-                + ": "
-                + str(exc),
+                + _reconcile_plain_text(exc),
                 file=sys.stderr,
             )
             _print_cleanup_already_happened(cleanup_paths_already_done)
@@ -10464,25 +11096,11 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             verification=verification_level,
             artifact_snapshot=artifact_snapshot,
         )
-        print("Recovery After Cleanup")
-        _print_reconcile_key_values(
-            [
-                (
-                    "selected phase",
-                    report.proposed_state.phase.value
-                    + " iteration "
-                    + str(int(report.proposed_state.iteration)),
-                ),
-                ("reason", str(report.decision or "-")),
-                ("contract", "ok" if recomputed_status.get("contract_ok") else "invalid"),
-            ]
+        print(
+            "Applying reconcile plan: recovery recomputed and validated...",
+            file=sys.stderr,
+            flush=True,
         )
-        if bool(getattr(args, "verbose", False)):
-            _print_reconcile_list(
-                "trusted handoffs",
-                _reconcile_valid_candidates(campaign, recomputed_status, report),
-            )
-        print("")
 
     restored_bootstrap_handoff: List[str] = []
     try:
@@ -10505,7 +11123,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             "refusing --apply because archived bootstrap staging could not be restored:",
             file=sys.stderr,
         )
-        print("  - " + type(exc).__name__ + ": " + str(exc), file=sys.stderr)
+        print("  - " + _reconcile_plain_text(exc), file=sys.stderr)
         _print_cleanup_already_happened(cleanup_paths_already_done)
         return 9
 
@@ -10520,13 +11138,20 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             transaction,
             "final state/artefact contract failed: " + str(contract_error),
         )
-        _print_reconcile_apply_blocked(
-            campaign,
-            title="Final State/Artefact Contract",
-            reasons=[contract_error],
-            next_actions=["inspect recovery contract before restarting"],
-        )
-        _print_cleanup_already_happened(cleanup_paths_already_done)
+        if cleanup_paths_already_done:
+            print(
+                "Final campaign-state validation failed: "
+                + _reconcile_plain_text(contract_error),
+                file=sys.stderr,
+            )
+            _print_cleanup_already_happened(cleanup_paths_already_done)
+        else:
+            _print_reconcile_apply_blocked(
+                campaign,
+                title="Final State/Artefact Contract",
+                reasons=[contract_error],
+                next_actions=["inspect recovery contract before restarting"],
+            )
         return 9
 
     ferebus_recovery_request = None
@@ -10558,9 +11183,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             print(
                 "refusing --apply because the existing FEREBUS candidate "
                 "could not be bound to a recovery request: "
-                + type(exc).__name__
-                + ": "
-                + str(exc),
+                + _reconcile_plain_text(exc),
                 file=sys.stderr,
             )
             return 9
@@ -10614,7 +11237,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             "repaired:",
             file=sys.stderr,
         )
-        print("  - " + type(exc).__name__ + ": " + str(exc), file=sys.stderr)
+        print("  - " + _reconcile_plain_text(exc), file=sys.stderr)
         _print_cleanup_already_happened(cleanup_paths_already_done)
         return 9
 
@@ -10629,7 +11252,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         if pointer_errors:
             reason += "; pointer rollback failed: " + "; ".join(pointer_errors)
         _fail_reconcile_transaction(transaction, reason)
-        print(reason, file=sys.stderr)
+        print(_reconcile_plain_text(reason), file=sys.stderr)
         return 9
     try:
         write_state(target_canonical, report.proposed_state)
@@ -10641,9 +11264,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         _fail_reconcile_transaction(transaction, reason)
         print(
             "failed to write recovered state.json: "
-            + type(exc).__name__
-            + ": "
-            + str(exc),
+            + _reconcile_plain_text(exc),
             file=sys.stderr,
         )
         _print_cleanup_already_happened(cleanup_paths_already_done)
@@ -10676,11 +11297,9 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         )
         print(
             "failed to update config lock after writing state.json; "
-            + restore_message
+            + _reconcile_plain_text(restore_message)
             + ": "
-            + type(exc).__name__
-            + ": "
-            + str(exc),
+            + _reconcile_plain_text(exc),
             file=sys.stderr,
         )
         _print_cleanup_already_happened(cleanup_paths_already_done)
@@ -10699,11 +11318,13 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             + str(exc)
         )
         _fail_reconcile_transaction(transaction, reason)
-        print(reason, file=sys.stderr)
-        print(
-            "The committed state and current pointers are coherent. Preview "
-            "reconcile, then apply the reviewed recovery to finish the recorded intent transaction.",
-            file=sys.stderr,
+        _print_reconcile_follow_up_required(
+            campaign,
+            report.proposed_state,
+            problem="completed submission bookkeeping could not be finalised",
+            next_command=_campaign_command(campaign, "reconcile"),
+            next_effect="preview the remaining bookkeeping repair before applying it",
+            verbose_detail=reason if bool(getattr(args, "verbose", False)) else None,
         )
         return 9
     try:
@@ -10859,14 +11480,17 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         try:
             transaction.set_status("COMMITTED")
         except Exception as exc:
-            print(
-                "reconcile state was recovered, but its transaction receipt "
-                "could not be finalised; automatic environment transition was "
-                "not attempted: "
-                + type(exc).__name__
-                + ": "
-                + str(exc),
-                file=sys.stderr,
+            detail = type(exc).__name__ + ": " + str(exc)
+            _print_reconcile_follow_up_required(
+                campaign,
+                report.proposed_state,
+                problem=(
+                    "the recovery transaction record could not be finalised; "
+                    "the software-environment update was not attempted"
+                ),
+                next_command=_campaign_command(campaign, "reconcile"),
+                next_effect="finish the recorded recovery transaction before resuming",
+                verbose_detail=(detail if bool(getattr(args, "verbose", False)) else None),
             )
             return 9
     try:
@@ -10879,27 +11503,16 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             config,
         )
     except Exception as exc:
-        print(
-            "reconcile recovery was committed, but automatic environment "
-            "transition was refused: "
-            + type(exc).__name__
-            + ": "
-            + str(exc),
-            file=sys.stderr,
-        )
-        print(
-            "Fix the reported environment blocker, then run resume; resume "
-            "will retry the transition automatically.",
-            file=sys.stderr,
+        detail = type(exc).__name__ + ": " + str(exc)
+        _print_reconcile_follow_up_required(
+            campaign,
+            report.proposed_state,
+            problem="the installed software environment could not be recorded safely",
+            next_command=_campaign_command(campaign, "resume"),
+            next_effect="retry the software-environment transition and continue the campaign",
+            verbose_detail=(detail if bool(getattr(args, "verbose", False)) else None),
         )
         return 13
-    if isinstance(environment_transition, dict) and bool(
-        environment_transition.get("changed", False)
-    ):
-        print(
-            "Advanced environment generation to "
-            + str(environment_transition.get("generation"))
-        )
     final_contract_status = recovery_contract_status(
         campaign,
         report.proposed_state,
@@ -10919,6 +11532,13 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         archived_reference_data_staging=archived_reference_data_staging,
         retired_completed_staging=retired_completed_staging,
         restored_bootstrap_handoff=restored_bootstrap_handoff,
+        archived_ariadne_publication=archived_ariadne_publication,
+        ferebus_retrain_archive=ferebus_retrain_archive,
+        archived_array_outputs=archived_array_outputs,
+        refreshed_array_ledger=refreshed,
+        config_review=config_review,
+        resolved_intents=resolved_intents,
+        environment_transition=environment_transition,
         environment_transition_deferred=environment_transition_deferred,
         verbose=bool(getattr(args, "verbose", False)),
     )
@@ -12995,8 +13615,9 @@ Examples:
         "reconcile",
         help="Inspect on-disk artefacts and propose a recovered state.",
         description=(
-            "Inspect campaign artefacts and write state.json.proposed. With "
-            "--apply, safely promote the proposal when the recovery is clean."
+            "Inspect campaign evidence and show one recovery plan. With --apply, "
+            "commit the reviewed bookkeeping and temporary-data changes. Reconcile "
+            "does not start the daemon or submit Slurm jobs."
         ),
     )
     add_campaign(p_recon)

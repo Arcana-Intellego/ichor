@@ -406,16 +406,15 @@ def test_reconcile_refuses_nonempty_campaign_without_trusted_campaign_identity(
     assert rc == 0
     out = capsys.readouterr().out
     assert "ICHOR Reconcile" in out
-    assert "Recovery preview: blocked" in out
+    assert "Preview result: blocked" in out
     assert "Recovery Contract" not in out
     assert "no recoverable trusted campaign_uid" in out
-    assert "decision: stay HALTED" in out
-    assert "status: blocked" in out
+    assert "Manual review required" in out
+    assert "changes made: none" in out
     assert "=== Recovery guidance ===" not in out
-    assert "Recovery Target" in out
-    assert "Apply Plan" in out
-    assert "apply: blocked" in out
-    assert "Inspect" in out
+    assert "Recovery Target" not in out
+    assert "Apply Plan" not in out
+    assert "--verbose" in out
 
 
 def test_reconcile_prints_protected_staging_handoff(tmp_path, capsys):
@@ -432,18 +431,19 @@ def test_reconcile_prints_protected_staging_handoff(tmp_path, capsys):
             apply=False,
             archive_staging=False,
             restore_config_from_lock=False,
+            verbose=True,
         )
     )
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "Recovery Safety" in out
+    assert "Technical details" in out
     assert "protected:" in out
     assert "INITIAL_AIMALL@0 -> .DATA\\STAGING\\initial" in out or (
         "INITIAL_AIMALL@0 -> .DATA/STAGING/initial" in out
     )
     assert "Operator-review artefacts:" not in out
-    assert "blockers:" in out
+    assert "Manual review required" in out
 
 
 def test_phase_walltime_changes_are_allowed_runtime_changes(tmp_path):
@@ -1191,9 +1191,9 @@ def test_reconcile_apply_promotes_state_and_cleans_ferebus_staging(tmp_path, cap
     assert state.reference_data_version == 0
     assert state.models_version == -1
     assert not stale.exists()
-    assert "Recovery result: applied" in out
-    assert "Applied Changes" in out
-    assert "recovered state" in out
+    assert "Apply result: completed" in out
+    assert "Applied changes" in out
+    assert "campaign state" in out
     assert "written and verified" in out
     assert not (campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json.proposed").exists()
     assert sorted(
@@ -1460,9 +1460,11 @@ def test_reconcile_config_lock_failure_reports_prior_staging_archive(
 
     assert rc == 8
     assert "failed to update config lock" in err
-    assert "Some cleanup/archive operations already happened" in err
+    assert "Apply result: partially completed" in err
+    assert "Completed before the interruption" in err
     assert "STAGING.before-reconcile-" in err
-    assert "State/config lock was not applied." in err
+    assert "previous authoritative state retained" in err
+    assert "config lock: unchanged" in err
     state = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
     assert state.phase is old_state.phase
 
@@ -1560,7 +1562,7 @@ def test_reconcile_restore_config_from_lock_writes_proposal(tmp_path, capsys):
     proposed = campaign / "campaign.yaml.proposed"
     assert rc == 0
     assert proposed.is_file()
-    assert "Configuration recovery: proposal written" in out
+    assert "Proposal result: proposal written" in out
     assert "Config Proposal" in out
     restored = CampaignConfig.from_yaml(proposed)
     assert restored.system_name == "RESTORED"
@@ -1667,7 +1669,7 @@ def test_reconcile_apply_archives_data_staging_for_ferebus_reentry(tmp_path, cap
     ) == "old scratch"
     assert data_staging.is_dir()
     assert list(data_staging.iterdir()) == []
-    assert "archived staging:" in out
+    assert "staging" in out and "archived" in out
 
 
 def test_reconcile_apply_archives_safe_dangling_training_staging(tmp_path, capsys):
@@ -1697,7 +1699,7 @@ def test_reconcile_apply_archives_safe_dangling_training_staging(tmp_path, capsy
     archived = sorted((campaign / "QM_REFERENCE_DATA").glob("iteration-000001.staging.before-reconcile-*"))
     assert len(archived) == 1
     assert (archived[0] / "partial.txt").read_text(encoding="utf-8") == "partial\n"
-    assert "archived reference-data staging:" in out
+    assert "QM staging" in out and "archived" in out
 
 
 def test_reconcile_apply_cleans_transient_halted_ariadne_reentry(
@@ -1804,8 +1806,8 @@ def test_reconcile_apply_cleans_transient_halted_ariadne_reentry(
     assert (archived_scripts[0] / "ERRORS" / "ARIADNE_ARRAY-1.e").is_file()
     assert not (scripts / "OUTPUTS").exists()
     assert not (scripts / "ERRORS").exists()
-    assert "archived stale scripts:" in out
-    assert "removed model staging:" in out
+    assert "submission scripts" in out and "archived" in out
+    assert "model staging" in out and "removed" in out
 
 
 def test_reconcile_apply_recovers_prebootstrap_phase_a_submission_failure(
@@ -2041,7 +2043,7 @@ def test_reconcile_apply_archive_staging_explicitly_handles_non_ferebus_reentry(
     ) == "old scratch"
     assert data_staging.is_dir()
     assert list(data_staging.iterdir()) == []
-    assert "archived staging:" in out
+    assert "staging" in out and "archived" in out
     assert environment_transitions == [
         (
             campaign,
@@ -2123,7 +2125,7 @@ def test_reconcile_apply_restores_archived_initial_gaussian_handoff(
     assert (restored / "POINT_0000.pointdir" / "input.wfn").read_text(
         encoding="utf-8"
     ) == "wfn\n"
-    assert "restored bootstrap staging:" in out
+    assert "bootstrap staging" in out and "restored" in out
     events = list(iter_events(campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson"))
     restored_events = [
         e for e in events if e.get("event") == "staging_restored_from_archive"
@@ -2231,7 +2233,7 @@ def test_reconcile_apply_resolves_terminal_submission_intent(
     out = capsys.readouterr().out
 
     assert rc == 0
-    assert "Resolved terminal submission intents" in out
+    assert "submission records" in out and "retired 1 completed record" in out
     state = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
     assert state.phase is CampaignPhase.INITIAL_FEREBUS
     intent = submission_intent.load_intent(
@@ -2286,7 +2288,7 @@ def test_reconcile_apply_resolves_cancelled_intent_when_squeue_invalid_job_id(
     out = capsys.readouterr().out
 
     assert rc == 0
-    assert "Resolved terminal submission intents" in out
+    assert "submission records" in out and "retired 1 completed record" in out
     state = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
     assert state.phase is CampaignPhase.INITIAL_FEREBUS
     intent = submission_intent.load_intent(
@@ -2335,7 +2337,7 @@ def test_reconcile_apply_supersedes_stale_pre_submit_without_job_id(
     out = capsys.readouterr().out
 
     assert rc == 0
-    assert "Resolved terminal submission intents" in out
+    assert "submission records" in out and "retired 1 completed record" in out
     intent = submission_intent.load_intent(campaign, phase, 0)
     assert intent["status"] == "SUPERSEDED"
     assert intent["reason"] == "reconcile_apply_pre_submit_no_job_id"
@@ -2382,7 +2384,7 @@ def test_reconcile_apply_uses_job_name_accounting_for_ferebus_pre_submit_without
     out = capsys.readouterr().out
 
     assert rc == 0
-    assert "Resolved terminal submission intents" in out
+    assert "submission records" in out and "retired 1 completed record" in out
     intent = submission_intent.load_intent(campaign, phase, 0)
     assert intent["status"] == "SUPERSEDED"
     assert intent["reason"] == "reconcile_apply_pre_submit_no_job_id"
@@ -2473,7 +2475,7 @@ def test_reconcile_apply_marks_failed_pre_submit_without_job_id_from_accounting(
     out = capsys.readouterr().out
 
     assert rc == 0
-    assert "Resolved terminal submission intents" in out
+    assert "submission records" in out and "retired 1 completed record" in out
     intent = submission_intent.load_intent(campaign, phase, 0)
     assert intent["status"] == "FAILED"
     assert intent["reason"] == "reconcile_apply_terminal_job:FAILED"

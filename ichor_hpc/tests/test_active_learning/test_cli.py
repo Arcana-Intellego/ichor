@@ -2999,9 +2999,10 @@ def test_reconcile_applied_report_explains_deferred_environment_check(
     )
     output = capsys.readouterr().out
 
-    assert "Recovery result: applied" in output
-    assert "deferred until resume clears the completed stop" in output
-    assert "Campaign remains paused after iteration 1" in output
+    assert "Apply result: completed" in output
+    assert "will be checked when resume clears the completed stop" in output
+    assert "paused after iteration 1" in output
+    assert "Slurm jobs submitted: none" in output
     assert "ichor-al-daemon resume" in output
 
 
@@ -3072,6 +3073,124 @@ def test_reconcile_preview_retires_completed_staging_without_archive_flag(
     assert "Slurm work submitted: none" in output
     assert "--archive-staging" not in output
     assert "--apply" in output
+
+
+def test_reconcile_preview_uses_one_coherent_paused_campaign_report(
+    tmp_path,
+    capsys,
+):
+    state = fresh_campaign_state(max_iterations=40, campaign_uid="presentation-test")
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 9
+    state.shutdown_requested = True
+    state.lifecycle_context = make_lifecycle_context(
+        disposition="stopped",
+        reason_code="user_stop_boundary_reached",
+        message="stopped after iteration 8",
+        from_phase=CampaignPhase.STOP_CHECK,
+        iteration=9,
+        source="daemon_stop_control",
+        recovery_action="use resume to continue",
+        details={"mode": "after_iteration", "target_iteration": 8},
+    )
+    data = tmp_path / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True)
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    report = SimpleNamespace(
+        proposed_state=state,
+        unsafe_reasons=["dangling model staging directories exist"],
+        blocking_artifacts=["dangling model staging"],
+        active_submission_intents=[],
+        decision="STOPPED: existing user stop request remains authoritative",
+        completed_staging_retirement={
+            "eligible": [
+                {"context": "active", "iteration": 8, "action": "delete"}
+            ],
+            "pending_tombstones": [],
+        },
+    )
+    contract = {
+        "contract_ok": True,
+        "selected_phase": CampaignPhase.SEED_SELECT.value,
+        "missing_or_invalid_inputs": [],
+        "protected_artifacts": [],
+    }
+    config_review = SimpleNamespace(
+        allowed_changes=[
+            SimpleNamespace(
+                path="campaign.sampling_aggressiveness",
+                old=5,
+                new=6,
+                reason="editable before seed selection",
+            )
+        ],
+        blocked_changes=[],
+    )
+
+    cli_mod._print_reconcile_operator_report(
+        tmp_path,
+        report,
+        contract,
+        mode="dry_run",
+        proposed_state_path=data / "state.json.proposed",
+        config_review=config_review,
+    )
+    output = capsys.readouterr().out
+
+    assert output.count("ICHOR Reconcile") == 1
+    assert "Preview result: ready to apply" in output
+    assert "status       : paused after iteration 8" in output
+    assert "continue from: ARIADNE seed selection, iteration 9" in output
+    assert "configuration changed" in output
+    assert "completed temporary staging remains" in output
+    assert "unfinished temporary model output remains" in output
+    assert "delete temporary iteration-8 data already committed" in output
+    assert "sampling aggressiveness 5 -> 6" in output
+    assert "model staging" in output
+    assert "Slurm work" in output and "reconcile will not start jobs" in output
+    assert "committed QM data" in output and "unchanged" in output
+    assert "daemon                 : remains stopped" in output
+    assert "automatic campaign work: none" in output
+    assert "--apply" in output
+    assert "Recovery Safety" not in output
+    assert "state.json.proposed" not in output
+
+
+def test_reconcile_preview_clean_pause_recommends_resume_without_apply(
+    tmp_path,
+    capsys,
+):
+    state = _intentionally_stopped_seed_select_state()
+    data = tmp_path / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True)
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    report = SimpleNamespace(
+        proposed_state=state,
+        unsafe_reasons=[],
+        blocking_artifacts=[],
+        active_submission_intents=[],
+        decision="STOPPED: existing user stop request remains authoritative",
+    )
+    contract = {
+        "contract_ok": True,
+        "selected_phase": CampaignPhase.SEED_SELECT.value,
+        "missing_or_invalid_inputs": [],
+        "protected_artifacts": [],
+    }
+
+    cli_mod._print_reconcile_operator_report(
+        tmp_path,
+        report,
+        contract,
+        mode="dry_run",
+        proposed_state_path=data / "state.json.proposed",
+    )
+    output = capsys.readouterr().out
+
+    assert "Preview result: no reconcile changes needed" in output
+    assert "Planned changes" not in output
+    assert "ichor-al-daemon resume" in output
+    assert "--apply" not in output
 
 
 def test_preflight_describes_completed_stop_as_pause_not_backend_failure(tmp_path):
@@ -3525,9 +3644,9 @@ def test_cli_reconcile_writes_proposed_state(tmp_path, capsys):
     proposed = campaign / DEFAULT_DATA_SUBDIR / (DEFAULT_STATE_FILENAME + ".proposed")
     assert proposed.exists()
     captured = capsys.readouterr()
-    assert "proposed state:" in captured.out
-    assert "state.json.proposed" in captured.out
-    assert "Recovery preview: safe to apply" in captured.out
+    assert "Preview result: blocked" in captured.out
+    assert "campaign state is missing" in captured.out
+    assert "state.json.proposed" not in captured.out
     assert "reference-data versions: committed" not in captured.out
     assert "model versions" not in captured.out
 
@@ -3671,7 +3790,8 @@ def test_cli_reconcile_apply_requires_explicit_deep_verification(
 
     assert rc == 10
     captured = capsys.readouterr()
-    assert "--deep-verify --apply" in captured.err
+    assert "--deep-verify" in captured.err
+    assert "--deep-verify --apply" not in captured.err
 
 
 def test_cli_reconcile_json_is_proposal_only(tmp_path, capsys):
@@ -3727,17 +3847,17 @@ def test_cli_reconcile_cleanable_scripts_reports_candidate_without_manual_mv(
     assert rc == 0
     out = capsys.readouterr().out
     assert "ICHOR Reconcile" in out
-    assert "Recovery preview: safe to apply" in out
-    assert "Current Position" in out
-    assert "Last Failure" in out
-    assert "reason: too_many_failures: 1/1" in out
-    assert "Recovery Safety" in out
-    assert "stale sbatch scripts" in out
-    assert "expected recovery after cleanup" in out
-    assert "expected recovery after cleanup" in out
-    assert "PHASE_B_DIVERSITY@1" in out
+    assert "Preview result: ready to apply" in out
+    assert "Campaign state" in out
+    assert "Planned changes" in out
+    assert "submission scripts" in out
+    assert "archive stale temporary Slurm scripts" in out
+    assert "Data safety" in out
+    assert "After apply" in out
+    assert "Slurm work" in out
     assert "RESULTS.json" not in out
-    assert "Apply Plan" in out
+    assert "Recovery Safety" not in out
+    assert "Apply Plan" not in out
     assert "=== Recovery guidance ===" not in out
     assert "Operator-review artefacts:" not in out
     assert "mv " not in out
@@ -3875,13 +3995,13 @@ def test_cli_reconcile_apply_prints_final_recomputed_phase(
     assert rc == 0
     out = capsys.readouterr().out
     assert "ICHOR Reconcile" in out
-    assert "Recovery result: applied" in out
-    assert "Applied Changes" in out
-    assert "recover to PHASE_B_DIVERSITY iteration 1" in out
-    assert "recovered state" in out
+    assert "Apply result: completed" in out
+    assert "Applied changes" in out
+    assert "phase B diversity selection, iteration 1" in out
+    assert "campaign state" in out
     assert "written and verified" in out
-    assert "final data check: passed" in out
-    assert "retired completed staging" in out
+    assert "final authority check" in out
+    assert "completed staging" in out
     assert not completed_staging.exists()
     assert "Recovery Contract" not in out
     assert "RESULTS.json" not in out

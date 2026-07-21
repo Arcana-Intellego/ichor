@@ -235,8 +235,8 @@ def test_daemon_control_plain_apply_confirmation_matches_dispatched_flags(
 
     assert calls[0].apply is True
     assert calls[0].archive_staging is False
-    assert "without archiving staging" in prompts[0]
-    assert "clean stale" not in prompts[0]
+    assert "reviewed reconcile changes" in prompts[0]
+    assert "will not start the daemon or submit Slurm jobs" in prompts[0]
 
 
 def test_daemon_control_propagates_deep_reconcile_toggle(monkeypatch):

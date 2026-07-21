@@ -401,7 +401,8 @@ class DaemonControlFunctions:
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
         answer = user_input_free_flow(
-            "Apply the safe reconcile proposal without archiving staging? Type YES: ",
+            "Apply the reviewed reconcile changes? This will not start the daemon "
+            "or submit Slurm jobs. Type YES: ",
             "",
         )
         if answer != "YES":
@@ -426,7 +427,8 @@ class DaemonControlFunctions:
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
         answer = user_input_free_flow(
-            "Archive stale .DATA/STAGING and apply safe reconcile proposal? Type YES: ",
+            "Archive the reviewed temporary staging and apply reconcile changes? "
+            "This will not start the daemon or submit Slurm jobs. Type YES: ",
             "",
         )
         if answer != "YES":
