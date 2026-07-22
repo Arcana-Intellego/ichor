@@ -15,7 +15,7 @@ import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 from ..config import CampaignConfig
 from ..versioning.reference_data import ReferenceDataVersioning
@@ -110,11 +110,12 @@ def _lock_payload(
     *,
     campaign_uid: Optional[str],
     created_at_iso: Optional[str] = None,
+    checked_at_iso: Optional[str] = None,
     history_sequence: Optional[int] = None,
     history_entry_sha256: Optional[str] = None,
 ) -> Dict[str, Any]:
     payload = canonical_config(config)
-    now = _now_iso()
+    now = checked_at_iso or _now_iso()
     return {
         "schema_version": CONFIG_LOCK_SCHEMA_VERSION,
         "campaign_schema_version": int(payload.get("schema_version", -1)),
@@ -1470,6 +1471,8 @@ def review_config_changes(
 def archive_ferebus_iteration_staging_for_retrain(
     campaign_dir: Union[str, Path],
     proposed_state: CampaignState,
+    *,
+    archive_identity: Optional[str] = None,
 ) -> Optional[str]:
     """Losslessly archive complete FEREBUS output before explicit retraining."""
     if proposed_state.phase not in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
@@ -1491,7 +1494,7 @@ def archive_ferebus_iteration_staging_for_retrain(
     validate_ferebus_quality_evidence(target)
     archive = _reconcile_archive_target(
         campaign,
-        _timestamped_reconcile_sibling(target),
+        _timestamped_reconcile_sibling(target, archive_identity=archive_identity),
     )
     target.rename(archive)
     return str(archive)
@@ -1527,7 +1530,12 @@ def _reconcile_archive_target(campaign: Path, target: Path) -> Path:
     return campaign_owned_path(campaign, target)
 
 
-def clean_reentry_staging(campaign_dir: Union[str, Path], phase: CampaignPhase) -> List[str]:
+def clean_reentry_staging(
+    campaign_dir: Union[str, Path],
+    phase: CampaignPhase,
+    *,
+    archive_identity: Optional[str] = None,
+) -> List[str]:
     campaign = Path(campaign_dir)
     archived: List[str] = []
     if phase in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
@@ -1540,15 +1548,27 @@ def clean_reentry_staging(campaign_dir: Union[str, Path], phase: CampaignPhase) 
                 )
             destination = _reconcile_archive_target(
                 campaign,
-                _timestamped_reconcile_sibling(target),
+                _timestamped_reconcile_sibling(
+                    target,
+                    archive_identity=archive_identity,
+                ),
             )
             target.rename(destination)
             archived.append(str(destination))
-    archived.extend(archive_scripts_for_reconcile(campaign))
+    archived.extend(
+        archive_scripts_for_reconcile(
+            campaign,
+            archive_identity=archive_identity,
+        )
+    )
     return archived
 
 
-def archive_scripts_for_reconcile(campaign_dir: Union[str, Path]) -> List[str]:
+def archive_scripts_for_reconcile(
+    campaign_dir: Union[str, Path],
+    *,
+    archive_identity: Optional[str] = None,
+) -> List[str]:
     """Archive legacy flat scripts without touching immutable job bundles."""
     campaign = Path(campaign_dir)
     scripts = campaign / ".DATA" / "SCRIPTS"
@@ -1568,13 +1588,18 @@ def archive_scripts_for_reconcile(campaign_dir: Union[str, Path]) -> List[str]:
     if not legacy_children:
         return []
     _ensure_inside_campaign(campaign, scripts)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    stamp = str(
+        archive_identity
+        or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    )
     archive_root = _reconcile_archive_target(
         campaign,
         scripts / "LEGACY_BEFORE_RECONCILE",
     )
     archive_root.mkdir(parents=True, exist_ok=True)
     target = _reconcile_archive_target(campaign, archive_root / stamp)
+    if archive_identity is not None and target.exists():
+        raise FileExistsError("transaction archive target already exists: " + str(target))
     suffix = 1
     while target.exists():
         target = _reconcile_archive_target(
@@ -1596,9 +1621,18 @@ def archive_scripts_for_reconcile(campaign_dir: Union[str, Path]) -> List[str]:
     return [str(target)]
 
 
-def _timestamped_reconcile_sibling(path: Path) -> Path:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+def _timestamped_reconcile_sibling(
+    path: Path,
+    *,
+    archive_identity: Optional[str] = None,
+) -> Path:
+    stamp = str(
+        archive_identity
+        or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    )
     target = path.with_name(path.name + ".before-reconcile-" + stamp)
+    if archive_identity is not None and target.exists():
+        raise FileExistsError("transaction archive target already exists: " + str(target))
     suffix = 1
     while target.exists():
         target = path.with_name(
@@ -1634,6 +1668,7 @@ def _archive_completed_model_iteration_staging(
     *,
     verification: str = "authority",
     artifact_snapshot: Optional[Any] = None,
+    archive_identity: Optional[str] = None,
 ) -> Path:
     try:
         model_version = int(proposed_state.models_version)
@@ -1679,7 +1714,10 @@ def _archive_completed_model_iteration_staging(
         )
     archive = _reconcile_archive_target(
         campaign,
-        _timestamped_reconcile_sibling(target),
+        _timestamped_reconcile_sibling(
+            target,
+            archive_identity=archive_identity,
+        ),
     )
     target.rename(archive)
     return archive
@@ -1691,6 +1729,7 @@ def clean_model_iteration_staging_for_reconcile(
     *,
     verification: str = "authority",
     artifact_snapshot: Optional[Any] = None,
+    archive_identity: Optional[str] = None,
 ) -> List[str]:
     campaign = Path(campaign_dir)
     with trained_models_commit_lock(campaign):
@@ -1699,6 +1738,7 @@ def clean_model_iteration_staging_for_reconcile(
             proposed_state,
             verification=verification,
             artifact_snapshot=artifact_snapshot,
+            archive_identity=archive_identity,
         )
 
 
@@ -1708,6 +1748,7 @@ def _clean_model_iteration_staging_locked(
     *,
     verification: str = "authority",
     artifact_snapshot: Optional[Any] = None,
+    archive_identity: Optional[str] = None,
 ) -> List[str]:
     model_versioning = TrainedModelVersioning(trained_models_dir(campaign))
     archived_paths: List[str] = []
@@ -1719,7 +1760,10 @@ def _clean_model_iteration_staging_locked(
         _ensure_inside_campaign(campaign, dangling)
         archive = _reconcile_archive_target(
             campaign,
-            _timestamped_reconcile_sibling(dangling),
+            _timestamped_reconcile_sibling(
+                dangling,
+                archive_identity=archive_identity,
+            ),
         )
         dangling.rename(archive)
         archived_paths.append(str(archive))
@@ -1750,7 +1794,10 @@ def _clean_model_iteration_staging_locked(
             )
         archive = _reconcile_archive_target(
             campaign,
-            _timestamped_reconcile_sibling(target),
+            _timestamped_reconcile_sibling(
+                target,
+                archive_identity=archive_identity,
+            ),
         )
         os.replace(target, archive)
         _fsync_parent_dir(target)
@@ -1770,6 +1817,7 @@ def _clean_model_iteration_staging_locked(
             proposed_state,
             verification=verification,
             artifact_snapshot=artifact_snapshot,
+            archive_identity=archive_identity,
         )
         return archived_paths + [str(archived)]
     if proposed_state.phase not in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
@@ -1787,7 +1835,10 @@ def _clean_model_iteration_staging_locked(
         )
     archive = _reconcile_archive_target(
         campaign,
-        _timestamped_reconcile_sibling(target),
+        _timestamped_reconcile_sibling(
+            target,
+            archive_identity=archive_identity,
+        ),
     )
     target.rename(archive)
     return archived_paths + [str(archive)]
@@ -1828,6 +1879,7 @@ def archive_data_staging_for_ferebus_reentry(
     *,
     verification: str = "authority",
     artifact_snapshot: Optional[Any] = None,
+    archive_identity: Optional[str] = None,
 ) -> List[str]:
     ok, reason = ferebus_reentry_can_archive_data_staging(
         campaign_dir,
@@ -1845,11 +1897,16 @@ def archive_data_staging_for_ferebus_reentry(
     if not children:
         return []
     _ensure_inside_campaign(campaign, staging)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    stamp = str(
+        archive_identity
+        or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    )
     target = _reconcile_archive_target(
         campaign,
         staging.with_name(staging.name + ".before-reconcile-" + stamp),
     )
+    if archive_identity is not None and target.exists():
+        raise FileExistsError("transaction archive target already exists: " + str(target))
     suffix = 1
     while target.exists():
         target = _reconcile_archive_target(
@@ -1868,6 +1925,8 @@ def archive_data_staging_for_ferebus_reentry(
 
 def archive_data_staging_for_operator_reconcile(
     campaign_dir: Union[str, Path],
+    *,
+    archive_identity: Optional[str] = None,
 ) -> List[str]:
     """Archive ``.DATA/STAGING`` for an explicitly approved reconcile repair.
 
@@ -1888,11 +1947,16 @@ def archive_data_staging_for_operator_reconcile(
     if not children:
         return []
     _ensure_inside_campaign(campaign, staging)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    stamp = str(
+        archive_identity
+        or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    )
     target = _reconcile_archive_target(
         campaign,
         staging.with_name(staging.name + ".archived-" + stamp),
     )
+    if archive_identity is not None and target.exists():
+        raise FileExistsError("transaction archive target already exists: " + str(target))
     suffix = 1
     while target.exists():
         target = _reconcile_archive_target(
@@ -1921,6 +1985,132 @@ def apply_config_lock_update(
         campaign_uid=campaign_uid,
         reason="reconcile_config_update",
     )
+
+
+def prepare_config_lock_update(
+    campaign_dir: Union[str, Path],
+    config: CampaignConfig,
+    *,
+    campaign_uid: str,
+) -> Dict[str, Any]:
+    """Freeze the exact config-lock and history payloads for reconciliation."""
+    campaign = Path(campaign_dir).resolve()
+    path = config_lock_path(campaign)
+    existing: Optional[Dict[str, Any]] = None
+    created = None
+    if path.is_file():
+        existing = read_config_lock(
+            campaign,
+            expected_campaign_uid=str(campaign_uid),
+        )
+        created = str(existing.get("created_at_iso") or "") or None
+    now = _now_iso()
+    canonical = canonical_config(config)
+    fingerprint = config_fingerprint(canonical)
+    history_payload: Optional[Dict[str, Any]] = None
+    history_path: Optional[Path] = None
+    if (
+        existing is not None
+        and str(existing.get("fingerprint_sha256") or "") == fingerprint
+        and str(existing.get("campaign_uid") or "") == str(campaign_uid)
+        and int(existing.get("schema_version", -1)) == CONFIG_LOCK_SCHEMA_VERSION
+    ):
+        lock_payload = dict(existing)
+        lock_payload["last_checked_at_iso"] = now
+    else:
+        previous_sequence = (
+            None if existing is None else existing.get("history_sequence")
+        )
+        previous_sha = (
+            None if existing is None else existing.get("history_entry_sha256")
+        )
+        sequence = 0 if previous_sequence is None else int(previous_sequence) + 1
+        history_payload = {
+            "schema_version": CONFIG_LOCK_HISTORY_SCHEMA_VERSION,
+            "sequence": sequence,
+            "campaign_uid": str(campaign_uid),
+            "campaign_schema_version": int(config.schema_version),
+            "field_policy_version": CONFIG_LOCK_POLICY_VERSION,
+            "canonical_config": canonical,
+            "fingerprint_sha256": fingerprint,
+            "previous_entry_sha256": previous_sha,
+            "reason": "reconcile_config_update",
+            "created_at_iso": now,
+        }
+        history_payload["entry_sha256"] = _history_entry_sha256(history_payload)
+        history_path = config_lock_history_dir(campaign) / (
+            f"{sequence:08d}-" + str(history_payload["entry_sha256"]) + ".json"
+        )
+        lock_payload = _lock_payload(
+            config,
+            campaign_uid=str(campaign_uid),
+            created_at_iso=created,
+            checked_at_iso=now,
+            history_sequence=sequence,
+            history_entry_sha256=str(history_payload["entry_sha256"]),
+        )
+    return {
+        "lock_path": str(path),
+        "lock_payload": lock_payload,
+        "history_path": None if history_path is None else str(history_path),
+        "history_payload": history_payload,
+    }
+
+
+def publish_prepared_config_lock_update(
+    campaign_dir: Union[str, Path],
+    prepared: Mapping[str, Any],
+    *,
+    expected_campaign_uid: str,
+) -> Path:
+    """Publish one exact config-lock update prepared by reconciliation."""
+    campaign = Path(campaign_dir).resolve()
+    path = campaign_owned_path(campaign, config_lock_path(campaign))
+    prepared_lock_path = campaign_owned_path(
+        campaign,
+        Path(str(prepared.get("lock_path") or "")),
+    )
+    if prepared_lock_path != path:
+        raise ValueError("prepared config-lock target is invalid")
+    lock_payload = prepared.get("lock_payload")
+    if not isinstance(lock_payload, dict):
+        raise ValueError("prepared config-lock payload is missing")
+    history_payload = prepared.get("history_payload")
+    history_path_raw = prepared.get("history_path")
+    if history_payload is not None:
+        if not isinstance(history_payload, dict) or not history_path_raw:
+            raise ValueError("prepared config-lock history is incomplete")
+        history_path = campaign_owned_path(
+            campaign,
+            Path(str(history_path_raw)),
+        )
+        history_root = campaign_owned_path(
+            campaign,
+            config_lock_history_dir(campaign),
+        )
+        if history_path.parent != history_root:
+            raise ValueError("prepared config-lock history target is invalid")
+        expected_name = (
+            f"{int(history_payload['sequence']):08d}-"
+            + str(history_payload.get("entry_sha256") or "")
+            + ".json"
+        )
+        if history_path.name != expected_name:
+            raise ValueError("prepared config-lock history identity is invalid")
+        history_root.mkdir(parents=True, exist_ok=True)
+        if history_root.is_symlink() or not history_root.is_dir():
+            raise ValueError("prepared config-lock history root is unsafe")
+        if history_path.exists():
+            if _read_json_object(history_path, "config lock history entry") != history_payload:
+                raise ValueError("prepared config-lock history target conflicts")
+        else:
+            atomic_write_json(history_path, history_payload)
+    atomic_write_json(path, lock_payload)
+    read_config_lock(
+        campaign,
+        expected_campaign_uid=str(expected_campaign_uid),
+    )
+    return path
 
 
 def restore_config_from_lock_proposal(campaign_dir: Union[str, Path]) -> Path:
@@ -2062,6 +2252,7 @@ def archive_reference_data_staging_for_reconcile(
     *,
     verification: str = "authority",
     artifact_snapshot: Optional[Any] = None,
+    archive_identity: Optional[str] = None,
 ) -> List[str]:
     ok, reason = reference_data_staging_can_archive_for_reconcile(
         campaign_dir,
@@ -2075,12 +2266,19 @@ def archive_reference_data_staging_for_reconcile(
     training = campaign / "QM_REFERENCE_DATA"
     tv = ReferenceDataVersioning(training)
     archived: List[str] = []
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    stamp = str(
+        archive_identity
+        or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    )
     for staging in tv.list_dangling_staging():
         target = _reconcile_archive_target(
             campaign,
             staging.with_name(staging.name + ".before-reconcile-" + stamp),
         )
+        if archive_identity is not None and target.exists():
+            raise FileExistsError(
+                "transaction archive target already exists: " + str(target)
+            )
         suffix = 1
         while target.exists():
             target = _reconcile_archive_target(

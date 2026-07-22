@@ -223,6 +223,7 @@ def stateful_campaign_artifacts(campaign_dir: Union[str, Path]) -> List[str]:
     add_matches(".DATA/ACTIVE_LEARNING/stop_request.json")
     add_matches(".DATA/ACTIVE_LEARNING/stop_request_history/*.json")
     add_matches(".DATA/ACTIVE_LEARNING/reconcile_transactions/*.json")
+    add_matches(".DATA/ACTIVE_LEARNING/reconcile_transactions/.t-*")
     add_matches(".DATA/ACTIVE_LEARNING/reference_commit_transactions/*.json")
     add_matches(".DATA/ACTIVE_LEARNING/execution_identity.json")
     add_matches(".DATA/ACTIVE_LEARNING/environment_current.json")
@@ -287,6 +288,7 @@ class ReconciliationReport:
     script_inventory: Dict[str, Any] = field(default_factory=dict)
     scratch_inventory: List[Dict[str, Any]] = field(default_factory=list)
     reconcile_transactions: List[Dict[str, Any]] = field(default_factory=list)
+    reconcile_transaction_recovery: Optional[Dict[str, Any]] = None
     reference_commit_transactions: List[Dict[str, Any]] = field(default_factory=list)
     completed_staging_retirement: Dict[str, Any] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
@@ -1442,8 +1444,12 @@ def propose_recovery(
         record
         for record in reconcile_transactions
         if record.get("status") not in {"COMMITTED", "FAILED"}
-        and str(record.get("transaction_id") or "")
-        != str(_active_reconcile_transaction_id or "")
+        and not (
+            bool(str(record.get("transaction_id") or ""))
+            and bool(str(_active_reconcile_transaction_id or ""))
+            and str(record.get("transaction_id"))
+            == str(_active_reconcile_transaction_id)
+        )
     ]
     if blocking_reconcile_transactions:
         unsafe_reasons.append(

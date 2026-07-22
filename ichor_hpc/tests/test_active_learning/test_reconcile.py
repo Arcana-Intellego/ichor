@@ -1518,6 +1518,24 @@ def test_authority_recovery_reuses_control_inventory_from_snapshot(
     assert report.artifact_snapshot is snapshot
 
 
+def test_invalid_reconcile_transaction_is_never_hidden_by_empty_active_id(tmp_path):
+    campaign, _, _, _ = _campaign_dirs(tmp_path)
+    root = campaign / ".DATA" / "ACTIVE_LEARNING" / "reconcile_transactions"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "broken.json").write_text("{not-json\n", encoding="utf-8")
+
+    report = propose_recovery(campaign)
+
+    assert any(
+        "incomplete or invalid reconcile transaction evidence" in reason
+        for reason in report.unsafe_reasons
+    )
+    assert any(
+        record.get("status") == "INVALID"
+        for record in report.reconcile_transactions
+    )
+
+
 def test_propose_recovery_reports_decision_and_trusted_versions(tmp_path):
     campaign, _, training, models = _campaign_dirs(tmp_path)
     mv = VersionedDirectory(models)

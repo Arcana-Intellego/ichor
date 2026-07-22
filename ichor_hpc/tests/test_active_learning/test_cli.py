@@ -1839,6 +1839,49 @@ def test_status_recommendation_dicts_are_json_ready(tmp_path):
     assert "primary" in data[0]
 
 
+@pytest.mark.parametrize(
+    ("recovery", "expected_code"),
+    [
+        (
+            {
+                "state": "recoverable",
+                "recoverable": True,
+                "reason": "the previous reconcile stopped before changing campaign data",
+            },
+            "reconcile_transaction_recoverable",
+        ),
+        (
+            {
+                "state": "blocked",
+                "recoverable": False,
+                "reason": "campaign authority is ambiguous",
+            },
+            "reconcile_transaction_manual_review",
+        ),
+    ],
+)
+def test_status_recommends_preview_for_interrupted_reconcile(
+    tmp_path,
+    recovery,
+    expected_code,
+):
+    campaign = _campaign_with_config(tmp_path)
+    payload = {
+        "phase": CampaignPhase.SEED_SELECT.value,
+        "_presentation_reconcile_transaction_recovery": recovery,
+        "state_artifact_contract_status": {"ok": True},
+        "artifact_manifest_status": {},
+    }
+
+    recommendations = build_status_recommendations(campaign, payload)
+
+    assert recommendations[0].code == expected_code
+    assert recommendations[0].command.startswith(
+        "ichor-al-daemon reconcile --campaign-dir "
+    )
+    assert str(campaign) in recommendations[0].command
+
+
 def test_status_recommends_repeating_incomplete_job_cancellation(tmp_path):
     campaign = _campaign_with_config(tmp_path)
     recommendations = build_status_recommendations(

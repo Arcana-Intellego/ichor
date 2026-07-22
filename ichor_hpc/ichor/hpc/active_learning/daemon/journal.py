@@ -121,6 +121,7 @@ KNOWN_EVENT_TYPES = (
     "phase_output_contract_invalid",
     "required_phase_output_missing_after_failure",
     "reconcile_applied",
+    "reconcile_transaction_recovered",
     "committed_artifact_settle_retry",
     "ariadne_optional_diagnostics_warning",
     "ariadne_legacy_missing_trajectory_sha256",
@@ -272,6 +273,7 @@ def _build_event_context_registry() -> Tuple[Dict[str, str], frozenset[str]]:
         "STATE": ("state_corrupt",),
         "RECONCILE": (
             "reconcile_applied",
+            "reconcile_transaction_recovered",
             "reconcile_resolved_terminal_intent",
             "staging_archived",
             "staging_restored_from_archive",

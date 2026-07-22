@@ -1210,6 +1210,78 @@ def test_reconcile_apply_promotes_state_and_cleans_ferebus_staging(tmp_path, cap
     assert lock["canonical_config"]["ferebus"]["kernel"] == "periodic_rbf"
 
 
+def test_reconcile_apply_recovers_failure_to_publish_committed_transaction(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon.reconcile_transaction import (
+        ReconcileTransaction,
+        inventory_reconcile_transactions,
+    )
+
+    campaign = _campaign(tmp_path)
+    _commit_reference_data_version(campaign, 0)
+    _write_halted_pre_ferebus_state(campaign)
+    config = CampaignConfig()
+    write_config_lock(campaign, config)
+    _write_config(campaign, config)
+
+    real_resolve = ReconcileTransaction.resolve
+    failed = {"value": False}
+
+    def fail_first_finalisation(self, *, status, disposition, reason):
+        if disposition == "committed" and not failed["value"]:
+            failed["value"] = True
+            raise OSError("transaction finalisation failed")
+        return real_resolve(
+            self,
+            status=status,
+            disposition=disposition,
+            reason=reason,
+        )
+
+    monkeypatch.setattr(ReconcileTransaction, "resolve", fail_first_finalisation)
+    first_rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=True,
+        )
+    )
+    first_output = capsys.readouterr()
+
+    assert first_rc == 9
+    assert "transaction record could not be finalised" in first_output.err
+    assert any(
+        record["status"] == "COMMITTING"
+        for record in inventory_reconcile_transactions(campaign)
+    )
+    assert read_state(
+        campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json"
+    ).phase is CampaignPhase.INITIAL_FEREBUS
+
+    monkeypatch.setattr(ReconcileTransaction, "resolve", real_resolve)
+    second_rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=True,
+        )
+    )
+    second_output = capsys.readouterr()
+
+    assert second_rc == 0, second_output.err
+    assert all(
+        record["status"] in {"COMMITTED", "FAILED"}
+        for record in inventory_reconcile_transactions(campaign)
+    )
+    journal = (
+        campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson"
+    ).read_text(encoding="utf-8")
+    assert "reconcile_transaction_recovered" in journal
+
+
 def test_completed_ferebus_staging_is_archived_when_committed_models_match(
     tmp_path,
     monkeypatch,
@@ -1405,7 +1477,7 @@ def test_reconcile_apply_config_lock_failure_restores_old_state(
         return real_write_state(path, state)
 
     monkeypatch.setattr(cli_mod, "write_state", spy_write_state)
-    monkeypatch.setattr(cli_mod, "apply_config_lock_update", fail_config_lock)
+    monkeypatch.setattr(cli_mod, "publish_reconcile_config_target", fail_config_lock)
 
     rc = cmd_reconcile(
         argparse.Namespace(
@@ -1446,7 +1518,7 @@ def test_reconcile_config_lock_failure_reports_prior_staging_archive(
     def fail_config_lock(path, config):
         raise OSError("lock failed")
 
-    monkeypatch.setattr(cli_mod, "apply_config_lock_update", fail_config_lock)
+    monkeypatch.setattr(cli_mod, "publish_reconcile_config_target", fail_config_lock)
 
     rc = cmd_reconcile(
         argparse.Namespace(

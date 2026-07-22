@@ -578,15 +578,19 @@ def archive_existing_array_task_outputs(
     iteration: int,
     *,
     task_ids: Optional[Sequence[int]] = None,
+    archive_identity: Optional[str] = None,
 ) -> List[str]:
     phase = str(getattr(phase_name, "value", phase_name))
     if not supports_partial_array_recovery(phase):
         raise ValueError("phase does not support array output archive: " + phase)
     campaign = Path(campaign_dir)
-    stamp = (
-        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-        + "-"
-        + uuid.uuid4().hex[:8]
+    stamp = str(
+        archive_identity
+        or (
+            datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+            + "-"
+            + uuid.uuid4().hex[:8]
+        )
     )
     from .filesystem import campaign_owned_path, operational_path
 

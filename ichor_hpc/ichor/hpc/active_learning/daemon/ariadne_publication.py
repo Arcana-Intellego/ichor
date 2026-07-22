@@ -341,6 +341,7 @@ def archive_ariadne_publication(
     submission_identity: Optional[str] = None,
     classification: Optional[Mapping[str, Any]] = None,
     force: bool = False,
+    archive_identity: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Move one stale derived publication into a resumable evidence bundle."""
     campaign = Path(campaign_dir).resolve()
@@ -385,10 +386,13 @@ def archive_ariadne_publication(
             raise AriadnePublicationError(
                 "ARIADNE publication archive root is unsafe: " + str(root)
             )
-        archive_id = (
-            datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
-            + "-"
-            + uuid.uuid4().hex[:8]
+        archive_id = str(
+            archive_identity
+            or (
+                datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+                + "-"
+                + uuid.uuid4().hex[:8]
+            )
         )
         archive_dir = campaign_owned_path(campaign, root / archive_id)
         archive_dir.mkdir()

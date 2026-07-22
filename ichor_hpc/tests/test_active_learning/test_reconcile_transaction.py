@@ -3,19 +3,39 @@
 from __future__ import annotations
 
 import json
+import os
+import uuid
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
 from ichor.hpc.active_learning import cli
 from ichor.hpc.active_learning.daemon.reconcile_transaction import (
+    RECONCILE_TRANSACTION_SCHEMA_VERSION,
+    apply_reconcile_transaction_recovery,
     begin_reconcile_transaction,
+    build_reconcile_commit_plan,
+    inspect_reconcile_transaction_recovery,
     inventory_reconcile_transactions,
     read_reconcile_transaction,
     restore_version_pointer,
     snapshot_version_pointer,
 )
+from ichor.hpc.active_learning.daemon.state import (
+    CampaignState,
+    atomic_write_json,
+    write_state,
+)
+from ichor.hpc.active_learning.config import CampaignConfig
+from ichor.hpc.active_learning.daemon.config_lock import (
+    read_config_lock,
+    write_config_lock,
+)
 from ichor.hpc.active_learning.daemon.reconcile import stateful_campaign_artifacts
 from ichor.hpc.active_learning.daemon.submission_intent import (
     load_intent,
+    mark_failed,
     mark_submitted,
     write_pre_submit_intent,
 )
@@ -101,6 +121,469 @@ def test_reconcile_pointer_snapshot_restores_previous_binding(tmp_path):
     restore_version_pointer(campaign, snapshot)
 
     assert versions.current_version() == 0
+
+
+def _write_v1_transaction(
+    campaign,
+    *,
+    status,
+    planned_operations=None,
+    proposed_phase="INIT",
+    proposed_iteration=0,
+    extra=None,
+):
+    root = campaign / ".DATA" / "ACTIVE_LEARNING" / "reconcile_transactions"
+    root.mkdir(parents=True, exist_ok=True)
+    transaction_id = uuid.uuid4().hex
+    payload = {
+        "schema_version": 1,
+        "transaction_id": transaction_id,
+        "status": status,
+        "created_at_iso": "2026-01-01T00:00:00+00:00",
+        "updated_at_iso": "2026-01-01T00:00:00+00:00",
+        "proposed_phase": proposed_phase,
+        "proposed_iteration": proposed_iteration,
+        "planned_operations": list(planned_operations or []),
+        "intent_transitions": [],
+        "completed_operations": [],
+        "warnings": [],
+    }
+    payload.update(dict(extra or {}))
+    path = root / (transaction_id + ".json")
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return path
+
+
+def test_schema_v1_terminal_transaction_remains_readable_and_unchanged(tmp_path):
+    campaign = tmp_path / "campaign"
+    path = _write_v1_transaction(campaign, status="COMMITTED")
+    before = path.read_bytes()
+
+    payload = read_reconcile_transaction(path)
+    inventory = inventory_reconcile_transactions(campaign)
+
+    assert RECONCILE_TRANSACTION_SCHEMA_VERSION == 2
+    assert payload["schema_version"] == 1
+    assert inventory[0]["status"] == "COMMITTED"
+    assert path.read_bytes() == before
+
+
+def test_schema_v1_prepared_transaction_is_safely_abandoned(tmp_path):
+    campaign = tmp_path / "campaign"
+    path = _write_v1_transaction(campaign, status="PREPARED")
+
+    inspection = inspect_reconcile_transaction_recovery(campaign)
+    assert inspection["recoverable"] is True
+    assert inspection["disposition"] == "abandoned_before_mutation"
+
+    apply_reconcile_transaction_recovery(campaign, inspection)
+
+    payload = read_reconcile_transaction(path)
+    assert payload["status"] == "FAILED"
+    assert payload["resolution"]["disposition"] == "abandoned_before_mutation"
+
+
+def test_schema_v1_known_mutating_cleanup_is_retired_with_state_unchanged(tmp_path):
+    campaign = tmp_path / "campaign"
+    state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json"
+    state_path.parent.mkdir(parents=True)
+    write_state(state_path, CampaignState())
+    path = _write_v1_transaction(
+        campaign,
+        status="MUTATING",
+        planned_operations=[
+            "archive_reconcile_evidence",
+            "repair_current_pointers",
+            "write_recovered_state",
+            "update_config_lock",
+            "publish_intent_transitions",
+        ],
+    )
+
+    inspection = inspect_reconcile_transaction_recovery(campaign)
+    assert inspection["recoverable"] is True
+    assert inspection["disposition"] == "completed_safe_cleanup"
+
+    apply_reconcile_transaction_recovery(campaign, inspection)
+
+    assert read_reconcile_transaction(path)["status"] == "FAILED"
+    assert CampaignState.from_dict(json.loads(state_path.read_text())).phase.value == "INIT"
+
+
+def test_schema_v1_untouched_commit_restores_exact_pointer_and_retires(tmp_path):
+    campaign = tmp_path / "campaign"
+    state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json"
+    state_path.parent.mkdir(parents=True)
+    write_state(state_path, CampaignState())
+    versions = VersionedDirectory(campaign / "QM_REFERENCE_DATA")
+    versions.iteration_path(0).mkdir(parents=True)
+    pointer_snapshot = snapshot_version_pointer(
+        campaign,
+        versions,
+        label="reference_data",
+        requested_version=0,
+    )
+    versions.update_current(0)
+    path = _write_v1_transaction(
+        campaign,
+        status="COMMITTING",
+        proposed_phase="PHASE_A_DIVERSITY",
+        extra={"pointer_snapshots": [pointer_snapshot]},
+    )
+
+    inspection = inspect_reconcile_transaction_recovery(campaign)
+
+    assert inspection["action"] == "rollback_v1_pointers"
+    apply_reconcile_transaction_recovery(campaign, inspection)
+    assert versions.current_version() is None
+    assert read_reconcile_transaction(path)["status"] == "FAILED"
+
+
+def test_prepared_atomic_temp_is_promoted_then_abandoned(tmp_path):
+    campaign = tmp_path / "campaign"
+    transaction = begin_reconcile_transaction(
+        campaign,
+        proposed_phase="INIT",
+        proposed_iteration=0,
+        planned_operations=["write_recovered_state"],
+        intent_transitions=[],
+    )
+    temp = transaction.path.parent / ".t-deadbeefcafe"
+    os.replace(transaction.path, temp)
+
+    first = inspect_reconcile_transaction_recovery(campaign)
+    assert first["action"] == "promote_prepared_orphan"
+    apply_reconcile_transaction_recovery(campaign, first)
+
+    second = inspect_reconcile_transaction_recovery(campaign)
+    assert second["action"] == "abandon"
+    apply_reconcile_transaction_recovery(campaign, second)
+
+    payload = read_reconcile_transaction(transaction.path)
+    assert payload["status"] == "FAILED"
+    assert not temp.exists()
+
+
+def test_redundant_atomic_temp_is_archived_before_canonical_recovery(tmp_path):
+    campaign = tmp_path / "campaign"
+    transaction = begin_reconcile_transaction(
+        campaign,
+        proposed_phase="INIT",
+        proposed_iteration=0,
+        planned_operations=["write_recovered_state"],
+        intent_transitions=[],
+    )
+    temp = transaction.path.parent / ".t-feedfacecafe"
+    temp.write_bytes(transaction.path.read_bytes())
+
+    first = inspect_reconcile_transaction_recovery(campaign)
+    assert first["action"] == "archive_redundant_orphan"
+    result = apply_reconcile_transaction_recovery(campaign, first)
+
+    assert Path(result["archived_path"]).is_file()
+    assert transaction.path.is_file()
+    second = inspect_reconcile_transaction_recovery(campaign)
+    assert second["action"] == "abandon"
+
+
+def test_malformed_atomic_temp_remains_a_manual_review_blocker(tmp_path):
+    campaign = tmp_path / "campaign"
+    root = campaign / ".DATA" / "ACTIVE_LEARNING" / "reconcile_transactions"
+    root.mkdir(parents=True)
+    (root / ".t-deadbeefcafe").write_text("not-json", encoding="utf-8")
+
+    inspection = inspect_reconcile_transaction_recovery(campaign)
+
+    assert inspection["state"] == "blocked"
+    assert inspection["recoverable"] is False
+
+
+def test_multiple_nonterminal_transactions_remain_blocked(tmp_path):
+    campaign = tmp_path / "campaign"
+    _write_v1_transaction(campaign, status="PREPARED")
+    _write_v1_transaction(campaign, status="PREPARED")
+
+    inspection = inspect_reconcile_transaction_recovery(campaign)
+
+    assert inspection["state"] == "blocked"
+    assert "multiple" in inspection["reason"]
+
+
+def test_schema_v2_prepared_authority_drift_remains_blocked(tmp_path):
+    campaign = tmp_path / "campaign"
+    state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json"
+    state_path.parent.mkdir(parents=True)
+    state = CampaignState()
+    write_state(state_path, state)
+    begin_reconcile_transaction(
+        campaign,
+        proposed_phase=state.phase.value,
+        proposed_iteration=state.iteration,
+        planned_operations=["write_recovered_state"],
+        intent_transitions=[],
+        campaign_uid=state.campaign_uid,
+        source_authority_anchor_sha256="0" * 64,
+    )
+
+    inspection = inspect_reconcile_transaction_recovery(
+        campaign,
+        artifact_snapshot=SimpleNamespace(anchor_records=()),
+    )
+
+    assert inspection["state"] == "blocked"
+    assert "authority changed" in inspection["reason"]
+
+
+def test_schema_v2_committing_post_state_is_adopted(tmp_path):
+    campaign = tmp_path / "campaign"
+    state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json"
+    state_path.parent.mkdir(parents=True)
+    state = CampaignState()
+    write_state(state_path, state)
+    snapshot = SimpleNamespace(anchor_records=(), anchor_sha256=None)
+    transaction = begin_reconcile_transaction(
+        campaign,
+        proposed_phase=state.phase.value,
+        proposed_iteration=state.iteration,
+        planned_operations=["write_recovered_state"],
+        intent_transitions=[],
+        campaign_uid=state.campaign_uid,
+    )
+    transaction.set_status("MUTATING")
+    transaction.prepare_commit(
+        build_reconcile_commit_plan(
+            campaign,
+            transaction_id=transaction.payload["transaction_id"],
+            proposed_state=state,
+            config=None,
+            intent_transitions=[],
+            artifact_snapshot=snapshot,
+        )
+    )
+
+    inspection = inspect_reconcile_transaction_recovery(campaign)
+    assert inspection["action"] == "adopt"
+    apply_reconcile_transaction_recovery(campaign, inspection)
+
+    payload = read_reconcile_transaction(transaction.path)
+    assert payload["status"] == "COMMITTED"
+    assert payload["resolution"]["disposition"] == "adopted_committed_state"
+
+
+def test_schema_v2_committing_untouched_authority_is_abandoned(tmp_path):
+    campaign = tmp_path / "campaign"
+    state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json"
+    state_path.parent.mkdir(parents=True)
+    before = CampaignState()
+    write_state(state_path, before)
+    after = CampaignState.from_dict(before.to_dict())
+    after.max_iterations += 1
+    snapshot = SimpleNamespace(anchor_records=(), anchor_sha256=None)
+    transaction = begin_reconcile_transaction(
+        campaign,
+        proposed_phase=after.phase.value,
+        proposed_iteration=after.iteration,
+        planned_operations=["write_recovered_state"],
+        intent_transitions=[],
+        campaign_uid=after.campaign_uid,
+    )
+    transaction.set_status("MUTATING")
+    transaction.prepare_commit(
+        build_reconcile_commit_plan(
+            campaign,
+            transaction_id=transaction.payload["transaction_id"],
+            proposed_state=after,
+            config=None,
+            intent_transitions=[],
+            artifact_snapshot=snapshot,
+        )
+    )
+
+    inspection = inspect_reconcile_transaction_recovery(campaign)
+    assert inspection["action"] == "abandon"
+    assert inspection["disposition"] == "rolled_back_exactly"
+    apply_reconcile_transaction_recovery(campaign, inspection)
+    assert read_reconcile_transaction(transaction.path)["status"] == "FAILED"
+
+
+def test_schema_v2_committing_unknown_state_remains_blocked(tmp_path):
+    campaign = tmp_path / "campaign"
+    state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json"
+    state_path.parent.mkdir(parents=True)
+    before = CampaignState()
+    write_state(state_path, before)
+    after = CampaignState.from_dict(before.to_dict())
+    after.max_iterations += 1
+    snapshot = SimpleNamespace(anchor_records=(), anchor_sha256=None)
+    transaction = begin_reconcile_transaction(
+        campaign,
+        proposed_phase=after.phase.value,
+        proposed_iteration=after.iteration,
+        planned_operations=["write_recovered_state"],
+        intent_transitions=[],
+        campaign_uid=after.campaign_uid,
+    )
+    transaction.set_status("MUTATING")
+    transaction.prepare_commit(
+        build_reconcile_commit_plan(
+            campaign,
+            transaction_id=transaction.payload["transaction_id"],
+            proposed_state=after,
+            config=None,
+            intent_transitions=[],
+            artifact_snapshot=snapshot,
+        )
+    )
+    third = CampaignState.from_dict(before.to_dict())
+    third.max_iterations += 2
+    write_state(state_path, third)
+
+    inspection = inspect_reconcile_transaction_recovery(campaign)
+
+    assert inspection["state"] == "blocked"
+    assert inspection["recoverable"] is False
+
+
+def test_schema_v2_partial_authority_commit_rolls_forward(tmp_path):
+    campaign = tmp_path / "campaign"
+    state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json"
+    state_path.parent.mkdir(parents=True)
+    before = CampaignState()
+    write_state(state_path, before)
+    after = CampaignState.from_dict(before.to_dict())
+    after.max_iterations += 1
+
+    versions = VersionedDirectory(campaign / "QM_REFERENCE_DATA")
+    versions.iteration_path(0).mkdir(parents=True)
+    versions.iteration_path(1).mkdir()
+    versions.update_current(0)
+
+    snapshot = SimpleNamespace(anchor_records=(), anchor_sha256=None)
+    transaction = begin_reconcile_transaction(
+        campaign,
+        proposed_phase=after.phase.value,
+        proposed_iteration=after.iteration,
+        planned_operations=["write_recovered_state"],
+        intent_transitions=[],
+        campaign_uid=after.campaign_uid,
+    )
+    transaction.set_status("MUTATING")
+    plan = build_reconcile_commit_plan(
+        campaign,
+        transaction_id=transaction.payload["transaction_id"],
+        proposed_state=after,
+        config=None,
+        intent_transitions=[],
+        artifact_snapshot=snapshot,
+    )
+    plan["pointers"] = [
+        {
+            "label": "test_reference_data",
+            "parent": "QM_REFERENCE_DATA",
+            "prefix": "iteration",
+            "name_width": 6,
+            "before_version": 0,
+            "after_version": 1,
+        }
+    ]
+    transaction.prepare_commit(plan)
+    write_state(state_path, after)
+
+    inspection = inspect_reconcile_transaction_recovery(campaign)
+    assert inspection["action"] == "roll_forward"
+    apply_reconcile_transaction_recovery(campaign, inspection)
+
+    assert versions.current_version() == 1
+    assert read_reconcile_transaction(transaction.path)["status"] == "COMMITTED"
+
+
+def test_schema_v2_partial_config_history_commit_rolls_forward_exact_payloads(tmp_path):
+    campaign = tmp_path / "campaign"
+    state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json"
+    state_path.parent.mkdir(parents=True)
+    state = CampaignState()
+    write_state(state_path, state)
+    original = CampaignConfig()
+    write_config_lock(campaign, original, campaign_uid=state.campaign_uid)
+    changed = CampaignConfig()
+    changed.ferebus.physical_prior_scale = 0.95
+    snapshot = SimpleNamespace(anchor_records=(), anchor_sha256=None)
+    transaction = begin_reconcile_transaction(
+        campaign,
+        proposed_phase=state.phase.value,
+        proposed_iteration=state.iteration,
+        planned_operations=["update_config_lock"],
+        intent_transitions=[],
+        campaign_uid=state.campaign_uid,
+    )
+    transaction.set_status("MUTATING")
+    plan = build_reconcile_commit_plan(
+        campaign,
+        transaction_id=transaction.payload["transaction_id"],
+        proposed_state=state,
+        config=changed,
+        intent_transitions=[],
+        artifact_snapshot=snapshot,
+    )
+    transaction.prepare_commit(plan)
+    history_record = plan["config_lock"]["files"][0]
+    atomic_write_json(
+        campaign / history_record["path"],
+        history_record["after_payload"],
+    )
+
+    inspection = inspect_reconcile_transaction_recovery(campaign)
+    assert inspection["action"] == "roll_forward"
+    apply_reconcile_transaction_recovery(campaign, inspection)
+
+    lock = read_config_lock(campaign, expected_campaign_uid=state.campaign_uid)
+    assert lock["canonical_config"] == changed.to_dict()
+    assert read_reconcile_transaction(transaction.path)["status"] == "COMMITTED"
+
+
+def test_schema_v2_partial_intent_commit_rolls_forward_exact_payload(tmp_path):
+    campaign = tmp_path / "campaign"
+    state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json"
+    state_path.parent.mkdir(parents=True)
+    state = CampaignState()
+    write_state(state_path, state)
+    write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=state.phase.value,
+        iteration=state.iteration,
+        expected_tasks=1,
+        scheduler_identity_kind="synthetic",
+    )
+    mark_failed(campaign, state.phase.value, state.iteration, "test failure")
+    snapshot = SimpleNamespace(anchor_records=(), anchor_sha256=None)
+    transaction = begin_reconcile_transaction(
+        campaign,
+        proposed_phase=state.phase.value,
+        proposed_iteration=state.iteration,
+        planned_operations=["publish_intent_transitions"],
+        intent_transitions=[],
+        campaign_uid=state.campaign_uid,
+    )
+    transaction.set_status("MUTATING")
+    transaction.prepare_commit(
+        build_reconcile_commit_plan(
+            campaign,
+            transaction_id=transaction.payload["transaction_id"],
+            proposed_state=state,
+            config=None,
+            intent_transitions=[],
+            artifact_snapshot=snapshot,
+        )
+    )
+
+    inspection = inspect_reconcile_transaction_recovery(campaign)
+    assert inspection["action"] == "roll_forward"
+    apply_reconcile_transaction_recovery(campaign, inspection)
+
+    intent = load_intent(campaign, state.phase.value, state.iteration)
+    assert intent["status"] == "SUPERSEDED"
+    assert intent["reason"] == "reconcile_apply_retry"
 
 
 def test_terminal_intent_classification_is_proposal_only(tmp_path, monkeypatch):

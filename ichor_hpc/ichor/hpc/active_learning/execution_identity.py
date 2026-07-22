@@ -1452,7 +1452,9 @@ def advance_environment_generation(
     from .daemon.artifact_contracts import verify_state_referenced_artifacts
     from .daemon.config_lock import review_config_changes
     from .daemon.submission_intent import ACTIVE_STATUSES, inventory_intents
-    from .daemon.reconcile_transaction import inventory_reconcile_transactions
+    from .daemon.reconcile_transaction import (
+        inspect_reconcile_transaction_recovery,
+    )
 
     review = review_config_changes(
         campaign,
@@ -1481,21 +1483,25 @@ def advance_environment_generation(
         raise ExecutionIdentityError(
             "environment transition is blocked by active submission intents"
         )
-    active_reconcile_transactions = [
-        record
-        for record in inventory_reconcile_transactions(campaign)
-        if str(record.get("status") or "") not in {"COMMITTED", "FAILED"}
-    ]
-    if active_reconcile_transactions:
-        raise ExecutionIdentityError(
-            "environment transition is blocked by an incomplete reconcile transaction"
-        )
     from .daemon.artifact_snapshot import build_committed_artifact_snapshot
 
     snapshot = build_committed_artifact_snapshot(
         campaign,
         verification_level="authority",
     )
+    transaction_recovery = inspect_reconcile_transaction_recovery(
+        campaign,
+        artifact_snapshot=snapshot,
+    )
+    if str(transaction_recovery.get("state") or "") != "none":
+        if bool(transaction_recovery.get("recoverable", False)):
+            raise ExecutionIdentityError(
+                "environment transition is waiting for ordinary reconcile to recover "
+                "an interrupted transaction"
+            )
+        raise ExecutionIdentityError(
+            "environment transition is blocked by ambiguous reconcile transaction evidence"
+        )
     verify_state_referenced_artifacts(
         campaign,
         state,

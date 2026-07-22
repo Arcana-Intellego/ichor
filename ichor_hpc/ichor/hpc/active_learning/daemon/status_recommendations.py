@@ -249,6 +249,36 @@ def _ownership_blockers(
     return []
 
 
+def _reconcile_transaction_recommendation(
+    campaign: Path,
+    payload: Dict[str, Any],
+) -> Optional[StatusRecommendation]:
+    if _daemon_is_active(payload):
+        return None
+    recovery = payload.get("_presentation_reconcile_transaction_recovery")
+    if not isinstance(recovery, dict):
+        return None
+    state = str(recovery.get("state") or "")
+    reason = _short_error(recovery.get("reason"))
+    if state == "recoverable" and bool(recovery.get("recoverable", False)):
+        return StatusRecommendation(
+            code="reconcile_transaction_recoverable",
+            severity="required",
+            primary="preview recovery from the interrupted reconcile before continuing",
+            why=reason or "the previous reconcile did not finish recording its result",
+            command=_reconcile_cmd(campaign),
+        )
+    if state == "blocked":
+        return StatusRecommendation(
+            code="reconcile_transaction_manual_review",
+            severity="blocked",
+            primary="review the interrupted reconcile evidence before continuing",
+            why=reason or "the interrupted reconcile cannot be recovered automatically",
+            command=_reconcile_cmd(campaign),
+        )
+    return None
+
+
 def _daemon_running_recommendation(
     campaign: Path,
     payload: Dict[str, Any],
@@ -1050,6 +1080,13 @@ def build_status_recommendations(
                 ),
             )
         ] + stale_pid
+
+    transaction_recovery = _reconcile_transaction_recommendation(
+        campaign,
+        payload,
+    )
+    if transaction_recovery is not None:
+        return [transaction_recovery] + stale_pid
 
     scheduler_uncertain = _scheduler_uncertain_resume_recommendation(
         campaign,

@@ -77,7 +77,6 @@ from .submit.slurm_contracts import (
     validate_parent_job_id,
 )
 from .daemon.config_lock import (
-    apply_config_lock_update,
     archive_ferebus_iteration_staging_for_retrain,
     archive_scripts_for_reconcile,
     archive_data_staging_for_ferebus_reentry,
@@ -142,7 +141,12 @@ from .daemon.ariadne_publication import (
 )
 from .daemon.reconcile_transaction import (
     ReconcileTransaction,
+    apply_reconcile_transaction_recovery,
     begin_reconcile_transaction,
+    build_reconcile_commit_plan,
+    inspect_reconcile_transaction_recovery,
+    publish_reconcile_config_target,
+    publish_reconcile_intent_target,
     restore_version_pointer,
     snapshot_version_pointer,
 )
@@ -158,7 +162,7 @@ from .daemon.state import (
     write_state,
     make_lifecycle_context,
 )
-from .daemon.filesystem import operational_data_dir, operational_path
+from .daemon.filesystem import campaign_owned_path, operational_data_dir, operational_path
 from .daemon.status_recommendations import (
     build_status_recommendations,
     recommendation_dicts,
@@ -926,6 +930,52 @@ def _copy_existing_timestamped(path: Path, marker: str) -> Optional[Path]:
 
     target = _timestamped_sibling(path, marker)
     shutil.copy2(path, target)
+    return target
+
+
+def _copy_existing_reconcile_backup(
+    campaign: Path,
+    path: Path,
+    transaction: ReconcileTransaction,
+) -> Optional[Path]:
+    if not path.exists():
+        return None
+    import hashlib
+    import shutil
+
+    commit_plan = transaction.payload.get("commit_plan")
+    state_plan = (
+        commit_plan.get("state") if isinstance(commit_plan, Mapping) else None
+    )
+    if not isinstance(state_plan, Mapping):
+        raise ValueError("reconcile transaction state backup plan is missing")
+    target = campaign_owned_path(
+        campaign,
+        campaign / Path(str(state_plan.get("backup_path") or "")),
+    )
+    expected = state_plan.get("before")
+    expected_sha = (
+        str(expected.get("sha256") or "")
+        if isinstance(expected, Mapping)
+        else ""
+    )
+
+    def digest(candidate: Path) -> str:
+        value = hashlib.sha256()
+        with candidate.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                value.update(block)
+        return value.hexdigest()
+
+    if target.exists():
+        if target.is_symlink() or not target.is_file():
+            raise ValueError("reconcile state backup is unsafe: " + str(target))
+        if not expected_sha or digest(target) != expected_sha:
+            raise ValueError("reconcile state backup digest mismatch")
+        return target
+    shutil.copy2(path, target)
+    if expected_sha and digest(target) != expected_sha:
+        raise ValueError("reconcile state backup did not preserve source bytes")
     return target
 
 
@@ -1862,6 +1912,7 @@ _STATUS_BLOCKED_RECOMMENDATIONS = frozenset(
         "halted_replacement_reserve_exhausted",
         "halted_scheduler_hard_failure",
         "halted_seed_pool_exhausted",
+        "reconcile_transaction_manual_review",
     }
 )
 
@@ -1921,6 +1972,8 @@ _STATUS_PRESENTATION_RECOMMENDATIONS = frozenset(
         "user_stop_cancellation_incomplete",
         "user_stop_draining",
         "shutdown_requested",
+        "reconcile_transaction_recoverable",
+        "reconcile_transaction_manual_review",
     }
     | {
         "phase_" + phase.value.lower() + "_ready"
@@ -2445,6 +2498,10 @@ def _status_overall(payload: Dict[str, Any]) -> str:
     code = str(_first_recommendation(payload).get("code") or "")
     if _status_ownership_uncertain(payload):
         return "cannot determine safely"
+    if code == "reconcile_transaction_manual_review":
+        return "blocked"
+    if code == "reconcile_transaction_recoverable":
+        return "needs attention"
     if _status_control_problem(payload) or _status_artifact_problem(payload):
         return "blocked" if code in _STATUS_BLOCKED_RECOMMENDATIONS else "needs attention"
     if phase == CampaignPhase.HALTED.value:
@@ -2932,6 +2989,10 @@ def _status_plain_reason(payload: Dict[str, Any], code: str) -> Optional[str]:
         "journal_corrupt",
     }:
         return "one or more campaign control records could not be validated"
+    if code == "reconcile_transaction_recoverable":
+        return "a previous reconcile was interrupted, but its recorded evidence is recoverable"
+    if code == "reconcile_transaction_manual_review":
+        return "a previous reconcile was interrupted and its recorded evidence is ambiguous"
     return None
 
 
@@ -3441,6 +3502,7 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "phase_output_contract_invalid": "phase output contract invalid",
     "required_phase_output_missing_after_failure": "failure output missing",
     "reconcile_applied": "reconcile applied",
+    "reconcile_transaction_recovered": "interrupted reconcile recovered",
     "reconcile_resolved_terminal_intent": "terminal intent resolved",
     "partial_array_recovery_prepared": "partial array recovery prepared",
     "partial_array_recovery_postprocess_only": "partial array postprocess ready",
@@ -3562,6 +3624,7 @@ _JOURNAL_OK_EVENTS = {
     "point_allocation_replacement_prepared",
     "provenance_index_repaired",
     "reconcile_applied",
+    "reconcile_transaction_recovered",
     "reconcile_resolved_terminal_intent",
     "reference_commit_shards_resolved",
     "reference_scales_computed",
@@ -6407,7 +6470,18 @@ def cmd_status(args: argparse.Namespace) -> int:
             snapshot=status_snapshot,
         )
         payload["artifact_verification"] = status_snapshot.verification_payload()
+        status_transaction_recovery = inspect_reconcile_transaction_recovery(
+            campaign,
+            artifact_snapshot=status_snapshot,
+        )
     except Exception as exc:
+        try:
+            status_transaction_recovery = inspect_reconcile_transaction_recovery(
+                campaign,
+                artifact_snapshot=None,
+            )
+        except Exception:
+            status_transaction_recovery = None
         payload["artifact_manifest_status"] = {
             "ok": False,
             "error": type(exc).__name__ + ": " + str(exc),
@@ -6418,6 +6492,12 @@ def cmd_status(args: argparse.Namespace) -> int:
             "errors": [type(exc).__name__ + ": " + str(exc)],
         }
     presentation_payload = dict(payload)
+    if isinstance(status_transaction_recovery, Mapping) and str(
+        status_transaction_recovery.get("state") or ""
+    ) != "none":
+        presentation_payload["_presentation_reconcile_transaction_recovery"] = (
+            dict(status_transaction_recovery)
+        )
     presentation_payload["_presentation_execution_identity_checked"] = True
     try:
         from .execution_identity import (
@@ -7283,6 +7363,13 @@ def _perform_reconcile_apply_mutations(
     artifact_snapshot: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Perform only lossless, transaction-recorded reconcile mutations."""
+    transaction_payload = getattr(transaction, "payload", None)
+    archive_identity = (
+        str(transaction_payload.get("transaction_id"))
+        if isinstance(transaction_payload, Mapping)
+        and transaction_payload.get("transaction_id")
+        else None
+    )
     result: Dict[str, Any] = {
         "ferebus_retrain_archive": [],
         "archived_array_outputs": [],
@@ -7330,6 +7417,7 @@ def _perform_reconcile_apply_mutations(
             ),
             classification=publication,
             force=archive_for_replay,
+            archive_identity=archive_identity,
         )
         if bool(archived_publication.get("changed", False)):
             paths = [str(archived_publication["archive_dir"])]
@@ -7339,6 +7427,7 @@ def _perform_reconcile_apply_mutations(
         archived = archive_ferebus_iteration_staging_for_retrain(
             campaign,
             report.proposed_state,
+            archive_identity=archive_identity,
         )
         if archived is not None:
             result["ferebus_retrain_archive"] = [str(archived)]
@@ -7350,6 +7439,7 @@ def _perform_reconcile_apply_mutations(
                 campaign,
                 force_array_phase,
                 int(force_array_iteration),
+                archive_identity=archive_identity,
             )
             result["archived_array_outputs"] = list(archived_outputs)
             transaction.record_paths(
@@ -7369,7 +7459,10 @@ def _perform_reconcile_apply_mutations(
         )
 
     if ".DATA/SCRIPTS contains sbatch scripts" in report.unsafe_reasons:
-        paths = archive_scripts_for_reconcile(campaign)
+        paths = archive_scripts_for_reconcile(
+            campaign,
+            archive_identity=archive_identity,
+        )
         result["archived_scripts"] = paths
         transaction.record_paths("archive_scripts", paths)
 
@@ -7409,9 +7502,13 @@ def _perform_reconcile_apply_mutations(
                 report.proposed_state,
                 verification=verification,
                 artifact_snapshot=artifact_snapshot,
+                archive_identity=archive_identity,
             )
         elif data_staging_archive_mode == "user":
-            paths = archive_data_staging_for_operator_reconcile(campaign)
+            paths = archive_data_staging_for_operator_reconcile(
+                campaign,
+                archive_identity=archive_identity,
+            )
         else:
             paths = []
         result["archived_data_staging"] = paths
@@ -7423,6 +7520,7 @@ def _perform_reconcile_apply_mutations(
             report.proposed_state,
             verification=verification,
             artifact_snapshot=artifact_snapshot,
+            archive_identity=archive_identity,
         )
         result["archived_model_staging"] = paths
         transaction.record_paths("archive_model_staging", paths)
@@ -7433,11 +7531,16 @@ def _perform_reconcile_apply_mutations(
             report.proposed_state,
             verification=verification,
             artifact_snapshot=artifact_snapshot,
+            archive_identity=archive_identity,
         )
         result["archived_reference_data_staging"] = paths
         transaction.record_paths("archive_reference_data_staging", paths)
 
-    paths = clean_reentry_staging(campaign, report.proposed_state.phase)
+    paths = clean_reentry_staging(
+        campaign,
+        report.proposed_state.phase,
+        archive_identity=archive_identity,
+    )
     result["archived_reentry_staging"] = paths
     transaction.record_paths("archive_reentry_staging", paths)
     return result
@@ -7450,7 +7553,14 @@ def _fail_reconcile_transaction(
     if transaction is None:
         return
     try:
-        transaction.set_status("FAILED", reason=reason)
+        if (
+            int(transaction.payload.get("schema_version", 1)) >= 2
+            and str(transaction.payload.get("status") or "")
+            in {"MUTATING", "COMMITTING"}
+        ):
+            transaction.record_interruption(reason)
+        else:
+            transaction.set_status("FAILED", reason=reason)
     except Exception:
         pass
 
@@ -7478,17 +7588,33 @@ def _publish_reconcile_intent_transitions(
     campaign: Path,
     resolved_intents: Sequence[Mapping[str, Any]],
     recovered_state: Any,
+    *,
+    commit_plan: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """Publish scheduler-backed intent transitions after the core commit."""
     from .daemon.journal import append_event
 
+    planned = (
+        {
+            (str(item["phase"]), int(item["iteration"])): item
+            for item in commit_plan.get("intent_transitions") or []
+        }
+        if isinstance(commit_plan, Mapping)
+        else {}
+    )
+    published: set[Tuple[str, int]] = set()
     for item in resolved_intents:
         phase = str(item["phase"])
         iteration = int(item["iteration"])
         reason = str(item["reason"])
         target_status = str(item["target_status"])
         completion_receipt = item.get("completion_receipt")
-        if target_status == "SUPERSEDED":
+        if isinstance(commit_plan, Mapping):
+            plan_record = planned.get((phase, iteration))
+            if not isinstance(plan_record, Mapping):
+                raise ValueError("reconcile intent commit plan is incomplete")
+            publish_reconcile_intent_target(campaign, plan_record)
+        elif target_status == "SUPERSEDED":
             _submission_intent.mark_superseded(
                 campaign,
                 phase,
@@ -7501,16 +7627,12 @@ def _publish_reconcile_intent_transitions(
                 ),
             )
         elif target_status == "FAILED":
-            _submission_intent.mark_failed(
-                campaign,
-                phase,
-                iteration,
-                reason,
-            )
+            _submission_intent.mark_failed(campaign, phase, iteration, reason)
         else:
             raise ValueError(
                 "unsupported reconcile intent transition: " + target_status
             )
+        published.add((phase, iteration))
         receipt_backed = isinstance(completion_receipt, Mapping)
         append_event(
             campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
@@ -7532,21 +7654,25 @@ def _publish_reconcile_intent_transitions(
             ),
         )
 
-    phase = recovered_state.phase.value
-    iteration = int(recovered_state.iteration)
-    current = _submission_intent.load_intent(
-        campaign,
-        phase,
-        iteration,
-        expected_campaign_uid=str(recovered_state.campaign_uid),
-    )
-    if current is not None and str(current.get("status")) == "FAILED":
-        _submission_intent.mark_superseded(
+    for key, plan_record in planned.items():
+        if key not in published:
+            publish_reconcile_intent_target(campaign, plan_record)
+    if not isinstance(commit_plan, Mapping):
+        phase = recovered_state.phase.value
+        iteration = int(recovered_state.iteration)
+        current = _submission_intent.load_intent(
             campaign,
             phase,
             iteration,
-            "reconcile_apply_retry",
+            expected_campaign_uid=str(recovered_state.campaign_uid),
         )
+        if current is not None and str(current.get("status")) == "FAILED":
+            _submission_intent.mark_superseded(
+                campaign,
+                phase,
+                iteration,
+                "reconcile_apply_retry",
+            )
 
 
 def _retry_phase_from_cleaned_report(report) -> Optional[CampaignPhase]:
@@ -8429,6 +8555,46 @@ def _reconcile_presentation(
 
     cleanup_rows, reason_parts, warnings, preserved = _reconcile_cleanup_rows(report)
     planned: List[Tuple[str, str]] = list(cleanup_rows)
+    transaction_recovery = getattr(
+        report,
+        "reconcile_transaction_recovery",
+        None,
+    )
+    if isinstance(transaction_recovery, Mapping):
+        if bool(transaction_recovery.get("recoverable", False)):
+            disposition = str(transaction_recovery.get("disposition") or "")
+            if disposition == "abandoned_before_mutation":
+                description = "close a previous reconcile that stopped before changing campaign data"
+            elif disposition == "completed_safe_cleanup":
+                description = "finish bookkeeping for interrupted temporary-data cleanup"
+            elif disposition == "adopted_committed_state":
+                description = "confirm campaign changes that were already published"
+            elif disposition == "rolled_forward":
+                description = "complete partially published campaign bookkeeping"
+            else:
+                description = _reconcile_plain_text(
+                    transaction_recovery.get("reason")
+                )
+            planned.insert(0, ("interrupted reconcile", description))
+            reason_parts.insert(0, "a previous reconcile was interrupted")
+        elif str(transaction_recovery.get("state") or "") == "blocked":
+            blocker = _reconcile_plain_text(transaction_recovery.get("reason"))
+            if blocker not in blockers:
+                blockers.insert(0, blocker)
+        elif str(transaction_recovery.get("state") or "") == "recovered":
+            disposition = str(transaction_recovery.get("disposition") or "")
+            description = {
+                "abandoned_before_mutation": "closed an interrupted reconcile that made no campaign changes",
+                "completed_safe_cleanup": "completed bookkeeping for interrupted temporary-data cleanup",
+                "adopted_committed_state": "adopted campaign changes that were already fully published",
+                "rolled_back_exactly": "restored the exact pre-reconcile authority",
+                "rolled_forward": "completed partially published campaign bookkeeping",
+            }.get(
+                disposition,
+                _reconcile_plain_text(transaction_recovery.get("reason")),
+            )
+            planned.insert(0, ("interrupted reconcile", description))
+            reason_parts.insert(0, "an interrupted reconcile was recovered")
     allowed_changes = list(getattr(config_review, "allowed_changes", []) or [])
     for change in allowed_changes:
         planned.append(
@@ -10432,12 +10598,92 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 9
+    transaction_recovery = inspect_reconcile_transaction_recovery(
+        campaign,
+        artifact_snapshot=artifact_snapshot,
+    )
+    transaction_recovery_results: List[Dict[str, Any]] = []
+    if bool(getattr(args, "apply", False)) and bool(
+        transaction_recovery.get("recoverable", False)
+    ):
+        for _ in range(4):
+            try:
+                result = apply_reconcile_transaction_recovery(
+                    campaign,
+                    transaction_recovery,
+                    artifact_snapshot=artifact_snapshot,
+                )
+            except Exception as exc:
+                print(
+                    "interrupted reconcile transaction could not be recovered: "
+                    + _reconcile_plain_text(exc),
+                    file=sys.stderr,
+                )
+                return 9
+            transaction_recovery_results.append(dict(result))
+            if result.get("transaction_id") and result.get("disposition"):
+                try:
+                    from .daemon.journal import append_event
+
+                    append_event(
+                        _campaign_paths(campaign)["journal"],
+                        "reconcile_transaction_recovered",
+                        phase=(str(result.get("phase") or "") or None),
+                        iteration=int(result.get("iteration") or 0),
+                        transaction_id=str(result["transaction_id"]),
+                        prior_status=str(
+                            result.get("transaction_status") or ""
+                        ),
+                        disposition=str(result["disposition"]),
+                        reason=str(result.get("reason") or ""),
+                        scheduler_jobs_submitted=0,
+                    )
+                except Exception:
+                    pass
+            try:
+                artifact_snapshot = build_committed_artifact_snapshot(
+                    campaign,
+                    verification_level=verification_level,
+                    progress_stream=(sys.stderr if deep_verify else None),
+                )
+            except Exception as exc:
+                print(
+                    "campaign authority could not be rechecked after transaction recovery: "
+                    + _reconcile_plain_text(exc),
+                    file=sys.stderr,
+                )
+                return 9
+            transaction_recovery = inspect_reconcile_transaction_recovery(
+                campaign,
+                artifact_snapshot=artifact_snapshot,
+            )
+            if not bool(transaction_recovery.get("recoverable", False)):
+                break
+        if bool(transaction_recovery.get("recoverable", False)):
+            print(
+                "interrupted reconcile transaction recovery did not converge",
+                file=sys.stderr,
+            )
+            return 9
+    recovery_record = transaction_recovery.get("record")
+    active_recovery_id = None
+    if bool(transaction_recovery.get("recoverable", False)):
+        active_recovery_id = str(
+            transaction_recovery.get("transaction_id")
+            or (
+                recovery_record.get("transaction_id")
+                if isinstance(recovery_record, Mapping)
+                else ""
+            )
+            or ""
+        ) or None
     try:
         report = propose_recovery(
             campaign,
             allow_fresh_init_on_nonempty=bool(
                 getattr(args, "allow_fresh_init", False)
             ),
+            _active_reconcile_transaction_id=active_recovery_id,
             artifact_snapshot=artifact_snapshot,
             verification_level=verification_level,
         )
@@ -10447,6 +10693,24 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 9
+    if transaction_recovery_results:
+        report.reconcile_transaction_recovery = {
+            "state": "recovered",
+            "recoverable": False,
+            "results": [dict(item) for item in transaction_recovery_results],
+            "disposition": str(
+                transaction_recovery_results[-1].get("disposition") or ""
+            ),
+            "reason": str(
+                transaction_recovery_results[-1].get("reason") or ""
+            ),
+        }
+    else:
+        report.reconcile_transaction_recovery = (
+            dict(transaction_recovery)
+            if str(transaction_recovery.get("state") or "") != "none"
+            else None
+        )
     config_path = campaign / "campaign.yaml"
     config = None
     config_review = None
@@ -10927,6 +11191,16 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         planned_operations.insert(0, "retire_completed_staging")
     if cleanable_now or retrain_ferebus or force_resubmit_array:
         planned_operations.insert(0, "archive_reconcile_evidence")
+    transaction_id = secrets.token_hex(16)
+    mutation_plan = [
+        {
+            "operation_id": "operation-" + str(index).zfill(4),
+            "kind": "reconcile_operation",
+            "name": str(name),
+            "archive_identity": transaction_id,
+        }
+        for index, name in enumerate(planned_operations)
+    ]
     try:
         artifact_snapshot.assert_anchors_unchanged(campaign)
         transaction = begin_reconcile_transaction(
@@ -10935,6 +11209,12 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             proposed_iteration=int(report.proposed_state.iteration),
             planned_operations=planned_operations,
             intent_transitions=resolved_intents,
+            campaign_uid=str(report.proposed_state.campaign_uid),
+            source_authority_anchor_sha256=str(
+                artifact_snapshot.anchor_sha256
+            ),
+            mutation_plan=mutation_plan,
+            transaction_id=transaction_id,
         )
         transaction.set_status("MUTATING")
         mutation_result = _perform_reconcile_apply_mutations(
@@ -11192,7 +11472,15 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     try:
         if transaction is None:
             raise RuntimeError("reconcile transaction was not created")
-        transaction.set_status("COMMITTING")
+        commit_plan = build_reconcile_commit_plan(
+            campaign,
+            transaction_id=str(transaction.payload["transaction_id"]),
+            proposed_state=report.proposed_state,
+            config=config,
+            intent_transitions=resolved_intents,
+            artifact_snapshot=artifact_snapshot,
+        )
+        transaction.prepare_commit(commit_plan)
         state_train_version = int(report.proposed_state.reference_data_version)
         if state_train_version >= 0:
             from .versioning.reference_data import ReferenceDataVersioning
@@ -11242,9 +11530,12 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         return 9
 
     try:
-        backup_path = _copy_existing_timestamped(
+        if transaction is None:
+            raise RuntimeError("reconcile transaction was not created")
+        backup_path = _copy_existing_reconcile_backup(
+            campaign,
             target_canonical,
-            ".before-reconcile-",
+            transaction,
         )
     except Exception as exc:
         pointer_errors = _restore_reconcile_pointer_snapshots(campaign, pointer_snapshots)
@@ -11270,11 +11561,10 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         _print_cleanup_already_happened(cleanup_paths_already_done)
         return 9
     try:
-        apply_config_lock_update(
-            campaign,
-            config,
-            campaign_uid=str(report.proposed_state.campaign_uid),
-        )
+        config_commit = commit_plan.get("config_lock")
+        if not isinstance(config_commit, Mapping):
+            raise ValueError("reconcile config-lock commit plan is missing")
+        publish_reconcile_config_target(campaign, config_commit)
     except Exception as exc:
         try:
             _restore_state_from_backup_atomic(target_canonical, backup_path)
@@ -11309,6 +11599,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             campaign,
             resolved_intents,
             report.proposed_state,
+            commit_plan=commit_plan,
         )
     except Exception as exc:
         reason = (
@@ -11478,7 +11769,11 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         pass
     if transaction is not None:
         try:
-            transaction.set_status("COMMITTED")
+            transaction.resolve(
+                status="COMMITTED",
+                disposition="committed",
+                reason="reconcile apply completed",
+            )
         except Exception as exc:
             detail = type(exc).__name__ + ": " + str(exc)
             _print_reconcile_follow_up_required(

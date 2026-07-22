@@ -1410,3 +1410,79 @@ def mark_superseded(
         status="SUPERSEDED", reason=reason,
         completion_receipt=completion_receipt,
     )
+
+
+def prepare_reconcile_terminal_transition(
+    campaign_dir: Union[str, Path],
+    phase_name: str,
+    iteration: int,
+    *,
+    target_status: str,
+    reason: str,
+    completion_receipt: Optional[Dict[str, Any]] = None,
+    expected_campaign_uid: Optional[str] = None,
+    updated_at_iso: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build the exact terminal intent payload used by reconcile commit."""
+    path = intent_path(campaign_dir, phase_name, iteration)
+    data = load_intent(
+        campaign_dir,
+        phase_name,
+        iteration,
+        expected_campaign_uid=expected_campaign_uid,
+    )
+    if not isinstance(data, dict):
+        raise FileNotFoundError("submission intent does not exist")
+    target = str(target_status)
+    if target not in {"FAILED", "SUPERSEDED"}:
+        raise ValueError("unsupported reconcile intent target: " + target)
+    previous = str(data.get("status") or "")
+    if target not in _STATUS_TRANSITIONS.get(previous, set()):
+        raise ValueError(
+            "illegal submission intent transition: " + previous + " -> " + target
+        )
+    prepared = dict(data)
+    prepared["status"] = target
+    prepared["reason"] = str(reason)
+    if completion_receipt is not None:
+        prepared["completion_receipt"] = dict(completion_receipt)
+    now = str(updated_at_iso or _now_iso())
+    _timestamp(now, "reconcile intent update time")
+    prepared["updated_iso"] = now
+    prepared["updated_at_iso"] = now
+    return _validate_intent_payload(
+        prepared,
+        path=path,
+        phase_name=str(phase_name),
+        iteration=int(iteration),
+        expected_campaign_uid=expected_campaign_uid,
+    )
+
+
+def publish_prepared_reconcile_transition(
+    campaign_dir: Union[str, Path],
+    phase_name: str,
+    iteration: int,
+    payload: Mapping[str, Any],
+    *,
+    expected_campaign_uid: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Publish one exact terminal intent payload prepared by reconcile."""
+    path = intent_path(campaign_dir, phase_name, iteration)
+    prepared = _validate_intent_payload(
+        dict(payload),
+        path=path,
+        phase_name=str(phase_name),
+        iteration=int(iteration),
+        expected_campaign_uid=expected_campaign_uid,
+    )
+    atomic_write_json(path, prepared)
+    loaded = load_intent(
+        campaign_dir,
+        phase_name,
+        iteration,
+        expected_campaign_uid=expected_campaign_uid,
+    )
+    if not isinstance(loaded, dict) or loaded != prepared:
+        raise ValueError("published reconcile intent payload did not round-trip")
+    return loaded
