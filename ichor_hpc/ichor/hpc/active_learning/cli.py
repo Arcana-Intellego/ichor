@@ -11470,7 +11470,6 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             )
             return 9
 
-    pointer_snapshots: List[Dict[str, Any]] = []
     try:
         if transaction is None:
             raise RuntimeError("reconcile transaction was not created")
@@ -11483,6 +11482,25 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             artifact_snapshot=artifact_snapshot,
         )
         transaction.prepare_commit(commit_plan)
+    except Exception as exc:
+        reason = (
+            "reconcile commit plan preparation failed: "
+            + type(exc).__name__
+            + ": "
+            + str(exc)
+        )
+        _fail_reconcile_transaction(transaction, reason)
+        print(
+            "refusing --apply because the recovery commit plan could not be "
+            "prepared:",
+            file=sys.stderr,
+        )
+        print("  - " + _reconcile_plain_text(exc), file=sys.stderr)
+        _print_cleanup_already_happened(cleanup_paths_already_done)
+        return 9
+
+    pointer_snapshots: List[Dict[str, Any]] = []
+    try:
         state_train_version = int(report.proposed_state.reference_data_version)
         if state_train_version >= 0:
             from .versioning.reference_data import ReferenceDataVersioning

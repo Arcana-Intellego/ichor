@@ -99,6 +99,24 @@ def _relative_path(campaign: Path, path: Path) -> str:
     return owned.relative_to(campaign).as_posix()
 
 
+def _managed_version_pointer_paths(
+    campaign: Path,
+    versioning: VersionedDirectory,
+) -> Tuple[str, str]:
+    """Return managed pointer identities without rejecting the POSIX link."""
+    parent = campaign_owned_path(campaign, versioning.parent)
+    pointers = (
+        versioning.current_link_path(),
+        versioning._pointer_path(),
+    )
+    relative_paths: List[str] = []
+    for pointer in pointers:
+        if pointer.parent != parent:
+            raise ValueError("managed version pointer has an unexpected parent")
+        relative_paths.append(pointer.relative_to(campaign).as_posix())
+    return relative_paths[0], relative_paths[1]
+
+
 def snapshot_small_file(
     campaign_dir: Path,
     path: Path,
@@ -739,14 +757,17 @@ def build_reconcile_commit_plan(
             for record in config_record.get("files") or []
         )
     for record in pointer_records:
-        parent = campaign / Path(str(record["parent"]))
-        pointer = VersionedDirectory(
-            parent,
+        versioning = VersionedDirectory(
+            campaign / Path(str(record["parent"])),
             prefix=str(record["prefix"]),
             name_width=int(record["name_width"]),
-        )._pointer_path()
-        excluded.add(_relative_path(campaign, pointer))
-        excluded.add(_relative_path(campaign, parent / "current"))
+        )
+        excluded.update(
+            _managed_version_pointer_paths(
+                campaign,
+                versioning,
+            )
+        )
     stable_records = _stable_authority_records(
         artifact_snapshot,
         excluded_paths=excluded,

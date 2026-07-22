@@ -1445,6 +1445,39 @@ def test_reconcile_apply_write_state_failure_keeps_old_state(
     assert (campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json.proposed").is_file()
 
 
+def test_reconcile_commit_plan_failure_is_not_reported_as_pointer_repair(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign(tmp_path)
+    _commit_reference_data_version(campaign, 0)
+    _write_halted_pre_ferebus_state(campaign)
+    config = CampaignConfig()
+    write_config_lock(campaign, config)
+    _write_config(campaign, config)
+
+    def fail_commit_plan(*args, **kwargs):
+        raise ValueError("synthetic commit-plan failure")
+
+    monkeypatch.setattr(cli_mod, "build_reconcile_commit_plan", fail_commit_plan)
+
+    rc = cmd_reconcile(
+        argparse.Namespace(
+            campaign_dir=str(campaign),
+            allow_fresh_init=False,
+            apply=True,
+            restore_config_from_lock=False,
+        )
+    )
+    err = capsys.readouterr().err
+
+    assert rc == 9
+    assert "recovery commit plan could not be prepared" in err
+    assert "synthetic commit-plan failure" in err
+    assert "committed current pointers could not be repaired" not in err
+
+
 def test_reconcile_apply_config_lock_failure_restores_old_state(
     tmp_path,
     capsys,

@@ -18,13 +18,16 @@ from ichor.hpc.active_learning.daemon.reconcile_transaction import (
     build_reconcile_commit_plan,
     inspect_reconcile_transaction_recovery,
     inventory_reconcile_transactions,
+    publish_reconcile_config_target,
     read_reconcile_transaction,
     restore_version_pointer,
     snapshot_version_pointer,
 )
 from ichor.hpc.active_learning.daemon.state import (
+    CampaignPhase,
     CampaignState,
     atomic_write_json,
+    make_lifecycle_context,
     write_state,
 )
 from ichor.hpc.active_learning.config import CampaignConfig
@@ -39,8 +42,273 @@ from ichor.hpc.active_learning.daemon.submission_intent import (
     mark_submitted,
     write_pre_submit_intent,
 )
+from ichor.hpc.active_learning.daemon.stop_control import (
+    build_stop_request,
+    complete_stop_request,
+    install_stop_request,
+    stop_request_path,
+)
 from ichor.hpc.active_learning.submit import sacct_poll
 from ichor.hpc.active_learning.versioning.versioned_directory import VersionedDirectory
+
+
+def _committed_pointer_fixture(
+    campaign: Path,
+    *,
+    phase: CampaignPhase = CampaignPhase.SEED_SELECT,
+    iteration: int = 11,
+    version: int = 10,
+    symlinks: bool = False,
+) -> CampaignState:
+    state = CampaignState()
+    state.phase = phase
+    state.iteration = int(iteration)
+    state.max_iterations = 40
+    state.reference_data_version = int(version)
+    state.validation_set_version = int(version)
+    state.models_version = int(version)
+    state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    write_state(state_path, state)
+
+    for name in ("QM_REFERENCE_DATA", "TRAINED_MODELS"):
+        versions = VersionedDirectory(campaign / name)
+        target = versions.iteration_path(version)
+        target.mkdir(parents=True)
+        if symlinks:
+            os.symlink(target.name, versions.current_link_path())
+        else:
+            versions._pointer_path().write_text(
+                target.name + "\n",
+                encoding="utf-8",
+            )
+    return state
+
+
+def _pointer_commit_plan(campaign: Path, state: CampaignState, *, config=None):
+    pointer_anchors = tuple(
+        (name, 1, "0" * 64)
+        for name in (
+            "QM_REFERENCE_DATA/current",
+            "QM_REFERENCE_DATA/.current.pointer",
+            "TRAINED_MODELS/current",
+            "TRAINED_MODELS/.current.pointer",
+        )
+    )
+    return build_reconcile_commit_plan(
+        campaign,
+        transaction_id=uuid.uuid4().hex,
+        proposed_state=state,
+        config=config,
+        intent_transitions=[],
+        artifact_snapshot=SimpleNamespace(anchor_records=pointer_anchors),
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink contract")
+def test_commit_plan_accepts_managed_posix_current_symlinks(tmp_path):
+    campaign = tmp_path / "campaign"
+    state = _committed_pointer_fixture(campaign, symlinks=True)
+
+    plan = _pointer_commit_plan(campaign, state)
+
+    assert plan["stable_authority_records"] == []
+    assert [record["before_version"] for record in plan["pointers"]] == [10, 10]
+    assert [record["after_version"] for record in plan["pointers"]] == [10, 10]
+
+
+def test_commit_plan_accepts_managed_pointer_fallback_files(tmp_path):
+    campaign = tmp_path / "campaign"
+    state = _committed_pointer_fixture(campaign)
+
+    plan = _pointer_commit_plan(campaign, state)
+
+    assert plan["stable_authority_records"] == []
+    assert [record["before_version"] for record in plan["pointers"]] == [10, 10]
+
+
+def test_commit_plan_still_rejects_regular_current_file(tmp_path):
+    campaign = tmp_path / "campaign"
+    state = _committed_pointer_fixture(campaign)
+    pointer = campaign / "QM_REFERENCE_DATA" / "current"
+    pointer.write_text("iteration-000010\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="current path is not a symlink"):
+        _pointer_commit_plan(campaign, state)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink contract")
+def test_commit_plan_rejects_noncanonical_current_symlink_target(tmp_path):
+    campaign = tmp_path / "campaign"
+    state = _committed_pointer_fixture(campaign, symlinks=True)
+    pointer = campaign / "QM_REFERENCE_DATA" / "current"
+    pointer.unlink()
+    os.symlink("../iteration-000010", pointer)
+
+    with pytest.raises(ValueError, match="version basename"):
+        _pointer_commit_plan(campaign, state)
+
+
+def test_pointer_planning_interruption_is_retired_before_retry(tmp_path):
+    campaign = tmp_path / "campaign"
+    state = _committed_pointer_fixture(campaign)
+    transaction = begin_reconcile_transaction(
+        campaign,
+        proposed_phase=state.phase.value,
+        proposed_iteration=state.iteration,
+        planned_operations=["repair_current_pointers", "update_config_lock"],
+        intent_transitions=[],
+        campaign_uid=state.campaign_uid,
+    )
+    transaction.set_status("MUTATING")
+    transaction.record_interruption(
+        "current pointer repair failed: ValueError: path contains a symlink: "
+        + str(campaign / "QM_REFERENCE_DATA" / "current")
+    )
+
+    inspection = inspect_reconcile_transaction_recovery(campaign)
+
+    assert inspection["action"] == "abandon"
+    assert inspection["disposition"] == "completed_safe_cleanup"
+    apply_reconcile_transaction_recovery(campaign, inspection)
+    assert read_reconcile_transaction(transaction.path)["status"] == "FAILED"
+    assert _pointer_commit_plan(campaign, state)["pointers"]
+
+
+@pytest.mark.parametrize(
+    (
+        "mode",
+        "source_phase",
+        "source_iteration",
+        "phase_started",
+        "current_phase",
+        "current_iteration",
+    ),
+    [
+        pytest.param(
+            "immediate",
+            CampaignPhase.SEED_SELECT,
+            11,
+            False,
+            CampaignPhase.SEED_SELECT,
+            11,
+            id="immediate",
+        ),
+        pytest.param(
+            "after_phase",
+            CampaignPhase.SEED_SELECT,
+            11,
+            False,
+            CampaignPhase.SEED_SELECT,
+            11,
+            id="after-unstarted-phase",
+        ),
+        pytest.param(
+            "after_phase",
+            CampaignPhase.FEREBUS,
+            10,
+            True,
+            CampaignPhase.STOP_CHECK,
+            10,
+            id="after-completed-phase",
+        ),
+        pytest.param(
+            "after_iteration",
+            CampaignPhase.STOP_CHECK,
+            10,
+            True,
+            CampaignPhase.SEED_SELECT,
+            11,
+            id="after-completed-iteration",
+        ),
+    ],
+)
+def test_commit_plan_preserves_completed_stop_while_updating_config(
+    tmp_path,
+    mode,
+    source_phase,
+    source_iteration,
+    phase_started,
+    current_phase,
+    current_iteration,
+):
+    campaign = tmp_path / "campaign"
+    state = _committed_pointer_fixture(
+        campaign,
+        phase=current_phase,
+        iteration=current_iteration,
+        symlinks=(os.name != "nt"),
+    )
+    source = CampaignState.from_dict(state.to_dict())
+    source.phase = source_phase
+    source.iteration = source_iteration
+    request, _ = install_stop_request(
+        campaign,
+        build_stop_request(
+            source,
+            mode=mode,
+            phase_started=phase_started,
+        ),
+    )
+    receipt = (
+        {"path": "receipt.json"}
+        if mode != "immediate" and phase_started
+        else None
+    )
+    complete_stop_request(
+        campaign,
+        request["request_id"],
+        reason=(
+            "immediate"
+            if mode == "immediate"
+            else (
+                ("phase_completed" if phase_started else "phase_not_started")
+                if mode == "after_phase"
+                else "active_iteration_completed"
+            )
+        ),
+        completion_receipt=receipt,
+    )
+    state.shutdown_requested = True
+    state.lifecycle_context = make_lifecycle_context(
+        disposition="stopped",
+        reason_code="user_stop_boundary_reached",
+        message="test stop boundary reached",
+        from_phase=source_phase,
+        iteration=current_iteration,
+        source="daemon_stop_control",
+        recovery_action="use resume to continue",
+        details={"mode": mode},
+    )
+    write_state(
+        campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json",
+        state,
+    )
+    original = CampaignConfig()
+    write_config_lock(campaign, original, campaign_uid=state.campaign_uid)
+    changed = CampaignConfig()
+    changed.campaign.sampling_aggressiveness = 7
+    stop_before = stop_request_path(campaign).read_bytes()
+
+    plan = _pointer_commit_plan(campaign, state, config=changed)
+    publish_reconcile_config_target(campaign, plan["config_lock"])
+
+    assert stop_request_path(campaign).read_bytes() == stop_before
+    persisted = CampaignState.from_dict(
+        json.loads(
+            (
+                campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json"
+            ).read_text(encoding="utf-8")
+        )
+    )
+    assert persisted.shutdown_requested is True
+    assert persisted.phase is current_phase
+    assert persisted.iteration == current_iteration
+    lock = read_config_lock(campaign, expected_campaign_uid=state.campaign_uid)
+    assert lock["canonical_config"]["campaign"]["sampling_aggressiveness"] == 7
+    assert not (
+        campaign / ".DATA" / "ACTIVE_LEARNING" / "submission_intents"
+    ).exists()
 
 
 def test_reconcile_transaction_records_lossless_moves_and_status(tmp_path):
