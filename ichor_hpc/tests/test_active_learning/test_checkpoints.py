@@ -89,6 +89,12 @@ def _idle_campaign(tmp_path: Path, monkeypatch) -> Path:
     retired = campaign / ".DATA" / "STAGING_RETIRED" / "diagnostic"
     retired.mkdir(parents=True)
     (retired / "rejected.bin").write_bytes(b"rejected staging")
+    exported = campaign / "EXPORTED_GEOMETRIES" / "iteration-000001-model-batch"
+    exported.mkdir(parents=True)
+    (exported / "000001_train_slot-000000_seed-000001.xyz").write_text(
+        "1\nseed\nH 0 0 0\n1\nfinal\nH 0 0 0\n",
+        encoding="ascii",
+    )
     monkeypatch.setattr(
         checkpoints,
         "verify_state_referenced_artifacts",
@@ -123,6 +129,7 @@ def test_checkpoint_deduplicates_verifies_and_restores(tmp_path, monkeypatch):
     assert not any(
         path.startswith(".DATA/STAGING_RETIRED/") for path in relative_paths
     )
+    assert not any(path.startswith("EXPORTED_GEOMETRIES/") for path in relative_paths)
     object_paths = list((Path(created["store"]) / "objects").iterdir())
     assert len(object_paths) == len({item["sha256"] for item in manifest["files"]})
 

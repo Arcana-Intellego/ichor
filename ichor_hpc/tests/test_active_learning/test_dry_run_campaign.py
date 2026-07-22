@@ -13,6 +13,7 @@ The test runs locally in pytest's tmp_path, but the file-system flow is
 the same one CSF4 would exercise.
 """
 import json
+import re
 import shutil
 import stat
 from pathlib import Path
@@ -20,6 +21,10 @@ from pathlib import Path
 import pytest
 
 from ichor.hpc.active_learning.cli import main as cli_main
+from ichor.hpc.active_learning.batch_geometry_export import (
+    BatchGeometryExportError,
+    export_batch_geometries,
+)
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.daemon.daemon import Daemon, DEFAULT_DATA_SUBDIR
 from ichor.hpc.active_learning.daemon.dry_run_executor import DryRunPhaseExecutor
@@ -79,6 +84,91 @@ def test_dry_run_finishes_in_DONE(tmp_path):
     campaign, d, _, _ = _run_two_iter_campaign(tmp_path)
     state = read_state(d.state_path())
     assert state.phase is CampaignPhase.DONE
+
+
+def test_completed_model_batches_export_seed_and_committed_geometries(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from ichor.core.files.xyz.strict_xyz import read_xyz_frames
+    from ichor.hpc.active_learning import batch_geometry_export as export_module
+
+    campaign, d, _, _ = _run_two_iter_campaign(tmp_path)
+    state_bytes = d.state_path().read_bytes()
+    journal_path = campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson"
+    journal_bytes = journal_path.read_bytes()
+
+    summary = export_batch_geometries(campaign, 1)
+    assert summary.iterations == (1,)
+    assert summary.training_count == 1
+    assert summary.internal_validation_count == 1
+    assert summary.total_count == 2
+    assert summary.maximum_coordinate_discrepancy_angstrom <= 1.0e-6
+    names = sorted(path.name for path in summary.output_path.glob("*.xyz"))
+    assert len(names) == 2
+    assert re.fullmatch(r"000001_train_slot-\d{6}_seed-\d{6}\.xyz", names[0])
+    assert re.fullmatch(r"000002_int_val_slot-\d{6}_seed-\d{6}\.xyz", names[1])
+    for name in names:
+        frames = read_xyz_frames(summary.output_path / name)
+        assert len(frames) == 2
+        assert [atom.type for atom in frames[0]] == [atom.type for atom in frames[1]]
+
+    marker = summary.output_path / "obsolete.txt"
+    marker.write_text("old export", encoding="utf-8")
+    repeated = export_batch_geometries(campaign, 1)
+    assert repeated.output_path == summary.output_path
+    assert not marker.exists()
+
+    all_summary = export_batch_geometries(campaign, "all")
+    assert all_summary.iterations == (1, 2)
+    assert all_summary.training_count == 2
+    assert all_summary.internal_validation_count == 2
+    assert sorted(path.name for path in all_summary.output_path.iterdir()) == [
+        "iteration-000001-model-batch",
+        "iteration-000002-model-batch",
+    ]
+
+    existing = tmp_path / "existing-export"
+    existing.mkdir()
+    with pytest.raises(FileExistsError, match="already exists"):
+        export_batch_geometries(campaign, 1, output_dir=existing)
+    with pytest.raises(BatchGeometryExportError, match="bootstrap iteration 0"):
+        export_batch_geometries(campaign, 0)
+    with pytest.raises(BatchGeometryExportError, match="not finalised"):
+        export_batch_geometries(campaign, 3)
+
+    no_scan_output = tmp_path / "no-scan-export"
+    with monkeypatch.context() as context:
+        context.setattr(
+            Path,
+            "rglob",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("geometry export recursively scanned a campaign tree")
+            ),
+        )
+        context.setattr(
+            export_module.os,
+            "walk",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("geometry export recursively walked a campaign tree")
+            ),
+        )
+        export_batch_geometries(campaign, 2, output_dir=no_scan_output)
+
+    d.config.to_yaml(campaign / "campaign.yaml")
+    monkeypatch.chdir(campaign)
+    cli_output = tmp_path / "cli-export"
+    assert cli_main([
+        "export-batch-geometries",
+        "--iteration",
+        "1",
+        "--output-dir",
+        str(cli_output),
+    ]) == 0
+    assert "Exported batch geometries" in capsys.readouterr().out
+    assert d.state_path().read_bytes() == state_bytes
+    assert journal_path.read_bytes() == journal_bytes
 
 
 def test_dry_run_writes_one_stub_script_per_sbatch_phase_per_iter(tmp_path):

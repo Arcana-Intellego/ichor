@@ -556,6 +556,48 @@ and copy important committed results to backed-up storage periodically. The
 daemon warns when a live campaign root is under :code:`$HOME`.
 
 
+Exporting completed model-batch geometries
+------------------------------------------
+
+Export the geometries introduced by one completed active-learning iteration::
+
+    ichor-al-daemon export-batch-geometries --iteration 8
+
+The command writes one two-frame XYZ file for each accepted training or
+internal-validation slot. The first frame is the original ARIADNE seed and
+the second is the final committed QM geometry. External-validation points are
+excluded. Replacement attempts are followed through the accepted allocation
+attempt, and files are ordered with training slots first and internal-
+validation slots second.
+
+By default, iteration 8 is published atomically under::
+
+    EXPORTED_GEOMETRIES/iteration-000008-model-batch
+
+Repeating the default command atomically replaces that derived export. An
+explicit destination must not already exist::
+
+    ichor-al-daemon export-batch-geometries \
+        --iteration 8 \
+        --output-dir ~/exports/water-dimer-iteration-8
+
+Use :code:`--iteration all` to export the contiguous finalised active-
+iteration prefix. Its default destination is
+:code:`EXPORTED_GEOMETRIES/all-model-batches`, with one child directory per
+iteration. Iteration 0 is not exportable because bootstrap data has no
+ARIADNE seed geometry.
+
+Before writing anything, the command checks the finalised sampling manifest,
+complete point allocation, reference-commit ledger, committed reference-data
+version, FEREBUS split snapshot and committed model version. For each exported
+slot it validates candidate, seed, task, split, provenance, receipt and
+point-directory identities, atom order, and the ARIADNE-to-QM coordinate
+agreement. It reads only the selected geometry payloads and their bound
+control files. It does not change campaign state, append to the journal,
+contact Slurm, reconcile the campaign or rerun scientific work. Exported
+geometries are derived data and are excluded from checkpoints.
+
+
 Recovery + troubleshooting
 --------------------------
 

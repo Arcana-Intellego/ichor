@@ -38,6 +38,7 @@ _EXCLUDED_DIRECTORY_PARTS = {
     "__pycache__",
 }
 _EXCLUDED_OPERATIONAL_PREFIXES = (
+    ("EXPORTED_GEOMETRIES",),
     (".DATA", "CACHE"),
     (".DATA", "SCRATCH"),
     (".DATA", "SCRATCH_CLEANUP"),

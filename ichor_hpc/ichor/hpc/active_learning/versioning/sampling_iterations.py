@@ -5,8 +5,8 @@ from __future__ import annotations
 import hashlib
 from ..strict_json import strict_json as json
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
+from pathlib import Path, PurePosixPath
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 from ..daemon.state import atomic_write_json
 from ..handoff_manifests import (
@@ -229,6 +229,195 @@ def _verify_inventory(root: Path, payload: Mapping[str, Any], manifest_name: str
         "directories": actual_directories,
     }):
         raise SamplingIterationError("sampling iteration inventory SHA mismatch")
+
+
+def _authority_inventory(payload: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Validate the declared inventory without inspecting its payload tree."""
+    raw_files = payload.get("files")
+    raw_directories = payload.get("directories")
+    if not isinstance(raw_files, list) or not isinstance(raw_directories, list):
+        raise SamplingIterationError("sampling manifest inventory is invalid")
+    if str(payload.get("inventory_sha256") or "") != _canonical_sha256(
+        {"files": raw_files, "directories": raw_directories}
+    ):
+        raise SamplingIterationError("sampling iteration inventory SHA mismatch")
+
+    files: Dict[str, Dict[str, Any]] = {}
+    for raw in raw_files:
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "path",
+            "size",
+            "sha256",
+            "role",
+        }:
+            raise SamplingIterationError("sampling manifest file record is invalid")
+        relative = str(raw.get("path") or "")
+        path = PurePosixPath(relative)
+        if (
+            not relative
+            or path.is_absolute()
+            or "\\" in relative
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or relative in files
+        ):
+            raise SamplingIterationError("sampling manifest file path is invalid")
+        size = raw.get("size")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise SamplingIterationError("sampling manifest file size is invalid")
+        digest = str(raw.get("sha256") or "")
+        if len(digest) != 64 or any(
+            character not in "0123456789abcdef" for character in digest
+        ):
+            raise SamplingIterationError("sampling manifest file SHA-256 is invalid")
+        role = str(raw.get("role") or "")
+        if role not in {"authoritative", "derived_cache"}:
+            raise SamplingIterationError("sampling manifest file role is invalid")
+        files[relative] = dict(raw)
+
+    directories = []
+    for raw in raw_directories:
+        if not isinstance(raw, str):
+            raise SamplingIterationError("sampling manifest directory is invalid")
+        path = PurePosixPath(raw)
+        if (
+            not raw
+            or path.is_absolute()
+            or "\\" in raw
+            or any(part in {"", ".", ".."} for part in path.parts)
+        ):
+            raise SamplingIterationError("sampling manifest directory path is invalid")
+        directories.append(raw)
+    if len(directories) != len(set(directories)):
+        raise SamplingIterationError("sampling manifest directories are not unique")
+    return files
+
+
+def sampling_manifest_file_binding(
+    payload: Mapping[str, Any],
+    relative_path: str,
+) -> Dict[str, Any]:
+    """Return one validated file binding from a sampling authority manifest."""
+    files = _authority_inventory(payload)
+    binding = files.get(str(relative_path))
+    if binding is None:
+        raise SamplingIterationError(
+            "sampling manifest does not bind required artefact: "
+            + str(relative_path)
+        )
+    return dict(binding)
+
+
+def _authority_head_binding(reference: Any, models: Any) -> Dict[str, Any]:
+    if int(reference.version) != int(models.version):
+        raise SamplingIterationError("reference-data/model version mismatch")
+    if str(reference.campaign_uid) != str(models.campaign_uid):
+        raise SamplingIterationError("reference-data/model campaign UID mismatch")
+    if int(models.reference_data_version) != int(reference.version):
+        raise SamplingIterationError("model/reference-data version binding mismatch")
+    if str(models.reference_data_view_sha256) != str(
+        reference.cumulative_view_sha256
+    ):
+        raise SamplingIterationError("model/reference-data view binding mismatch")
+    return {
+        "version": int(reference.version),
+        "reference_data": {
+            "head_manifest_sha256": str(reference.head_manifest_sha256),
+            "cumulative_view_sha256": str(reference.cumulative_view_sha256),
+            "point_count": int(len(reference.entries)),
+        },
+        "trained_models": {
+            "head_manifest_sha256": str(models.head_manifest_sha256),
+            "model_set_sha256": str(models.model_set_sha256),
+            "reference_data_view_sha256": str(
+                models.reference_data_view_sha256
+            ),
+        },
+    }
+
+
+def resolve_sampling_iteration_authority_chain(
+    campaign_dir: Path,
+    through_iteration: int,
+    *,
+    expected_campaign_uid: Optional[str] = None,
+    reference_views: Optional[Sequence[Any]] = None,
+    model_sets: Optional[Sequence[Any]] = None,
+) -> Tuple[Dict[str, Any], ...]:
+    """Validate finalisation authority linearly without walking iteration trees."""
+    campaign = Path(campaign_dir)
+    target = int(through_iteration)
+    if target < 0:
+        raise SamplingIterationError("sampling authority target must be >= 0")
+    if reference_views is None:
+        from .reference_data import resolve_reference_data_chain
+
+        reference_views = resolve_reference_data_chain(
+            campaign,
+            target,
+            verification="authority",
+        )
+    if model_sets is None:
+        from .trained_models import resolve_trained_model_chain
+
+        model_sets = resolve_trained_model_chain(
+            campaign,
+            target,
+            verification="authority",
+            reference_views=reference_views,
+        )
+    references = {int(view.version): view for view in reference_views}
+    models = {int(model.version): model for model in model_sets}
+    expected_versions = set(range(target + 1))
+    if expected_versions - set(references) or expected_versions - set(models):
+        raise SamplingIterationError("sampling authority heads are incomplete")
+
+    bootstrap_path = bootstrap_manifest_path(campaign)
+    bootstrap = _read_manifest(bootstrap_path, kind="bootstrap", iteration=0)
+    campaign_uid = str(bootstrap.get("campaign_uid") or "")
+    if expected_campaign_uid is not None and campaign_uid != str(
+        expected_campaign_uid
+    ):
+        raise SamplingIterationError("bootstrap campaign UID mismatch")
+    _authority_inventory(bootstrap)
+    if bootstrap.get("parent") is not None or bootstrap.get("input_head") is not None:
+        raise SamplingIterationError("bootstrap sampling authority has a parent")
+    if bootstrap.get("output_head") != _authority_head_binding(
+        references[0], models[0]
+    ):
+        raise SamplingIterationError("bootstrap output-head binding mismatch")
+
+    resolved = [bootstrap]
+    previous_path = bootstrap_path
+    for iteration in range(1, target + 1):
+        path = active_iteration_manifest_path(campaign, iteration)
+        payload = _read_manifest(
+            path,
+            kind="active_iteration",
+            iteration=iteration,
+        )
+        if str(payload.get("campaign_uid") or "") != campaign_uid:
+            raise SamplingIterationError("active iteration campaign UID mismatch")
+        _authority_inventory(payload)
+        if payload.get("input_head") != _authority_head_binding(
+            references[iteration - 1], models[iteration - 1]
+        ):
+            raise SamplingIterationError("active iteration input-head binding mismatch")
+        if payload.get("output_head") != _authority_head_binding(
+            references[iteration], models[iteration]
+        ):
+            raise SamplingIterationError("active iteration output-head binding mismatch")
+        parent = payload.get("parent")
+        expected_parent = previous_path.resolve().relative_to(
+            campaign.resolve()
+        ).as_posix()
+        if not isinstance(parent, Mapping) or parent != {
+            "path": expected_parent,
+            "sha256": sha256_file(previous_path),
+        }:
+            raise SamplingIterationError("active iteration parent binding mismatch")
+        resolved.append(payload)
+        previous_path = path
+    return tuple(resolved)
 
 
 def _read_manifest(path: Path, *, kind: str, iteration: int) -> Dict[str, Any]:
@@ -508,6 +697,8 @@ __all__ = [
     "finalise_bootstrap",
     "verify_bootstrap",
     "finalise_active_iteration",
+    "resolve_sampling_iteration_authority_chain",
+    "sampling_manifest_file_binding",
     "verify_active_iteration",
     "verify_sampling_chain",
 ]

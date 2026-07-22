@@ -209,6 +209,7 @@ def test_additive_output_flags_parse_without_changing_default_commands():
         "import-pool",
         "preflight",
         "resource-plan",
+        "export-batch-geometries",
         "checkpoint",
         "checkpoint-status",
         "verify-checkpoint",
@@ -218,6 +219,9 @@ def test_additive_output_flags_parse_without_changing_default_commands():
     assert parser.parse_args(["init", "--verbose"]).verbose is True
     assert parser.parse_args(["stop", "--verbose"]).verbose is True
     assert parser.parse_args(["resource-plan", "--verbose"]).verbose is True
+    assert parser.parse_args(
+        ["export-batch-geometries", "--iteration", "all"]
+    ).iteration == "all"
     assert parser.parse_args(["config-check", "--human"]).human is True
     assert parser.parse_args(["config-check", "--json"]).json is True
     with pytest.raises(SystemExit):

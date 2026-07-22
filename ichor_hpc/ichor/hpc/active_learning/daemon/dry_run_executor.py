@@ -3025,6 +3025,32 @@ class DryRunPhaseExecutor:
                 "dry-run staged quantum task count does not match allocation"
             )
         pointdirs = [staging_root / name for name in point_names]
+        if not initial:
+            from ..versioning.provenance import read_provenance
+
+            attempts_by_candidate = {
+                str(attempt["candidate_id"]): attempt for attempt in attempts
+            }
+            ordered_attempts = []
+            for point_dir in pointdirs:
+                provenance = read_provenance(point_dir)
+                phase_b = provenance.get("phase_b")
+                candidate_id = (
+                    str(phase_b.get("candidate_id") or "")
+                    if isinstance(phase_b, dict)
+                    else ""
+                )
+                attempt = attempts_by_candidate.pop(candidate_id, None)
+                if attempt is None:
+                    raise BackendSubmissionError(
+                        "dry-run staged point provenance does not match allocation"
+                    )
+                ordered_attempts.append(attempt)
+            if attempts_by_candidate:
+                raise BackendSubmissionError(
+                    "dry-run allocation contains unstaged candidates"
+                )
+            attempts = ordered_attempts
         for i, (attempt, point_dir) in enumerate(zip(attempts, pointdirs)):
             provenance_source = Path(str(attempt.get("provenance_json") or ""))
             provenance_dest = point_dir / PROVENANCE_FILENAME

@@ -10,6 +10,8 @@ Console entry point 'ichor-al-daemon' registered in
     reconcile  Inspect on-disk artefacts and propose a recovered state.
     journal    Tail or filter the campaign journal.
     init       Bootstrap campaign.yaml, daemon state, config lock, and pool.
+    export-batch-geometries
+               Export accepted active-iteration seed/final geometry pairs.
 
 Commands that operate on a campaign accept '--campaign-dir DIR'. When it is
 omitted, the CLI uses the current working directory if it contains
@@ -13461,6 +13463,55 @@ def cmd_resource_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export_batch_geometries(args: argparse.Namespace) -> int:
+    """Export accepted active-iteration seed and committed QM geometries."""
+    from .batch_geometry_export import export_batch_geometries
+
+    try:
+        campaign = resolve_campaign_dir(getattr(args, "campaign_dir", None))
+        summary = export_batch_geometries(
+            campaign,
+            getattr(args, "iteration"),
+            output_dir=getattr(args, "output_dir", None),
+        )
+    except (
+        FileExistsError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        print("Batch geometries were not exported: " + str(exc), file=sys.stderr)
+        return 2
+
+    if len(summary.iterations) == 1:
+        iteration_text = str(summary.iterations[0])
+    else:
+        iteration_text = (
+            str(summary.iterations[0])
+            + "-"
+            + str(summary.iterations[-1])
+            + " ("
+            + str(len(summary.iterations))
+            + " iterations)"
+        )
+    print("Exported batch geometries")
+    print("  output: " + str(summary.output_path))
+    print("  iterations: " + iteration_text)
+    print("  training files: " + str(summary.training_count))
+    print(
+        "  internal-validation files: "
+        + str(summary.internal_validation_count)
+    )
+    print("  total XYZ files: " + str(summary.total_count))
+    print(
+        "  maximum coordinate discrepancy: "
+        + format(summary.maximum_coordinate_discrepancy_angstrom, ".12g")
+        + " A"
+    )
+    return 0
+
+
 def _checkpoint_destination(
     config: CampaignConfig,
     override: Optional[str],
@@ -13671,6 +13722,23 @@ def _nonnegative_cli_int(value: str) -> int:
     return parsed
 
 
+def _export_iteration_cli(value: str) -> Union[int, str]:
+    text = str(value).strip().lower()
+    if text == "all":
+        return "all"
+    try:
+        parsed = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "expected a positive iteration number or 'all'"
+        ) from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(
+            "expected a positive iteration number or 'all'"
+        )
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     examples = """\
 Campaign directory:
@@ -13684,6 +13752,7 @@ Examples:
   ichor-al-daemon start --mode live
   ichor-al-daemon start --mode live --background
   ichor-al-daemon journal -e phase_submitted
+  ichor-al-daemon export-batch-geometries --iteration 8
 
   ichor-al-daemon start -c ~/campaigns/water_001 --mode live
 """
@@ -14268,6 +14337,35 @@ Examples:
         help="Show formulae, evidence hashes, profile limits and telemetry details.",
     )
     p_resource.set_defaults(func=cmd_resource_plan)
+
+    p_export = sub.add_parser(
+        "export-batch-geometries",
+        help="Export accepted active-iteration seed/final geometry pairs.",
+        description=(
+            "Validate one completed active-learning model batch and export one "
+            "two-frame XYZ file per accepted training or internal-validation "
+            "slot. Use --iteration all to export every completed active iteration."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_campaign(p_export)
+    p_export.add_argument(
+        "--iteration",
+        required=True,
+        type=_export_iteration_cli,
+        metavar="N|all",
+        help="Completed active iteration number, or 'all'. Iteration 0 is not exportable.",
+    )
+    p_export.add_argument(
+        "--output-dir",
+        default=None,
+        help=(
+            "Exact output directory. It must not already exist. Without this "
+            "option, publish under EXPORTED_GEOMETRIES and atomically replace "
+            "an earlier export of the same iteration selection."
+        ),
+    )
+    p_export.set_defaults(func=cmd_export_batch_geometries)
 
     p_checkpoint = sub.add_parser(
         "checkpoint",

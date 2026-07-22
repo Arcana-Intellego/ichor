@@ -261,6 +261,24 @@ def _load(path: Path) -> Dict[str, Any]:
         ) from exc
 
 
+def read_split_assignments(campaign_dir: Path) -> Dict[str, Any]:
+    """Read and validate the complete split history without acquiring its lock."""
+    campaign = Path(campaign_dir)
+    path = ledger_path(campaign)
+    if path.is_symlink() or not path.is_file():
+        raise FileNotFoundError("FEREBUS split ledger is missing: " + str(path))
+    payload = _load(path)
+    _verify_reference_manifest_bindings(campaign, payload)
+    return payload
+
+
+def validate_split_assignments_payload(
+    payload: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Validate an immutable split-ledger snapshot without writing it."""
+    return _validate_payload(payload)
+
+
 def _verify_reference_manifest_bindings(
     campaign: Path,
     payload: Mapping[str, Any],
@@ -688,5 +706,7 @@ __all__ = [
     "FEREBUS_SPLIT_LEDGER_FILENAME",
     "FEREBUS_SPLIT_LEDGER_SCHEMA_VERSION",
     "ledger_path",
+    "read_split_assignments",
+    "validate_split_assignments_payload",
     "ensure_split_assignments",
 ]
