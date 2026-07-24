@@ -218,6 +218,16 @@ def aligned_mass_weighted_rmsd(reference: Atoms, mobile: Atoms) -> float:
     return float(np.sqrt(max(0.0, weighted_sq / denom)))
 
 
+def aligned_per_atom_displacements(reference: Atoms, mobile: Atoms) -> np.ndarray:
+    """Return per-atom Euclidean displacements after mass-weighted alignment."""
+    _validate_compatible_geometries(reference, mobile)
+    ref = atoms_to_coordinates(reference)
+    mob = atoms_to_coordinates(mobile)
+    masses = np.asarray(reference.masses, dtype=float)
+    aligned = kabsch_align(ref, mob, weights=masses)
+    return np.linalg.norm(aligned - ref, axis=1)
+
+
 
 def aligned_mass_weighted_displacement(reference: Atoms, mobile: Atoms) -> np.ndarray:
     _validate_compatible_geometries(reference, mobile)

@@ -19,7 +19,8 @@ from .geometry_protocol import FULLSPACE_RMSD_SCALE_MULTIPLIER
 
 
 SAMPLING_SCALE_MODEL_SCHEMA_VERSION = 2
-SAMPLING_SCALE_MODEL_MODEL_VERSION = 3
+SAMPLING_SCALE_MODEL_MODEL_VERSION = 4
+LEGACY_SAMPLING_SCALE_MODEL_MODEL_VERSION = 3
 SAMPLING_SCALE_MODEL_FILENAME = "SAMPLING_SCALE_MODEL.json"
 
 
@@ -236,15 +237,72 @@ def _per_atom_displacements(result: Dict[str, Any]) -> List[float]:
     final = _coords(result, "final_coordinates")
     if start is None or final is None or len(start) != len(final):
         return []
-    out: List[float] = []
-    for a, b in zip(start, final):
-        dx = float(b[0]) - float(a[0])
-        dy = float(b[1]) - float(a[1])
-        dz = float(b[2]) - float(a[2])
-        d = math.sqrt(dx * dx + dy * dy + dz * dz)
-        if math.isfinite(d):
-            out.append(float(d))
-    return out
+    atom_types = result.get("atom_types")
+    if (
+        not isinstance(atom_types, list)
+        or len(atom_types) != len(start)
+        or any(not isinstance(symbol, str) or not symbol for symbol in atom_types)
+    ):
+        return []
+    try:
+        from ichor.core.adversarial.geometry import aligned_per_atom_displacements
+        from ichor.core.atoms import Atom, Atoms
+
+        reference = Atoms(
+            [
+                Atom(str(symbol), float(coords[0]), float(coords[1]), float(coords[2]))
+                for symbol, coords in zip(atom_types, start)
+            ]
+        )
+        mobile = Atoms(
+            [
+                Atom(str(symbol), float(coords[0]), float(coords[1]), float(coords[2]))
+                for symbol, coords in zip(atom_types, final)
+            ]
+        )
+        displacements = aligned_per_atom_displacements(reference, mobile)
+    except Exception:
+        return []
+    return [
+        float(value)
+        for value in displacements
+        if _finite_nonnegative(value) is not None
+    ]
+
+
+def _history_policy_context(iter_dir: Path) -> Tuple[Optional[Dict[str, Any]], str]:
+    from .sampling_protocol import (
+        sampling_policy_history_context,
+        sampling_protocol_resolved_path,
+    )
+
+    path = sampling_protocol_resolved_path(iter_dir)
+    if not path.exists() and not path.is_symlink():
+        return (
+            {
+                "policy_version": 0,
+                "level": None,
+                "table_sha256": None,
+                "normalisation_factor": 1.0,
+                "source": "legacy_missing_protocol_neutral",
+            },
+            "missing",
+        )
+    if path.is_symlink() or not path.is_file():
+        return None, "invalid"
+    payload = _json(path)
+    if not isinstance(payload, dict):
+        return None, "invalid"
+    try:
+        expected_iteration = int(iter_dir.name.split("-")[-1])
+        if int(payload.get("iteration", -1)) != expected_iteration:
+            return None, "invalid"
+        context = sampling_policy_history_context(payload)
+    except (TypeError, ValueError):
+        return None, "invalid"
+    context = dict(context)
+    context["source"] = "resolved_sampling_protocol"
+    return context, "resolved"
 
 
 def _collect_history(
@@ -252,8 +310,10 @@ def _collect_history(
     iteration: int,
     *,
     window: int,
+    normalise_history: bool,
 ) -> Dict[str, Any]:
     movement_values: List[float] = []
+    fallback_movement_values: List[float] = []
     rmsd_values: List[float] = []
     residual_values: List[float] = []
     max_atom_displacements: List[float] = []
@@ -276,43 +336,124 @@ def _collect_history(
         "n_deduplicated_fallback_records": 0,
         "n_fallback_results_records_used": 0,
     }
+    policy_diagnostics = {
+        "n_iterations_with_resolved_policy": 0,
+        "n_iterations_with_missing_policy": 0,
+        "n_iterations_with_invalid_policy": 0,
+        "n_records_skipped_invalid_policy": 0,
+        "n_primary_movement_values": 0,
+        "n_fallback_movement_values": 0,
+        "n_fallback_movement_values_used": 0,
+        "normalisation_applied": bool(normalise_history),
+        "iterations": [],
+    }
     from .layout import active_iteration_dir
 
     start = max(1, int(iteration) - int(window))
-    accepted_history: List[Tuple[Path, Dict[str, Any], str]] = []
     if int(iteration) > 0 and int(window) > 0:
         for previous in range(start, int(iteration)):
             iter_dir = active_iteration_dir(campaign_dir, previous)
             if not iter_dir.exists():
                 continue
             records, counts = _accepted_history_records_for_iteration(iter_dir)
-            accepted_history.extend(records)
             for key in history_filter:
                 history_filter[key] += int(counts.get(key, 0))
-    for iter_dir, record, _source in accepted_history:
-        n_records += 1
-        metrics = _record_metrics(record)
-        for key, dest in (
-            ("movement_rmsd_ang", movement_values),
-            ("aligned_mass_weighted_rmsd_ang", movement_values),
-            ("aligned_rmsd_ang", rmsd_values),
-            ("fullspace_residual_distance", residual_values),
-            ("max_displacement_ang", max_atom_displacements),
-            ("min_pair_distance_ang", min_pair_distances),
-        ):
-            value = _finite_positive(metrics.get(key))
-            if value is not None:
-                dest.append(float(value))
-        result_path = _result_path(iter_dir, record)
-        if result_path is None or not result_path.is_file():
-            continue
-        result = _json(result_path)
-        if not isinstance(result, dict):
-            continue
-        n_result_json += 1
-        for index, displacement in enumerate(_per_atom_displacements(result)):
-            if _finite_nonnegative(displacement) is not None:
-                per_atom_by_index.setdefault(int(index), []).append(float(displacement))
+            if not records:
+                continue
+            context: Dict[str, Any] = {
+                "policy_version": 0,
+                "level": None,
+                "normalisation_factor": 1.0,
+                "source": "normalisation_disabled",
+            }
+            context_status = "disabled"
+            if normalise_history:
+                loaded_context, context_status = _history_policy_context(iter_dir)
+                if loaded_context is None:
+                    policy_diagnostics["n_iterations_with_invalid_policy"] += 1
+                    policy_diagnostics["n_records_skipped_invalid_policy"] += len(
+                        records
+                    )
+                    policy_diagnostics["iterations"].append(
+                        {
+                            "iteration": int(previous),
+                            "status": "invalid",
+                            "n_records": int(len(records)),
+                        }
+                    )
+                    continue
+                context = loaded_context
+                if context_status == "missing":
+                    policy_diagnostics["n_iterations_with_missing_policy"] += 1
+                else:
+                    policy_diagnostics["n_iterations_with_resolved_policy"] += 1
+            factor = _finite_positive(context.get("normalisation_factor")) or 1.0
+            policy_diagnostics["iterations"].append(
+                {
+                    "iteration": int(previous),
+                    "status": context_status,
+                    "policy_version": int(context.get("policy_version") or 0),
+                    "sampling_aggressiveness": context.get("level"),
+                    "normalisation_factor": float(factor),
+                    "n_records": int(len(records)),
+                }
+            )
+            for _record_dir, record, _source in records:
+                n_records += 1
+                metrics = _record_metrics(record)
+                primary_movement = _finite_positive(
+                    metrics.get("movement_rmsd_ang")
+                )
+                fallback_movement = _finite_positive(
+                    metrics.get("aligned_mass_weighted_rmsd_ang")
+                )
+                if normalise_history:
+                    if primary_movement is not None:
+                        movement_values.append(float(primary_movement) / factor)
+                        policy_diagnostics["n_primary_movement_values"] += 1
+                    elif fallback_movement is not None:
+                        fallback_movement_values.append(
+                            float(fallback_movement) / factor
+                        )
+                        policy_diagnostics["n_fallback_movement_values"] += 1
+                else:
+                    for value in (primary_movement, fallback_movement):
+                        if value is not None:
+                            movement_values.append(float(value))
+                for key, dest in (
+                    ("aligned_rmsd_ang", rmsd_values),
+                    ("fullspace_residual_distance", residual_values),
+                    ("max_displacement_ang", max_atom_displacements),
+                    ("min_pair_distance_ang", min_pair_distances),
+                ):
+                    value = _finite_positive(metrics.get(key))
+                    if value is not None:
+                        dest.append(float(value))
+                result_path = _result_path(iter_dir, record)
+                if result_path is None or not result_path.is_file():
+                    continue
+                result = _json(result_path)
+                if not isinstance(result, dict):
+                    continue
+                n_result_json += 1
+                for index, displacement in enumerate(
+                    _per_atom_displacements(result)
+                ):
+                    value = _finite_nonnegative(displacement)
+                    if value is not None:
+                        per_atom_by_index.setdefault(int(index), []).append(
+                            float(value) / factor
+                            if normalise_history
+                            else float(value)
+                        )
+    movement_metric = "movement_rmsd_ang"
+    if normalise_history and not movement_values and fallback_movement_values:
+        movement_values = fallback_movement_values
+        movement_metric = "aligned_mass_weighted_rmsd_ang_fallback"
+        policy_diagnostics["n_fallback_movement_values_used"] = len(
+            fallback_movement_values
+        )
+    policy_diagnostics["movement_metric"] = movement_metric
     return {
         "n_records": int(n_records),
         "n_result_json": int(n_result_json),
@@ -323,6 +464,7 @@ def _collect_history(
         "min_pair_distances": min_pair_distances,
         "per_atom_by_index": per_atom_by_index,
         "history_filter": history_filter,
+        "policy_diagnostics": policy_diagnostics,
     }
 
 
@@ -403,8 +545,20 @@ def build_sampling_scale_model(
     *,
     geometry_scale_payload: Optional[Dict[str, Any]] = None,
     write_manifest: bool = True,
+    model_version: int = SAMPLING_SCALE_MODEL_MODEL_VERSION,
+    normalise_history: bool = True,
 ) -> Dict[str, Any]:
     """Build the daemon-owned scale model for one active-learning iteration."""
+    if int(model_version) not in {
+        LEGACY_SAMPLING_SCALE_MODEL_MODEL_VERSION,
+        SAMPLING_SCALE_MODEL_MODEL_VERSION,
+    }:
+        raise ValueError("unsupported sampling scale model version")
+    if (
+        int(model_version) == LEGACY_SAMPLING_SCALE_MODEL_MODEL_VERSION
+        and normalise_history
+    ):
+        raise ValueError("legacy sampling scale model cannot normalise history")
     campaign = Path(campaign_dir)
     from .layout import active_iteration_dir
 
@@ -420,12 +574,34 @@ def build_sampling_scale_model(
         getattr(getattr(config, "geometry_novelty", None), "history_window_iterations", 5)
         or 5
     )
-    history = _collect_history(campaign, int(iteration), window=window)
+    history = _collect_history(
+        campaign,
+        int(iteration),
+        window=window,
+        normalise_history=bool(normalise_history),
+    )
     movement_median = _percentile(history["movement_values"], 0.50)
     if movement_median is not None:
         geometry_value = movement_median
-        geometry_source = "ariadne_landing_history"
+        geometry_source = (
+            "normalised_ariadne_landing_history"
+            if normalise_history
+            else "ariadne_landing_history"
+        )
         geometry_n = len(history["movement_values"])
+    elif (
+        normalise_history
+        and int(
+            history["policy_diagnostics"].get(
+                "n_records_skipped_invalid_policy",
+                0,
+            )
+        )
+        > 0
+    ):
+        geometry_value = None
+        geometry_source = "invalid_sampling_policy_history"
+        geometry_n = 0
 
     geometry_scale = _scale_entry(
         geometry_value,
@@ -469,7 +645,11 @@ def build_sampling_scale_model(
         per_atom_source = "uniform_geometry_motion_scale"
         per_atom_fallback = True
     else:
-        per_atom_source = "result_json_per_atom_displacement_history"
+        per_atom_source = (
+            "result_json_rigid_aligned_per_atom_displacement_history"
+            if normalise_history
+            else "result_json_per_atom_displacement_history"
+        )
         per_atom_fallback = False
 
     min_pair_floor = _finite_positive(
@@ -508,7 +688,7 @@ def build_sampling_scale_model(
 
     payload = {
         "schema_version": SAMPLING_SCALE_MODEL_SCHEMA_VERSION,
-        "model_version": SAMPLING_SCALE_MODEL_MODEL_VERSION,
+        "model_version": int(model_version),
         "iteration": int(iteration),
         "generated_at_iso": _now_iso(),
         "geometry_motion_scale": geometry_scale,
@@ -552,10 +732,23 @@ def build_sampling_scale_model(
             "n_records": int(history["n_records"]),
             "n_result_json": int(history["n_result_json"]),
             "movement_summary": _summary(history["movement_values"]),
+            "movement_metric": (
+                history["policy_diagnostics"].get("movement_metric")
+                if normalise_history
+                else "legacy_mixed_movement_metrics"
+            ),
             "aligned_rmsd_summary": _summary(history["rmsd_values"]),
             "residual_summary": _summary(history["residual_values"]),
             "max_atom_displacement_summary": _summary(history["max_atom_displacements"]),
             "filter": dict(history.get("history_filter") or {}),
+            "policy_normalisation": (
+                dict(history.get("policy_diagnostics") or {})
+                if normalise_history
+                else {
+                    "normalisation_applied": False,
+                    "movement_metric": "legacy_mixed_movement_metrics",
+                }
+            ),
         },
         "per_seed_scale_model": per_seed_scale_model,
         "diagnostics": {
@@ -564,6 +757,14 @@ def build_sampling_scale_model(
             "uses_only_existing_campaign_data": True,
             "fallback_warnings": fallback_warnings,
             "history_filter": dict(history.get("history_filter") or {}),
+            "history_policy_normalisation": (
+                dict(history.get("policy_diagnostics") or {})
+                if normalise_history
+                else {
+                    "normalisation_applied": False,
+                    "movement_metric": "legacy_mixed_movement_metrics",
+                }
+            ),
         },
     }
     if write_manifest:
@@ -584,6 +785,11 @@ def read_sampling_scale_model(
         raise ValueError("SAMPLING_SCALE_MODEL.json must contain an object")
     if int(payload.get("schema_version", -1)) != SAMPLING_SCALE_MODEL_SCHEMA_VERSION:
         raise ValueError("unsupported sampling scale model schema")
+    if int(payload.get("model_version", -1)) not in {
+        LEGACY_SAMPLING_SCALE_MODEL_MODEL_VERSION,
+        SAMPLING_SCALE_MODEL_MODEL_VERSION,
+    }:
+        raise ValueError("unsupported sampling scale model version")
     if expected_iteration is not None and int(payload.get("iteration", -1)) != int(expected_iteration):
         raise ValueError("sampling scale model iteration mismatch")
     return payload
@@ -600,6 +806,7 @@ def scale_model_value(payload: Optional[Dict[str, Any]], path: Sequence[str], de
 
 __all__ = [
     "SAMPLING_SCALE_MODEL_FILENAME",
+    "LEGACY_SAMPLING_SCALE_MODEL_MODEL_VERSION",
     "SAMPLING_SCALE_MODEL_MODEL_VERSION",
     "SAMPLING_SCALE_MODEL_SCHEMA_VERSION",
     "build_sampling_scale_model",

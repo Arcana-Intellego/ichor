@@ -180,7 +180,12 @@ than migrated implicitly. The source pool has the fixed campaign path
 ``pool.xyz``. ``ichor-al-daemon init --source /path/to/source.xyz`` copies an
 external source to that path before SHA-pinning it in daemon-owned metadata.
 ``sampling_aggressiveness`` is a dimensionless campaign control whose ARIADNE
-trust radius is normalised for molecular size.
+movement target and initial trust radius increase from conservative level 1 to
+stress-test level 10. Chemistry, overlap and absolute displacement safety limits
+do not relax with this setting. Sampling policy snapshots are versioned per
+iteration: an iteration that already has a resolved snapshot continues with
+that exact policy after an ICHOR update, while the next unresolved iteration
+uses the current policy.
 
 Custom bootstrap inputs
 ~~~~~~~~~~~~~~~~~~~~~~~

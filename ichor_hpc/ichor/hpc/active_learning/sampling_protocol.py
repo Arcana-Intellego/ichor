@@ -31,7 +31,8 @@ from .geometry_protocol import (
 
 SAMPLING_PROTOCOL_SCHEMA_VERSION = 2
 SAMPLING_PROTOCOL_AUDIT_SCHEMA_VERSION = 2
-SAMPLING_AGGRESSIVENESS_POLICY_VERSION = 1
+SAMPLING_AGGRESSIVENESS_POLICY_VERSION = 2
+LEGACY_SAMPLING_AGGRESSIVENESS_POLICY_VERSION = 1
 SAMPLING_PROTOCOL_RESOLVED_FILENAME = "SAMPLING_PROTOCOL_RESOLVED.json"
 SAMPLING_PROTOCOL_AUDIT_FILENAME = "SAMPLING_PROTOCOL_AUDIT.json"
 SAMPLING_PROTOCOL_CALIBRATION_FILENAME = "ERROR_CALIBRATION_MODEL.json"
@@ -39,6 +40,8 @@ SAMPLING_PROTOCOL_CALIBRATION_FILENAME = "ERROR_CALIBRATION_MODEL.json"
 
 @dataclass(frozen=True)
 class SamplingAggressivenessPolicy:
+    """Frozen sampling-aggressiveness policy v1."""
+
     fallback_scale_angstrom: float
     phase_b_min_separation_scale: float
     movement_trust_multiplier: float
@@ -57,6 +60,37 @@ class SamplingAggressivenessPolicy:
     bond_ratio_upper: float = 1.35
     angle_ratio_lower: float = 0.65
     angle_ratio_upper: float = 1.45
+
+
+@dataclass(frozen=True)
+class SamplingAggressivenessPolicyV2:
+    """Sampling policy with independent movement and optimiser controls."""
+
+    fallback_scale_angstrom: float
+    phase_b_min_separation_scale: float
+    target_motion_ratio: float
+    initial_trust_multiplier: float
+    trust_max_to_initial_ratio: float
+    lambda_distance: float
+    lambda_residual: float
+    lambda_rmsd: float
+    max_whitened_distance: float
+    max_atom_displacement_ang: float
+    min_pair_distance_ang: float
+    max_scaled_atom_move: float
+    max_scaled_rmsd: float
+    max_scaled_fullspace_residual: float
+    normalised_chemistry_penalty_cap: float
+    bond_ratio_lower: float = 0.70
+    bond_ratio_upper: float = 1.35
+    angle_ratio_lower: float = 0.65
+    angle_ratio_upper: float = 1.45
+
+
+SamplingPolicy = Union[
+    SamplingAggressivenessPolicy,
+    SamplingAggressivenessPolicyV2,
+]
 
 
 @dataclass
@@ -81,7 +115,7 @@ class ResolvedAdversarialSafety:
     phase_b_filter_enabled: bool = True
 
 
-_POLICIES: Dict[int, SamplingAggressivenessPolicy] = {
+_POLICIES_V1: Dict[int, SamplingAggressivenessPolicy] = {
     1: SamplingAggressivenessPolicy(0.020, 0.70, 0.65, 5.000, 2.00, 1.00, 0.50, 4.0, 0.70, 0.65, 20.0, 2.5, 4.0, 10.0),
     2: SamplingAggressivenessPolicy(0.025, 0.65, 0.75, 5.000, 1.70, 0.85, 0.42, 5.0, 0.80, 0.65, 24.0, 3.0, 4.8, 12.0),
     3: SamplingAggressivenessPolicy(0.030, 0.60, 0.85, 5.000, 1.45, 0.70, 0.35, 6.0, 0.90, 0.65, 28.0, 3.4, 5.5, 14.0),
@@ -92,6 +126,49 @@ _POLICIES: Dict[int, SamplingAggressivenessPolicy] = {
     8: SamplingAggressivenessPolicy(0.090, 0.44, 1.23, 3.438, 0.70, 0.35, 0.18, 13.0, 1.60, 0.60, 48.0, 6.0, 9.4, 26.0),
     9: SamplingAggressivenessPolicy(0.110, 0.42, 1.32, 3.333, 0.60, 0.30, 0.16, 14.0, 1.70, 0.60, 52.0, 6.6, 10.2, 28.0),
     10: SamplingAggressivenessPolicy(0.130, 0.40, 1.40, 3.250, 0.50, 0.25, 0.14, 15.0, 1.80, 0.60, 56.0, 7.2, 11.0, 30.0),
+}
+
+
+def _v2_policy(
+    target_motion_ratio: float,
+    initial_trust_multiplier: float,
+    lambda_distance: float,
+) -> SamplingAggressivenessPolicyV2:
+    return SamplingAggressivenessPolicyV2(
+        fallback_scale_angstrom=0.05,
+        phase_b_min_separation_scale=0.50,
+        target_motion_ratio=float(target_motion_ratio),
+        initial_trust_multiplier=float(initial_trust_multiplier),
+        trust_max_to_initial_ratio=4.0,
+        lambda_distance=float(lambda_distance),
+        lambda_residual=0.50 * float(lambda_distance),
+        lambda_rmsd=0.25 * float(lambda_distance),
+        max_whitened_distance=10.0,
+        max_atom_displacement_ang=1.25,
+        min_pair_distance_ang=0.60,
+        max_scaled_atom_move=36.0,
+        max_scaled_rmsd=4.2,
+        max_scaled_fullspace_residual=7.0,
+        normalised_chemistry_penalty_cap=20.0,
+    )
+
+
+_POLICIES_V2: Dict[int, SamplingAggressivenessPolicyV2] = {
+    1: _v2_policy(0.35, 0.60, 2.00),
+    2: _v2_policy(0.45, 0.70, 1.68),
+    3: _v2_policy(0.58, 0.82, 1.41),
+    4: _v2_policy(0.75, 0.91, 1.19),
+    5: _v2_policy(1.00, 1.00, 1.00),
+    6: _v2_policy(1.25, 1.15, 0.84),
+    7: _v2_policy(1.55, 1.32, 0.71),
+    8: _v2_policy(1.90, 1.52, 0.60),
+    9: _v2_policy(2.30, 1.75, 0.50),
+    10: _v2_policy(2.75, 2.00, 0.42),
+}
+
+_POLICY_TABLES: Dict[int, Dict[int, SamplingPolicy]] = {
+    LEGACY_SAMPLING_AGGRESSIVENESS_POLICY_VERSION: _POLICIES_V1,
+    SAMPLING_AGGRESSIVENESS_POLICY_VERSION: _POLICIES_V2,
 }
 
 
@@ -106,7 +183,9 @@ class ResolvedSamplingProtocol:
     schema_version: int
     iteration: int
     sampling_aggressiveness: int
-    policy: SamplingAggressivenessPolicy
+    sampling_policy_version: int
+    sampling_policy_table_sha256: str
+    policy: SamplingPolicy
     effective_config: CampaignConfig
     geometry_scale_payload: Dict[str, Any]
     resolved_geometry_scale_angstrom: Optional[float]
@@ -143,16 +222,58 @@ def _iteration_dir(campaign_dir: Union[str, Path], iteration: int) -> Path:
     return active_iteration_dir(campaign_dir, int(iteration))
 
 
-def _policy_for(config: CampaignConfig) -> SamplingAggressivenessPolicy:
-    level = int(config.campaign.sampling_aggressiveness)
+def _policy_table(policy_version: int) -> Dict[int, SamplingPolicy]:
     try:
-        policy = _POLICIES[level]
+        return _POLICY_TABLES[int(policy_version)]
+    except KeyError as exc:
+        raise ValueError(
+            "unsupported sampling-aggressiveness policy version: "
+            + str(policy_version)
+        ) from exc
+
+
+def _policy_for_level(level: int, policy_version: int) -> SamplingPolicy:
+    try:
+        policy = _policy_table(policy_version)[int(level)]
     except KeyError as exc:
         raise ValueError("campaign.sampling_aggressiveness must be in [1, 10]") from exc
     return policy
 
 
-def dimensionless_policy_payload(policy: SamplingAggressivenessPolicy) -> Dict[str, Any]:
+def _policy_for(
+    config: CampaignConfig,
+    policy_version: int = SAMPLING_AGGRESSIVENESS_POLICY_VERSION,
+) -> SamplingPolicy:
+    return _policy_for_level(
+        int(config.campaign.sampling_aggressiveness),
+        int(policy_version),
+    )
+
+
+def _policy_payload(policy: SamplingPolicy) -> Dict[str, Any]:
+    return asdict(policy)
+
+
+def _target_motion_ratio(policy: SamplingPolicy, policy_version: int) -> float:
+    if int(policy_version) == LEGACY_SAMPLING_AGGRESSIVENESS_POLICY_VERSION:
+        return float(policy.movement_trust_multiplier)
+    if isinstance(policy, SamplingAggressivenessPolicyV2):
+        return float(policy.target_motion_ratio)
+    raise ValueError("sampling policy type does not match policy version")
+
+
+def _initial_trust_multiplier(
+    policy: SamplingPolicy,
+    policy_version: int,
+) -> float:
+    if int(policy_version) == LEGACY_SAMPLING_AGGRESSIVENESS_POLICY_VERSION:
+        return float(policy.movement_trust_multiplier)
+    if isinstance(policy, SamplingAggressivenessPolicyV2):
+        return float(policy.initial_trust_multiplier)
+    raise ValueError("sampling policy type does not match policy version")
+
+
+def dimensionless_policy_payload(policy: SamplingPolicy) -> Dict[str, Any]:
     """Return the safety caps resolved by one immutable policy entry."""
     return {
         "max_scaled_atom_move": float(policy.max_scaled_atom_move),
@@ -209,7 +330,7 @@ def hidden_sampling_overrides(config: CampaignConfig) -> List[Dict[str, Any]]:
 
 def _effective_campaign_config(
     config: CampaignConfig,
-    policy: SamplingAggressivenessPolicy,
+    policy: SamplingPolicy,
 ) -> CampaignConfig:
     effective = copy.deepcopy(config)
     effective.anti_overlap = AntiOverlapConfigBlock(
@@ -253,16 +374,40 @@ def _effective_campaign_config(
 
 def _apply_policy_to_acquisition_config(
     acquisition_config: Any,
-    policy: SamplingAggressivenessPolicy,
+    policy: SamplingPolicy,
+    policy_version: int,
 ) -> Any:
     movement = acquisition_config.movement_band
+    target_motion_ratio = _target_motion_ratio(policy, policy_version)
+    if int(policy_version) == LEGACY_SAMPLING_AGGRESSIVENESS_POLICY_VERSION:
+        hard_min_fraction = (
+            float(MOVEMENT_BAND_HARD_MIN_FRACTION) * target_motion_ratio
+        )
+        target_low_fraction = (
+            float(MOVEMENT_BAND_TARGET_LOW_FRACTION) * target_motion_ratio
+        )
+        target_peak_fraction = (
+            float(MOVEMENT_BAND_TARGET_PEAK_FRACTION) * target_motion_ratio
+        )
+        target_high_fraction = (
+            float(MOVEMENT_BAND_TARGET_HIGH_FRACTION) * target_motion_ratio
+        )
+        hard_max_fraction = (
+            float(MOVEMENT_BAND_HARD_MAX_FRACTION) * target_motion_ratio
+        )
+    else:
+        hard_min_fraction = 0.250 * target_motion_ratio
+        target_low_fraction = 0.625 * target_motion_ratio
+        target_peak_fraction = 1.000 * target_motion_ratio
+        target_high_fraction = 1.875 * target_motion_ratio
+        hard_max_fraction = 3.125 * target_motion_ratio
     scaled_movement = replace(
         movement,
-        hard_min_fraction=float(MOVEMENT_BAND_HARD_MIN_FRACTION) * float(policy.movement_trust_multiplier),
-        target_low_fraction=float(MOVEMENT_BAND_TARGET_LOW_FRACTION) * float(policy.movement_trust_multiplier),
-        target_peak_fraction=float(MOVEMENT_BAND_TARGET_PEAK_FRACTION) * float(policy.movement_trust_multiplier),
-        target_high_fraction=float(MOVEMENT_BAND_TARGET_HIGH_FRACTION) * float(policy.movement_trust_multiplier),
-        hard_max_fraction=float(MOVEMENT_BAND_HARD_MAX_FRACTION) * float(policy.movement_trust_multiplier),
+        hard_min_fraction=float(hard_min_fraction),
+        target_low_fraction=float(target_low_fraction),
+        target_peak_fraction=float(target_peak_fraction),
+        target_high_fraction=float(target_high_fraction),
+        hard_max_fraction=float(hard_max_fraction),
     )
     return replace(
         acquisition_config,
@@ -331,13 +476,18 @@ def _apply_scale_model_to_acquisition_config(
 
 def _attach_trust_radius_policy(
     scale_model_payload: Dict[str, Any],
-    policy: SamplingAggressivenessPolicy,
+    policy: SamplingPolicy,
+    policy_version: int,
 ) -> Dict[str, Any]:
     payload = dict(scale_model_payload)
     payload["trust_radius_policy"] = {
         "enabled": True,
         "normalisation": "weighted_mobility_sqrt_effective_atoms",
-        "aggressiveness_multiplier": float(policy.movement_trust_multiplier),
+        "aggressiveness_multiplier": _initial_trust_multiplier(
+            policy,
+            policy_version,
+        ),
+        "target_motion_ratio": _target_motion_ratio(policy, policy_version),
         "max_to_initial_ratio": float(policy.trust_max_to_initial_ratio),
         "under_move_feedback_min_factor": 1.0,
         "under_move_feedback_max_factor": 2.0,
@@ -366,25 +516,30 @@ def _canonical_sha(payload: Dict[str, Any]) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def sampling_policy_table_payload() -> Dict[str, Any]:
+def sampling_policy_table_payload(
+    policy_version: int = SAMPLING_AGGRESSIVENESS_POLICY_VERSION,
+) -> Dict[str, Any]:
+    version = int(policy_version)
     return {
-        "policy_version": SAMPLING_AGGRESSIVENESS_POLICY_VERSION,
+        "policy_version": version,
         "levels": {
-            str(level): asdict(policy)
-            for level, policy in sorted(_POLICIES.items())
+            str(level): _policy_payload(policy)
+            for level, policy in sorted(_policy_table(version).items())
         },
     }
 
 
-def sampling_policy_table_sha256() -> str:
-    return _canonical_sha(sampling_policy_table_payload())
+def sampling_policy_table_sha256(
+    policy_version: int = SAMPLING_AGGRESSIVENESS_POLICY_VERSION,
+) -> str:
+    return _canonical_sha(sampling_policy_table_payload(policy_version))
 
 
-def _validate_policy_table() -> None:
-    if set(_POLICIES) != set(range(1, 11)):
+def _validate_v1_policy_table() -> None:
+    if set(_POLICIES_V1) != set(range(1, 11)):
         raise RuntimeError("sampling-aggressiveness policy must define levels 1 to 10")
     previous: Optional[SamplingAggressivenessPolicy] = None
-    for level, policy in sorted(_POLICIES.items()):
+    for level, policy in sorted(_POLICIES_V1.items()):
         values = asdict(policy)
         for name, raw in values.items():
             value = float(raw)
@@ -412,11 +567,96 @@ def _validate_policy_table() -> None:
         previous = policy
 
 
-_validate_policy_table()
+def _validate_v2_policy_table() -> None:
+    if set(_POLICIES_V2) != set(range(1, 11)):
+        raise RuntimeError("sampling-aggressiveness policy must define levels 1 to 10")
+    previous: Optional[SamplingAggressivenessPolicyV2] = None
+    fixed_fields = (
+        "fallback_scale_angstrom",
+        "phase_b_min_separation_scale",
+        "trust_max_to_initial_ratio",
+        "max_whitened_distance",
+        "max_atom_displacement_ang",
+        "min_pair_distance_ang",
+        "max_scaled_atom_move",
+        "max_scaled_rmsd",
+        "max_scaled_fullspace_residual",
+        "normalised_chemistry_penalty_cap",
+        "bond_ratio_lower",
+        "bond_ratio_upper",
+        "angle_ratio_lower",
+        "angle_ratio_upper",
+    )
+    baseline = _POLICIES_V2[1]
+    for level, policy in sorted(_POLICIES_V2.items()):
+        for name, raw in asdict(policy).items():
+            value = float(raw)
+            if not math.isfinite(value) or value <= 0.0:
+                raise RuntimeError(
+                    "sampling policy level " + str(level) + " has invalid " + name
+                )
+        for name in fixed_fields:
+            if getattr(policy, name) != getattr(baseline, name):
+                raise RuntimeError("sampling policy safety controls must remain fixed")
+        if policy.lambda_residual != 0.50 * policy.lambda_distance:
+            raise RuntimeError("sampling policy residual penalty ratio is invalid")
+        if policy.lambda_rmsd != 0.25 * policy.lambda_distance:
+            raise RuntimeError("sampling policy RMSD penalty ratio is invalid")
+        if not (
+            policy.bond_ratio_lower < policy.bond_ratio_upper
+            and policy.angle_ratio_lower < policy.angle_ratio_upper
+        ):
+            raise RuntimeError("sampling policy chemistry ratios are unordered")
+        if previous is not None:
+            if policy.target_motion_ratio <= previous.target_motion_ratio:
+                raise RuntimeError("sampling policy target movement must increase")
+            if (
+                policy.initial_trust_multiplier
+                <= previous.initial_trust_multiplier
+            ):
+                raise RuntimeError("sampling policy initial trust must increase")
+            if policy.lambda_distance >= previous.lambda_distance:
+                raise RuntimeError("sampling policy confinement penalty must decrease")
+            previous_max = (
+                previous.initial_trust_multiplier
+                * previous.trust_max_to_initial_ratio
+            )
+            current_max = (
+                policy.initial_trust_multiplier
+                * policy.trust_max_to_initial_ratio
+            )
+            if current_max <= previous_max:
+                raise RuntimeError("sampling policy maximum trust must increase")
+        previous = policy
+
+
+_validate_v1_policy_table()
+_validate_v2_policy_table()
+
+
+def sampling_policy_history_context(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate persisted policy identity and return its history scale factor."""
+    try:
+        policy_version = int(payload["sampling_policy_version"])
+        level = int(payload["sampling_aggressiveness"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("sampling protocol policy identity is incomplete") from exc
+    policy = _policy_for_level(level, policy_version)
+    expected_hash = sampling_policy_table_sha256(policy_version)
+    if str(payload.get("sampling_policy_table_sha256") or "") != expected_hash:
+        raise ValueError("sampling protocol policy table SHA mismatch")
+    if payload.get("sampling_policy") != _policy_payload(policy):
+        raise ValueError("sampling protocol policy entry mismatch")
+    return {
+        "policy_version": policy_version,
+        "level": level,
+        "table_sha256": expected_hash,
+        "normalisation_factor": _target_motion_ratio(policy, policy_version),
+    }
 
 
 def _resolved_manifest_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, Any]:
-    policy = asdict(resolved.policy)
+    policy = _policy_payload(resolved.policy)
     geometry_payload = dict(resolved.geometry_scale_payload or {})
     scale_model = dict(resolved.scale_model_payload or {})
     scale = resolved.resolved_geometry_scale_angstrom
@@ -466,8 +706,10 @@ def _resolved_manifest_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, 
             None if resolved.audit_manifest_path is None
             else str(resolved.audit_manifest_path)
         ),
-        "sampling_policy_version": SAMPLING_AGGRESSIVENESS_POLICY_VERSION,
-        "sampling_policy_table_sha256": sampling_policy_table_sha256(),
+        "sampling_policy_version": int(resolved.sampling_policy_version),
+        "sampling_policy_table_sha256": str(
+            resolved.sampling_policy_table_sha256
+        ),
         "sampling_policy": policy,
         "dimensionless_policy": dimensionless_policy_payload(resolved.policy),
         "geometry_novelty_scale": geometry_payload,
@@ -559,8 +801,10 @@ def _resolved_manifest_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, 
         "sha256": _canonical_sha(
             {
                 "sampling_aggressiveness": resolved.sampling_aggressiveness,
-                "sampling_policy_version": SAMPLING_AGGRESSIVENESS_POLICY_VERSION,
-                "sampling_policy_table_sha256": sampling_policy_table_sha256(),
+                "sampling_policy_version": int(resolved.sampling_policy_version),
+                "sampling_policy_table_sha256": str(
+                    resolved.sampling_policy_table_sha256
+                ),
                 "sampling_policy": policy,
                 "geometry_input_fingerprint": geometry_payload.get("input_fingerprint"),
                 "hidden_overrides": resolved.hidden_overrides_detected,
@@ -706,9 +950,11 @@ def _sampling_protocol_audit_payload(resolved: ResolvedSamplingProtocol) -> Dict
                 "editable_campaign_field": "campaign.sampling_aggressiveness",
                 "hidden_low_level_blocks": list(_HIDDEN_TOP_LEVEL_BLOCKS),
             },
-            "sampling_policy_version": SAMPLING_AGGRESSIVENESS_POLICY_VERSION,
-            "sampling_policy_table_sha256": sampling_policy_table_sha256(),
-            "sampling_policy": asdict(resolved.policy),
+            "sampling_policy_version": int(resolved.sampling_policy_version),
+            "sampling_policy_table_sha256": str(
+                resolved.sampling_policy_table_sha256
+            ),
+            "sampling_policy": _policy_payload(resolved.policy),
             "dimensionless_policy": dimensionless,
             "enforced_landing_gates": {
                 "scaled_whitened_distance_max": float(
@@ -796,6 +1042,7 @@ def resolve_sampling_protocol(
     iteration: int,
     *,
     write_manifest: bool = True,
+    _policy_version: Optional[int] = None,
 ) -> ResolvedSamplingProtocol:
     from .geometry_novelty import (
         apply_geometry_novelty_to_acquisition_config,
@@ -803,12 +1050,20 @@ def resolve_sampling_protocol(
         resolve_geometry_novelty_consumers,
     )
     from .sampling_scale_model import (
+        LEGACY_SAMPLING_SCALE_MODEL_MODEL_VERSION,
+        SAMPLING_SCALE_MODEL_MODEL_VERSION,
         build_sampling_scale_model,
         sampling_scale_model_path,
     )
 
+    policy_version = (
+        SAMPLING_AGGRESSIVENESS_POLICY_VERSION
+        if _policy_version is None
+        else int(_policy_version)
+    )
     level = int(config.campaign.sampling_aggressiveness)
-    policy = _policy_for(config)
+    policy = _policy_for(config, policy_version)
+    policy_table_sha256 = sampling_policy_table_sha256(policy_version)
     effective = _effective_campaign_config(config, policy)
     calibration_snapshot = _resolve_error_calibration_snapshot(
         campaign_dir,
@@ -827,18 +1082,27 @@ def resolve_sampling_protocol(
         int(iteration),
         geometry_scale_payload=dict(geometry_payload),
         write_manifest=write_manifest,
+        model_version=(
+            LEGACY_SAMPLING_SCALE_MODEL_MODEL_VERSION
+            if policy_version == LEGACY_SAMPLING_AGGRESSIVENESS_POLICY_VERSION
+            else SAMPLING_SCALE_MODEL_MODEL_VERSION
+        ),
+        normalise_history=(
+            policy_version != LEGACY_SAMPLING_AGGRESSIVENESS_POLICY_VERSION
+        ),
     )
     scale_model_payload = dict(scale_model_payload)
     scale_model_payload = _attach_trust_radius_policy(
         scale_model_payload,
         policy,
+        policy_version,
     )
     scale_model_payload["dimensionless_policy"] = dimensionless_policy_payload(policy)
     scale_model_payload["sampling_policy"] = {
-        "version": SAMPLING_AGGRESSIVENESS_POLICY_VERSION,
-        "table_sha256": sampling_policy_table_sha256(),
+        "version": policy_version,
+        "table_sha256": policy_table_sha256,
         "level": level,
-        "entry": asdict(policy),
+        "entry": _policy_payload(policy),
     }
     scale_model_payload["bond_angle_reference"] = {
         "source": "sampling_policy_fixed_chemistry_invariants",
@@ -856,7 +1120,11 @@ def resolve_sampling_protocol(
         effective,
         geometry_payload,
     )
-    acquisition_config = _apply_policy_to_acquisition_config(acquisition_config, policy)
+    acquisition_config = _apply_policy_to_acquisition_config(
+        acquisition_config,
+        policy,
+        policy_version,
+    )
     acquisition_config = _apply_scale_model_to_acquisition_config(
         acquisition_config,
         scale_model_payload,
@@ -900,6 +1168,8 @@ def resolve_sampling_protocol(
         schema_version=SAMPLING_PROTOCOL_SCHEMA_VERSION,
         iteration=int(iteration),
         sampling_aggressiveness=level,
+        sampling_policy_version=policy_version,
+        sampling_policy_table_sha256=policy_table_sha256,
         policy=policy,
         effective_config=effective,
         geometry_scale_payload=dict(geometry_payload),
@@ -941,6 +1211,8 @@ def load_sampling_protocol(
         resolve_geometry_novelty_consumers,
     )
     from .sampling_scale_model import (
+        LEGACY_SAMPLING_SCALE_MODEL_MODEL_VERSION,
+        SAMPLING_SCALE_MODEL_MODEL_VERSION,
         read_sampling_scale_model,
         sampling_scale_model_path,
     )
@@ -963,7 +1235,7 @@ def load_sampling_protocol(
         expected_iteration=int(iteration),
     )
     calibration_snapshot = _load_error_calibration_snapshot(iter_dir, protocol_payload)
-    read_sampling_protocol_audit(
+    audit_payload = read_sampling_protocol_audit(
         iter_dir,
         expected_iteration=int(iteration),
     )
@@ -986,7 +1258,45 @@ def load_sampling_protocol(
         raise ValueError(
             "resolved sampling protocol aggressiveness does not match campaign config"
         )
-    policy = _policy_for(config)
+    try:
+        policy_version = int(protocol_payload["sampling_policy_version"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("resolved sampling protocol policy version is missing") from exc
+    policy = _policy_for(config, policy_version)
+    policy_table_sha256 = sampling_policy_table_sha256(policy_version)
+    if (
+        str(protocol_payload.get("sampling_policy_table_sha256") or "")
+        != policy_table_sha256
+    ):
+        raise ValueError("resolved sampling protocol policy table SHA mismatch")
+    if protocol_payload.get("sampling_policy") != _policy_payload(policy):
+        raise ValueError("resolved sampling protocol policy entry mismatch")
+    if int(audit_payload.get("sampling_policy_version", -1)) != policy_version:
+        raise ValueError("sampling protocol audit policy version mismatch")
+    if (
+        str(audit_payload.get("sampling_policy_table_sha256") or "")
+        != policy_table_sha256
+    ):
+        raise ValueError("sampling protocol audit policy table SHA mismatch")
+    if audit_payload.get("sampling_policy") != _policy_payload(policy):
+        raise ValueError("sampling protocol audit policy entry mismatch")
+    expected_model_version = (
+        LEGACY_SAMPLING_SCALE_MODEL_MODEL_VERSION
+        if policy_version == LEGACY_SAMPLING_AGGRESSIVENESS_POLICY_VERSION
+        else SAMPLING_SCALE_MODEL_MODEL_VERSION
+    )
+    if int(scale_model_payload.get("model_version", -1)) != expected_model_version:
+        raise ValueError(
+            "sampling scale model version does not match sampling policy version"
+        )
+    scale_policy = dict(scale_model_payload.get("sampling_policy") or {})
+    if (
+        int(scale_policy.get("version", -1)) != policy_version
+        or str(scale_policy.get("table_sha256") or "") != policy_table_sha256
+        or int(scale_policy.get("level", -1)) != level
+        or scale_policy.get("entry") != _policy_payload(policy)
+    ):
+        raise ValueError("sampling scale model policy binding mismatch")
     effective = _effective_campaign_config(config, policy)
     frozen_settings = calibration_snapshot.get("settings")
     if isinstance(frozen_settings, dict) and frozen_settings:
@@ -1001,6 +1311,7 @@ def load_sampling_protocol(
     acquisition_config = _apply_policy_to_acquisition_config(
         acquisition_config,
         policy,
+        policy_version,
     )
     acquisition_config = _apply_scale_model_to_acquisition_config(
         acquisition_config,
@@ -1047,6 +1358,8 @@ def load_sampling_protocol(
         schema_version=SAMPLING_PROTOCOL_SCHEMA_VERSION,
         iteration=int(iteration),
         sampling_aggressiveness=level,
+        sampling_policy_version=policy_version,
+        sampling_policy_table_sha256=policy_table_sha256,
         policy=policy,
         effective_config=effective,
         geometry_scale_payload=dict(geometry_payload),
@@ -1148,10 +1461,15 @@ def preview_sampling_protocol(
         apply_geometry_novelty_to_acquisition_config,
         resolve_geometry_novelty_consumers,
     )
-    from .sampling_scale_model import build_sampling_scale_model
+    from .sampling_scale_model import (
+        SAMPLING_SCALE_MODEL_MODEL_VERSION,
+        build_sampling_scale_model,
+    )
 
     level = int(config.campaign.sampling_aggressiveness)
-    policy = _policy_for(config)
+    policy_version = SAMPLING_AGGRESSIVENESS_POLICY_VERSION
+    policy = _policy_for(config, policy_version)
+    policy_table_sha256 = sampling_policy_table_sha256(policy_version)
     effective = _effective_campaign_config(config, policy)
     if geometry_scale_payload is None:
         geometry_scale_payload = {
@@ -1169,18 +1487,21 @@ def preview_sampling_protocol(
         int(iteration),
         geometry_scale_payload=dict(geometry_scale_payload),
         write_manifest=False,
+        model_version=SAMPLING_SCALE_MODEL_MODEL_VERSION,
+        normalise_history=True,
     )
     scale_model_payload = dict(scale_model_payload)
     scale_model_payload = _attach_trust_radius_policy(
         scale_model_payload,
         policy,
+        policy_version,
     )
     scale_model_payload["dimensionless_policy"] = dimensionless_policy_payload(policy)
     scale_model_payload["sampling_policy"] = {
-        "version": SAMPLING_AGGRESSIVENESS_POLICY_VERSION,
-        "table_sha256": sampling_policy_table_sha256(),
+        "version": policy_version,
+        "table_sha256": policy_table_sha256,
         "level": level,
-        "entry": asdict(policy),
+        "entry": _policy_payload(policy),
     }
     scale_model_payload["bond_angle_reference"] = {
         "source": "sampling_policy_fixed_chemistry_invariants",
@@ -1198,7 +1519,11 @@ def preview_sampling_protocol(
         effective,
         geometry_scale_payload,
     )
-    acquisition_config = _apply_policy_to_acquisition_config(acquisition_config, policy)
+    acquisition_config = _apply_policy_to_acquisition_config(
+        acquisition_config,
+        policy,
+        policy_version,
+    )
     acquisition_config = _apply_scale_model_to_acquisition_config(
         acquisition_config,
         scale_model_payload,
@@ -1234,6 +1559,8 @@ def preview_sampling_protocol(
         schema_version=SAMPLING_PROTOCOL_SCHEMA_VERSION,
         iteration=int(iteration),
         sampling_aggressiveness=level,
+        sampling_policy_version=policy_version,
+        sampling_policy_table_sha256=policy_table_sha256,
         policy=policy,
         effective_config=effective,
         geometry_scale_payload=dict(geometry_scale_payload),
@@ -1270,9 +1597,12 @@ __all__ = [
     "SAMPLING_PROTOCOL_RESOLVED_FILENAME",
     "SAMPLING_PROTOCOL_SCHEMA_VERSION",
     "ResolvedSamplingProtocol",
+    "LEGACY_SAMPLING_AGGRESSIVENESS_POLICY_VERSION",
     "SAMPLING_AGGRESSIVENESS_POLICY_VERSION",
     "SamplingAggressivenessPolicy",
+    "SamplingAggressivenessPolicyV2",
     "dimensionless_policy_payload",
+    "sampling_policy_history_context",
     "sampling_policy_table_payload",
     "sampling_policy_table_sha256",
     "hidden_sampling_overrides",

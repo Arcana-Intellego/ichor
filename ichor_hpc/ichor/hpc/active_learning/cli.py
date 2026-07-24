@@ -3183,6 +3183,56 @@ def _format_status(
     )
     lines.append("")
     lines.extend(_format_runtime_status(payload, verbose=True))
+    sampling_protocol = payload.get("_presentation_sampling_protocol")
+    if isinstance(sampling_protocol, Mapping):
+        policy_version = int(sampling_protocol.get("policy_version") or 0)
+        baseline_source = str(
+            sampling_protocol.get("baseline_source") or "unavailable"
+        )
+        baseline_source = {
+            "normalised_ariadne_landing_history": (
+                "accepted ARIADNE movement history, normalised by producer preset"
+            ),
+            "ariadne_landing_history": "accepted ARIADNE movement history",
+            "fallback": "configured fallback because usable history is unavailable",
+        }.get(baseline_source, baseline_source.replace("_", " "))
+        protocol_rows: List[Tuple[str, Any]] = [
+            (
+                "sampling aggressiveness",
+                sampling_protocol.get("sampling_aggressiveness"),
+            ),
+            ("preset policy", "v" + str(policy_version)),
+        ]
+        if policy_version >= 2:
+            protocol_rows.extend(
+                [
+                    (
+                        "target movement",
+                        str(sampling_protocol.get("target_motion_ratio"))
+                        + "x historical baseline",
+                    ),
+                    (
+                        "initial trust radius",
+                        str(sampling_protocol.get("initial_trust_multiplier"))
+                        + "x nominal",
+                    ),
+                ]
+            )
+        else:
+            protocol_rows.append(
+                (
+                    "legacy movement/trust multiplier",
+                    sampling_protocol.get("movement_trust_multiplier"),
+                )
+            )
+        protocol_rows.append(
+            (
+                "movement baseline",
+                baseline_source,
+            )
+        )
+        lines.append("")
+        lines.extend(_section("Sampling protocol", protocol_rows))
     lifecycle = _format_lifecycle_status(payload)
     if lifecycle:
         lines.append("")
@@ -6527,6 +6577,44 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
     )
     payload["next_action"] = payload["recommendations"][0]["primary"]
+    if (
+        not bool(getattr(args, "json", False))
+        and bool(getattr(args, "verbose", False))
+    ):
+        try:
+            from .layout import active_iteration_dir
+            from .sampling_protocol import (
+                read_sampling_protocol_resolved,
+                sampling_protocol_resolved_path,
+            )
+
+            iteration_dir = active_iteration_dir(campaign, int(state.iteration))
+            protocol_path = sampling_protocol_resolved_path(iteration_dir)
+            if protocol_path.is_file() and not protocol_path.is_symlink():
+                protocol = read_sampling_protocol_resolved(
+                    iteration_dir,
+                    expected_iteration=int(state.iteration),
+                )
+                policy = dict(protocol.get("sampling_policy") or {})
+                scale_model = dict(protocol.get("sampling_scale_model") or {})
+                payload["_presentation_sampling_protocol"] = {
+                    "sampling_aggressiveness": int(
+                        protocol["sampling_aggressiveness"]
+                    ),
+                    "policy_version": int(protocol["sampling_policy_version"]),
+                    "target_motion_ratio": policy.get("target_motion_ratio"),
+                    "initial_trust_multiplier": policy.get(
+                        "initial_trust_multiplier"
+                    ),
+                    "movement_trust_multiplier": policy.get(
+                        "movement_trust_multiplier"
+                    ),
+                    "baseline_source": dict(
+                        scale_model.get("geometry_motion_scale") or {}
+                    ).get("source"),
+                }
+        except Exception:
+            pass
     if bool(getattr(args, "json", False)):
         print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
     else:

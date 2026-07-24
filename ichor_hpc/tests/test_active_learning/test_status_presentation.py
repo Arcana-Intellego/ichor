@@ -139,6 +139,42 @@ def test_retained_staging_diagnostics_are_verbose_only(tmp_path):
     assert str(retained) in verbose
 
 
+def test_sampling_policy_details_are_verbose_only():
+    payload = _active_ariadne_payload()
+    payload["_presentation_sampling_protocol"] = {
+        "sampling_aggressiveness": 7,
+        "policy_version": 2,
+        "target_motion_ratio": 1.55,
+        "initial_trust_multiplier": 1.32,
+        "movement_trust_multiplier": None,
+        "baseline_source": "normalised_ariadne_landing_history",
+    }
+
+    concise = cli._format_status(
+        payload,
+        verbose=False,
+        campaign=Path("campaign"),
+        journal_events=[],
+    )
+    verbose = cli._format_status(
+        payload,
+        verbose=True,
+        campaign=Path("campaign"),
+        journal_events=[],
+    )
+
+    assert "Sampling protocol" not in concise
+    assert "Sampling protocol" in verbose
+    assert "sampling aggressiveness: 7" in verbose
+    assert "preset policy: v2" in verbose
+    assert "target movement: 1.55x historical baseline" in verbose
+    assert "initial trust radius: 1.32x nominal" in verbose
+    assert (
+        "movement baseline: accepted ARIADNE movement history, normalised by "
+        "producer preset"
+    ) in verbose
+
+
 def test_status_phase_policies_cover_every_campaign_phase():
     expected = {phase.value for phase in CampaignPhase}
 

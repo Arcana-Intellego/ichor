@@ -1742,6 +1742,35 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 sampling_aggressiveness=int(
                     resolved_protocol.sampling_aggressiveness
                 ),
+                sampling_policy_version=int(
+                    resolved_protocol.sampling_policy_version
+                ),
+                sampling_policy_table_sha256=str(
+                    resolved_protocol.sampling_policy_table_sha256
+                ),
+                target_motion_ratio=(
+                    resolved_protocol.scale_model_payload.get(
+                        "trust_radius_policy",
+                        {},
+                    ).get("target_motion_ratio")
+                ),
+                initial_trust_multiplier=(
+                    resolved_protocol.scale_model_payload.get(
+                        "trust_radius_policy",
+                        {},
+                    ).get("aggressiveness_multiplier")
+                ),
+                history_records=(
+                    resolved_protocol.scale_model_payload.get("history", {}).get(
+                        "n_records"
+                    )
+                ),
+                history_baseline_source=(
+                    resolved_protocol.scale_model_payload.get(
+                        "geometry_motion_scale",
+                        {},
+                    ).get("source")
+                ),
                 scale_angstrom=payload.get("scale_angstrom"),
                 scale_resolution_mode=payload.get("scale_resolution_mode"),
                 n_values=payload.get("n_values"),

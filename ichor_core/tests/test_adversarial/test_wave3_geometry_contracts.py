@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from ichor.core.adversarial.geometry import (
+    aligned_per_atom_displacements,
     aligned_mass_weighted_displacement,
     aligned_mass_weighted_distance,
     aligned_mass_weighted_rmsd,
@@ -52,6 +53,7 @@ def test_atoms_advanced_indexing_rejects_mixed_key_kinds():
         aligned_mass_weighted_distance,
         aligned_mass_weighted_rmsd,
         aligned_mass_weighted_displacement,
+        aligned_per_atom_displacements,
     ],
 )
 def test_aligned_metrics_reject_reordered_atom_identity(metric):
@@ -82,6 +84,49 @@ def test_aligned_metrics_reject_count_units_and_non_finite_coordinates():
     invalid[0].coordinates[0] = np.nan
     with pytest.raises(ValueError, match="finite"):
         aligned_mass_weighted_rmsd(reference, invalid)
+
+
+def test_aligned_per_atom_displacements_remove_rigid_motion():
+    reference = _water()
+    theta = np.deg2rad(37.0)
+    rotation = np.asarray(
+        [
+            [np.cos(theta), -np.sin(theta), 0.0],
+            [np.sin(theta), np.cos(theta), 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    moved_coordinates = (
+        np.asarray(reference.coordinates, dtype=float) @ rotation.T
+        + np.asarray([4.0, -2.0, 1.5])
+    )
+    moved = coordinates_to_atoms(reference, moved_coordinates)
+
+    assert aligned_per_atom_displacements(reference, moved) == pytest.approx(
+        np.zeros(len(reference)),
+        abs=1.0e-12,
+    )
+
+
+def test_aligned_per_atom_displacements_preserve_internal_deformation():
+    reference = _water()
+    deformed = coordinates_to_atoms(
+        reference,
+        np.asarray(reference.coordinates, dtype=float)
+        + np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                [0.08, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ]
+        ),
+    )
+
+    displacements = aligned_per_atom_displacements(reference, deformed)
+
+    assert displacements.shape == (len(reference),)
+    assert np.all(np.isfinite(displacements))
+    assert float(np.max(displacements)) > 0.01
 
 
 @pytest.mark.parametrize(
