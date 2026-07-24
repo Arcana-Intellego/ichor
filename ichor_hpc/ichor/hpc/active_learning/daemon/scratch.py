@@ -120,13 +120,24 @@ def scratch_path_template(
     phase_name: str,
     iteration: int,
     submission_identity: str,
+    *,
+    scheduler_kind: str = "slurm",
 ) -> str:
+    kind = str(scheduler_kind).strip().lower()
+    if kind not in {"slurm", "sge"}:
+        raise ValueError("scratch scheduler kind must be slurm or sge")
+    if kind == "slurm":
+        job_component = "job-${SLURM_JOB_ID}"
+        task_component = "task-${SLURM_ARRAY_TASK_ID:-0}"
+    else:
+        job_component = "job-${ICHOR_SCHEDULER_JOB_ID}"
+        task_component = "task-${ICHOR_SCHEDULER_ARRAY_TASK_ID:-0}"
     return str(
         attempt_scratch_root(
             campaign_dir, phase_name, iteration, submission_identity
         )
-        / "job-${SLURM_JOB_ID}"
-        / "task-${SLURM_ARRAY_TASK_ID:-0}"
+        / job_component
+        / task_component
     )
 
 

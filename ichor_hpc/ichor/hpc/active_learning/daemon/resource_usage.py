@@ -1,4 +1,4 @@
-"""Advisory Slurm resource-use telemetry for completed attempts."""
+"""Advisory scheduler resource-use telemetry for completed attempts."""
 from __future__ import annotations
 
 import math
@@ -10,7 +10,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Union
 
 from .state import atomic_write_json
-from ..submit.slurm_contracts import run_scheduler_command
+from ..strict_json import strict_json as json
+from ..submit import sge
+from ..submit.scheduler_backend import get_scheduler_backend
 
 
 USAGE_SCHEMA_VERSION = 2
@@ -29,8 +31,6 @@ def usage_path(campaign_dir: Union[str, Path]) -> Path:
 
 def read_usage_records(campaign_dir: Union[str, Path]) -> Dict[str, Any]:
     """Read the telemetry ledger without hiding corruption as absence."""
-    from ..strict_json import strict_json as json
-
     path = usage_path(campaign_dir)
     if path.is_symlink():
         raise ValueError("resource usage records must not be a symlink: " + str(path))
@@ -125,6 +125,98 @@ def parse_usage_rows(stdout: str) -> List[Dict[str, Any]]:
             "max_vm_size_mib": _memory_mib(max_vm),
             "total_cpu": total_cpu,
         })
+    return rows
+
+
+def _sge_memory_mib(value: Any, *, bare_unit: str) -> Optional[float]:
+    text = str(value or "").strip()
+    if not text or text in {"Unknown", "N/A", "-"}:
+        return None
+    match = re.fullmatch(
+        r"([0-9]+(?:\.[0-9]+)?)([KMGT]?)(?:I?B)?",
+        text,
+        re.IGNORECASE,
+    )
+    if match is not None and match.group(2):
+        amount = float(match.group(1))
+        scale = {
+            "K": 1.0 / 1024.0,
+            "M": 1.0,
+            "G": 1024.0,
+            "T": 1024.0 * 1024.0,
+        }[match.group(2).upper()]
+        return amount * scale
+    try:
+        amount = float(text)
+    except ValueError:
+        return None
+    if amount < 0 or not math.isfinite(amount):
+        return None
+    if bare_unit == "kib":
+        return amount / 1024.0
+    if bare_unit == "bytes":
+        return amount / (1024.0 * 1024.0)
+    raise ValueError("unsupported bare SGE memory unit")
+
+
+def parse_sge_usage_records(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    job_id: str,
+) -> List[Dict[str, Any]]:
+    """Normalise qacct records into the existing telemetry row contract."""
+    parent = sge.validate_sge_parent_job_id(job_id)
+    rows: List[Dict[str, Any]] = []
+    for record in records:
+        if str(record.get("jobnumber") or "").strip() != parent:
+            continue
+        task_text = str(record.get("taskid") or "").strip()
+        if task_text in {"", "undefined", "NONE"}:
+            logical_job_id = parent
+            raw_job_id = parent
+        else:
+            if not re.fullmatch(r"[1-9][0-9]*", task_text):
+                raise ValueError("qacct telemetry contains a malformed task ID")
+            native_task_id = int(task_text)
+            logical_job_id = parent + "_" + str(native_task_id - 1)
+            raw_job_id = parent + "." + str(native_task_id)
+        try:
+            failed = int(str(record.get("failed") or ""))
+            exit_status = int(str(record.get("exit_status") or ""))
+            elapsed_seconds = sge.parse_sge_duration_seconds(
+                record.get("ru_wallclock") or "0"
+            )
+            allocated_cpus = int(str(record.get("slots") or "1"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("qacct telemetry contains malformed numeric fields") from exc
+        if min(failed, exit_status, elapsed_seconds) < 0 or allocated_cpus <= 0:
+            raise ValueError("qacct telemetry contains out-of-range numeric fields")
+        rows.append(
+            {
+                "job_id": logical_job_id,
+                "job_id_raw": raw_job_id,
+                "state": (
+                    "COMPLETED"
+                    if failed == 0 and exit_status == 0
+                    else "FAILED"
+                ),
+                "exit_code": str(exit_status) + ":0",
+                "elapsed_seconds": elapsed_seconds,
+                "allocated_cpus": allocated_cpus,
+                "requested_memory": "",
+                # SGE reports ru_maxrss as KiB when no suffix is present.
+                "max_rss_mib": _sge_memory_mib(
+                    record.get("ru_maxrss"),
+                    bare_unit="kib",
+                ),
+                # maxvmem is normally suffixed; a bare value is bytes.
+                "max_vm_size_mib": _sge_memory_mib(
+                    record.get("maxvmem"),
+                    bare_unit="bytes",
+                ),
+                "total_cpu": str(record.get("cpu") or ""),
+            }
+        )
     return rows
 
 
@@ -353,31 +445,36 @@ def collect_usage(
     )
     if previous is not None and str(previous.get("telemetry_status")) == "final":
         return previous
-    query_command = [
-        "sacct",
-        "-n",
-        "-P",
-        "--array",
-        "-j",
+    scheduler_kind = str(
+        intent.get("scheduler_identity_kind") or "slurm"
+    ).strip().lower()
+    backend = get_scheduler_backend(scheduler_kind)
+    evidence = backend.collect_usage_evidence(
         job_id,
-        "--format=JobID,JobIDRaw,State,ExitCode,ElapsedRaw,AllocCPUS,ReqMem,MaxRSS,MaxVMSize,TotalCPU",
-    ]
-    completed = run_scheduler_command(
-        runner,
-        query_command,
+        runner=runner,
         timeout_seconds=int(timeout_seconds),
-        check=False,
-        capture_output=True,
-        text=True,
     )
-    if int(getattr(completed, "returncode", 1)) != 0:
-        raise RuntimeError("sacct telemetry failed: " + str(getattr(completed, "stderr", "")))
-    parsed_rows = parse_usage_rows(getattr(completed, "stdout", "") or "")
-    if not parsed_rows:
-        raise RuntimeError("sacct telemetry returned no rows")
-    rows = _scientific_task_rows(parsed_rows, job_id)
-    if not rows:
-        raise RuntimeError("sacct telemetry returned no scientific task rows")
+    query_command = list(evidence.command)
+    if scheduler_kind == "slurm":
+        query_stdout = evidence.stdout
+        parsed_rows = parse_usage_rows(query_stdout)
+        if not parsed_rows:
+            raise RuntimeError("sacct telemetry returned no rows")
+        rows = _scientific_task_rows(parsed_rows, job_id)
+        if not rows:
+            raise RuntimeError("sacct telemetry returned no scientific task rows")
+    elif scheduler_kind == "sge":
+        records = list(evidence.records or ())
+        query_stdout = json.dumps(
+            records,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        rows = parse_sge_usage_records(records, job_id=job_id)
+        if not rows:
+            raise RuntimeError("qacct telemetry returned no scientific task rows")
+    else:
+        raise AssertionError("validated scheduler backend was not handled")
     expected_raw = intent.get("expected_tasks")
     expected_tasks = None
     if expected_raw is not None:
@@ -396,7 +493,7 @@ def collect_usage(
         unexpected = sorted(observed_ids - expected_ids)
         if unexpected:
             raise ValueError(
-                "sacct telemetry returned unexpected array task IDs: "
+                "scheduler telemetry returned unexpected array task IDs: "
                 + repr(unexpected[:10])
             )
     summary = summarise_usage(
@@ -408,7 +505,7 @@ def collect_usage(
         rows=rows,
         expected_tasks=expected_tasks,
         query_command=query_command,
-        query_stdout=getattr(completed, "stdout", "") or "",
+        query_stdout=query_stdout,
         collection_sequence=(
             1 if previous is None else int(previous.get("collection_sequence", 0)) + 1
         ),

@@ -26,18 +26,23 @@ Install the three packages in order::
     python3 -m pip install -e ichor_hpc
     python3 -m pip install -e ichor_cli
 
-For a full Manchester CSF3/CSF4 live active-learning install, use the cluster
-installer. It creates the CSF-specific venv, checks sibling FEREBUS_CPU/
-ARIADNE trees, builds ARIADNE/FEREBUS/PLUMED where needed, verifies xTB/ASE,
-and safely upserts ``~/ichor_config.yaml``::
+For a full CSF3, CSF4, or ffluxlab live active-learning install, use the
+unified cluster installer. It creates the machine-specific venv, builds
+ARIADNE/FEREBUS/PLUMED where needed, verifies xTB/ASE, and safely upserts
+``~/ichor_config.yaml``::
 
-    bash scripts/install_ichor_csf.sh --machine csf4 --projects-dir ~/projects
-    bash scripts/install_ichor_csf.sh --machine csf3 --projects-dir ~/projects
+    bash scripts/install_ichor.sh --machine auto --projects-dir ~/projects
+    bash scripts/install_ichor.sh --machine ffluxlab \
+        --projects-dir ~/projects --allow-download
 
-After installation, source the matching runtime helper in every new CSF shell
-before running :code:`ichor-cli` or :code:`ichor-al-daemon`::
+After installation, source the runtime helper in every new cluster shell before
+running :code:`ichor-cli` or :code:`ichor-al-daemon`::
 
-    source scripts/env_ichor_csf.sh --smoke
+    source scripts/env_ichor.sh --smoke
+
+The historical :code:`install_ichor_csf.sh`, :code:`env_ichor_csf.sh`,
+:code:`lib_ichor_csf.sh`, and :code:`install_ichor_csf3` names remain
+compatibility entry points.
 
 Run the bundled example to confirm the install works (~30 seconds on a
 laptop, no cluster required)::
@@ -260,6 +265,8 @@ config-file format. CSF4 operators at Manchester can reuse the canonical
 :code:`ichor_config.yaml` checked in at the repo root. CSF3 operators should
 start from :code:`examples/csf3_first_live_iter/README.md`, which documents the
 private CPython 3.11 non-Conda route and CSF3 oneAPI runtime modules.
+ffluxlab uses the canonical :code:`ffluxlab` profile, a private CPython 3.11
+environment, and Sun Grid Engine.
 
 
 Backend availability
@@ -277,6 +284,10 @@ Backend availability
      - Cluster-side (SLURM)
      - :code:`--mode live`
      - :code:`which sbatch && which sacct`
+   * - qsub / qstat / qacct / qdel
+     - Cluster-side (Sun Grid Engine)
+     - :code:`--mode live` on ffluxlab
+     - :code:`which qsub qstat qacct qdel`
    * - Gaussian g16
      - Cluster module declared in :code:`~/ichor_config.yaml`
      - :code:`--mode live`
@@ -497,7 +508,7 @@ An array member writes
 directory. :code:`hpc.max_job_log_files_per_directory` in
 :code:`~/ichor_config.yaml` caps each directory independently; submission is
 refused before :code:`sbatch` when the cap would be exceeded. A partial retry
-uses a dense Slurm index and preserves the dense-to-logical mapping in the
+uses a dense scheduler index and preserves the dense-to-logical mapping in the
 attempt bundle.
 
 Scratch is campaign-owned and lazy::
@@ -537,12 +548,12 @@ The default concise view is for the current phase and iteration. Use
 :code:`--verbose` for formula components, evidence hashes, profile limits and
 telemetry internals, or :code:`--json` for machine-readable output. Submitted or completed work
 shows its immutable resource record; ready work is previewed from validated
-evidence; local phases report no Slurm resources. Under :code:`--all`, future
+evidence; local phases report no scheduler resources. Under :code:`--all`, future
 evidence that has not yet been produced is informational. Explicitly
 requesting such a phase returns exit code 14.
 
 When :code:`resources.scheduler_usage_telemetry` is enabled, terminal jobs
-record bounded Slurm accounting summaries in
+record bounded scheduler accounting summaries in
 :code:`.DATA/ACTIVE_LEARNING/resource_usage_records.json`. The record includes
 RSS/VM and elapsed-time quantiles, maxima, failure and outlier samples, plus
 advisory :code:`p95 * 1.25` memory and :code:`p95 * 1.5` walltime values.
@@ -599,7 +610,7 @@ slot it validates candidate, seed, task, split, provenance, receipt and
 point-directory identities, atom order, and the ARIADNE-to-QM coordinate
 agreement. It reads only the selected geometry payloads and their bound
 control files. It does not change campaign state, append to the journal,
-contact Slurm, reconcile the campaign or rerun scientific work. Exported
+contact the scheduler, reconcile the campaign or rerun scientific work. Exported
 geometries are derived data and are excluded from checkpoints.
 
 
@@ -611,7 +622,7 @@ Stopping and resuming
 
 User stops use a separate atomic control file rather than allowing the
 CLI process to rewrite ``state.json`` while the daemon owns it. The default
-stop is immediate at the next daemon tick; it does not cancel Slurm jobs::
+stop is immediate at the next daemon tick; it does not cancel scheduler jobs::
 
     ichor-al-daemon stop --campaign-dir .
 
@@ -694,10 +705,10 @@ maintenance command is required. Normal status displays the recorded active
 generation without inspecting the current package installation.
 
 Do not pull, edit or reinstall the editable ICHOR checkout while the daemon or
-any campaign Slurm job is active. Submitted tasks bind the exact ICHOR package
+any campaign scheduler job is active. Submitted tasks bind the exact ICHOR package
 tree recorded when their resources were prepared; changing that tree while
 they run makes the affected tasks fail deliberately rather than mix software
-identities. Stop at a safe boundary and wait for all Slurm work to finish
+identities. Stop at a safe boundary and wait for all scheduler work to finish
 before updating the checkout.
 
 When :code:`state.json` is missing or malformed and campaign authority must be
@@ -747,7 +758,7 @@ campaign file with an unreviewed proposal.
 What reconcile still does not do:
 
 - except for the authenticated FEREBUS measurement-recovery path described
-  above, it does not postprocess successful Slurm jobs whose daemon-side commit
+  above, it does not postprocess successful scheduler jobs whose daemon-side commit
   did not run;
 - it does not harvest uncommitted Gaussian/AIMAll outputs into a training
   version;

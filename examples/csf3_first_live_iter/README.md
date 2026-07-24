@@ -9,9 +9,9 @@ Recommended install path:
 
 ```bash
 cd ~/projects/ichor-active-learning
-bash scripts/install_ichor_csf.sh --machine csf3 --projects-dir ~/projects \
+bash scripts/install_ichor.sh --machine csf3 --projects-dir ~/projects \
     --aimall-path ~/AIMAll/aimqb.ish
-source scripts/env_ichor_csf.sh --smoke
+source scripts/env_ichor.sh --smoke
 ```
 
 The installer uses private CPython 3.11 by default, checks download access,
@@ -19,7 +19,7 @@ prints exact staging instructions when downloads are blocked, builds ARIADNE,
 FEREBUS, and PLUMED with `--jobs 4` by default, verifies xTB/ASE, and backs up
 `~/ichor_config.yaml` before upserting the CSF3 profile. The manual sections
 below are kept as a fallback and for troubleshooting individual components.
-For day-to-day use after installation, the sourced `env_ichor_csf.sh` helper is
+For day-to-day use after installation, the sourced `env_ichor.sh` helper is
 the expected way to load oneAPI/MKL runtime modules and avoid ARIADNE `libmkl`
 import errors.
 
@@ -133,7 +133,7 @@ in the venv and under `$HOME/opt`; no binaries are committed to this repo.
 ## 5. Configure `~/ichor_config.yaml`
 
 The repository root [`ichor_config.yaml`](../../ichor_config.yaml) is the
-single canonical CSF3 profile. Run `scripts/install_ichor_csf.sh --machine
+single canonical CSF3 profile. Run `scripts/install_ichor.sh --machine
 csf3`; the installer copies that profile atomically into
 `~/ichor_config.yaml` and overrides only the local Python, AIMAll, FEREBUS and
 PLUMED paths. Do not maintain a second profile in this guide.
@@ -158,7 +158,7 @@ are rejected so a staged input cannot disagree with its submitted resources.
 ## 6. Preflight and launch
 
 ```bash
-source ~/projects/ichor-active-learning/scripts/env_ichor_csf.sh --smoke
+source ~/projects/ichor-active-learning/scripts/env_ichor.sh --smoke
 
 ichor-al-daemon init
 ichor-al-daemon config-check --campaign-dir . --human

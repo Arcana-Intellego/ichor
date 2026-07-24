@@ -1,4 +1,4 @@
-"""Smoke tests for the sourced CSF runtime helper."""
+"""Smoke tests for the sourced cluster runtime helper."""
 from __future__ import annotations
 
 import os
@@ -11,8 +11,10 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-SCRIPT = REPO_ROOT / "scripts" / "env_ichor_csf.sh"
-LIB = REPO_ROOT / "scripts" / "lib_ichor_csf.sh"
+SCRIPT = REPO_ROOT / "scripts" / "env_ichor.sh"
+LIB = REPO_ROOT / "scripts" / "lib_ichor.sh"
+LEGACY_SCRIPT = REPO_ROOT / "scripts" / "env_ichor_csf.sh"
+LEGACY_LIB = REPO_ROOT / "scripts" / "lib_ichor_csf.sh"
 
 
 def _bash() -> str:
@@ -78,15 +80,17 @@ def test_env_script_is_present_and_documents_sourcing():
     assert os.access(SCRIPT, os.R_OK)
     text = SCRIPT.read_text(encoding="utf-8")
     assert "This script must be sourced" in text
-    assert "source scripts/env_ichor_csf.sh\n" in text
-    assert "source scripts/env_ichor_csf.sh --machine csf3" in text
-    assert "source scripts/env_ichor_csf.sh --machine csf4" in text
+    assert "source scripts/env_ichor.sh\n" in text
+    assert "source scripts/env_ichor.sh --machine csf3" in text
+    assert "source scripts/env_ichor.sh --machine csf4" in text
+    assert "source scripts/env_ichor.sh --machine ffluxlab" in text
+    assert "env_ichor.sh" in LEGACY_SCRIPT.read_text(encoding="utf-8")
 
 
 def test_env_script_contains_required_runtime_contracts():
     text = SCRIPT.read_text(encoding="utf-8")
     lib_text = LIB.read_text(encoding="utf-8")
-    assert 'source "${_ichor_env_script_dir}/lib_ichor_csf.sh"' in text
+    assert 'source "${_ichor_env_script_dir}/lib_ichor.sh"' in text
     assert "compilers/intel/oneapi/2025.0.1" in text
     assert "umf compiler-rt tbb compiler" in text
     assert "mkl/2025.0" in text
@@ -100,7 +104,7 @@ def test_env_script_contains_required_runtime_contracts():
     assert "ichor_csf_deactivate_existing_venv" in text
     assert "ichor_csf_warn_path_hazards" in text
     assert "ichor_csf_path_inside" in text
-    assert "--machine csf3|csf4" in text
+    assert "--machine csf3|csf4|ffluxlab" in text
     assert "ichor_csf_detect_machine_from_evidence" in lib_text
     assert "hostname -f" in lib_text
     assert "hostname -s" in lib_text
@@ -131,7 +135,7 @@ def test_env_script_default_setup_does_not_smoke_imports():
 
 def test_machine_detection_precedes_runtime_environment_mutation():
     text = SCRIPT.read_text(encoding="utf-8")
-    detection = 'machine="$(ichor_csf_detect_machine "${machine}")"'
+    detection = 'machine="$(ichor_detect_machine "${machine}")"'
     assert text.index(detection) < text.index("ichor_csf_deactivate_existing_venv")
     module_load = '_ichor_env_load_runtime_modules "${machine}" "${do_purge}"'
     assert text.index(detection) < text.index(module_load)
@@ -141,6 +145,8 @@ def test_env_script_bash_syntax():
     bash = _bash()
     subprocess.run([bash, "-n", str(LIB)], check=True)
     subprocess.run([bash, "-n", str(SCRIPT)], check=True)
+    subprocess.run([bash, "-n", str(LEGACY_LIB)], check=True)
+    subprocess.run([bash, "-n", str(LEGACY_SCRIPT)], check=True)
 
 
 def test_env_script_refuses_direct_execution():

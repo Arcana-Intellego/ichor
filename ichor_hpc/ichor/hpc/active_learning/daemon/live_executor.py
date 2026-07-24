@@ -73,6 +73,7 @@ from .resource_solver import (
     ResolvedPhaseResources,
     gaussian_mdef,
     resolve_phase_resources,
+    slurm_memory_mib,
     validate_partition_walltime,
 )
 from .resource_records import (
@@ -85,7 +86,7 @@ from .script_bundles import (
     bundle_root,
     prepare_attempt_bundle,
     read_source_array_task_ids,
-    slurm_log_paths,
+    scheduler_log_paths,
     write_attempt_script,
     write_script_binding,
 )
@@ -109,18 +110,19 @@ from .runtime_environment import (
     DEFAULT_DAEMON_RUNTIME_MODULES,
     configured_daemon_runtime_modules,
     configured_python_library_paths,
+    module_initialisation_lines,
+    native_runtime_setup_lines,
     normalise_module_list,
     python_library_path_export_lines,
 )
-from ..submit.slurm_contracts import (
-    parse_sbatch_parsable_output,
-    run_scheduler_command,
-)
+from ..submit.scheduler_backend import get_scheduler_backend
+from ..submit.sge import sge_safe_job_name
 
 
 __all__ = [
     "LiveBackendsPhaseExecutor",
     "LiveBackendNotAvailableError",
+    "build_scheduler_script",
     "build_sbatch_script",
     "live_job_name",
     "make_live_job_finder",
@@ -141,6 +143,18 @@ def _format_slurm_walltime_hours(hours: Any) -> str:
     mm, ss = divmod(rem, 60)
     clock = f"{hh:02d}:{mm:02d}:{ss:02d}"
     return str(days) + "-" + clock if days else clock
+
+
+def _format_sge_walltime_hours(hours: Any) -> str:
+    try:
+        total_seconds = int(math.ceil(float(hours) * 3600.0))
+    except (TypeError, ValueError) as exc:
+        raise BackendSubmissionError("walltime_hours must be a positive number") from exc
+    if total_seconds <= 0:
+        raise BackendSubmissionError("walltime_hours must be > 0")
+    hh, rem = divmod(total_seconds, 3600)
+    mm, ss = divmod(rem, 60)
+    return f"{hh:02d}:{mm:02d}:{ss:02d}"
 
 _SHEBANG_RE = re.compile(r"^#![A-Za-z0-9_./ -]+$")
 _SHELL_PATH_FRAGMENT_RE = re.compile(r"^[A-Za-z0-9_./${}:+-]+$")
@@ -1428,6 +1442,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
     def __post_init__(self) -> None:
         DryRunPhaseExecutor.__post_init__(self)
+        self.scheduler_identity_kind = _configured_scheduler()
+        self._scheduler_backend = get_scheduler_backend(
+            self.scheduler_identity_kind
+        )
         if self.backend_check:
             avail = check_backends()
             if not avail.all_present:
@@ -1985,6 +2003,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 phase_name,
                 int(getattr(state, "iteration", 0)),
                 identity,
+                scheduler_kind=self.scheduler_identity_kind,
             )
             ferebus_path = _configured_backend_path("ferebus", "ferebus")
             allow_bare_ferebus = (
@@ -2088,22 +2107,40 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     "cpus_per_task": int(resolved.cpus_per_task),
                     "ntasks": int(resolved.ntasks),
                     "submission_script_path": bundle.script,
-                    "output_path": slurm_log_paths(bundle, is_array=True)[
+                    "output_path": scheduler_log_paths(
+                        bundle,
+                        scheduler_kind=self.scheduler_identity_kind,
+                        is_array=True,
+                    )[
                         "output"
                     ],
-                    "error_path": slurm_log_paths(bundle, is_array=True)[
+                    "error_path": scheduler_log_paths(
+                        bundle,
+                        scheduler_kind=self.scheduler_identity_kind,
+                        is_array=True,
+                    )[
                         "error"
                     ],
                     "path_to_executable": path_to_executable,
                     "array_concurrency_limit": getattr(
                         resources, "array_concurrency_limit", None
                     ),
+                    "scheduler_queue": resolved.extra.get("scheduler_queue"),
+                    "parallel_environment": resolved.extra.get(
+                        "parallel_environment"
+                    ),
                     "runtime_preamble": [
+                        *(
+                            module_initialisation_lines()
+                            if self.scheduler_identity_kind == "sge"
+                            else []
+                        ),
                         "module purge",
                         *[
                             "module load " + module
                             for module in _configured_daemon_runtime_modules()
                         ],
+                        *native_runtime_setup_lines(),
                         "export ICHOR_ACTIVE_WORKERS="
                         + str(
                             int(
@@ -2184,6 +2221,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 scheduler_timeout_seconds=int(
                     self.config.runtime.scheduler_command_timeout_seconds
                 ),
+                scheduler_kind=self.scheduler_identity_kind,
             )
         except BackendSubmissionError:
             raise
@@ -2732,52 +2770,39 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             raise BackendSubmissionError(
                 "final submitted script has no immutable binding"
             )
+        submission_stage = (
+            "slurm_submission"
+            if self.scheduler_identity_kind == "slurm"
+            else "sge_submission"
+        )
         self._report_runtime_progress(
-            "slurm_submission",
+            submission_stage,
             completed=0,
             total=(int(array_size) if array_size is not None else 1),
             unit="tasks",
         )
-        result = run_scheduler_command(
-            self.sbatch_runner,
-            [
-                "sbatch",
-                "--parsable",
-                "--export=ALL,ICHOR_SCRIPT_BINDING_SHA256=" + binding_sha,
-                str(script),
-            ],
-            timeout_seconds=int(
-                self.config.runtime.scheduler_command_timeout_seconds
-            ),
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        stdout = getattr(result, "stdout", "") or ""
-        stderr = getattr(result, "stderr", "") or ""
-        return_code = int(getattr(result, "returncode", 1))
-        if return_code != 0:
-            raise BackendSubmissionError(
-                "sbatch failed for phase " + phase_name + ": "
-                + repr(stderr) + " stdout=" + repr(stdout)
-            )
         try:
-            job_id, _cluster = parse_sbatch_parsable_output(stdout)
-        except ValueError as exc:
+            submission = self._scheduler_backend.submit(
+                script,
+                binding_sha256=binding_sha,
+                runner=self.sbatch_runner,
+                timeout_seconds=int(
+                    self.config.runtime.scheduler_command_timeout_seconds
+                ),
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
             raise BackendSubmissionError(
-                "sbatch returned invalid parsable output for phase "
+                self._scheduler_backend.display_name
+                + " submission failed for phase "
                 + phase_name
                 + ": "
                 + str(exc)
-                + "; stdout="
-                + repr(stdout)
-                + "; stderr="
-                + repr(stderr)
             ) from exc
+        job_id = submission.job_id
         self.artefact_log.append(str(script))
         expected_tasks = int(array_size) if array_size is not None else 1
         self._report_runtime_progress(
-            "slurm_submission",
+            submission_stage,
             completed=expected_tasks,
             total=expected_tasks,
             unit="tasks",
@@ -2895,6 +2920,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             phase_name,
             int(state.iteration),
             identity,
+            scheduler_kind=self.scheduler_identity_kind,
         )
         payload = resolution_payload(
             campaign_uid=str(state.campaign_uid),
@@ -2942,7 +2968,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             resource_resolution_path=str(resolution_binding["path"]),
             resource_resolution_sha256=str(resolution_binding["sha256"]),
         )
-        body = build_sbatch_script(
+        body = build_scheduler_script(
             phase_name=phase_name,
             iteration=state.iteration,
             campaign_dir=self.campaign_dir,
@@ -2957,6 +2983,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             attempt_bundle=bundle,
             submission_intent=active_intent,
             resource_resolution_binding=resolution_binding,
+            scheduler_kind=self.scheduler_identity_kind,
         )
         script = write_attempt_script(bundle, body)
         script_binding = write_script_binding(bundle)
@@ -5901,7 +5928,7 @@ def _current_submission_job_name(
         )
     except Exception as exc:
         raise BackendSubmissionError(
-            "cannot render a Slurm job name from the active submission intent: "
+            "cannot render a scheduler job name from the active submission intent: "
             + type(exc).__name__
             + ": "
             + str(exc)[:160]
@@ -5919,11 +5946,14 @@ def make_live_job_finder(
     *,
     campaign_dir: Optional[Path] = None,
     timeout_seconds: int = 60,
+    scheduler_kind: Optional[str] = None,
 ):
     """the job_finder the daemon uses in live mode: given (state, phase) return the JobID of an
     already-running job for that exact phase+iteration, or None. lets the daemon adopt a job a crash
     orphaned rather than double-submit (A24/A25)."""
-    from ..submit.sacct_poll import JobNameLookup, find_running_job_by_name_detailed
+    from ..submit.sacct_poll import JobNameLookup
+
+    backend = get_scheduler_backend(scheduler_kind or _configured_scheduler())
 
     def _finder(state, phase):
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
@@ -5960,15 +5990,16 @@ def make_live_job_finder(
             if legacy not in names:
                 names.append(legacy)
         names = [name for name in names if name]
+        if backend.identity_kind == "sge":
+            names = [sge_safe_job_name(name) for name in names]
         inconclusive: Optional[JobNameLookup] = None
         last_lookup = JobNameLookup(None, inconclusive=False)
         use_squeue_fallback = squeue_runner is not None or sacct_runner is None
         for name in names:
-            found = find_running_job_by_name_detailed(
+            found = backend.find_running_job_by_name(
                 name,
-                sacct_runner=sacct_runner,
-                squeue_runner=squeue_runner,
-                use_squeue_fallback=use_squeue_fallback,
+                accounting_runner=(sacct_runner or subprocess.run),
+                queue_runner=(squeue_runner or subprocess.run),
                 timeout_seconds=int(timeout_seconds),
             )
             last_lookup = found
@@ -5986,9 +6017,10 @@ def make_live_job_accounting_finder(
     squeue_runner=None,
     *,
     timeout_seconds: int = 60,
+    scheduler_kind: Optional[str] = None,
 ):
     """Return a live-mode expected-job-name accounting lookup."""
-    from ..submit.sacct_poll import find_accounted_job_by_name_detailed
+    backend = get_scheduler_backend(scheduler_kind or _configured_scheduler())
 
     def _finder(state, phase, active_intent):
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
@@ -6006,18 +6038,19 @@ def make_live_job_accounting_finder(
             if legacy not in names:
                 names.append(legacy)
         names = [name for name in names if name]
+        if backend.identity_kind == "sge":
+            names = [sge_safe_job_name(name) for name in names]
         inconclusive = None
         last_lookup = None
         use_squeue_fallback = squeue_runner is not None or sacct_runner is None
         for name in names:
-            found = find_accounted_job_by_name_detailed(
+            found = backend.find_accounted_job_by_name(
                 name,
                 expected_task_count=(
                     None if expected_tasks is None else int(expected_tasks)
                 ),
-                sacct_runner=sacct_runner,
-                squeue_runner=squeue_runner,
-                use_squeue_fallback=use_squeue_fallback,
+                accounting_runner=(sacct_runner or subprocess.run),
+                queue_runner=(squeue_runner or subprocess.run),
                 submission_kind=str(active_intent.get("submission_kind")),
                 timeout_seconds=int(timeout_seconds),
             )
@@ -6031,14 +6064,19 @@ def make_live_job_accounting_finder(
     return _finder
 
 
-def make_live_job_liveness_checker(squeue_runner=None, *, timeout_seconds: int = 60):
-    """Return a live-mode checker for whether an existing Slurm JobID is active."""
-    from ..submit.sacct_poll import find_active_job_by_id_detailed
+def make_live_job_liveness_checker(
+    squeue_runner=None,
+    *,
+    timeout_seconds: int = 60,
+    scheduler_kind: Optional[str] = None,
+):
+    """Return a live-mode checker for an existing scheduler JobID."""
+    backend = get_scheduler_backend(scheduler_kind or _configured_scheduler())
 
     def _checker(job_id):
-        return find_active_job_by_id_detailed(
+        return backend.find_active_job_by_id(
             job_id,
-            squeue_runner=squeue_runner,
+            queue_runner=(squeue_runner or subprocess.run),
             timeout_seconds=int(timeout_seconds),
         )
 
@@ -6123,6 +6161,30 @@ def _configured_max_array_task_id() -> Optional[int]:
     return value
 
 
+def _configured_max_array_tasks() -> Optional[int]:
+    raw = profile_value("hpc", "max_array_tasks", default=None)
+    if raw is None:
+        legacy = _configured_max_array_task_id()
+        return None if legacy is None else int(legacy) + 1
+    if isinstance(raw, bool) or (
+        isinstance(raw, float) and not raw.is_integer()
+    ):
+        raise BackendSubmissionError(
+            "configured hpc.max_array_tasks must be an integer"
+        )
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise BackendSubmissionError(
+            "configured hpc.max_array_tasks must be an integer"
+        ) from exc
+    if value <= 0:
+        raise BackendSubmissionError(
+            "configured hpc.max_array_tasks must be > 0"
+        )
+    return value
+
+
 def _configured_max_job_log_files_per_directory() -> int:
     raw = profile_value(
         "hpc", "max_job_log_files_per_directory", default=5000
@@ -6150,17 +6212,18 @@ def _configured_scheduler() -> str:
     if active_machine() == "_default":
         raise BackendSubmissionError(
             "_default is a fallback configuration, not a live active-learning "
-            "profile; set ICHOR_MACHINE to a real Slurm profile such as csf3 "
-            "or csf4"
+            "profile; set ICHOR_MACHINE to a live profile such as csf3, csf4, "
+            "or ffluxlab"
         )
     raw = profile_value("hpc", "scheduler", default=None)
     if raw is None:
         return "slurm"
     value = str(raw).strip().lower()
     _reject_shell_control_chars("configured hpc.scheduler", value)
-    if value != "slurm":
+    if value not in {"slurm", "sge"}:
         raise BackendSubmissionError(
-            "active-learning live mode supports hpc.scheduler='slurm'; got "
+            "active-learning live mode supports hpc.scheduler='slurm' or "
+            "'sge'; got "
             + repr(value)
         )
     return value
@@ -6189,13 +6252,13 @@ def _configured_ferebus_platform() -> str:
 
 
 def _configured_daemon_runtime_modules() -> List[str]:
-    """Modules loaded by daemon-owned live sbatch scripts.
+    """Modules loaded by daemon-owned scheduler scripts.
 
     Python and ARIADNE/MKL runtime modules are kept in ichor_config.yaml so a
     cluster-module update does not require a code edit. Missing config falls
     back to the current CSF4 stack for off-cluster tests and legacy configs.
-    FEREBUS is not included: pyferebus writes and submits its own script for
-    FEREBUS phases.
+    FEREBUS is not included: pyferebus generates the initial source script,
+    which ICHOR replaces with a scheduler-native wrapper before submission.
     """
     try:
         return configured_daemon_runtime_modules()
@@ -6255,8 +6318,8 @@ def _job_scratch_preamble(
         + _shell_quote(str(submission_intent.get("attempt_id") or ""))
         + " --submission-identity "
         + _shell_quote(identity)
-        + ' --job-id "${SLURM_JOB_ID}"'
-        + ' --array-task-id "${SLURM_ARRAY_TASK_ID:-0}"'
+        + ' --job-id "${ICHOR_SCHEDULER_JOB_ID}"'
+        + ' --array-task-id "${ICHOR_SCHEDULER_ARRAY_TASK_ID:-0}"'
         + ' --resource-resolution "$ICHOR_RESOURCE_RESOLUTION"'
         + ' --resource-resolution-sha256 "$ICHOR_RESOURCE_RESOLUTION_SHA256"'
         + ' --script-binding "$ICHOR_SCRIPT_BINDING"'
@@ -6284,7 +6347,7 @@ def _job_scratch_preamble(
     ]
 
 
-def build_sbatch_script(
+def build_scheduler_script(
     *,
     phase_name: str,
     iteration: int,
@@ -6301,33 +6364,44 @@ def build_sbatch_script(
     submission_intent: Optional[Dict[str, Any]] = None,
     resource_resolution_binding: Optional[Dict[str, Any]] = None,
     dry_run: bool = False,
+    scheduler_kind: Optional[str] = None,
 ) -> str:
-    """Return the body of an sbatch script for the given phase.
+    """Return a scheduler-native live script for the given phase.
 
     Resources come from config.resources (partition / walltime / mem /
     cpus-per-task / ntasks); walltime_hours and partition may still be passed
-    to override them. array_size, when given, turns the job into a
-    0..array_size-1 SLURM array. array_task_map, when given, maps that
-    dense Slurm index onto the original logical task id for partial array
-    recovery.
+    to override them. Native task indexes are normalised to a zero-based
+    ICHOR logical task ID before any scientific code is invoked.
 
     Paths are absolute (resolved campaign dir) so the script does not depend
-    on sbatch being launched from any particular directory.
+    on submission being launched from any particular directory.
     """
-    _configured_scheduler()
+    scheduler = str(scheduler_kind or _configured_scheduler()).strip().lower()
+    if scheduler not in {"slurm", "sge"}:
+        raise BackendSubmissionError("unsupported scheduler: " + repr(scheduler))
     res = config.resources
     part = str(partition if partition is not None else res.partition_for(phase_name))
     is_array = array_size is not None and int(array_size) > 0
     if is_array:
-        max_array_task_id = _configured_max_array_task_id()
-        highest_task_id = int(array_size) - 1
-        if max_array_task_id is not None and highest_task_id > max_array_task_id:
-            raise BackendSubmissionError(
-                "array task id "
-                + str(highest_task_id)
-                + " exceeds configured hpc.max_array_task_id "
-                + str(max_array_task_id)
-            )
+        if scheduler == "slurm":
+            max_array_task_id = _configured_max_array_task_id()
+            highest_task_id = int(array_size) - 1
+            if max_array_task_id is not None and highest_task_id > max_array_task_id:
+                raise BackendSubmissionError(
+                    "array task id "
+                    + str(highest_task_id)
+                    + " exceeds configured hpc.max_array_task_id "
+                    + str(max_array_task_id)
+                )
+        else:
+            maximum_tasks = _configured_max_array_tasks()
+            if maximum_tasks is not None and int(array_size) > maximum_tasks:
+                raise BackendSubmissionError(
+                    "array size "
+                    + str(int(array_size))
+                    + " exceeds configured hpc.max_array_tasks "
+                    + str(maximum_tasks)
+                )
     resolved = resolved_resources or resolve_phase_resources(
         phase_name=phase_name,
         config=config,
@@ -6353,7 +6427,9 @@ def build_sbatch_script(
         )
     except ValueError as exc:
         raise BackendSubmissionError(str(exc)) from exc
-    _reject_shell_control_chars("Slurm job name", job_name)
+    if scheduler == "sge":
+        job_name = sge_safe_job_name(job_name)
+    _reject_shell_control_chars("scheduler job name", job_name)
     identity = str(
         (submission_intent or {}).get("submission_identity")
         or "unbound-preview"
@@ -6373,36 +6449,81 @@ def build_sbatch_script(
             errors=root / "ERRORS",
             array_task_map=array_task_map,
         )
-    log_paths = slurm_log_paths(bundle, is_array=is_array)
-    lines: List[str] = [
-        _configured_jobscript_shebang(),
-        "#SBATCH --job-name=" + job_name,
-        "#SBATCH --partition=" + str(resolved.partition),
-        "#SBATCH --time=" + _format_slurm_walltime_hours(wall),
-        "#SBATCH --mem-per-cpu=" + str(mem_per_cpu),
-        "#SBATCH --cpus-per-task=" + str(int(cpus)),
-        "#SBATCH --ntasks=" + str(int(ntasks)),
-    ]
-    if is_array:
-        throttle = getattr(res, "array_concurrency_limit", None)
-        array_spec = "0-" + str(int(array_size) - 1)
-        if throttle is not None:
-            try:
-                throttle_i = int(throttle)
-            except (TypeError, ValueError) as exc:
+    log_paths = scheduler_log_paths(
+        bundle,
+        scheduler_kind=scheduler,
+        is_array=is_array,
+    )
+    throttle = getattr(res, "array_concurrency_limit", None)
+    throttle_i: Optional[int] = None
+    if is_array and throttle is not None:
+        try:
+            throttle_i = int(throttle)
+        except (TypeError, ValueError) as exc:
+            raise BackendSubmissionError(
+                "resources.array_concurrency_limit must be a positive integer"
+            ) from exc
+        if throttle_i <= 0:
+            raise BackendSubmissionError(
+                "resources.array_concurrency_limit must be > 0"
+            )
+        throttle_i = min(throttle_i, int(array_size))
+    lines: List[str] = [_configured_jobscript_shebang()]
+    if scheduler == "slurm":
+        lines += [
+            "#SBATCH --job-name=" + job_name,
+            "#SBATCH --partition=" + str(resolved.partition),
+            "#SBATCH --time=" + _format_slurm_walltime_hours(wall),
+            "#SBATCH --mem-per-cpu=" + str(mem_per_cpu),
+            "#SBATCH --cpus-per-task=" + str(int(cpus)),
+            "#SBATCH --ntasks=" + str(int(ntasks)),
+        ]
+        if is_array:
+            array_spec = "0-" + str(int(array_size) - 1)
+            if throttle_i is not None:
+                array_spec += "%" + str(throttle_i)
+            lines.append("#SBATCH --array=" + array_spec)
+        lines += [
+            "#SBATCH --output=" + log_paths["output"],
+            "#SBATCH --error=" + log_paths["error"],
+        ]
+    else:
+        if int(ntasks) != 1:
+            raise BackendSubmissionError(
+                "SGE live phases require resources.ntasks=1"
+            )
+        queue = str(resolved.extra.get("scheduler_queue") or "").strip()
+        if not queue:
+            raise BackendSubmissionError(
+                "SGE resource resolution has no scheduler queue"
+            )
+        pe = str(resolved.extra.get("parallel_environment") or "").strip()
+        total_memory_mib = int(
+            math.ceil(slurm_memory_mib(mem_per_cpu) * float(max(1, cpus)))
+        )
+        lines += [
+            "#$ -S /bin/bash",
+            "#$ -V",
+            "#$ -N " + job_name,
+            "#$ -q " + queue,
+            "#$ -l h_rt=" + _format_sge_walltime_hours(wall),
+            "#$ -l h_vmem=" + str(total_memory_mib) + "M",
+        ]
+        if int(cpus) > 1 or pe:
+            if not pe:
                 raise BackendSubmissionError(
-                    "resources.array_concurrency_limit must be a positive integer"
-                ) from exc
-            if throttle_i <= 0:
-                raise BackendSubmissionError(
-                    "resources.array_concurrency_limit must be > 0"
+                    "parallel SGE work has no configured parallel environment"
                 )
-            throttle_i = min(throttle_i, int(array_size))
-            array_spec += "%" + str(throttle_i)
-        lines.append("#SBATCH --array=" + array_spec)
+            lines.append("#$ -pe " + pe + " " + str(int(cpus)))
+        if is_array:
+            lines.append("#$ -t 1-" + str(int(array_size)))
+            if throttle_i is not None:
+                lines.append("#$ -tc " + str(throttle_i))
+        lines += [
+            "#$ -o " + log_paths["output"],
+            "#$ -e " + log_paths["error"],
+        ]
     lines += [
-        "#SBATCH --output=" + log_paths["output"],
-        "#SBATCH --error=" + log_paths["error"],
         "",
         "# Resolved ICHOR resources: backend="
         + str(resolved.backend)
@@ -6417,9 +6538,30 @@ def build_sbatch_script(
         "set -euo pipefail",
         "export LC_ALL=C",
         "export LC_NUMERIC=C",
+    ]
+    if scheduler == "slurm":
+        lines += [
+            'export ICHOR_SCHEDULER_JOB_ID="${SLURM_JOB_ID:?missing SLURM_JOB_ID}"',
+            'export ICHOR_SCHEDULER_ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"',
+            'export ICHOR_SCHEDULER_CPUS="${SLURM_CPUS_PER_TASK:-1}"',
+        ]
+    else:
+        lines += [
+            'export ICHOR_SCHEDULER_JOB_ID="${JOB_ID:?missing JOB_ID}"',
+            (
+                ': "${SGE_TASK_ID:?missing SGE_TASK_ID}"; '
+                'export ICHOR_SCHEDULER_ARRAY_TASK_ID="$((SGE_TASK_ID - 1))"'
+                if is_array
+                else "export ICHOR_SCHEDULER_ARRAY_TASK_ID=0"
+            ),
+            'export ICHOR_SCHEDULER_CPUS="${NSLOTS:-1}"',
+        ]
+    lines += [
         "",
+        *module_initialisation_lines(),
         "module purge",
         *["module load " + m for m in _configured_daemon_runtime_modules()],
+        *native_runtime_setup_lines(),
         *python_library_path_export_lines(configured_python_library_paths()),
         "",
     ]
@@ -6445,8 +6587,15 @@ def build_sbatch_script(
             script_binding_path=attempt_bundle.script_binding,
         )
     if dry_run:
+        renderer_name = (
+            "Slurm"
+            if scheduler == "slurm"
+            else "Sun Grid Engine"
+        )
         lines += [
-            "# DRY-RUN: production Slurm/resource/environment renderer only.",
+            "# DRY-RUN: production "
+            + renderer_name
+            + "/resource/environment renderer only.",
             "# No scientific backend is invoked.",
             "echo " + _shell_quote(
                 "DRYRUN " + str(phase_name) + " iteration=" + str(int(iteration))
@@ -6509,10 +6658,19 @@ def build_sbatch_script(
     return "\n".join(lines)
 
 
+def build_sbatch_script(**kwargs: Any) -> str:
+    """Compatibility wrapper preserving the established Slurm renderer API."""
+    if active_machine() == "_default":
+        _configured_scheduler()
+    supplied = dict(kwargs)
+    supplied["scheduler_kind"] = "slurm"
+    return build_scheduler_script(**supplied)
+
+
 def _array_task_mapping_lines(array_task_map: Optional[Path]) -> List[str]:
     if array_task_map is None:
         return [
-            'ICHOR_LOGICAL_ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID}"',
+            'ICHOR_LOGICAL_ARRAY_TASK_ID="${ICHOR_SCHEDULER_ARRAY_TASK_ID}"',
         ]
     task_map = _shell_quote(str(Path(array_task_map).resolve()))
     python = _python_executable_for_script()
@@ -6547,8 +6705,8 @@ def _array_task_mapping_lines(array_task_map: Optional[Path]) -> List[str]:
         )
         + " "
         + task_map
-        + ' "$SLURM_ARRAY_TASK_ID")',
-        'if [ -z "$ICHOR_LOGICAL_ARRAY_TASK_ID" ]; then echo "no logical task id for retry index $SLURM_ARRAY_TASK_ID" >&2; exit 1; fi',
+        + ' "$ICHOR_SCHEDULER_ARRAY_TASK_ID")',
+        'if [ -z "$ICHOR_LOGICAL_ARRAY_TASK_ID" ]; then echo "no logical task id for retry index $ICHOR_SCHEDULER_ARRAY_TASK_ID" >&2; exit 1; fi',
         'case "$ICHOR_LOGICAL_ARRAY_TASK_ID" in (*[!0-9]*|"") echo "unsafe logical task id: $ICHOR_LOGICAL_ARRAY_TASK_ID" >&2; exit 1 ;; esac',
     ]
 
@@ -6614,7 +6772,7 @@ def _gaussian_invocation_block(
         "export ICHOR_GAUSSIAN_PHASE=" + phase_q,
         "export ICHOR_ITERATION=" + str(int(iteration)),
         'export GAUSS_SCRDIR="$ICHOR_JOB_SCRATCH/gaussian"',
-        'export GAUSS_PDEF="${SLURM_CPUS_PER_TASK:-1}"',
+        'export GAUSS_PDEF="${ICHOR_SCHEDULER_CPUS:-1}"',
         "export GAUSS_MDEF=" + mdef,
         'mkdir -p "$GAUSS_SCRDIR"',
         'echo "GAUSS_SCRDIR=$GAUSS_SCRDIR"',
@@ -6685,11 +6843,12 @@ def _aimall_invocation_block(
     array_task_map: Optional[Path] = None,
 ) -> List[str]:
     aimall_path = _configured_backend_path("aimall", "~/AIMAll/aimqb.ish")
+    aimall_modules = _configured_backend_modules("aimall", [])
     aimall_cfg = getattr(config, "aimall", None)
     args: List[str] = []
     if bool(getattr(aimall_cfg, "nogui", True)):
         args.append("-nogui")
-    args.append('-nproc="${SLURM_CPUS_PER_TASK:-1}"')
+    args.append('-nproc="${ICHOR_SCHEDULER_CPUS:-1}"')
     args.append('-naat="$AIMALL_NAAT"')
     encomp = int(getattr(aimall_cfg, "encomp", 3))
     args.append("-encomp=" + str(encomp))
@@ -6704,6 +6863,8 @@ def _aimall_invocation_block(
     camp_q = _shell_quote(camp)
     python = _python_executable_for_script()
     return [
+        *["module load " + module for module in aimall_modules],
+        "",
         "# per-point AIMAll array over the .wfn files gaussian produced.",
         "export ICHOR_CAMPAIGN_DIR=" + camp_q,
         "export ICHOR_ITERATION=" + str(int(iteration)),

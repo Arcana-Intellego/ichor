@@ -222,14 +222,17 @@ def plan_phase(
             "phase": phase,
             "iteration": int(iteration),
             "status": "local",
-            "message": "phase runs in the daemon process and requests no Slurm resources",
+            "message": (
+                "phase runs in the daemon process and requests no scheduler "
+                "resources"
+            ),
         }
     if phase not in SBATCH_PHASES:
         return {
             "phase": phase,
             "iteration": int(iteration),
             "status": "local",
-            "message": "terminal phase requests no Slurm resources",
+            "message": "terminal phase requests no scheduler resources",
         }
     existing = _submitted_plan(campaign, phase, int(iteration))
     if existing is not None:
@@ -360,15 +363,27 @@ def build_resource_plan(
     }
 
 
-def _human_status(value: Any) -> str:
+def _scheduler_name(resources: Any) -> str:
+    if not isinstance(resources, dict):
+        return "scheduler"
+    extra = resources.get("extra")
+    extra = extra if isinstance(extra, dict) else {}
+    return (
+        "Sun Grid Engine"
+        if str(extra.get("scheduler") or "slurm").strip().lower() == "sge"
+        else "Slurm"
+    )
+
+
+def _human_status(value: Any, *, scheduler_name: str = "scheduler") -> str:
     return {
         "prepared": "prepared for submission",
-        "submitted": "submitted to Slurm",
+        "submitted": "submitted to " + scheduler_name,
         "completed": "completed",
         "failed": "failed",
         "superseded": "replaced by a later attempt",
         "ready": "ready for submission",
-        "local": "runs locally without Slurm",
+        "local": "runs locally without scheduler submission",
         "evidence_not_yet_produced": "waiting for data from an earlier phase",
         "evidence_invalid": "resource evidence is invalid",
     }.get(str(value), str(value).replace("_", " "))
@@ -396,12 +411,34 @@ def format_resource_plan(
         for plan in payload["plans"]:
             lines.append("")
             lines.append(str(plan["phase"]))
-            lines.append("  Status: " + _human_status(plan.get("status")))
             resources = plan.get("resources")
+            scheduler_name = _scheduler_name(resources)
+            lines.append(
+                "  Status: "
+                + _human_status(
+                    plan.get("status"),
+                    scheduler_name=scheduler_name,
+                )
+            )
             if isinstance(resources, dict):
                 extra = resources.get("extra")
                 extra = extra if isinstance(extra, dict) else {}
-                lines.append("  Runs on: Slurm partition " + str(resources.get("partition")))
+                if scheduler_name == "Sun Grid Engine":
+                    lines.append(
+                        "  Runs on: Sun Grid Engine queue "
+                        + str(extra.get("scheduler_queue") or resources.get("partition"))
+                    )
+                    parallel_environment = extra.get("parallel_environment")
+                    if parallel_environment:
+                        lines.append(
+                            "  Parallel environment: "
+                            + str(parallel_environment)
+                        )
+                else:
+                    lines.append(
+                        "  Runs on: Slurm partition "
+                        + str(resources.get("partition"))
+                    )
                 array_size = extra.get("array_size")
                 if array_size is not None:
                     lines.append("  Array tasks: " + str(array_size))

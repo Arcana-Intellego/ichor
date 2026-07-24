@@ -606,7 +606,7 @@ def install_stop_request(
                 return existing, "existing"
             if str(existing.get("status")) == "cancelling":
                 raise StopControlError(
-                    "a Slurm cancellation request is already in progress; "
+                    "a scheduler cancellation request is already in progress; "
                     "rerun the same immediate --cancel-jobs request"
                 )
             if str(candidate["mode"]) != "immediate":

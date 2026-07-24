@@ -353,8 +353,10 @@ class Daemon:
             self.scheduler_identity_kind = str(
                 getattr(self.executor, "scheduler_identity_kind", "synthetic")
             )
-        if self.scheduler_identity_kind not in {"synthetic", "slurm"}:
-            raise ValueError("scheduler_identity_kind must be synthetic or slurm")
+        if self.scheduler_identity_kind not in {"synthetic", "slurm", "sge"}:
+            raise ValueError(
+                "scheduler_identity_kind must be synthetic, slurm, or sge"
+            )
 
     # --- path helpers ---------------------------------------------------
 
@@ -738,6 +740,11 @@ class Daemon:
         )
 
     def _journal(self, event_type: str, **payload: Any) -> None:
+        if (
+            "scheduler_identity_kind" not in payload
+            and self.scheduler_identity_kind in {"slurm", "sge"}
+        ):
+            payload["scheduler_identity_kind"] = self.scheduler_identity_kind
         if "phase" not in payload and self._journal_phase_snapshot is not None:
             payload["phase"] = self._journal_phase_snapshot
         if (
@@ -834,8 +841,13 @@ class Daemon:
                 event, **dict(payload)
             ),
         )
+        stage = (
+            "sge_scheduler_wait"
+            if self.scheduler_identity_kind == "sge"
+            else "scheduler_wait"
+        )
         reporter.start(
-            "scheduler_wait",
+            stage,
             completed=0,
             total=expected_tasks,
             unit="tasks",
@@ -853,13 +865,26 @@ class Daemon:
         key = phase.value + ":" + str(job_id)
         reporter = self._scheduler_progress_reporters.pop(key, None)
         if reporter is not None:
+            stage = (
+                "sge_scheduler_wait"
+                if self.scheduler_identity_kind == "sge"
+                else "scheduler_wait"
+            )
+            scheduler_name = (
+                "Sun Grid Engine"
+                if self.scheduler_identity_kind == "sge"
+                else "Slurm"
+            )
             if int(failed or 0) > 0:
                 reporter.fail(
-                    "Slurm reported " + str(int(failed or 0)) + " failed task(s)",
-                    stage="scheduler_wait",
+                    scheduler_name
+                    + " reported "
+                    + str(int(failed or 0))
+                    + " failed task(s)",
+                    stage=stage,
                 )
             else:
-                reporter.complete(stage="scheduler_wait")
+                reporter.complete(stage=stage)
 
     def _close_scheduler_progress_reporters(self) -> None:
         for reporter in list(self._scheduler_progress_reporters.values()):
@@ -1656,6 +1681,23 @@ class Daemon:
             and postprocess_source is not None
         )
         if active_intent is not None:
+            recorded_scheduler = str(
+                active_intent.get("scheduler_identity_kind") or ""
+            ).strip().lower()
+            if (
+                self.scheduler_identity_kind in {"slurm", "sge"}
+                and recorded_scheduler in {"slurm", "sge"}
+                and recorded_scheduler != self.scheduler_identity_kind
+            ):
+                return self._halt_scheduler_uncertain(
+                    state,
+                    phase,
+                    "active_submission_scheduler_changed: recorded "
+                    + recorded_scheduler
+                    + ", active profile "
+                    + str(self.scheduler_identity_kind)
+                    + "; refusing to query or replace scheduler-owned work",
+                )
             intent_environment_status = self._verify_intent_environment_binding(
                 state,
                 phase,
@@ -1918,7 +1960,11 @@ class Daemon:
                 phase_reporter.fail(
                     "BackendSubmissionError: " + str(exc),
                     stage=(
-                        "slurm_submission"
+                        (
+                            "sge_submission"
+                            if self.scheduler_identity_kind == "sge"
+                            else "slurm_submission"
+                        )
                         if phase_name in SBATCH_PHASES
                         else "phase_entry"
                     ),
@@ -1988,6 +2034,7 @@ class Daemon:
             self._journal(
                 "sbatch", phase=phase_name, job_id=result.submitted_job_id,
                 iteration=state.iteration,
+                scheduler_identity_kind=self.scheduler_identity_kind,
                 expected_tasks=result.expected_tasks,
                 **_journal_metadata_payload(
                     getattr(result, "submission_metadata", {}) or {}
@@ -2000,7 +2047,11 @@ class Daemon:
             )
             if phase_reporter is not None:
                 phase_reporter.complete(
-                    stage="slurm_submission",
+                    stage=(
+                        "sge_submission"
+                        if self.scheduler_identity_kind == "sge"
+                        else "slurm_submission"
+                    ),
                     job_id=str(result.submitted_job_id),
                     expected_tasks=result.expected_tasks,
                 )
@@ -2392,7 +2443,11 @@ class Daemon:
             for observation in summary.observations
         ]
         scheduler_reporter.update(
-            stage="scheduler_wait",
+            stage=(
+                "sge_scheduler_wait"
+                if self.scheduler_identity_kind == "sge"
+                else "scheduler_wait"
+            ),
             completed=int(getattr(summary, "n_completed", 0)),
             total=(
                 int(expected_tasks)
@@ -2577,7 +2632,13 @@ class Daemon:
                     + str(max_missing)
                     + " ticks missed "
                     + str(int(getattr(summary, "n_missing", 0)))
-                    + " expected Slurm array task rows",
+                    + " expected "
+                    + (
+                        "Sun Grid Engine"
+                        if self.scheduler_identity_kind == "sge"
+                        else "Slurm"
+                    )
+                    + " array task rows",
                 )
             return TickStatus.POLLING
         if missing_key in state.sacct_empty_streak:
@@ -3821,7 +3882,7 @@ class Daemon:
         """Move the campaign to HALTED after an unexpected tick exception.
 
         This is deliberately not routed through ``_halt``. A generic daemon
-        exception is not evidence that a submitted Slurm job failed, so pending
+        exception is not evidence that a submitted scheduler job failed, so pending
         jobs and active submission intents must remain intact for user
         cancellation or reconciliation.
         """
@@ -3839,7 +3900,7 @@ class Daemon:
             source="daemon",
             scheduler_uncertain=any(bool(value) for value in state.pending_jobs.values()),
             recovery_action=(
-                "inspect LAST_EXCEPTION.json and any preserved Slurm jobs, then reconcile"
+                "inspect LAST_EXCEPTION.json and any preserved scheduler jobs, then reconcile"
             ),
             details={"exception_type": type(exc).__name__},
         )

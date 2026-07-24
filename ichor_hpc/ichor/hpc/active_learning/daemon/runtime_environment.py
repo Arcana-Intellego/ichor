@@ -138,6 +138,45 @@ def python_library_path_export_lines(paths: List[str]) -> List[str]:
     ]
 
 
+def native_runtime_setup_lines() -> List[str]:
+    """Render machine-specific native runtime discovery for submitted jobs."""
+    if (active_machine() or "").lower() != "ffluxlab":
+        return []
+    return [
+        'ICHOR_INTEL_ROOT="$(readlink -f /home/modules/compilers/intel/21.0.3)"',
+        (
+            'ICHOR_INTEL_LIBIMF="$(find "$ICHOR_INTEL_ROOT" '
+            "\\( -type f -o -type l \\) "
+            "-path '*/intel64_lin/libimf.so' -print -quit)"
+        ),
+        (
+            '[ -n "$ICHOR_INTEL_LIBIMF" ] || '
+            "{ echo '64-bit Intel runtime is unavailable' >&2; exit 1; }"
+        ),
+        'ICHOR_INTEL_RUNTIME_DIR="$(dirname "$ICHOR_INTEL_LIBIMF")"',
+        (
+            'export LD_LIBRARY_PATH="$ICHOR_INTEL_RUNTIME_DIR'
+            '${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"'
+        ),
+        (
+            'export LIBRARY_PATH="$ICHOR_INTEL_RUNTIME_DIR'
+            '${LIBRARY_PATH:+:$LIBRARY_PATH}"'
+        ),
+    ]
+
+
+def module_initialisation_lines() -> List[str]:
+    """Make the Environment Modules shell function available in batch jobs."""
+    return [
+        "if ! type module >/dev/null 2>&1; then",
+        "  for init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash; do",
+        '    if [ -r "$init" ]; then . "$init"; break; fi',
+        "  done",
+        "fi",
+        "type module >/dev/null 2>&1 || { echo 'environment modules are unavailable' >&2; exit 1; }",
+    ]
+
+
 def module_load_lines(modules: List[str]) -> List[str]:
     return ["module load " + module for module in modules]
 
@@ -149,7 +188,9 @@ __all__ = [
     "SUBMITTED_PYTHON_IMPORTS",
     "configured_daemon_runtime_modules",
     "configured_python_library_paths",
+    "module_initialisation_lines",
     "module_load_lines",
+    "native_runtime_setup_lines",
     "normalise_module_list",
     "python_library_path_export_lines",
 ]

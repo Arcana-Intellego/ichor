@@ -12,16 +12,16 @@ To install ichor, simply do
 This will install all the packages in editable mode, so that any changes to the source code will
 be available to the user directly.
 
-On Manchester CSF3/CSF4, prefer the unified active-learning installer from
-the repository root. It keeps downloads opt-in, checks the sibling POLUS,
-FEREBUS_CPU, and ARIADNE trees, builds native ARIADNE/FEREBUS/PLUMED components
-where needed, verifies xTB/ASE, and updates only the active CSF profile in
-``~/ichor_config.yaml``:
+On CSF3, CSF4, and ffluxlab, prefer the unified active-learning installer from
+the repository root. It keeps downloads opt-in, builds native
+ARIADNE/FEREBUS/PLUMED components where needed, verifies xTB/ASE, and updates
+only the active machine profile in ``~/ichor_config.yaml``:
 
 .. code-block:: text
 
-    bash scripts/install_ichor_csf.sh --machine csf4 --projects-dir ~/projects
-    bash scripts/install_ichor_csf.sh --machine csf3 --projects-dir ~/projects
+    bash scripts/install_ichor.sh --machine auto --projects-dir ~/projects
+    bash scripts/install_ichor.sh --machine ffluxlab \
+        --projects-dir ~/projects --allow-download
 
 After installation, source the runtime helper that matches the cluster in
 each new shell. It loads the runtime modules, activates the venv, clears build
@@ -29,7 +29,11 @@ compiler variables, and verifies ARIADNE/PLUMED:
 
 .. code-block:: text
 
-    source scripts/env_ichor_csf.sh --smoke
+    source scripts/env_ichor.sh --smoke
+
+The historical ``install_ichor_csf.sh``, ``env_ichor_csf.sh``,
+``lib_ichor_csf.sh``, and ``install_ichor_csf3`` names remain compatibility
+wrappers.
 
 +++++++++++++++++++++++++++++++++
 Setting up ichor_config.yaml file
@@ -49,7 +53,7 @@ Below is a more thorough explanation on how to set up ichor on a compute cluster
 
 .. warning::
 
-    You will need to make separate environments for CSF3 and CSF4.
+    You will need separate environments for CSF3, CSF4, and ffluxlab.
 
     .. For CSF3 use ``source activate my_env`` to activate a CONDA environment in both the login node and when submitting jobs.
     .. Check out the guide here. Not sure why this is required.
@@ -161,6 +165,28 @@ To make sure you are using the latest versions of the packages, use
 
     python3 -m pip install --upgrade pip setuptools
 
+ffluxlab and Sun Grid Engine
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+ffluxlab uses Sun Grid Engine rather than Slurm. The canonical installer
+builds private CPython 3.11.15 and the pinned native dependencies, uses GCC
+11.1.0 for Python, PLUMED, and FEREBUS, and uses Intel 21.0.3 for ARIADNE.
+Missing public source trees are cloned through non-interactive HTTPS only when
+``--allow-download`` is supplied; an existing source tree is never pulled or
+modified automatically.
+
+After installation, verify the login and submitted environments before
+initialising a campaign:
+
+.. code-block:: text
+
+    source scripts/env_ichor.sh --machine ffluxlab --smoke
+    ichor-al-daemon preflight --campaign-dir . --submit-environment-smoke
+
+Generated jobs use ``qsub``, ``qstat``, ``qacct``, and ``qdel`` through the
+daemon's scheduler adapter. ICHOR keeps logical array task IDs zero-based even
+though native SGE array task IDs begin at one.
+
 +++++++++++++++++++
 PLUMED without Conda
 +++++++++++++++++++
@@ -237,9 +263,10 @@ If you download the code as a zip, you will not be able to pull from github and 
 
 .. warning::
 
-    You will need to use HTTPS to clone a repository to CSF3/CSF4 as SSH is not supported on the servers.
-    Therefore, you will also need to create a Personal Access Token as Github no longer accepts direct password authentication on a server.
-    Below are two guides how to clone a repository and create a personal access token
+    Use HTTPS when SSH access is unavailable on the cluster. Public repositories
+    such as ARIADNE and FEREBUS_CPU do not require GitHub credentials. A personal
+    access token is needed only for a private repository that your account is
+    authorised to read.
 
     * `Github Cloning a Repository <https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository>`_
     * `Github Personal Access Token <https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens>`_

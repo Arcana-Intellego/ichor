@@ -37,6 +37,7 @@ from .runtime_environment import (
     SUBMITTED_PYTHON_IMPORTS,
     configured_daemon_runtime_modules,
     configured_python_library_paths,
+    native_runtime_setup_lines,
     normalise_module_list,
     python_library_path_export_lines,
 )
@@ -81,11 +82,27 @@ class BackendAvailability:
     ariadne_abi_probe: Optional[Dict[str, object]] = None
     ariadne_runtime_probe: Optional[Dict[str, object]] = None
     pyferebus_probe_error: str = ""
+    scheduler_kind: str = "slurm"
+    qsub: bool = False
+    qsub_path: str = ""
+    qacct: bool = False
+    qacct_path: str = ""
+    qstat: bool = False
+    qstat_path: str = ""
+    qdel: bool = False
+    qdel_path: str = ""
+    aimall_verified: bool = False
+    aimall_probe_error: str = ""
 
     @property
     def all_present(self) -> bool:
+        scheduler_ok = (
+            self.sbatch and self.sacct and self.squeue
+            if self.scheduler_kind == "slurm"
+            else self.qsub and self.qacct and self.qstat and self.qdel
+        )
         return (
-            self.profile and self.sbatch and self.sacct and self.squeue and
+            self.profile and scheduler_ok and
             self.batch_python and self.gaussian and
             self.aimall and self.ferebus and self.ariadne and
             self.pyferebus and self.bc
@@ -94,8 +111,13 @@ class BackendAvailability:
     @property
     def missing(self) -> List[str]:
         out: List[str] = []
+        scheduler_fields = (
+            ("sbatch", "sacct", "squeue")
+            if self.scheduler_kind == "slurm"
+            else ("qsub", "qacct", "qstat", "qdel")
+        )
         for attr in (
-            "profile", "sbatch", "sacct", "squeue", "batch_python",
+            "profile", *scheduler_fields, "batch_python",
             "gaussian", "aimall", "ferebus",
             "ariadne", "pyferebus", "bc",
         ):
@@ -244,6 +266,7 @@ def _probe_configured_python_details(
                 "set -euo pipefail",
                 "module purge",
                 *module_lines,
+                *native_runtime_setup_lines(),
                 *python_library_path_export_lines(list(library_paths or [])),
             ]
             + ["exec " + shlex.quote(executable) + " -c " + shlex.quote(probe)]
@@ -358,7 +381,7 @@ def _probe_gaussian_environment() -> tuple[bool, str, str]:
     if executable and not re.fullmatch(r"[A-Za-z0-9_./${}:+~-]+", executable):
         return False, "", "configured Gaussian executable path is unsafe"
     module_lines = ["module load " + module for module in modules]
-    if executable:
+    if executable and any(character in executable for character in "/$~"):
         command = (
             "candidate="
             + shlex.quote(executable)
@@ -366,11 +389,17 @@ def _probe_gaussian_environment() -> tuple[bool, str, str]:
             + "test -x \"$candidate\"; printf '%s\\n' \"$candidate\""
         )
     else:
-        command = "command -v g16"
+        command = "command -v " + shlex.quote(executable or "g16")
     try:
         completed = _run_login_shell(
             "\n".join(
-                ["set -euo pipefail", "module purge", *module_lines, command]
+                [
+                    "set -euo pipefail",
+                    "module purge",
+                    *module_lines,
+                    *native_runtime_setup_lines(),
+                    command,
+                ]
             ),
             timeout=30,
         )
@@ -384,23 +413,76 @@ def _probe_gaussian_environment() -> tuple[bool, str, str]:
     return True, resolved_path, ""
 
 
+def _probe_aimall_environment() -> tuple[bool, str, str]:
+    """Resolve AIMAll under the same module block used by submitted jobs."""
+    raw_modules = profile_value("software", "aimall", "modules", default=None)
+    try:
+        aimall_modules = normalise_module_list(raw_modules, label="aimall")
+        runtime_modules = configured_daemon_runtime_modules()
+    except (ValueError, ClusterProfileError) as exc:
+        return False, "", str(exc)
+    modules = list(runtime_modules)
+    for module in aimall_modules:
+        if module not in modules:
+            modules.append(module)
+    executable = str(
+        profile_value("software", "aimall", "executable_path", default="") or ""
+    ).strip()
+    if executable and not re.fullmatch(r"[A-Za-z0-9_./${}:+~-]+", executable):
+        return False, "", "configured AIMAll executable path is unsafe"
+    if executable and any(character in executable for character in "/$~"):
+        command = (
+            "candidate="
+            + shlex.quote(executable)
+            + "; candidate=$(eval \"printf '%s' \\\"$candidate\\\"\"); "
+            + "test -x \"$candidate\"; printf '%s\\n' \"$candidate\""
+        )
+    else:
+        command = "command -v " + shlex.quote(executable or "aimqb.ish")
+    try:
+        completed = _run_login_shell(
+            "\n".join(
+                ["set -euo pipefail", "module purge", *[
+                    "module load " + module for module in modules
+                ], *native_runtime_setup_lines(), command]
+            ),
+            timeout=30,
+        )
+    except Exception as exc:
+        return False, "", type(exc).__name__ + ": " + str(exc)
+    resolved = (completed.stdout or "").strip().splitlines()
+    resolved_path = resolved[-1] if resolved else ""
+    if int(completed.returncode) != 0 or not resolved_path:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        return False, "", "AIMAll module/path probe failed: " + detail[:500]
+    return True, resolved_path, ""
+
+
 def check_backends() -> BackendAvailability:
     sbatch = _which("sbatch")
     sacct = _which("sacct")
     squeue = _which("squeue")
+    qsub = _which("qsub")
+    qacct = _which("qacct")
+    qstat = _which("qstat")
+    qdel = _which("qdel")
     bc = _which("bc")
     profile_error = ""
     try:
         profile = require_cluster_profile()
         machine = profile.machine
+        scheduler_kind = str(
+            profile.config[machine]["hpc"]["scheduler"]
+        ).strip().lower()
         profile_ok = True
     except ClusterProfileError as exc:
         machine = active_machine() or ""
+        scheduler_kind = "slurm"
         profile_ok = False
         profile_error = str(exc)
     try:
         gauss_ok, gauss, gaussian_probe_error = _probe_gaussian_environment()
-        aim = _from_config_or_path("aimall", "aimqb.ish", "aimqb")
+        aim_ok, aim, aimall_probe_error = _probe_aimall_environment()
         fer = _from_config_or_path("ferebus", "FEREBUS", "ferebus")
         python_executable = expanded_profile_value(
             "software", "python", "python_path", default=""
@@ -408,7 +490,8 @@ def check_backends() -> BackendAvailability:
     except Exception as exc:
         gauss_ok, gauss = False, ""
         gaussian_probe_error = type(exc).__name__ + ": " + str(exc)
-        aim = ""
+        aim_ok, aim = False, ""
+        aimall_probe_error = type(exc).__name__ + ": " + str(exc)
         fer = ""
         python_executable = ""
     try:
@@ -451,7 +534,7 @@ def check_backends() -> BackendAvailability:
         sacct=bool(sacct),
         squeue=bool(squeue),
         gaussian=bool(gauss_ok),
-        aimall=bool(aim),
+        aimall=bool(aim_ok),
         ferebus=bool(fer),
         ariadne=bool(batch_python and ariadne_status["ok"]),
         pyferebus=bool(batch_python and pyferebus_status["ok"]),
@@ -485,6 +568,17 @@ def check_backends() -> BackendAvailability:
             else None
         ),
         pyferebus_probe_error=str(pyferebus_status.get("error") or ""),
+        scheduler_kind=scheduler_kind,
+        qsub=bool(qsub),
+        qsub_path=qsub,
+        qacct=bool(qacct),
+        qacct_path=qacct,
+        qstat=bool(qstat),
+        qstat_path=qstat,
+        qdel=bool(qdel),
+        qdel_path=qdel,
+        aimall_verified=bool(aim_ok),
+        aimall_probe_error=str(aimall_probe_error),
     )
 
 
@@ -492,8 +586,13 @@ def missing_backend_message(avail: BackendAvailability) -> str:
     if avail.all_present:
         return ""
     profile = avail.active_profile or "<unresolved>"
+    scheduler_name = (
+        "Slurm" if avail.scheduler_kind == "slurm" else "Sun Grid Engine"
+    )
     lines = [
-        "The following configured Slurm backends are not available on PATH / PYTHONPATH:",
+        "The following configured "
+        + scheduler_name
+        + " backends are not available on PATH / PYTHONPATH:",
         "Active ICHOR profile: " + profile,
     ]
     if not avail.profile:
@@ -506,12 +605,22 @@ def missing_backend_message(avail: BackendAvailability) -> str:
                 "(for example ICHOR_MACHINE=csf3)."
             )
         )
-    if not avail.sbatch:
-        lines.append("  - sbatch (SLURM submit). Are you on a Slurm login node?")
-    if not avail.sacct:
-        lines.append("  - sacct (SLURM accounting).")
-    if not avail.squeue:
-        lines.append("  - squeue (SLURM liveness and throttled-array visibility).")
+    if avail.scheduler_kind == "slurm":
+        if not avail.sbatch:
+            lines.append("  - sbatch (Slurm submit). Are you on a Slurm login node?")
+        if not avail.sacct:
+            lines.append("  - sacct (Slurm accounting).")
+        if not avail.squeue:
+            lines.append("  - squeue (Slurm liveness and array visibility).")
+    else:
+        if not avail.qsub:
+            lines.append("  - qsub (Sun Grid Engine submit).")
+        if not avail.qacct:
+            lines.append("  - qacct (Sun Grid Engine accounting).")
+        if not avail.qstat:
+            lines.append("  - qstat (Sun Grid Engine liveness).")
+        if not avail.qdel:
+            lines.append("  - qdel (Sun Grid Engine cancellation).")
     if not avail.batch_python:
         lines.append(
             "  - configured batch Python (batch_python). "
@@ -519,17 +628,25 @@ def missing_backend_message(avail: BackendAvailability) -> str:
         )
     if not avail.gaussian:
         lines.append(
-            "  - Gaussian. Either g16 must be on PATH, or ~/ichor_config.yaml "
+            "  - Gaussian. The executable must be on PATH, or ~/ichor_config.yaml "
             "must declare <MACHINE>.software.gaussian.modules and "
             "executable_path. The module name is cluster-specific; do not load Gaussian on "
             "the login node; it is jobscript-only."
         )
     if not avail.aimall:
         lines.append(
-            "  - aimqb.ish (AIMAll). Declare the path in "
-            "~/ichor_config.yaml under <MACHINE>.software.aimall."
-            "executable_path (default ~/AIMAll/aimqb.ish), "
-            "or put aimqb.ish on PATH."
+            "  - AIMAll. "
+            + (
+                avail.aimall_probe_error
+                or "Declare the executable and modules in "
+                "~/ichor_config.yaml under <MACHINE>.software.aimall."
+            )
+            + " "
+            + (
+                ""
+                if avail.aimall_probe_error
+                else "The executable may be a module-provided command."
+            )
         )
     if not avail.ferebus:
         lines.append(

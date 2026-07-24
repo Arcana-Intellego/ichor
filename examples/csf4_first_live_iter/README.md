@@ -17,9 +17,9 @@ Recommended install path:
 
 ```bash
 cd ~/projects/ichor-active-learning
-bash scripts/install_ichor_csf.sh --machine csf4 --projects-dir ~/projects \
+bash scripts/install_ichor.sh --machine csf4 --projects-dir ~/projects \
     --aimall-path ~/AIMAll/aimqb.ish
-source scripts/env_ichor_csf.sh --smoke
+source scripts/env_ichor.sh --smoke
 ```
 
 The installer checks download access first, explains how to stage missing
@@ -180,7 +180,7 @@ automatically.
 ICHOR reads backend executable paths from `~/ichor_config.yaml` at start.
 
 The repository root [`ichor_config.yaml`](../../ichor_config.yaml) is the
-single canonical CSF4 profile. Run `scripts/install_ichor_csf.sh --machine
+single canonical CSF4 profile. Run `scripts/install_ichor.sh --machine
 csf4`; the installer copies that profile atomically into
 `~/ichor_config.yaml` and overrides only the local Python, AIMAll, FEREBUS and
 PLUMED paths. Do not maintain a second profile in this guide.

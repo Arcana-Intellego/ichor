@@ -2,6 +2,9 @@ venv/
 .vscode/
 .DS_Store
 *.sh
+!scripts/install_ichor.sh
+!scripts/env_ichor.sh
+!scripts/lib_ichor.sh
 !scripts/install_ichor_csf.sh
 !scripts/env_ichor_csf.sh
 *.csv

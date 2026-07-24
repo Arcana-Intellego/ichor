@@ -1,4 +1,4 @@
-"""pyferebus wrapper that captures the SLURM JobID.
+"""pyferebus wrapper that captures the native scheduler JobID.
 
 The raw pyferebus.MODEL.run() shells out via os.system at
 pyferebus/src/pyferebus/executors/trainer.py:97. That call:
@@ -10,9 +10,8 @@ pyferebus/src/pyferebus/executors/trainer.py:97. That call:
 
 submit_ferebus(...) bypasses that path by constructing MODEL with
 submitToComputeNode=False, so pyferebus only writes runFerebus.sh.
-We then drive sbatch --parsable via subprocess.run, capturing JobID,
-optional cluster, and stdout/stderr. The result is a FerebusSubmission
-dataclass ready for sacct polling.
+ICHOR replaces the generated scheduler wrapper and submits it through the
+selected Slurm or SGE adapter, capturing the JobID and command output.
 
 Both pyferebus.MODEL and subprocess.run are injectable via the optional
 model_class and submit_runner parameters; tests pass stubs so no real
@@ -33,8 +32,8 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .slurm_contracts import (
     parse_sbatch_parsable_output as _parse_sbatch_parsable_output,
-    run_scheduler_command,
 )
+from .scheduler_backend import get_scheduler_backend
 
 
 __all__ = [
@@ -102,7 +101,7 @@ _DEFAULT_MODEL_KWARGS: Dict[str, Any] = {
 
 
 class FerebusSubmissionError(RuntimeError):
-    """Raised when sbatch submission fails or JobID cannot be parsed."""
+    """Raised when scheduler submission fails or its JobID is invalid."""
 
 
 @dataclass(frozen=True)
@@ -231,18 +230,30 @@ def _harden_generated_script(
     runtime_preamble: Optional[Sequence[str]] = None,
     expected_tasks: Optional[int] = None,
     array_concurrency_limit: Optional[int] = None,
+    scheduler_kind: str = "slurm",
+    scheduler_queue: Optional[str] = None,
+    parallel_environment: Optional[str] = None,
 ) -> None:
     text = script.read_text(encoding="utf-8")
+    scheduler = str(scheduler_kind).strip().lower()
+    if scheduler not in {"slurm", "sge"}:
+        raise FerebusSubmissionError(
+            "unsupported FEREBUS scheduler " + repr(scheduler)
+        )
     if expected_job_name is not None:
-        _reject_control_chars("expected FEREBUS Slurm job name", str(expected_job_name))
+        _reject_control_chars("expected FEREBUS scheduler job name", str(expected_job_name))
     hardening_lines = {
         "set -eo pipefail",
         "set -euo pipefail",
         "export LC_ALL=C",
         "export LC_NUMERIC=C",
     }
-    def _drop_sbatch_directive(line: str) -> bool:
+    def _drop_scheduler_directive(line: str) -> bool:
         stripped = line.strip()
+        if stripped.startswith("#$"):
+            return True
+        if scheduler == "sge":
+            return stripped.startswith("#SBATCH")
         if re.match(r"^#SBATCH\s+(?:-t\b|--time(?:=|\b))", stripped):
             return True
         if partition is not None and re.match(
@@ -284,37 +295,110 @@ def _harden_generated_script(
         line
         for line in text.splitlines()
         if line.strip() not in hardening_lines
-        and not _drop_sbatch_directive(line)
+        and not _drop_scheduler_directive(line)
     ]
-    sbatch_insert_at = 1 if lines and lines[0].startswith("#!") else 0
-    while sbatch_insert_at < len(lines):
-        stripped = lines[sbatch_insert_at].lstrip()
-        if stripped.startswith("#SBATCH"):
-            sbatch_insert_at += 1
+    if lines and lines[0].startswith("#!"):
+        lines[0] = "#!/bin/bash" if scheduler == "sge" else lines[0]
+    insert_at = 1 if lines and lines[0].startswith("#!") else 0
+    while insert_at < len(lines):
+        stripped = lines[insert_at].lstrip()
+        if stripped.startswith("#SBATCH") or stripped.startswith("#$"):
+            insert_at += 1
             continue
         break
-    directives = []
-    if expected_job_name is not None:
-        directives.append("#SBATCH --job-name=" + str(expected_job_name))
-    directives.append("#SBATCH --time=" + _format_slurm_walltime_hours(walltime_hours))
-    if partition is not None:
-        directives.append("#SBATCH --partition=" + str(partition))
-    if mem_per_cpu is not None:
-        directives.append("#SBATCH --mem-per-cpu=" + str(mem_per_cpu))
-    if cpus_per_task is not None:
-        directives.append("#SBATCH --cpus-per-task=" + str(int(cpus_per_task)))
-    if ntasks is not None:
-        directives.append("#SBATCH --ntasks=" + str(int(ntasks)))
-    if output_path is not None:
-        directives.append("#SBATCH --output=" + str(output_path))
-    if error_path is not None:
-        directives.append("#SBATCH --error=" + str(error_path))
+    directives: List[str] = []
+    environment_aliases: List[str]
+    if scheduler == "slurm":
+        if expected_job_name is not None:
+            directives.append("#SBATCH --job-name=" + str(expected_job_name))
+        directives.append("#SBATCH --time=" + _format_slurm_walltime_hours(walltime_hours))
+        if partition is not None:
+            directives.append("#SBATCH --partition=" + str(partition))
+        if mem_per_cpu is not None:
+            directives.append("#SBATCH --mem-per-cpu=" + str(mem_per_cpu))
+        if cpus_per_task is not None:
+            directives.append("#SBATCH --cpus-per-task=" + str(int(cpus_per_task)))
+        if ntasks is not None:
+            directives.append("#SBATCH --ntasks=" + str(int(ntasks)))
+        if output_path is not None:
+            directives.append("#SBATCH --output=" + str(output_path))
+        if error_path is not None:
+            directives.append("#SBATCH --error=" + str(error_path))
+        environment_aliases = [
+            'export ICHOR_SCHEDULER_JOB_ID="${SLURM_JOB_ID:?missing SLURM_JOB_ID}"',
+            'export ICHOR_SCHEDULER_ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"',
+            'export ICHOR_SCHEDULER_CPUS="${SLURM_CPUS_PER_TASK:-1}"',
+        ]
+    else:
+        directives.extend(["#$ -S /bin/bash", "#$ -V"])
+        if expected_job_name is not None:
+            directives.append("#$ -N " + str(expected_job_name))
+        total_seconds = int(math.ceil(float(walltime_hours) * 3600.0))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        directives.append(
+            "#$ -l h_rt="
+            + str(hours).zfill(2)
+            + ":"
+            + str(minutes).zfill(2)
+            + ":"
+            + str(seconds).zfill(2)
+        )
+        if scheduler_queue:
+            directives.append("#$ -q " + str(scheduler_queue))
+        cpus = int(cpus_per_task or 1)
+        if cpus > 1:
+            if not parallel_environment:
+                raise FerebusSubmissionError(
+                    "SGE FEREBUS multicore work requires a parallel environment"
+                )
+            directives.append(
+                "#$ -pe " + str(parallel_environment) + " " + str(cpus)
+            )
+        if ntasks is not None and int(ntasks) != 1:
+            raise FerebusSubmissionError(
+                "SGE FEREBUS requires one shared-memory task"
+            )
+        if mem_per_cpu is not None:
+            match = re.fullmatch(
+                r"([1-9][0-9]*)([KMGT]?)",
+                str(mem_per_cpu).strip().upper(),
+            )
+            if match is None:
+                raise FerebusSubmissionError(
+                    "unsupported SGE FEREBUS memory syntax: "
+                    + repr(mem_per_cpu)
+                )
+            scale = {
+                "": 1,
+                "K": 1.0 / 1024.0,
+                "M": 1,
+                "G": 1024,
+                "T": 1024 * 1024,
+            }[match.group(2)]
+            total_memory_mib = int(
+                math.ceil(int(match.group(1)) * scale * cpus)
+            )
+            directives.append("#$ -l h_vmem=" + str(total_memory_mib) + "M")
+        if output_path is not None:
+            directives.append("#$ -o " + str(output_path))
+        if error_path is not None:
+            directives.append("#$ -e " + str(error_path))
+        environment_aliases = [
+            'export ICHOR_SCHEDULER_JOB_ID="${JOB_ID:?missing JOB_ID}"',
+            'export ICHOR_SCHEDULER_ARRAY_TASK_ID="$(( ${SGE_TASK_ID:?missing SGE_TASK_ID} - 1 ))"',
+            'export ICHOR_SCHEDULER_CPUS="${NSLOTS:-1}"',
+        ]
     if expected_tasks is not None:
         if isinstance(expected_tasks, bool) or not isinstance(expected_tasks, int):
             raise FerebusSubmissionError("expected FEREBUS task count must be an integer")
         if expected_tasks <= 0:
             raise FerebusSubmissionError("expected FEREBUS task count must be > 0")
-        array_value = "0-" + str(expected_tasks - 1)
+        array_value = (
+            "0-" + str(expected_tasks - 1)
+            if scheduler == "slurm"
+            else "1-" + str(expected_tasks) + ":1"
+        )
         if array_concurrency_limit is not None:
             if (
                 isinstance(array_concurrency_limit, bool)
@@ -324,18 +408,32 @@ def _harden_generated_script(
                 raise FerebusSubmissionError(
                     "FEREBUS array concurrency limit must be a positive integer"
                 )
-            array_value += "%" + str(min(expected_tasks, array_concurrency_limit))
-        directives.append("#SBATCH --array=" + array_value)
-    lines[sbatch_insert_at:sbatch_insert_at] = directives + [
+            if scheduler == "slurm":
+                array_value += "%" + str(min(expected_tasks, array_concurrency_limit))
+        directives.append(
+            "#SBATCH --array=" + array_value
+            if scheduler == "slurm"
+            else "#$ -t " + array_value
+        )
+        if scheduler == "sge" and array_concurrency_limit is not None:
+            directives.append(
+                "#$ -tc " + str(min(expected_tasks, array_concurrency_limit))
+            )
+    lines[insert_at:insert_at] = directives + [
         "set -eo pipefail",
         "export LC_ALL=C",
         "export LC_NUMERIC=C",
+        *environment_aliases,
     ] + list(runtime_preamble or [])
     script.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
     if expected_job_name is not None:
         patched = script.read_text(encoding="utf-8")
         matches = re.findall(
-            r"(?m)^#SBATCH\s+(?:-J\s+|--job-name(?:=|\s+))(.+?)\s*$",
+            (
+                r"(?m)^#SBATCH\s+(?:-J\s+|--job-name(?:=|\s+))(.+?)\s*$"
+                if scheduler == "slurm"
+                else r"(?m)^#\$\s+-N\s+(.+?)\s*$"
+            ),
             patched,
         )
         if matches != [str(expected_job_name)]:
@@ -348,11 +446,19 @@ def _harden_generated_script(
     if expected_tasks is not None:
         patched = script.read_text(encoding="utf-8")
         array_matches = re.findall(
-            r"(?m)^#SBATCH\s+(?:-a\s+|--array(?:=|\s+))(.+?)\s*$",
+            (
+                r"(?m)^#SBATCH\s+(?:-a\s+|--array(?:=|\s+))(.+?)\s*$"
+                if scheduler == "slurm"
+                else r"(?m)^#\$\s+-t\s+(.+?)\s*$"
+            ),
             patched,
         )
-        expected_array = "0-" + str(expected_tasks - 1)
-        if array_concurrency_limit is not None:
+        expected_array = (
+            "0-" + str(expected_tasks - 1)
+            if scheduler == "slurm"
+            else "1-" + str(expected_tasks) + ":1"
+        )
+        if scheduler == "slurm" and array_concurrency_limit is not None:
             expected_array += "%" + str(
                 min(expected_tasks, int(array_concurrency_limit))
             )
@@ -808,28 +914,36 @@ def _replace_with_structured_task_script(
     script: Path,
     *,
     task_map: Path,
+    scheduler_kind: str,
 ) -> None:
     """Discard backend-owned shell commands and invoke the structured runner."""
     from ..daemon.state import atomic_write_text
 
-    shebang = "#!/bin/bash --login"
+    scheduler = str(scheduler_kind).strip().lower()
+    if scheduler not in {"slurm", "sge"}:
+        raise FerebusSubmissionError(
+            "unsupported FEREBUS scheduler " + repr(scheduler)
+        )
+    shebang = "#!/bin/bash" if scheduler == "sge" else "#!/bin/bash --login"
     scheduler_directives: List[str] = []
-    try:
-        original_lines = script.read_text(encoding="utf-8").splitlines()
-        first = original_lines[0]
-        if first.startswith("#!"):
-            shebang = first
-        scheduler_directives = [
-            line for line in original_lines if line.lstrip().startswith("#SBATCH")
-        ]
-    except (OSError, IndexError):
-        pass
+    if scheduler == "slurm":
+        try:
+            original_lines = script.read_text(encoding="utf-8").splitlines()
+            if original_lines and original_lines[0].startswith("#!"):
+                shebang = original_lines[0]
+            scheduler_directives = [
+                line
+                for line in original_lines
+                if line.lstrip().startswith("#SBATCH")
+            ]
+        except OSError:
+            pass
     command = (
         shlex.quote(str(Path(sys.executable).resolve()))
         + " -m ichor.hpc.active_learning.daemon.ferebus_task_runner"
         + " --task-map "
         + shlex.quote(str(task_map.resolve()))
-        + ' --task-index "${SLURM_ARRAY_TASK_ID}"'
+        + ' --task-index "${ICHOR_SCHEDULER_ARRAY_TASK_ID}"'
     )
     body = [shebang, *scheduler_directives, command]
     atomic_write_text(script, "\n".join(body) + "\n")
@@ -872,6 +986,9 @@ def submit_ferebus(
     runtime_preamble: Optional[Sequence[str]] = None,
     scheduler_timeout_seconds: int = 60,
     array_concurrency_limit: Optional[int] = None,
+    scheduler_kind: str = "slurm",
+    scheduler_queue: Optional[str] = None,
+    parallel_environment: Optional[str] = None,
     prepared_callback: Optional[
         Callable[[Path, Path, Sequence[Mapping[str, Any]]], Mapping[str, Any]]
     ] = None,
@@ -879,8 +996,7 @@ def submit_ferebus(
         Callable[[Path, Mapping[str, Any]], None]
     ] = None,
 ) -> FerebusSubmission:
-    """Generate the FEREBUS submission script via pyferebus, then submit it
-    ourselves through sbatch --parsable so we capture the JobID.
+    """Generate FEREBUS inputs via pyferebus and submit through the adapter.
 
     Parameters mirror the most-used pyferebus.MODEL kwargs. Any remaining
     upstream kwargs can be passed via "extra={...}" using exact upstream names
@@ -899,7 +1015,7 @@ def submit_ferebus(
     FileNotFoundError
         If "working_directory" does not exist before submission.
     FerebusSubmissionError
-        If sbatch exits non-zero or its stdout cannot be parsed.
+        If scheduler submission fails or its output cannot be parsed.
     """
     jd_file_path = _ensure_path(jd_file)
     working_dir = _ensure_path(working_directory)
@@ -986,8 +1102,7 @@ def submit_ferebus(
         move_dataset_files=move_dataset_files,
         extra=extra,
     )
-    #Force submitToComputeNode=False so pyferebus only writes the script;
-    #we drive sbatch ourselves to capture the JobID and exit code.
+    # Force pyferebus to write inputs without submitting its generated script.
     model_kwargs["submitToComputeNode"] = False
 
     cwd = os.getcwd()
@@ -1030,6 +1145,8 @@ def submit_ferebus(
             "submission_script_path",
             "path_to_executable",
             "array_concurrency_limit",
+            "scheduler_queue",
+            "parallel_environment",
         }
         unknown = sorted(set(overrides) - allowed)
         if unknown:
@@ -1053,11 +1170,20 @@ def submit_ferebus(
         array_concurrency_limit = overrides.get(
             "array_concurrency_limit", array_concurrency_limit
         )
+        scheduler_queue = overrides.get("scheduler_queue", scheduler_queue)
+        parallel_environment = overrides.get(
+            "parallel_environment",
+            parallel_environment,
+        )
     task_map = _write_structured_task_map(
         working_dir,
         executable=path_to_executable or "ferebus",
     )
-    _replace_with_structured_task_script(script, task_map=task_map)
+    _replace_with_structured_task_script(
+        script,
+        task_map=task_map,
+        scheduler_kind=scheduler_kind,
+    )
     _harden_generated_script(
         script,
         walltime_hours=walltime_hours,
@@ -1071,6 +1197,9 @@ def submit_ferebus(
         runtime_preamble=runtime_preamble,
         expected_tasks=expected_tasks,
         array_concurrency_limit=array_concurrency_limit,
+        scheduler_kind=scheduler_kind,
+        scheduler_queue=scheduler_queue,
+        parallel_environment=parallel_environment,
     )
     if submission_script_path is not None:
         from ..daemon.state import atomic_write_text
@@ -1110,31 +1239,27 @@ def submit_ferebus(
     submitted_argument = (
         str(script) if submission_script_path is not None else script.name
     )
-    completed = run_scheduler_command(
-        submit_runner,
-        [
-            "sbatch",
-            "--parsable",
-            "--export=ALL,ICHOR_SCRIPT_BINDING_SHA256="
-            + str(script_binding["sha256"]),
+    scheduler = get_scheduler_backend(scheduler_kind)
+    try:
+        scheduler_submission = scheduler.submit(
             submitted_argument,
-        ],
-        timeout_seconds=int(scheduler_timeout_seconds),
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=str(working_dir),
-    )
-    stdout = getattr(completed, "stdout", "") or ""
-    stderr = getattr(completed, "stderr", "") or ""
-    return_code = int(getattr(completed, "returncode", 1))
-    if return_code != 0:
-        raise FerebusSubmissionError(
-            "sbatch exited with code " + str(return_code)
-            + ". stdout: " + repr(stdout) + " stderr: " + repr(stderr)
+            binding_sha256=str(script_binding["sha256"]),
+            runner=submit_runner,
+            timeout_seconds=int(scheduler_timeout_seconds),
+            cwd=str(working_dir),
         )
-
-    job_id, cluster = parse_sbatch_parsable_output(stdout)
+    except Exception as exc:
+        raise FerebusSubmissionError(
+            scheduler.submit_command + " submission failed: " + str(exc)
+        ) from exc
+    stdout = scheduler_submission.stdout
+    stderr = scheduler_submission.stderr
+    job_id = scheduler_submission.job_id
+    cluster: Optional[str] = None
+    if str(scheduler_kind).strip().lower() == "slurm":
+        # The adapter validates the same parsable Slurm contract. Preserve the
+        # historical optional-cluster field for callers and stored metadata.
+        job_id, cluster = parse_sbatch_parsable_output(stdout)
     return FerebusSubmission(
         job_id=job_id,
         cluster=cluster,

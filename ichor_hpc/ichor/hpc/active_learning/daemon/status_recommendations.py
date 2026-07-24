@@ -119,6 +119,28 @@ def _active_submission_intents(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [item for item in intents if isinstance(item, dict)]
 
 
+def _scheduler_name(payload: Dict[str, Any]) -> str:
+    recorded = {
+        str(intent.get("scheduler_identity_kind") or "").strip().lower()
+        for intent in _active_submission_intents(payload)
+        if intent.get("job_id") and intent.get("scheduler_identity_kind")
+    }
+    kind = next(iter(recorded)) if len(recorded) == 1 else str(
+        payload.get("_presentation_scheduler_kind") or ""
+    ).strip().lower()
+    if not kind:
+        try:
+            from .cluster_profile import require_cluster_profile
+
+            profile = require_cluster_profile()
+            kind = str(
+                profile.config[profile.machine]["hpc"]["scheduler"]
+            ).strip().lower()
+        except Exception:
+            kind = "slurm"
+    return "Sun Grid Engine" if kind == "sge" else "Slurm"
+
+
 def _short_error(value: Any, *, limit: int = 180) -> str:
     text = str(value or "").strip()
     if len(text) > limit:
@@ -304,6 +326,7 @@ def _daemon_running_recommendation(
 def _job_recommendations(campaign: Path, payload: Dict[str, Any]) -> List[StatusRecommendation]:
     recommendations: List[StatusRecommendation] = []
     daemon_active = _daemon_is_active(payload)
+    scheduler_name = _scheduler_name(payload)
     pending = _active_pending_jobs(payload)
     if pending:
         recommendations.append(
@@ -311,11 +334,13 @@ def _job_recommendations(campaign: Path, payload: Dict[str, Any]) -> List[Status
                 code="pending_state_job",
                 severity="watch",
                 primary=(
-                    "Slurm work is recorded; monitor the running daemon"
+                    scheduler_name + " work is recorded; monitor the running daemon"
                     if daemon_active
-                    else "resume the daemon so it can monitor and postprocess the recorded Slurm work"
+                    else "resume the daemon so it can monitor and postprocess the recorded "
+                    + scheduler_name
+                    + " work"
                 ),
-                why="campaign state contains active Slurm job IDs",
+                why="campaign state contains active " + scheduler_name + " job IDs",
                 command=(
                     _journal_cmd(campaign) + " --last-n 40"
                     if daemon_active
@@ -347,11 +372,17 @@ def _job_recommendations(campaign: Path, payload: Dict[str, Any]) -> List[Status
                 code="active_submission_intent",
                 severity="watch",
                 primary=(
-                    "submitted Slurm work is recorded; monitor the running daemon"
+                    "submitted "
+                    + scheduler_name
+                    + " work is recorded; monitor the running daemon"
                     if daemon_active
-                    else "resume the daemon so it can adopt or postprocess the submitted Slurm work"
+                    else "resume the daemon so it can adopt or postprocess the submitted "
+                    + scheduler_name
+                    + " work"
                 ),
-                why="saved submission information contains a Slurm job ID",
+                why="saved submission information contains a "
+                + scheduler_name
+                + " job ID",
                 command=(
                     _journal_cmd(campaign) + " --last-n 40"
                     if daemon_active
@@ -378,7 +409,7 @@ def _job_recommendations(campaign: Path, payload: Dict[str, Any]) -> List[Status
                     if daemon_active
                     else "resume the daemon to continue the prepared local phase work"
                 ),
-                why="saved phase information has no Slurm job attached",
+                why="saved phase information has no scheduler job attached",
                 command=(
                     _journal_cmd(campaign) + " --last-n 40"
                     if daemon_active
@@ -421,11 +452,14 @@ def _scheduler_uncertain_resume_recommendation(
     ]
     if len(intents) != 1:
         return None
+    scheduler_name = _scheduler_name(payload)
     return StatusRecommendation(
         code="halted_scheduler_uncertain",
         severity="required",
         primary=(
-            "inspect Slurm accounting, then resume to re-poll the preserved job; "
+            "inspect "
+            + scheduler_name
+            + " accounting, then resume to re-poll the preserved job; "
             "resume will not resubmit while scheduler ownership remains recorded"
         ),
         why=_short_error(context.get("message")),
@@ -474,7 +508,7 @@ def _halt_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecom
                 command=_reconcile_cmd(campaign),
                 details=[
                     "reconcile will verify the original AIMAll task evidence and locked quality gates",
-                    "no Slurm job is submitted during this correction",
+                    "no scheduler job is submitted during this correction",
                 ],
             )
         return StatusRecommendation(
@@ -524,7 +558,9 @@ def _halt_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecom
                 code="halted_backend_submission_failed",
                 severity="required",
                 primary=(
-                    "ensure all daemon and Slurm work is stopped, reinstall the "
+                    "ensure all daemon and "
+                    + _scheduler_name(payload)
+                    + " work is stopped, reinstall the "
                     "current ICHOR checkout, then preview recovery"
                 ),
                 why=(
@@ -563,7 +599,9 @@ def _halt_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecom
         return StatusRecommendation(
             code="halted_scheduler_hard_failure",
             severity="blocked",
-            primary="inspect Slurm output/error logs before reconciling or restarting",
+            primary="inspect "
+            + _scheduler_name(payload)
+            + " output/error logs before reconciling or restarting",
             why="the latest halt looks like a hard job failure: " + _short_error(reason),
             command=_journal_cmd(campaign) + " --event-type halt --last-n 5",
         )
@@ -1009,7 +1047,9 @@ def build_status_recommendations(
                 StatusRecommendation(
                     code="user_stop_cancellation_incomplete",
                     severity="required",
-                    primary="rerun the immediate stop command to finish recorded Slurm cancellation",
+                    primary="rerun the immediate stop command to finish recorded "
+                    + _scheduler_name(payload)
+                    + " cancellation",
                     why=(
                         "the daemon is waiting for the CLI cancellation summary "
                         "for request " + str(stop_request.get("request_id"))

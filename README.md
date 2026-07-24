@@ -48,25 +48,29 @@ python3 -m pip install -e ichor_hpc
 python3 -m pip install -e ichor_cli
 ```
 
-For a full Manchester CSF3/CSF4 active-learning install, use the cluster
-installer instead. It checks the sibling POLUS/FEREBUS_CPU/ARIADNE trees,
-creates the CSF-specific venv, builds ARIADNE/FEREBUS/PLUMED where needed,
-and updates `~/ichor_config.yaml`:
+For a full CSF3, CSF4, or ffluxlab active-learning install, use the unified
+cluster installer instead. It detects the platform, creates a machine-specific
+venv, builds ARIADNE/FEREBUS/PLUMED where needed, and updates
+`~/ichor_config.yaml`:
 
 ```
-bash scripts/install_ichor_csf.sh --machine csf4 --projects-dir ~/projects
-# or
-bash scripts/install_ichor_csf.sh --machine csf3 --projects-dir ~/projects
+bash scripts/install_ichor.sh --machine auto --projects-dir ~/projects
+
+# A clean ffluxlab account can opt into downloading missing public sources:
+bash scripts/install_ichor.sh --machine ffluxlab \
+    --projects-dir ~/projects --allow-download
 ```
 
-After installation, source the matching runtime helper in each new CSF shell
-before running the CLI or daemon:
+After installation, source the runtime helper in each new shell before running
+the CLI or daemon:
 
 ```
-source scripts/env_ichor_csf.sh --smoke
-# or
-source scripts/env_ichor_csf.sh --smoke
+source scripts/env_ichor.sh --smoke
 ```
+
+The historical `install_ichor_csf.sh`, `env_ichor_csf.sh`,
+`lib_ichor_csf.sh`, and `install_ichor_csf3` entry points remain compatibility
+wrappers around these canonical scripts.
 
 ## Active learning daemon
 Run the bundled example to confirm everything works (no cluster

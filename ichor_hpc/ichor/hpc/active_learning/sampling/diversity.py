@@ -1616,7 +1616,7 @@ def _run_phase_b(args, campaign, config, *, progress_reporter: Any = None):
 def main(argv=None) -> int:
     """Command-line entrypoint for ICHOR exact diversity selection.
 
-    The daemon calls this from inside a sbatch script for both Phase A
+    The daemon calls this from inside a scheduler script for both Phase A
     (initial pool sub-sample, run once at the start of a campaign) and
     Phase B (per-iteration sub-sample over the adversarial pool).
 
@@ -1746,7 +1746,12 @@ def main(argv=None) -> int:
             replacement_round=int(getattr(state, "replacement_round", 0)),
             producer_kind="worker",
             identity={
-                "job_id": str(os.environ.get("SLURM_JOB_ID") or ""),
+                "job_id": str(
+                    os.environ.get("ICHOR_SCHEDULER_JOB_ID")
+                    or os.environ.get("SLURM_JOB_ID")
+                    or os.environ.get("JOB_ID")
+                    or ""
+                ),
                 "attempt_id": str(
                     os.environ.get("ICHOR_SUBMISSION_IDENTITY") or ""
                 ),

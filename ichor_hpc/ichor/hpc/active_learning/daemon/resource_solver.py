@@ -1,4 +1,4 @@
-"""Live Slurm resource resolution for active-learning backend phases.
+"""Live scheduler resource resolution for active-learning backend phases.
 
 Backend-specific CPU and memory requests live under ``resources``. Each
 request can be explicit or ``auto``. This module resolves those values using
@@ -147,7 +147,9 @@ def slurm_memory_mib(value: Any) -> float:
     text = str(value).strip().upper()
     match = _SLURM_MEM_RE.fullmatch(text)
     if not match:
-        raise BackendSubmissionError("unsupported Slurm memory syntax: " + repr(value))
+        raise BackendSubmissionError(
+            "unsupported scheduler memory syntax: " + repr(value)
+        )
     amount = int(match.group(1))
     unit = match.group(2) or "M"
     scale = {
@@ -177,6 +179,26 @@ def _partition_profile(partition: str) -> Optional[Dict[str, Any]]:
             + " must be a mapping"
         )
     return raw
+
+
+def scheduler_queue_for_partition(partition: str) -> str:
+    """Return the native queue for an SGE logical partition."""
+    profile = _partition_profile(partition)
+    if profile is None:
+        return str(partition)
+    raw = profile.get("scheduler_queue")
+    return str(raw).strip() if raw is not None else str(partition)
+
+
+def parallel_environment_for_partition(partition: str) -> Optional[str]:
+    profile = _partition_profile(partition)
+    if profile is None:
+        return None
+    raw = profile.get("parallel_environment")
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    return value or None
 
 
 def validate_partition_supported(partition: str) -> None:
@@ -721,7 +743,7 @@ def _gjf_atom_order(path: Path) -> Tuple[str, ...]:
 
 
 def _reject_gaussian_input_resource_directives(path: Path) -> None:
-    """Reject per-input resources; Slurm owns Gaussian CPU and memory limits."""
+    """Reject per-input resources; the scheduler owns Gaussian limits."""
     for line in path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
         if not stripped.startswith("%"):
@@ -732,7 +754,7 @@ def _reject_gaussian_input_resource_directives(path: Path) -> None:
         if key in {"mem", "nprocshared"}:
             raise ValueError(
                 "Gaussian input must not contain %Mem or %NProcShared; "
-                "the immutable Slurm resource resolution supplies GAUSS_MDEF "
+                "the immutable scheduler resource resolution supplies GAUSS_MDEF "
                 "and GAUSS_PDEF: "
                 + str(path)
             )
@@ -2046,6 +2068,11 @@ def resolve_phase_resources(
         },
         "evidence": evidence,
     })
+    scheduler = str(profile_value("hpc", "scheduler", default="slurm") or "slurm")
+    extra["scheduler"] = scheduler
+    if scheduler == "sge":
+        extra["scheduler_queue"] = scheduler_queue_for_partition(part)
+        extra["parallel_environment"] = parallel_environment_for_partition(part)
     if campaign_path is not None:
         try:
             extra["campaign_filesystem"] = {
@@ -2087,7 +2114,7 @@ def resolve_phase_resources(
 
 
 def gaussian_mdef(config: Any, resolved: ResolvedPhaseResources) -> str:
-    """Render a positive Gaussian memory limit within the Slurm allocation."""
+    """Render a positive Gaussian memory limit within the scheduler allocation."""
     allocated_mib = slurm_memory_mib(resolved.mem_per_cpu) * float(max(1, int(resolved.cpus_per_task)))
     usable_mib = allocated_mib * float(
         config.resources.gaussian_memory_fraction_of_slurm_for()
@@ -2096,11 +2123,13 @@ def gaussian_mdef(config: Any, resolved: ResolvedPhaseResources) -> str:
     if whole_mib < 1:
         raise BackendSubmissionError(
             "resolved Gaussian allocation is too small to express a positive "
-            "GAUSS_MDEF within the configured Slurm memory fraction"
+            "GAUSS_MDEF within the configured scheduler memory fraction"
         )
     whole_gib = whole_mib // 1024
     rendered = str(whole_gib) + "GB" if whole_gib >= 1 else str(whole_mib) + "MB"
     rendered_mib = float(whole_gib * 1024 if whole_gib >= 1 else whole_mib)
     if rendered_mib > usable_mib + 1.0e-9:
-        raise BackendSubmissionError("rendered GAUSS_MDEF exceeds its protected Slurm allocation")
+        raise BackendSubmissionError(
+            "rendered GAUSS_MDEF exceeds its protected scheduler allocation"
+        )
     return rendered

@@ -310,6 +310,24 @@ def slurm_log_paths(bundle: AttemptBundle, *, is_array: bool) -> Dict[str, str]:
     }
 
 
+def scheduler_log_paths(
+    bundle: AttemptBundle,
+    *,
+    scheduler_kind: str,
+    is_array: bool,
+) -> Dict[str, str]:
+    kind = str(scheduler_kind).strip().lower()
+    if kind == "slurm":
+        return slurm_log_paths(bundle, is_array=is_array)
+    if kind == "sge":
+        # SGE appends native job/task suffixes to files in these directories.
+        return {
+            "output": str(bundle.outputs.resolve()),
+            "error": str(bundle.errors.resolve()),
+        }
+    raise ValueError("unsupported scheduler kind: " + repr(kind))
+
+
 def read_array_task_map(path: Union[str, Path]) -> Sequence[int]:
     source = Path(path)
     try:
@@ -343,6 +361,7 @@ __all__ = [
     "read_array_task_map",
     "read_source_array_task_ids",
     "safe_component",
+    "scheduler_log_paths",
     "slurm_log_paths",
     "verify_script_binding",
     "write_attempt_script",

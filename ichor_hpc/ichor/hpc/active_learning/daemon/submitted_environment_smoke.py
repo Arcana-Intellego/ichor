@@ -1,4 +1,4 @@
-"""Opt-in Slurm smoke for the configured daemon runtime environment.
+"""Opt-in scheduler smoke for the configured daemon runtime environment.
 
 The smoke submits one short, single-core job.  It imports the Python modules
 used by daemon jobs and verifies configured executable paths, but performs no
@@ -17,17 +17,23 @@ from typing import Any, Callable, Dict
 
 from .cluster_profile import profile_value, require_cluster_profile
 from .resource_solver import (
+    parallel_environment_for_partition,
     partition_memory_per_core_gb,
+    scheduler_queue_for_partition,
     slurm_memory_mib,
     validate_partition_supported,
 )
 from .runtime_environment import (
     SUBMITTED_PYTHON_IMPORTS,
+    module_initialisation_lines,
+    native_runtime_setup_lines,
     normalise_module_list,
     python_library_path_export_lines,
 )
 from .state import atomic_write_json, atomic_write_text
 from ..submit.slurm_contracts import parse_sbatch_parsable_output
+from ..submit.scheduler_backend import get_scheduler_backend
+from ..submit.sacct_poll import aggregate_states
 
 
 SMOKE_SUCCESS_MARKER = "ICHOR_SUBMITTED_ENVIRONMENT_SMOKE_OK"
@@ -85,6 +91,23 @@ def _smoke_mem_per_cpu(config: Any, partition: str) -> str:
     return raw
 
 
+def _smoke_partition(config: Any, scheduler: str) -> str:
+    configured = str(config.resources.defaults.partition)
+    if scheduler != "sge":
+        return configured
+    partitions = profile_value("hpc", "partitions", default={})
+    if isinstance(partitions, dict):
+        serial = partitions.get("serial")
+        if (
+            isinstance(serial, dict)
+            and bool(serial.get("daemon_supported", False))
+            and int(serial.get("min_cpus", 0)) <= 1
+            and int(serial.get("max_cpus", 0)) >= 1
+        ):
+            return "serial"
+    return configured
+
+
 def _required_path(label: str, value: Any) -> str:
     path = str(value or "").strip()
     if not path:
@@ -100,16 +123,16 @@ def render_submitted_environment_smoke_script(
     availability: Any,
     output_path: Path,
 ) -> str:
-    """Render the exact module/import/executable checks for one Slurm job."""
+    """Render the exact module/import/executable checks for one scheduler job."""
     require_cluster_profile()
     scheduler = str(profile_value("hpc", "scheduler", default="")).strip().lower()
-    if scheduler != "slurm":
+    if scheduler not in {"slurm", "sge"}:
         raise SubmittedEnvironmentSmokeError(
-            "submitted environment smoke requires hpc.scheduler: slurm"
+            "submitted environment smoke requires hpc.scheduler: slurm or sge"
         )
     partition = _safe_slurm_token(
         "resources.defaults.partition",
-        config.resources.defaults.partition,
+        _smoke_partition(config, scheduler),
     )
     validate_partition_supported(partition)
     mem_per_cpu = _smoke_mem_per_cpu(config, partition)
@@ -121,6 +144,10 @@ def render_submitted_environment_smoke_script(
     gaussian_modules = normalise_module_list(
         profile_value("software", "gaussian", "modules", default=[]),
         label="gaussian",
+    )
+    aimall_modules = normalise_module_list(
+        profile_value("software", "aimall", "modules", default=[]),
+        label="aimall",
     )
     python_executable = _required_path(
         "configured submitted Python", availability.python_executable
@@ -139,21 +166,49 @@ def render_submitted_environment_smoke_script(
             "        importlib.import_module(name)",
         ]
     )
-    lines = [
-        _safe_jobscript_shebang(),
-        "#SBATCH --job-name=ichor-env-smoke",
-        "#SBATCH --partition=" + partition,
-        "#SBATCH --time=00:05:00",
-        "#SBATCH --mem-per-cpu=" + mem_per_cpu,
-        "#SBATCH --cpus-per-task=1",
-        "#SBATCH --ntasks=1",
-        "#SBATCH --output=" + output_text,
+    lines = [_safe_jobscript_shebang()]
+    if scheduler == "slurm":
+        lines += [
+            "#SBATCH --job-name=ichor-env-smoke",
+            "#SBATCH --partition=" + partition,
+            "#SBATCH --time=00:05:00",
+            "#SBATCH --mem-per-cpu=" + mem_per_cpu,
+            "#SBATCH --cpus-per-task=1",
+            "#SBATCH --ntasks=1",
+            "#SBATCH --output=" + output_text,
+        ]
+    else:
+        queue = _safe_slurm_token(
+            "SGE queue",
+            scheduler_queue_for_partition(partition),
+        )
+        pe = parallel_environment_for_partition(partition)
+        lines += [
+            "#$ -S /bin/bash",
+            "#$ -V",
+            "#$ -N ichor-env-smoke",
+            "#$ -q " + queue,
+            "#$ -l h_rt=00:05:00",
+            "#$ -l h_vmem="
+            + str(int(math.ceil(slurm_memory_mib(mem_per_cpu))))
+            + "M",
+            "#$ -o " + output_text,
+        ]
+        if pe:
+            lines.append("#$ -pe " + _safe_slurm_token("SGE PE", pe) + " 1")
+    lines += [
         "set -euo pipefail",
         "export LC_ALL=C",
         "export LC_NUMERIC=C",
+        *(
+            module_initialisation_lines()
+            if scheduler == "sge"
+            else []
+        ),
         "module purge",
     ]
     lines.extend("module load " + module for module in runtime_modules)
+    lines.extend(native_runtime_setup_lines())
     lines.extend(
         python_library_path_export_lines(
             list(getattr(availability, "batch_python_library_paths", ()) or ())
@@ -164,6 +219,9 @@ def render_submitted_environment_smoke_script(
     )
     for module in gaussian_modules:
         if module not in runtime_modules:
+            lines.append("module load " + module)
+    for module in aimall_modules:
+        if module not in runtime_modules and module not in gaussian_modules:
             lines.append("module load " + module)
     for label, executable in (
         ("Gaussian", gaussian_path),
@@ -193,8 +251,8 @@ def run_submitted_environment_smoke(
     config: Any,
     availability: Any,
     runner: Callable[..., Any] = subprocess.run,
-    settle_attempts: int = 5,
-    settle_seconds: float = 1.0,
+    settle_attempts: int = 120,
+    settle_seconds: float = 2.0,
 ) -> Dict[str, Any]:
     """Submit the commissioning smoke and return a machine-readable result."""
     campaign = Path(campaign_dir).expanduser().resolve()
@@ -226,29 +284,74 @@ def run_submitted_environment_smoke(
             output_path=output_path,
         )
         atomic_write_text(script_path, script)
-        completed = runner(
-            [
-                str(availability.sbatch_path),
-                "--parsable",
-                "--wait",
-                str(script_path),
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
-        result["submitted"] = True
-        if int(getattr(completed, "returncode", 1)) != 0:
-            detail = str(
-                getattr(completed, "stderr", "")
-                or getattr(completed, "stdout", "")
-                or "submitted smoke failed"
-            ).strip()
-            raise SubmittedEnvironmentSmokeError(
-                "submitted smoke job returned non-zero status: " + detail[:1000]
+        scheduler = str(
+            getattr(availability, "scheduler_kind", "")
+            or profile_value("hpc", "scheduler", default="slurm")
+        ).strip().lower()
+        if scheduler == "slurm":
+            completed = runner(
+                [
+                    str(availability.sbatch_path),
+                    "--parsable",
+                    "--wait",
+                    str(script_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=600,
             )
-        result["job_id"] = _parse_job_id(getattr(completed, "stdout", ""))
+            result["submitted"] = True
+            if int(getattr(completed, "returncode", 1)) != 0:
+                detail = str(
+                    getattr(completed, "stderr", "")
+                    or getattr(completed, "stdout", "")
+                    or "submitted smoke failed"
+                ).strip()
+                raise SubmittedEnvironmentSmokeError(
+                    "submitted smoke job returned non-zero status: " + detail[:1000]
+                )
+            result["job_id"] = _parse_job_id(getattr(completed, "stdout", ""))
+        else:
+            from ..versioning.manifest import sha256_file
+
+            backend = get_scheduler_backend(scheduler)
+            submission = backend.submit(
+                script_path,
+                binding_sha256=sha256_file(script_path),
+                runner=runner,
+                timeout_seconds=60,
+            )
+            result["submitted"] = True
+            result["job_id"] = submission.job_id
+            terminal = None
+            for attempt in range(max(1, int(settle_attempts))):
+                observations = backend.poll_job(
+                    submission.job_id,
+                    accounting_runner=runner,
+                    queue_runner=runner,
+                    timeout_seconds=60,
+                )
+                summary = aggregate_states(
+                    submission.job_id,
+                    observations,
+                    expected_task_count=1,
+                    submission_kind="scalar",
+                    strict_parent_job_id=False,
+                )
+                if summary.is_terminal:
+                    terminal = summary
+                    break
+                if attempt + 1 < max(1, int(settle_attempts)) and settle_seconds > 0:
+                    time.sleep(float(settle_seconds))
+            if terminal is None:
+                raise SubmittedEnvironmentSmokeError(
+                    "Sun Grid Engine did not produce terminal smoke accounting"
+                )
+            if not terminal.is_fully_successful:
+                raise SubmittedEnvironmentSmokeError(
+                    "submitted smoke job completed unsuccessfully"
+                )
         output = ""
         for attempt in range(max(1, int(settle_attempts))):
             if output_path.is_file():

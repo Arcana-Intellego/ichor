@@ -439,7 +439,8 @@ def test_build_sbatch_script_renders_aimall_directives():
 
     assert "#SBATCH --cpus-per-task=8" in body
     assert "AIMALL_TASK.json" in body
-    assert '-nproc="${SLURM_CPUS_PER_TASK:-1}"' in body
+    assert 'export ICHOR_SCHEDULER_CPUS="${SLURM_CPUS_PER_TASK:-1}"' in body
+    assert '-nproc="${ICHOR_SCHEDULER_CPUS:-1}"' in body
     assert '-naat="$AIMALL_NAAT"' in body
     assert "-encomp=3" in body
     assert "-boaq=auto_gs2" in body
@@ -735,7 +736,7 @@ def test_csf3_gaussian_block_uses_configured_module_path_and_scratch(monkeypatch
     assert 'export GAUSS_SCRDIR="$ICHOR_JOB_SCRATCH/gaussian"' in body
     assert 'rm -rf -- "$GAUSS_SCRDIR"' not in body
     assert "ichor_gaussian_${SLURM_JOB_ID}" not in body
-    assert 'export GAUSS_PDEF="${SLURM_CPUS_PER_TASK:-1}"' in body
+    assert 'export GAUSS_PDEF="${ICHOR_SCHEDULER_CPUS:-1}"' in body
     assert "export GAUSS_MDEF=27GB" in body
 
 
@@ -1933,7 +1934,7 @@ def test_build_sbatch_script_renders_aimall_block(monkeypatch):
     )
     command_line = next(line for line in body.splitlines() if "aimqb.ish" in line)
     assert command_line.startswith(shlex.quote("/opt/AIM All/aimqb.ish") + " -nogui")
-    assert '-nproc="${SLURM_CPUS_PER_TASK:-1}"' in command_line
+    assert '-nproc="${ICHOR_SCHEDULER_CPUS:-1}"' in command_line
     assert '-naat="$AIMALL_NAAT"' in command_line
     assert "-encomp=3" in command_line
     assert command_line.endswith(" input.wfn")

@@ -117,7 +117,7 @@ def main(argv=None) -> int:
     return 0
 
 
-if __name__ == "__main__":  # pragma: no cover - exercised through sbatch scripts
+if __name__ == "__main__":  # pragma: no cover - exercised through scheduler scripts
     raise SystemExit(main())
 
 

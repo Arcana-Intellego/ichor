@@ -434,9 +434,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     task_index = args.task_index
     if task_index is None:
-        raw = os.environ.get("SLURM_ARRAY_TASK_ID")
+        raw = (
+            os.environ.get("ICHOR_SCHEDULER_ARRAY_TASK_ID")
+            or os.environ.get("SLURM_ARRAY_TASK_ID")
+        )
         if raw is None or not raw.isdigit():
-            raise FerebusTaskRunnerError("SLURM_ARRAY_TASK_ID is missing or invalid")
+            raise FerebusTaskRunnerError(
+                "ICHOR scheduler array task ID is missing or invalid"
+            )
         task_index = int(raw)
     return execute_task(Path(args.task_map), task_index)
 

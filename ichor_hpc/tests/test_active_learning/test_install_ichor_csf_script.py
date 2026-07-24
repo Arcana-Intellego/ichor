@@ -1,4 +1,4 @@
-"""Smoke tests for the unified CSF install script."""
+"""Smoke tests for the unified cluster install script."""
 from __future__ import annotations
 
 import os
@@ -12,8 +12,10 @@ import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-SCRIPT = REPO_ROOT / "scripts" / "install_ichor_csf.sh"
-LIB = REPO_ROOT / "scripts" / "lib_ichor_csf.sh"
+SCRIPT = REPO_ROOT / "scripts" / "install_ichor.sh"
+LIB = REPO_ROOT / "scripts" / "lib_ichor.sh"
+LEGACY_SCRIPT = REPO_ROOT / "scripts" / "install_ichor_csf.sh"
+LEGACY_LIB = REPO_ROOT / "scripts" / "lib_ichor_csf.sh"
 CANONICAL_PROFILE = REPO_ROOT / "ichor_config.yaml"
 UPSERT = REPO_ROOT / "scripts" / "upsert_ichor_config.py"
 
@@ -70,7 +72,7 @@ def test_install_script_is_present():
     lib_text = LIB.read_text(encoding="utf-8")
     profile_text = CANONICAL_PROFILE.read_text(encoding="utf-8")
     upsert_text = UPSERT.read_text(encoding="utf-8")
-    assert "--machine auto|csf3|csf4" in text
+    assert "--machine auto|csf3|csf4|ffluxlab" in text
     assert "--only all|python|packages|ariadne|plumed|ferebus|config|verify|doctor" in text
     assert "--debug, --trace" in text
     assert "trap on_error ERR" in text
@@ -88,7 +90,7 @@ def test_install_script_is_present():
     assert "libs/gcc/openssl/1.1.1w" in text
     assert "--with-openssl=" in text
     assert "--with-openssl-rpath=auto" in text
-    assert "source \"${SCRIPT_DIR}/lib_ichor_csf.sh\"" in text
+    assert "source \"${SCRIPT_DIR}/lib_ichor.sh\"" in text
     assert "ichor_csf_module_is_shell_function()" in lib_text
     assert "ichor_csf_module_debug()" in lib_text
     assert "ichor_csf_find_ariadne_compiler_path()" in lib_text
@@ -138,6 +140,8 @@ def test_install_script_is_present():
     assert 'data[str(machine)] = profile' in upsert_text
     assert 'os.replace(temporary, path)' in upsert_text
     assert '_fsync_parent(path)' in upsert_text
+    assert "install_ichor.sh" in LEGACY_SCRIPT.read_text(encoding="utf-8")
+    assert "lib_ichor.sh" in LEGACY_LIB.read_text(encoding="utf-8")
 
 
 def test_install_script_bash_syntax():
@@ -146,11 +150,17 @@ def test_install_script_bash_syntax():
         pytest.skip("bash is not available on this host")
     subprocess.run([bash, "-n", str(LIB)], check=True)
     subprocess.run([bash, "-n", str(SCRIPT)], check=True)
+    subprocess.run([bash, "-n", str(LEGACY_LIB)], check=True)
+    subprocess.run([bash, "-n", str(LEGACY_SCRIPT)], check=True)
 
 
 @pytest.mark.parametrize(
     ("machine", "venv_name"),
-    [("csf3", "ichor-csf3"), ("csf4", "ichor-csf4")],
+    [
+        ("csf3", "ichor-csf3"),
+        ("csf4", "ichor-csf4"),
+        ("ffluxlab", "ichor-ffluxlab"),
+    ],
 )
 def test_install_script_dry_run_renders_cluster_defaults(machine, venv_name, tmp_path):
     result = _run_dry(machine, tmp_path)

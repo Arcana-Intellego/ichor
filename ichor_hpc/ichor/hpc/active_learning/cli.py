@@ -78,6 +78,11 @@ from .submit.slurm_contracts import (
     run_scheduler_command,
     validate_parent_job_id,
 )
+from .submit.scheduler_backend import (
+    current_scheduler_user,
+    get_scheduler_backend,
+)
+from .daemon.cluster_profile import profile_value, require_cluster_profile
 from .daemon.config_lock import (
     archive_ferebus_iteration_staging_for_retrain,
     archive_scripts_for_reconcile,
@@ -486,17 +491,25 @@ def _call_timeout_aware(
     """Preserve simple injected test adapters while timing real commands."""
     try:
         signature = inspect.signature(function)
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
         accepts_timeout = (
-            "timeout_seconds" in signature.parameters
-            or any(
-                parameter.kind is inspect.Parameter.VAR_KEYWORD
-                for parameter in signature.parameters.values()
-            )
+            "timeout_seconds" in signature.parameters or accepts_kwargs
         )
     except (TypeError, ValueError):
+        signature = None
+        accepts_kwargs = True
         accepts_timeout = True
     if accepts_timeout:
         kwargs["timeout_seconds"] = int(timeout_seconds)
+    if signature is not None and not accepts_kwargs:
+        kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key in signature.parameters
+        }
     return function(*args, **kwargs)
 
 
@@ -2099,6 +2112,40 @@ def _status_intent_counts(payload: Dict[str, Any]) -> Tuple[int, int]:
     return scheduler, local
 
 
+def _scheduler_display_name(
+    kind: Optional[str] = None,
+    *,
+    intents: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> str:
+    recorded = {
+        str(intent.get("scheduler_identity_kind") or "").strip().lower()
+        for intent in (intents or [])
+        if isinstance(intent, Mapping)
+        and intent.get("job_id")
+        and intent.get("scheduler_identity_kind")
+    }
+    if len(recorded) == 1:
+        kind = next(iter(recorded))
+    if not kind:
+        kind = str(
+            profile_value("hpc", "scheduler", default="slurm") or "slurm"
+        ).strip().lower()
+    try:
+        return str(get_scheduler_backend(kind).display_name)
+    except Exception:
+        return "scheduler"
+
+
+def _status_scheduler_display_name(payload: Mapping[str, Any]) -> str:
+    raw_intents = payload.get("active_submission_intents")
+    intents = (
+        [item for item in raw_intents if isinstance(item, Mapping)]
+        if isinstance(raw_intents, list)
+        else []
+    )
+    return _scheduler_display_name(intents=intents)
+
+
 def _seed_selection_progress_record(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     progress = payload.get("seed_selection_progress")
     if not isinstance(progress, dict) or progress.get("state") != "current":
@@ -2209,7 +2256,11 @@ def _status_progress_rows(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
             str(record.get("producer_kind") or "") == "scheduler"
             and not _status_daemon_active(payload)
         ):
-            progress_label = "last recorded Slurm progress"
+            progress_label = (
+                "last recorded "
+                + _status_scheduler_display_name(payload)
+                + " progress"
+            )
         rows.append((progress_label, count))
     elapsed = _format_elapsed_seconds(record.get("elapsed_seconds"))
     if elapsed:
@@ -2256,7 +2307,7 @@ def _format_journal_detail_value(key: str, value: Any) -> str:
     if str(key) in {"reason", "error"} and (
         "resource implementation ICHOR package tree has drifted" in str(value)
     ):
-        return "ICHOR installation changed after this Slurm work was prepared"
+        return "ICHOR installation changed after this scheduler work was prepared"
     if str(key).endswith("_seconds"):
         rounded = _round_journal_seconds(value)
         if rounded is not None:
@@ -2358,6 +2409,7 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
     scheduler_intents, local_intents = _status_intent_counts(payload)
     runtime_progress = _runtime_progress_record(payload)
     progress = _seed_selection_progress_record(payload)
+    scheduler_name = _status_scheduler_display_name(payload)
     if str(payload.get("background_startup_state") or "") in {
         "prepared",
         "spawned",
@@ -2378,7 +2430,9 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
                     + str(count)
                     + " "
                     + work_name
-                    + " Slurm "
+                    + " "
+                    + scheduler_name
+                    + " "
                     + kind
                     + ("" if count == 1 else "s")
                 )
@@ -2387,7 +2441,9 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
                 + str(count)
                 + " "
                 + work_name
-                + " Slurm "
+                + " "
+                + scheduler_name
+                + " "
                 + kind
                 + (" remains recorded." if count == 1 else "s remain recorded.")
             )
@@ -2402,14 +2458,18 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
                 + str(count)
                 + " "
                 + work_name
-                + " Slurm "
+                + " "
+                + scheduler_name
+                + " "
                 + kind
                 + ("" if count == 1 else "s")
             )
         return (
             "The daemon is stopped; "
             + str(count)
-            + " recorded Slurm job"
+            + " recorded "
+            + scheduler_name
+            + " job"
             + (" still needs monitoring or postprocessing." if count == 1 else "s still need monitoring or postprocessing.")
         )
     if local_intents:
@@ -2564,7 +2624,10 @@ def _format_runtime_status(payload: Dict[str, Any], *, verbose: bool) -> List[st
         stop_summary = "none"
     rows: List[tuple[str, Any]] = [
         ("daemon", _daemon_activity_status(payload)),
-        ("recorded Slurm jobs", _active_pending_jobs_summary(payload.get("pending_jobs"))),
+        (
+            "recorded " + _status_scheduler_display_name(payload) + " jobs",
+            _active_pending_jobs_summary(payload.get("pending_jobs")),
+        ),
         (
             "submission intents",
             _format_active_submission_intents(payload.get("active_submission_intents")),
@@ -3034,7 +3097,9 @@ def _status_next_rows(
         scheduler_intents, local_intents = _status_intent_counts(payload)
         if _status_active_job_count(payload) or scheduler_intents:
             automatic = (
-                "recorded Slurm work may continue, but the daemon will not monitor or "
+                "recorded "
+                + _status_scheduler_display_name(payload)
+                + " work may continue, but the daemon will not monitor or "
                 "postprocess it until resumed"
             )
         elif local_intents:
@@ -3636,6 +3701,22 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
 
 def _journal_event_label(event: Dict[str, Any]) -> str:
     raw = str(event.get("event", "<missing>"))
+    if str(event.get("scheduler_identity_kind") or "").lower() == "sge":
+        sge_labels = {
+            "sacct_error": "Sun Grid Engine accounting error",
+            "sacct_error_timeout": "Sun Grid Engine accounting error timeout",
+            "scheduler_usage_recorded": "Sun Grid Engine usage recorded",
+            "scheduler_usage_warning": "Sun Grid Engine usage unavailable",
+            "sacct_empty_timeout": "Sun Grid Engine accounting empty timeout",
+            "sacct_missing_timeout": "Sun Grid Engine accounting timeout",
+            "sacct_unknown_timeout": "Sun Grid Engine unknown-state timeout",
+            "sacct_empty_but_squeue_active": (
+                "waiting for Sun Grid Engine accounting"
+            ),
+            "scheduler_progress": "Sun Grid Engine progress",
+        }
+        if raw in sge_labels:
+            return sge_labels[raw]
     if raw in JOURNAL_EVENT_LABELS:
         return JOURNAL_EVENT_LABELS[raw]
     return raw.replace("_", " ")
@@ -3998,6 +4079,14 @@ def _journal_array_progress(event: Dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def _journal_scheduler_name(event: Dict[str, Any]) -> str:
+    return (
+        "Sun Grid Engine"
+        if str(event.get("scheduler_identity_kind") or "").lower() == "sge"
+        else "Slurm"
+    )
+
+
 def _sacct_row_summary(event: Dict[str, Any]) -> str:
     expected = _event_int(event, "n_expected")
     observed = _event_int(event, "n_observed")
@@ -4142,6 +4231,7 @@ def _journal_operator_summary(
     if raw == "queue_lifecycle_update":
         queue_event = str(event.get("queue_event") or "")
         status = str(event.get("status") or "").upper()
+        scheduler_name = _journal_scheduler_name(event)
         if queue_event == "postprocess_started":
             return "local postprocessing started"
         if queue_event == "postprocess_finished":
@@ -4152,7 +4242,7 @@ def _journal_operator_summary(
             )
         if queue_event == "terminal":
             return (
-                "Slurm tasks failed"
+                scheduler_name + " tasks failed"
                 if status in {
                     "FAILED",
                     "FAILURE",
@@ -4161,10 +4251,10 @@ def _journal_operator_summary(
                     "OUT_OF_MEMORY",
                     "NODE_FAIL",
                 }
-                else "Slurm tasks completed"
+                else scheduler_name + " tasks completed"
             )
         if queue_event == "first_sacct":
-            return "Slurm accounting available"
+            return scheduler_name + " accounting available"
         if status in _SQUEUE_PENDING_STATES:
             return "array pending" if _journal_array_progress(event) else "job pending"
         if status in _SQUEUE_RUNNING_STATES:
@@ -4682,24 +4772,38 @@ def cmd_start(args: argparse.Namespace) -> int:
         except LiveBackendNotAvailableError as exc:
             print(str(exc), file=sys.stderr)
             return 12
-        sacct_poller = None
-        # live mode: let the daemon spot + adopt an orphaned in-flight job on (re)entry rather than
-        # double-submitting after a crash or reconcile (A24/A25).
+        scheduler_kind = str(
+            getattr(executor, "scheduler_identity_kind", "slurm")
+        )
+        scheduler_backend = get_scheduler_backend(scheduler_kind)
         scheduler_timeout = int(
             config.runtime.scheduler_command_timeout_seconds
         )
+
+        def _live_scheduler_poller(job_id):
+            return scheduler_backend.poll_job(
+                job_id,
+                timeout_seconds=scheduler_timeout,
+            )
+
+        sacct_poller = _live_scheduler_poller
+        # live mode: let the daemon spot + adopt an orphaned in-flight job on (re)entry rather than
+        # double-submitting after a crash or reconcile (A24/A25).
         job_finder = _call_timeout_aware(
             make_live_job_finder,
             campaign_dir=campaign,
             timeout_seconds=scheduler_timeout,
+            scheduler_kind=scheduler_kind,
         )
         job_name_accounting_finder = _call_timeout_aware(
             make_live_job_accounting_finder,
             timeout_seconds=scheduler_timeout,
+            scheduler_kind=scheduler_kind,
         )
         job_liveness_checker = _call_timeout_aware(
             make_live_job_liveness_checker,
             timeout_seconds=scheduler_timeout,
+            scheduler_kind=scheduler_kind,
         )
         from .daemon.resource_usage import collect_usage
 
@@ -4718,7 +4822,9 @@ def cmd_start(args: argparse.Namespace) -> int:
         "config": config,
         "executor": executor,
         "scheduler_identity_kind": (
-            "slurm" if effective_mode == "live" else "synthetic"
+            str(getattr(executor, "scheduler_identity_kind", "slurm"))
+            if effective_mode == "live"
+            else "synthetic"
         ),
         "environment_preflight_ok": True,
     }
@@ -5025,6 +5131,9 @@ def _job_name_matches_expected(rows: Sequence[Dict[str, Any]], expected_names: S
 
 def _collect_stop_cancel_jobs(campaign: Path, state: Any) -> Dict[str, Dict[str, Any]]:
     jobs: Dict[str, Dict[str, Any]] = {}
+    profile_scheduler_kind = str(
+        profile_value("hpc", "scheduler", default="slurm") or "slurm"
+    ).strip().lower()
 
     def ensure(job_id: str) -> Dict[str, Any]:
         return jobs.setdefault(
@@ -5036,6 +5145,8 @@ def _collect_stop_cancel_jobs(campaign: Path, state: Any) -> Dict[str, Dict[str,
                 "intent_keys": set(),
                 "expected_tasks": None,
                 "submission_kind": None,
+                "scheduler_identity_kinds": set(),
+                "scheduler_identity_from_intent": False,
             },
         )
 
@@ -5048,9 +5159,15 @@ def _collect_stop_cancel_jobs(campaign: Path, state: Any) -> Dict[str, Dict[str,
         item["submission_kind"] = _submission_intent.submission_kind_for_phase(
             phase_name
         )
+        item["scheduler_identity_kinds"].add(profile_scheduler_kind)
         if phase_name not in _FEREBUS_JOB_NAME_EXTERNAL_PHASES:
             item["expected_job_names"].add(
-                live_job_name(state.campaign_uid, phase_name, int(state.iteration))
+                _submission_intent.expected_job_name(
+                    state.campaign_uid,
+                    phase_name,
+                    int(state.iteration),
+                    scheduler_identity_kind=profile_scheduler_kind,
+                )
             )
 
     campaign_uid = str(getattr(state, "campaign_uid", "") or "")
@@ -5072,8 +5189,149 @@ def _collect_stop_cancel_jobs(campaign: Path, state: Any) -> Dict[str, Dict[str,
             item["expected_job_names"].add(expected)
         item["expected_tasks"] = intent.get("expected_tasks")
         item["submission_kind"] = str(intent.get("submission_kind"))
+        recorded_scheduler = str(
+            intent.get("scheduler_identity_kind") or "slurm"
+        )
+        if item["scheduler_identity_from_intent"] is False:
+            item["scheduler_identity_kinds"].clear()
+            item["scheduler_identity_from_intent"] = True
+        item["scheduler_identity_kinds"].add(recorded_scheduler)
 
     return jobs
+
+
+def _lookup_active_scheduler_job_for_cancel(
+    job_id: str,
+    *,
+    scheduler_kind: str,
+    timeout_seconds: int = 60,
+) -> Dict[str, Any]:
+    backend = get_scheduler_backend(scheduler_kind)
+    return backend.cancellation_lookup(
+        job_id,
+        timeout_seconds=int(timeout_seconds),
+    )
+
+
+def _run_scheduler_cancel(
+    job_id: str,
+    *,
+    scheduler_kind: str,
+    timeout_seconds: int = 60,
+) -> Tuple[bool, str]:
+    return get_scheduler_backend(scheduler_kind).cancel(
+        job_id,
+        timeout_seconds=int(timeout_seconds),
+    )
+
+
+def _sge_rows_were_never_started(rows: Sequence[Mapping[str, Any]]) -> bool:
+    pending_states = {
+        "qw",
+        "hqw",
+        "hRqw",
+        "s",
+        "S",
+        "T",
+        "ts",
+        "tsS",
+        "tT",
+    }
+    return bool(rows) and all(
+        str(row.get("state") or "") in pending_states for row in rows
+    )
+
+
+def _confirm_cancelled_scheduler_job(
+    job_id: str,
+    *,
+    scheduler_kind: str,
+    expected_tasks: Optional[int],
+    submission_kind: str,
+    pre_cancel_rows: Sequence[Mapping[str, Any]],
+    confirmation_timeout_seconds: int,
+    command_timeout_seconds: int,
+) -> Tuple[bool, str]:
+    from .submit.sacct_poll import JobStatus, aggregate_states
+
+    backend = get_scheduler_backend(scheduler_kind)
+    deadline = time.monotonic() + float(confirmation_timeout_seconds)
+    last_reason = backend.display_name + " has not confirmed cancellation"
+    while True:
+        observations: Sequence[Any] = ()
+        try:
+            observations = backend.poll_job(
+                job_id,
+                timeout_seconds=int(command_timeout_seconds),
+                cancellation_requested=True,
+            )
+            summary = aggregate_states(
+                job_id,
+                observations,
+                expected_task_count=expected_tasks,
+                submission_kind=submission_kind,
+                strict_parent_job_id=(scheduler_kind == "slurm"),
+            )
+            if summary.is_terminal and int(summary.n_missing) == 0:
+                terminal_statuses = {
+                    observation.status for observation in summary.observations
+                }
+                if (
+                    scheduler_kind == "sge"
+                    and terminal_statuses
+                    and terminal_statuses.issubset(
+                        {JobStatus.COMPLETED, JobStatus.CANCELLED}
+                    )
+                ):
+                    return True, ""
+                if terminal_statuses == {JobStatus.CANCELLED}:
+                    return True, ""
+                states = sorted(
+                    {
+                        str(observation.status.value)
+                        for observation in summary.observations
+                    }
+                )
+                return False, (
+                    "job became terminal without cancellation-derived states: "
+                    + ", ".join(states)
+                )
+            if summary.n_unknown:
+                last_reason = "accounting returned an unknown cancellation state"
+            elif summary.n_missing:
+                last_reason = "accounting is missing expected cancellation rows"
+        except Exception as exc:
+            last_reason = type(exc).__name__ + ": " + str(exc)
+        lookup = _lookup_active_scheduler_job_for_cancel(
+            job_id,
+            scheduler_kind=scheduler_kind,
+            timeout_seconds=int(command_timeout_seconds),
+        )
+        if lookup.get("inconclusive"):
+            last_reason = (
+                backend.display_name
+                + " cancellation lookup is inconclusive: "
+                + str(lookup.get("error") or "unknown error")
+            )
+        elif lookup.get("active"):
+            last_reason = "job remains active or is still leaving the scheduler"
+        elif (
+            scheduler_kind == "sge"
+            and not observations
+            and _sge_rows_were_never_started(pre_cancel_rows)
+        ):
+            # SGE may never create qacct records for a queued or held array
+            # deleted before any task starts. The pre-cancel qstat ownership
+            # evidence plus confirmed disappearance is conclusive.
+            return True, ""
+        if time.monotonic() >= deadline:
+            return False, (
+                "cancellation confirmation timed out after "
+                + str(int(confirmation_timeout_seconds))
+                + " seconds: "
+                + last_reason
+            )
+        time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
 
 def _cancel_recorded_slurm_jobs(
@@ -5199,6 +5457,231 @@ def _cancel_recorded_slurm_jobs(
     }
 
 
+def _cancel_recorded_scheduler_jobs(
+    campaign: Path,
+    state: Any,
+    *,
+    command_timeout_seconds: int = 60,
+    confirmation_timeout_seconds: int = 120,
+) -> Dict[str, Any]:
+    """Cancel campaign-owned work through its recorded scheduler contract."""
+    jobs = _collect_stop_cancel_jobs(campaign, state)
+    all_kinds = {
+        kind
+        for item in jobs.values()
+        for kind in item.get("scheduler_identity_kinds", set())
+        if kind
+    }
+    if not all_kinds or all_kinds == {"slurm"}:
+        # Preserve the established Slurm implementation and its injected test
+        # seams byte-for-byte.
+        return _cancel_recorded_slurm_jobs(
+            campaign,
+            state,
+            command_timeout_seconds=int(command_timeout_seconds),
+            confirmation_timeout_seconds=int(confirmation_timeout_seconds),
+        )
+
+    cancelled: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+    campaign_uid = str(getattr(state, "campaign_uid", "") or "")
+    for intent in _load_active_submission_intents(
+        campaign,
+        fail_on_error=True,
+        expected_campaign_uid=(campaign_uid or None),
+    ):
+        if str(intent.get("job_id") or ""):
+            continue
+        phase_name, iteration = _intent_phase_iteration(intent)
+        skipped.append(
+            {
+                "job_id": "",
+                "scheduler_identity_kind": str(
+                    intent.get("scheduler_identity_kind") or "slurm"
+                ),
+                "reason": "active submission intent has no job_id: "
+                + str(phase_name)
+                + "@"
+                + str(iteration),
+            }
+        )
+
+    expected_owner = current_scheduler_user()
+    for job_id, item in sorted(jobs.items()):
+        scheduler_kinds = {
+            str(kind)
+            for kind in item.get("scheduler_identity_kinds", set())
+            if str(kind)
+        }
+        if len(scheduler_kinds) != 1:
+            failed.append(
+                {
+                    "job_id": job_id,
+                    "reason": "recorded scheduler identity is missing or contradictory",
+                }
+            )
+            continue
+        scheduler_kind = next(iter(scheduler_kinds))
+        try:
+            backend = get_scheduler_backend(scheduler_kind)
+        except ValueError as exc:
+            failed.append(
+                {
+                    "job_id": job_id,
+                    "scheduler_identity_kind": scheduler_kind,
+                    "reason": str(exc),
+                }
+            )
+            continue
+        lookup = _lookup_active_scheduler_job_for_cancel(
+            job_id,
+            scheduler_kind=scheduler_kind,
+            timeout_seconds=int(command_timeout_seconds),
+        )
+        if bool(lookup.get("inconclusive")):
+            failed.append(
+                {
+                    "job_id": job_id,
+                    "scheduler_identity_kind": scheduler_kind,
+                    "reason": backend.display_name
+                    + " lookup inconclusive: "
+                    + str(lookup.get("error") or "unknown error"),
+                }
+            )
+            continue
+        if not bool(lookup.get("active")):
+            skipped.append(
+                {
+                    "job_id": job_id,
+                    "scheduler_identity_kind": scheduler_kind,
+                    "reason": "not active in " + backend.display_name,
+                }
+            )
+            continue
+        rows = list(lookup.get("rows") or [])
+        foreign_owners = sorted(
+            {
+                str(row.get("owner") or "")
+                for row in rows
+                if str(row.get("owner") or "") != expected_owner
+            }
+        )
+        if foreign_owners:
+            failed.append(
+                {
+                    "job_id": job_id,
+                    "scheduler_identity_kind": scheduler_kind,
+                    "reason": "scheduler ownership mismatch",
+                    "expected_owner": expected_owner,
+                    "actual_owners": foreign_owners,
+                }
+            )
+            continue
+        expected_names = sorted(
+            str(name)
+            for name in item.get("expected_job_names", set())
+            if str(name)
+        )
+        if not _job_name_matches_expected(rows, expected_names):
+            failed.append(
+                {
+                    "job_id": job_id,
+                    "scheduler_identity_kind": scheduler_kind,
+                    "reason": "scheduler job name mismatch",
+                    "expected_job_names": expected_names,
+                    "actual_job_names": sorted(
+                        {str(row.get("job_name") or "") for row in rows}
+                    ),
+                }
+            )
+            continue
+        expected_tasks = item.get("expected_tasks")
+        if expected_tasks is not None and (
+            isinstance(expected_tasks, bool)
+            or not isinstance(expected_tasks, int)
+            or expected_tasks <= 0
+        ):
+            failed.append(
+                {
+                    "job_id": job_id,
+                    "scheduler_identity_kind": scheduler_kind,
+                    "reason": "submission intent has an invalid expected task count",
+                }
+            )
+            continue
+        submission_kind = str(item.get("submission_kind") or "")
+        if submission_kind not in {"scalar", "array"}:
+            failed.append(
+                {
+                    "job_id": job_id,
+                    "scheduler_identity_kind": scheduler_kind,
+                    "reason": "submission kind is unavailable for cancellation confirmation",
+                }
+            )
+            continue
+        if submission_kind == "array" and expected_tasks is None:
+            failed.append(
+                {
+                    "job_id": job_id,
+                    "scheduler_identity_kind": scheduler_kind,
+                    "reason": (
+                        "array task cardinality is unavailable; cancellation was not "
+                        "issued because complete terminal confirmation would be impossible"
+                    ),
+                }
+            )
+            continue
+        ok, message = _run_scheduler_cancel(
+            job_id,
+            scheduler_kind=scheduler_kind,
+            timeout_seconds=int(command_timeout_seconds),
+        )
+        if not ok:
+            failed.append(
+                {
+                    "job_id": job_id,
+                    "scheduler_identity_kind": scheduler_kind,
+                    "reason": backend.cancel_command + " failed: " + message,
+                }
+            )
+            continue
+        confirmed, confirmation_reason = _confirm_cancelled_scheduler_job(
+            job_id,
+            scheduler_kind=scheduler_kind,
+            expected_tasks=expected_tasks,
+            submission_kind=submission_kind,
+            pre_cancel_rows=rows,
+            confirmation_timeout_seconds=int(confirmation_timeout_seconds),
+            command_timeout_seconds=int(command_timeout_seconds),
+        )
+        if not confirmed:
+            failed.append(
+                {
+                    "job_id": job_id,
+                    "scheduler_identity_kind": scheduler_kind,
+                    "reason": confirmation_reason,
+                }
+            )
+            continue
+        cancelled.append(
+            {
+                "job_id": job_id,
+                "scheduler_identity_kind": scheduler_kind,
+                "phases": sorted(
+                    str(phase) for phase in item.get("phases", set())
+                ),
+                "intent_keys": [
+                    {"phase": str(phase_name), "iteration": int(iteration)}
+                    for phase_name, iteration in sorted(
+                        item.get("intent_keys", set())
+                    )
+                ],
+            }
+        )
+    return {"cancelled": cancelled, "skipped": skipped, "failed": failed}
+
+
 def _mark_cancelled_intents_without_state(
     campaign: Path,
     summary: Mapping[str, Any],
@@ -5234,6 +5717,15 @@ def _journal_cancel_jobs_summary(
             phase = getattr(state, "phase")
             context["phase"] = phase.value if hasattr(phase, "value") else str(phase)
             context["iteration"] = int(getattr(state, "iteration", 0))
+        recorded_kinds = {
+            str(item.get("scheduler_identity_kind") or "").strip().lower()
+            for bucket in ("cancelled", "skipped", "failed")
+            for item in (summary.get(bucket) or [])
+            if isinstance(item, Mapping)
+            and item.get("scheduler_identity_kind")
+        }
+        if len(recorded_kinds) == 1:
+            context["scheduler_identity_kind"] = next(iter(recorded_kinds))
         append_event(
             journal_path,
             "user_cancelled_jobs",
@@ -5266,9 +5758,19 @@ def _print_cancel_jobs_summary(
     cancelled = list(summary.get("cancelled") or [])
     skipped = list(summary.get("skipped") or [])
     failed = list(summary.get("failed") or [])
+    recorded_kinds = {
+        str(item.get("scheduler_identity_kind") or "").strip().lower()
+        for item in cancelled + skipped + failed
+        if isinstance(item, Mapping)
+        and item.get("scheduler_identity_kind")
+    }
+    scheduler_name = _scheduler_display_name(
+        next(iter(recorded_kinds)) if len(recorded_kinds) == 1 else None
+    )
     if not verbose:
         print(
-            "Slurm cancellation: "
+            scheduler_name
+            + " cancellation: "
             + str(len(cancelled))
             + " cancelled, "
             + str(len(skipped))
@@ -5284,13 +5786,13 @@ def _print_cancel_jobs_summary(
             )
         return
     if cancelled:
-        print("Cancelled Slurm jobs:")
+        print("Cancelled " + scheduler_name + " jobs:")
         for item in cancelled:
             phases = ", ".join(str(phase) for phase in item.get("phases", []))
             suffix = " (" + phases + ")" if phases else ""
             print("  - " + str(item.get("job_id")) + suffix)
     if skipped:
-        print("Skipped Slurm jobs:")
+        print("Skipped " + scheduler_name + " jobs:")
         for item in skipped:
             print("  - " + str(item.get("job_id")) + ": " + str(item.get("reason")))
     if failed:
@@ -5298,7 +5800,7 @@ def _print_cancel_jobs_summary(
         for item in failed:
             print("  - " + str(item.get("job_id")) + ": " + str(item.get("reason")), file=sys.stderr)
     if not cancelled and not skipped and not failed:
-        print("No recorded active Slurm jobs found.")
+        print("No recorded active " + scheduler_name + " jobs found.")
 
 
 def _signal_recorded_background_daemon(
@@ -5398,7 +5900,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
                 iteration=0,
             )
             try:
-                cancel_summary = _cancel_recorded_slurm_jobs(
+                cancel_summary = _cancel_recorded_scheduler_jobs(
                     campaign,
                     fallback_state,
                     command_timeout_seconds=command_timeout,
@@ -5432,7 +5934,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
                 iteration=0,
             )
             try:
-                cancel_summary = _cancel_recorded_slurm_jobs(
+                cancel_summary = _cancel_recorded_scheduler_jobs(
                     campaign,
                     fallback_state,
                     command_timeout_seconds=command_timeout,
@@ -5536,7 +6038,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
     cancel_summary = None
     if cancel_jobs:
         try:
-            cancel_summary = _cancel_recorded_slurm_jobs(
+            cancel_summary = _cancel_recorded_scheduler_jobs(
                 campaign,
                 state,
                 command_timeout_seconds=command_timeout,
@@ -5588,9 +6090,17 @@ def cmd_stop(args: argparse.Namespace) -> int:
         _print_cancel_jobs_summary(cancel_summary, verbose=stop_verbose)
         cancellation_failed = bool(cancel_summary.get("failed"))
     elif cancel_jobs:
-        print("No recorded Slurm jobs required cancellation.")
+        print(
+            "No recorded "
+            + _scheduler_display_name()
+            + " jobs required cancellation."
+        )
     else:
-        print("Recorded Slurm jobs, if any, were left running.")
+        print(
+            "Recorded "
+            + _scheduler_display_name()
+            + " jobs, if any, were left running."
+        )
     print("Monitor the stop:")
     print("  " + _campaign_command(campaign, "status"))
     print("  " + _campaign_command(campaign, "journal", " --last-n 20"))
@@ -5873,7 +6383,9 @@ def format_recovery_dashboard(campaign_dir: Path) -> str:
     )
     if ownership_active or has_slurm_job:
         recommendation = (
-            "cancel the recorded Slurm work first: ichor-al-daemon stop --campaign-dir "
+            "cancel the recorded "
+            + _scheduler_display_name(intents=intents)
+            + " work first: ichor-al-daemon stop --campaign-dir "
             + shlex.quote(str(campaign))
             + " --cancel-jobs"
             if has_slurm_job
@@ -6544,6 +7056,13 @@ def cmd_status(args: argparse.Namespace) -> int:
             "errors": [type(exc).__name__ + ": " + str(exc)],
         }
     presentation_payload = dict(payload)
+    try:
+        profile = require_cluster_profile()
+        presentation_payload["_presentation_scheduler_kind"] = str(
+            profile.config[profile.machine]["hpc"]["scheduler"]
+        ).strip().lower()
+    except Exception:
+        pass
     if isinstance(status_transaction_recovery, Mapping) and str(
         status_transaction_recovery.get("state") or ""
     ) != "none":
@@ -6930,7 +7449,14 @@ def cmd_resume(args: argparse.Namespace) -> int:
             print(
                 "restored "
                 + state.phase.value
-                + " to re-poll preserved Slurm job "
+                + " to re-poll preserved "
+                + _scheduler_display_name(
+                    str(
+                        preserved_intent.get("scheduler_identity_kind")
+                        or "slurm"
+                    )
+                )
+                + " job "
                 + str(preserved_intent["job_id"])
                 + "; no job was resubmitted"
             )
@@ -7163,25 +7689,84 @@ def _matching_sacct_observations(job_id: str, observations: Sequence[Any]) -> Li
 def _terminal_sacct_state_for_intent(
     job_id: str,
     observations: Sequence[Any],
+    *,
+    scheduler_kind: str = "slurm",
+    expected_task_count: Optional[int] = None,
+    submission_kind: Optional[str] = None,
 ) -> Tuple[Optional[str], str, int]:
     from .submit import sacct_poll
 
+    scheduler_name = _scheduler_display_name(scheduler_kind)
+    accounting_name = (
+        "qacct"
+        if str(scheduler_kind).strip().lower() == "sge"
+        else "sacct"
+    )
     matching = _matching_sacct_observations(job_id, observations)
     if not matching:
-        return None, "sacct returned no rows for job " + str(job_id), 0
+        return (
+            None,
+            accounting_name + " returned no rows for job " + str(job_id),
+            0,
+        )
+    if str(scheduler_kind).strip().lower() == "sge":
+        summary = sacct_poll.aggregate_states(
+            str(job_id),
+            matching,
+            expected_task_count=expected_task_count,
+            submission_kind=submission_kind,
+            strict_parent_job_id=False,
+        )
+        if summary.conflicting_task_indices:
+            return (
+                None,
+                "Sun Grid Engine accounting returned conflicting task rows",
+                len(matching),
+            )
+        if summary.out_of_range_task_indices:
+            return (
+                None,
+                "Sun Grid Engine accounting returned out-of-range task rows",
+                len(matching),
+            )
+        if int(summary.n_missing) > 0:
+            return (
+                None,
+                "Sun Grid Engine accounting is still missing "
+                + str(int(summary.n_missing))
+                + " of "
+                + str(int(summary.n_expected))
+                + " expected task rows",
+                len(matching),
+            )
+        matching = list(summary.observations)
     states = [observation.status for observation in matching]
     if any(state in sacct_poll.NON_TERMINAL_STATES for state in states):
-        return None, "sacct still has non-terminal rows for job " + str(job_id), len(matching)
+        return (
+            None,
+            scheduler_name + " still has non-terminal rows for job " + str(job_id),
+            len(matching),
+        )
     if any(state == sacct_poll.JobStatus.UNKNOWN for state in states):
-        return None, "sacct returned UNKNOWN rows for job " + str(job_id), len(matching)
+        return (
+            None,
+            scheduler_name + " returned unknown rows for job " + str(job_id),
+            len(matching),
+        )
     if not all(state in sacct_poll.TERMINAL_STATES for state in states):
-        return None, "sacct rows are not conclusively terminal for job " + str(job_id), len(matching)
+        return (
+            None,
+            scheduler_name
+            + " accounting rows are not conclusively terminal for job "
+            + str(job_id),
+            len(matching),
+        )
     failures = [state for state in states if state in sacct_poll.FAILURE_STATES]
     if failures:
         return failures[0].value, "", len(matching)
     return (
         None,
-        "sacct shows successful completion; reconcile will not clear "
+        scheduler_name + " shows successful completion; reconcile will not clear "
         "the intent without postprocess verification",
         len(matching),
     )
@@ -7228,6 +7813,24 @@ def _resolve_terminal_submission_intents_for_apply(
     blocking: List[Dict[str, Any]] = []
     for intent in active_intents:
         phase, iteration = _intent_phase_iteration(intent)
+        scheduler_kind = str(
+            intent.get("scheduler_identity_kind") or "slurm"
+        ).strip().lower()
+        try:
+            scheduler_backend = get_scheduler_backend(scheduler_kind)
+        except ValueError as exc:
+            blocking.append(
+                {
+                    "phase": phase,
+                    "iteration": iteration,
+                    "job_id": str(intent.get("job_id") or ""),
+                    "expected_job_name": str(
+                        intent.get("expected_job_name") or ""
+                    ),
+                    "reason": str(exc),
+                }
+            )
+            continue
         job_id = str(intent.get("job_id") or "")
         expected_job_name = str(intent.get("expected_job_name") or "")
         status = str(intent.get("status") or "")
@@ -7271,10 +7874,10 @@ def _resolve_terminal_submission_intents_for_apply(
                         iteration=int(iteration),
                         replacement_round=int(intent.get("replacement_round", 0) or 0),
                     )
-                lookup = sacct_poll.find_accounted_job_by_name_detailed(
+                lookup = scheduler_backend.find_accounted_job_by_name(
                     expected_job_name,
                     expected_task_count=expected_tasks,
-                    use_squeue_fallback=True,
+                    submission_kind=str(intent.get("submission_kind") or ""),
                 )
                 if lookup.inconclusive:
                     blocking.append({
@@ -7368,14 +7971,16 @@ def _resolve_terminal_submission_intents_for_apply(
                 "reason": "submission intent has no job_id",
             })
             continue
-        queue_lookup = sacct_poll.find_active_job_by_id_detailed(job_id)
+        queue_lookup = scheduler_backend.find_active_job_by_id(job_id)
         if queue_lookup.inconclusive:
             blocking.append({
                 "phase": phase,
                 "iteration": iteration,
                 "job_id": job_id,
                 "expected_job_name": expected_job_name,
-                "reason": "squeue lookup inconclusive: " + str(queue_lookup.error or "unknown error"),
+                "reason": scheduler_backend.display_name
+                + " queue lookup inconclusive: "
+                + str(queue_lookup.error or "unknown error"),
             })
             continue
         if queue_lookup.active:
@@ -7384,23 +7989,36 @@ def _resolve_terminal_submission_intents_for_apply(
                 "iteration": iteration,
                 "job_id": job_id,
                 "expected_job_name": expected_job_name,
-                "reason": "job is still active in squeue",
+                "reason": "job is still active in "
+                + scheduler_backend.queue_command,
             })
             continue
         try:
-            observations = sacct_poll.poll_job(job_id)
+            observations = scheduler_backend.poll_job(job_id)
         except Exception as exc:
             blocking.append({
                 "phase": phase,
                 "iteration": iteration,
                 "job_id": job_id,
                 "expected_job_name": expected_job_name,
-                "reason": "sacct lookup failed: " + type(exc).__name__ + ": " + str(exc),
+                "reason": scheduler_backend.display_name
+                + " accounting lookup failed: "
+                + type(exc).__name__
+                + ": "
+                + str(exc),
             })
             continue
         terminal_state, reason, n_rows = _terminal_sacct_state_for_intent(
             job_id,
             observations,
+            scheduler_kind=scheduler_kind,
+            expected_task_count=(
+                int(intent["expected_tasks"])
+                if isinstance(intent.get("expected_tasks"), int)
+                and not isinstance(intent.get("expected_tasks"), bool)
+                else None
+            ),
+            submission_kind=str(intent.get("submission_kind") or ""),
         )
         if terminal_state is None:
             blocking.append({
@@ -8184,7 +8802,9 @@ def _reconcile_apply_command(campaign: Path, report: Any) -> str:
 def _reconcile_human_reason(reason: Any) -> str:
     text = str(reason)
     mapping = {
-        ".DATA/SCRIPTS contains sbatch scripts": "stale sbatch scripts",
+        ".DATA/SCRIPTS contains sbatch scripts": (
+            "stale scheduler submission scripts"
+        ),
         "dangling model staging directories exist": "dangling model staging",
         "dangling reference-data staging directories exist": "dangling reference-data staging",
         ".DATA/STAGING is non-empty": ".DATA/STAGING is non-empty",
@@ -8538,7 +9158,13 @@ def _reconcile_active_work(
         )
     if scheduler_jobs:
         count = len(scheduler_jobs)
-        return str(count) + " recorded Slurm job" + ("" if count == 1 else "s")
+        return (
+            str(count)
+            + " recorded "
+            + _scheduler_display_name(intents=intents)
+            + " job"
+            + ("" if count == 1 else "s")
+        )
     local = [
         item
         for item in intents
@@ -8594,7 +9220,14 @@ def _reconcile_cleanup_rows(
         rows.append(("QM staging", "archive unfinished temporary QM publication data"))
         reasons.append("unfinished QM publication data remains")
     if ".DATA/SCRIPTS contains sbatch scripts" in raw_reasons:
-        rows.append(("submission scripts", "archive stale temporary Slurm scripts"))
+        rows.append(
+            (
+                "submission scripts",
+                "archive stale temporary "
+                + _scheduler_display_name()
+                + " scripts",
+            )
+        )
         reasons.append("stale submission scripts remain")
     if ".DATA/STAGING is non-empty" in raw_reasons:
         rows.append(("staging", "archive unclassified temporary staging for review"))
@@ -8614,6 +9247,10 @@ def _reconcile_presentation(
     runtime_status: Optional[Dict[str, Any]] = None,
 ) -> _ReconcilePresentation:
     current, current_error = _reconcile_load_current_state(campaign)
+    active_intents = list(
+        getattr(report, "active_submission_intents", []) or []
+    )
+    scheduler_name = _scheduler_display_name(intents=active_intents)
     proposed = report.proposed_state
     target_phase, target_iteration, target_round = _reconcile_display_target(report)
     raw_blockers = _reconcile_hard_blockers(report, contract_status)
@@ -8828,7 +9465,12 @@ def _reconcile_presentation(
     )
 
     if result == "ready to apply":
-        planned.append(("Slurm work", "none; reconcile will not start jobs"))
+        planned.append(
+            (
+                scheduler_name + " work",
+                "none; reconcile will not start jobs",
+            )
+        )
 
     protected = list(contract_status.get("protected_artifacts", []) or [])
     safety = [
@@ -8857,7 +9499,11 @@ def _reconcile_presentation(
     if result == "ready to apply":
         next_label = "run"
         next_command = _reconcile_apply_command(campaign, report)
-        next_effect = "apply the listed changes; no daemon or Slurm job will start"
+        next_effect = (
+            "apply the listed changes; no daemon or "
+            + scheduler_name
+            + " job will start"
+        )
     elif result == "no reconcile changes needed":
         next_label = "run"
         next_command = _campaign_command(campaign, "resume")
@@ -8952,10 +9598,18 @@ def _reconcile_read_current_state_summary(
     pending_jobs = getattr(state, "pending_jobs", {}) or {}
     pending_count = sum(1 for job_id in pending_jobs.values() if job_id)
     completed_markers = sum(1 for job_id in pending_jobs.values() if not job_id)
+    scheduler_name = _scheduler_display_name(intents=active_intents)
     if scheduler_intents:
-        job_text = str(len(scheduler_intents)) + " recorded Slurm job(s)"
+        job_text = (
+            str(len(scheduler_intents))
+            + " recorded "
+            + scheduler_name
+            + " job(s)"
+        )
     elif pending_count:
-        job_text = str(pending_count) + " recorded Slurm job(s)"
+        job_text = (
+            str(pending_count) + " recorded " + scheduler_name + " job(s)"
+        )
     elif local_intents:
         job_text = "none; local recovery work is prepared"
     else:
@@ -9174,7 +9828,12 @@ def _print_reconcile_aimall_quality_revalidation(report: Any) -> None:
                 if revalidation.get("allocation_generation") is not None
                 else "pending",
             ),
-            ("scheduler work", "none; no Slurm jobs will be submitted"),
+            (
+                "scheduler work",
+                "none; no "
+                + _scheduler_display_name()
+                + " jobs will be submitted",
+            ),
         ]
     )
     print("")
@@ -9205,7 +9864,7 @@ def _print_reconcile_completed_staging(report: Any) -> None:
         )
     if tombstones:
         print("  interrupted deletions to retry: " + str(len(tombstones)))
-    print("  Slurm work submitted: none")
+    print("  " + _scheduler_display_name() + " work submitted: none")
     print("")
 
 
@@ -9527,7 +10186,7 @@ def _print_reconcile_apply_plan_compact(
             [
                 "revalidate the parser-rejected AIMAll point(s)",
                 "complete the existing point allocation",
-                "prepare QM reference publication without submitting Slurm work",
+                "prepare QM reference publication without submitting scheduler work",
                 "recover to REFERENCE_COMMIT",
             ],
         )
@@ -9857,7 +10516,7 @@ def _print_reconcile_applied_operator_report(
         [
             ("now", _reconcile_state_summary(report.proposed_state, None)),
             ("daemon", "not running"),
-            ("Slurm jobs submitted", "none"),
+            (_scheduler_display_name() + " jobs submitted", "none"),
         ]
     )
     print("")
@@ -9964,7 +10623,10 @@ def _print_reconcile_follow_up_required(
     print("Campaign state", file=sys.stderr)
     print("  now: " + _reconcile_state_summary(state, None), file=sys.stderr)
     print("  daemon: not running", file=sys.stderr)
-    print("  Slurm jobs submitted: none", file=sys.stderr)
+    print(
+        "  " + _scheduler_display_name() + " jobs submitted: none",
+        file=sys.stderr,
+    )
     print("", file=sys.stderr)
     print("Follow-up required", file=sys.stderr)
     print("  problem: " + _reconcile_plain_text(problem), file=sys.stderr)
@@ -10052,40 +10714,72 @@ def _scratch_intent_index(campaign: Path) -> Dict[str, Dict[str, Any]]:
 def _scratch_scheduler_state(
     job_id: str,
     expected_task_count: Optional[int] = None,
+    scheduler_kind: str = "slurm",
 ) -> Tuple[str, str]:
-    """Return active, inactive, or inconclusive for one recorded Slurm job."""
+    """Return active, inactive, or inconclusive for one recorded scheduler job."""
     from .submit import sacct_poll
 
+    backend = get_scheduler_backend(scheduler_kind)
     try:
-        queue = sacct_poll.find_active_job_by_id_detailed(str(job_id))
+        if scheduler_kind == "slurm":
+            queue = sacct_poll.find_active_job_by_id_detailed(str(job_id))
+        else:
+            queue = backend.find_active_job_by_id(str(job_id))
     except Exception as exc:
         return "inconclusive", type(exc).__name__ + ": " + str(exc)
     if bool(getattr(queue, "inconclusive", False)):
-        return "inconclusive", str(getattr(queue, "error", None) or "squeue lookup failed")
+        return (
+            "inconclusive",
+            str(
+                getattr(queue, "error", None)
+                or backend.display_name + " queue lookup failed"
+            ),
+        )
     if bool(getattr(queue, "active", False)):
-        return "active", "squeue reports active rows"
+        return "active", backend.display_name + " reports active rows"
     try:
-        observations = sacct_poll.poll_job(str(job_id))
+        if scheduler_kind == "slurm":
+            observations = sacct_poll.poll_job(str(job_id))
+        else:
+            observations = backend.poll_job(str(job_id))
     except Exception as exc:
-        return "inconclusive", "sacct lookup failed: " + type(exc).__name__ + ": " + str(exc)
+        return (
+            "inconclusive",
+            backend.display_name
+            + " accounting lookup failed: "
+            + type(exc).__name__
+            + ": "
+            + str(exc),
+        )
     if not observations:
-        return "inconclusive", "sacct returned no rows"
+        return "inconclusive", backend.display_name + " returned no accounting rows"
     matching = _matching_sacct_observations(str(job_id), observations)
     if not matching:
-        return "inconclusive", "sacct returned no matching task rows"
+        return (
+            "inconclusive",
+            backend.accounting_command + " returned no matching task rows",
+        )
     summary = sacct_poll.aggregate_states(
         str(job_id),
         matching,
         expected_task_count=expected_task_count,
+        strict_parent_job_id=(scheduler_kind == "slurm"),
     )
     if summary.conflicting_task_indices:
-        return "inconclusive", "sacct returned conflicting task rows"
+        return (
+            "inconclusive",
+            backend.accounting_command + " returned conflicting task rows",
+        )
     if summary.out_of_range_task_indices:
-        return "inconclusive", "sacct returned out-of-range task rows"
+        return (
+            "inconclusive",
+            backend.accounting_command + " returned out-of-range task rows",
+        )
     if summary.n_missing:
         return (
             "inconclusive",
-            "sacct is missing "
+            backend.accounting_command
+            + " is missing "
             + str(summary.n_missing)
             + " of "
             + str(summary.n_expected)
@@ -10093,12 +10787,21 @@ def _scratch_scheduler_state(
         )
     states = [observation.status for observation in summary.observations]
     if any(state in sacct_poll.NON_TERMINAL_STATES for state in states):
-        return "active", "sacct reports non-terminal rows"
+        return (
+            "active",
+            backend.accounting_command + " reports non-terminal rows",
+        )
     if any(state == sacct_poll.JobStatus.UNKNOWN for state in states):
-        return "inconclusive", "sacct reports UNKNOWN rows"
+        return (
+            "inconclusive",
+            backend.accounting_command + " reports unknown rows",
+        )
     if not all(state in sacct_poll.TERMINAL_STATES for state in states):
-        return "inconclusive", "sacct rows are not conclusively terminal"
-    return "inactive", "squeue absent and sacct rows are terminal"
+        return (
+            "inconclusive",
+            backend.accounting_command + " rows are not conclusively terminal",
+        )
+    return "inactive", backend.display_name + " rows are terminal"
 
 
 def _scratch_attempt_report(campaign: Path) -> List[Dict[str, Any]]:
@@ -10126,12 +10829,15 @@ def _scratch_attempt_report(campaign: Path) -> List[Dict[str, Any]]:
         group["task_statuses"].add(str(record.get("status") or "prepared"))
         group["job_ids"].add(str(record.get("job_id") or ""))
     intent_index = _scratch_intent_index(campaign)
-    scheduler_cache: Dict[Tuple[str, Optional[int]], Tuple[str, str]] = {}
+    scheduler_cache: Dict[Tuple[str, Optional[int], str], Tuple[str, str]] = {}
     output: List[Dict[str, Any]] = [dict(item) for item in invalid]
     for group in grouped.values():
         attempt_id = str(group["attempt_id"])
         identity = str(group["submission_identity"])
         intent = intent_index.get(attempt_id) or intent_index.get(identity) or {}
+        scheduler_kind = str(
+            intent.get("scheduler_identity_kind") or "slurm"
+        ).strip().lower()
         expected_tasks: Optional[int] = None
         expected_tasks_error: Optional[str] = None
         if intent.get("expected_tasks") is not None:
@@ -10155,12 +10861,19 @@ def _scratch_attempt_report(campaign: Path) -> List[Dict[str, Any]]:
                 job_states[job_id] = "inconclusive"
                 scheduler_reasons[job_id] = expected_tasks_error
                 continue
-            cache_key = (job_id, expected_tasks)
+            cache_key = (job_id, expected_tasks, scheduler_kind)
             if cache_key not in scheduler_cache:
-                scheduler_cache[cache_key] = _scratch_scheduler_state(
-                    job_id,
-                    expected_task_count=expected_tasks,
-                )
+                if scheduler_kind == "slurm":
+                    scheduler_cache[cache_key] = _scratch_scheduler_state(
+                        job_id,
+                        expected_task_count=expected_tasks,
+                    )
+                else:
+                    scheduler_cache[cache_key] = _scratch_scheduler_state(
+                        job_id,
+                        expected_task_count=expected_tasks,
+                        scheduler_kind=scheduler_kind,
+                    )
             scheduler_state, reason = scheduler_cache[cache_key]
             job_states[job_id] = scheduler_state
             scheduler_reasons[job_id] = reason
@@ -12876,6 +13589,22 @@ def _preflight_failure_details(payload: Dict[str, Any]) -> List[str]:
                 details.append("make sacct available; the daemon needs it for polling")
             elif name == "squeue":
                 details.append("make squeue available; the daemon uses it to confirm live Slurm ownership")
+            elif name == "qsub":
+                details.append(
+                    "make qsub available on the Sun Grid Engine submission host"
+                )
+            elif name == "qacct":
+                details.append(
+                    "make qacct available; the daemon needs it for accounting"
+                )
+            elif name == "qstat":
+                details.append(
+                    "make qstat available; the daemon uses it to confirm live Sun Grid Engine ownership"
+                )
+            elif name == "qdel":
+                details.append(
+                    "make qdel available; immediate stop uses it for cancellation"
+                )
             elif name == "batch_python":
                 details.append(
                     "configure an absolute submitted Python path and install the ICHOR runtime in that environment"
@@ -12883,9 +13612,13 @@ def _preflight_failure_details(payload: Dict[str, Any]) -> List[str]:
             elif name == "bc":
                 details.append("make bc available; pyferebus scripts use it")
             elif name == "gaussian":
-                details.append("configure Gaussian module/executable or make g16 available")
+                details.append(
+                    "configure the machine profile's Gaussian module and executable"
+                )
             elif name == "aimall":
-                details.append("configure an executable AIMAll aimqb.ish path")
+                details.append(
+                    "configure the machine profile's AIMAll module and executable"
+                )
             elif name == "ferebus":
                 details.append("configure or install the FEREBUS executable")
             elif name == "ariadne":
@@ -12961,9 +13694,19 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
 
     lines.append("")
     lines.append("Scheduler")
-    lines.append(_preflight_check_line("sbatch", avail.get("sbatch"), avail.get("sbatch_path") or "not found"))
-    lines.append(_preflight_check_line("sacct", avail.get("sacct"), avail.get("sacct_path") or "not found"))
-    lines.append(_preflight_check_line("squeue", avail.get("squeue"), avail.get("squeue_path") or "not found"))
+    if str(avail.get("scheduler_kind") or "slurm") == "sge":
+        for command in ("qsub", "qacct", "qstat", "qdel"):
+            lines.append(
+                _preflight_check_line(
+                    command,
+                    avail.get(command),
+                    avail.get(command + "_path") or "not found",
+                )
+            )
+    else:
+        lines.append(_preflight_check_line("sbatch", avail.get("sbatch"), avail.get("sbatch_path") or "not found"))
+        lines.append(_preflight_check_line("sacct", avail.get("sacct"), avail.get("sacct_path") or "not found"))
+        lines.append(_preflight_check_line("squeue", avail.get("squeue"), avail.get("squeue_path") or "not found"))
     lines.append(_preflight_check_line("bc", avail.get("bc"), avail.get("bc_path") or "not found"))
 
     lines.append("")
@@ -13016,7 +13759,15 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
             or "not configured",
         )
     )
-    lines.append(_preflight_check_line("AIMAll", avail.get("aimall"), avail.get("aimall_path") or "not found"))
+    lines.append(
+        _preflight_check_line(
+            "AIMAll submitted environment",
+            avail.get("aimall_verified", avail.get("aimall")),
+            avail.get("aimall_path")
+            or avail.get("aimall_probe_error")
+            or "not found",
+        )
+    )
 
     lines.append("")
     lines.append("FEREBUS")
@@ -13218,7 +13969,9 @@ def _preflight_launch_advice(
             intent.get("job_id") for intent in intents
         ):
             return (
-                "resume the daemon to monitor recorded Slurm work",
+                "resume the daemon to monitor recorded "
+                + _scheduler_display_name(intents=intents)
+                + " work",
                 _campaign_command(campaign, "resume"),
             )
         if intents:
@@ -13971,7 +14724,7 @@ Examples:
         help="Request an immediate or receipt-backed boundary stop.",
         description=(
             "Request daemon shutdown for the resolved campaign. Plain stop is "
-            "immediate at the next tick and does not cancel Slurm jobs."
+            "immediate at the next tick and does not cancel scheduler jobs."
         ),
     )
     add_campaign(p_stop)
@@ -14007,7 +14760,7 @@ Examples:
         "--cancel-jobs",
         action="store_true",
         help=(
-            "Also scancel active Slurm jobs recorded by this campaign. "
+            "Also cancel active scheduler jobs recorded by this campaign. "
             "Plain stop only requests daemon shutdown and leaves jobs alone."
         ),
     )
@@ -14087,7 +14840,7 @@ Examples:
         description=(
             "Inspect campaign evidence and show one recovery plan. With --apply, "
             "commit the reviewed bookkeeping and temporary-data changes. Reconcile "
-            "does not start the daemon or submit Slurm jobs."
+            "does not start the daemon or submit scheduler jobs."
         ),
     )
     add_campaign(p_recon)
@@ -14372,9 +15125,9 @@ Examples:
 
     p_pre = sub.add_parser(
         "preflight",
-        help="Check configured live Slurm backends.",
+        help="Check configured live scheduler backends.",
         description=(
-            "Check the configured Slurm/Gaussian/AIMAll/FEREBUS/ARIADNE "
+            "Check the configured scheduler/Gaussian/AIMAll/FEREBUS/ARIADNE "
             "backend profile, campaign.yaml, and trajectory-pool feasibility."
         ),
     )
@@ -14399,7 +15152,7 @@ Examples:
         action="store_true",
         help=(
             "After ordinary preflight passes, submit one five-minute, one-core "
-            "Slurm job that verifies the compute-node module, Python-import, "
+            "scheduler job that verifies the compute-node module, Python-import, "
             "and executable environment without running scientific work."
         ),
     )

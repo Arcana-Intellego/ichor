@@ -1,4 +1,4 @@
-"""Per-point input staging for the live sbatch phases.
+"""Per-point input staging for live scheduler-backed phases.
 
 Lays out the POINT_<k>.pointdir tree (and the POINTS.txt the array jobs index
 into) on the login node before submit, reusing the core file writers. Nothing
@@ -95,7 +95,7 @@ def write_points_file(staging_dir: Path, pointdirs: Sequence[Path]) -> Path:
     """One absolute pointdir path per line; the array sed-lookup reads this."""
     points_file = Path(staging_dir) / "POINTS.txt"
     body = "\n".join(str(Path(p).resolve()) for p in pointdirs)
-    # force LF. the array sbatch sed-reads this on a linux node, and if we ever stage from
+    # Force LF. The array script reads this with sed on a Linux node, and if we ever stage from
     # windows the default crlf leaves a trailing \r so cd "$POINT_DIR" quietly breaks.
     atomic_write_text(points_file, body + ("\n" if body else ""))
     return points_file

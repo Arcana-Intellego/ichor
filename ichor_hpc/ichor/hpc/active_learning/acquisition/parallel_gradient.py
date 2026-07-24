@@ -69,11 +69,14 @@ def _gradient_mp_disabled() -> bool:
     return os.environ.get("ICHOR_DISABLE_GRADIENT_MP") == "1"
 
 
-def _slurm_cpu_cap() -> int:
+def _scheduler_cpu_cap() -> int:
     # Resource resolution may allocate CPUs for memory only. Scientific
     # workers are capped separately through ICHOR_ACTIVE_WORKERS.
-    raw = os.environ.get("ICHOR_ACTIVE_WORKERS") or os.environ.get(
-        "SLURM_CPUS_PER_TASK"
+    raw = (
+        os.environ.get("ICHOR_ACTIVE_WORKERS")
+        or os.environ.get("ICHOR_SCHEDULER_CPUS")
+        or os.environ.get("SLURM_CPUS_PER_TASK")
+        or os.environ.get("NSLOTS")
     )
     if raw:
         try:
@@ -81,6 +84,11 @@ def _slurm_cpu_cap() -> int:
         except ValueError:
             pass
     return max(1, os.cpu_count() or 1)
+
+
+def _slurm_cpu_cap() -> int:
+    """Compatibility alias for callers predating scheduler-neutral workers."""
+    return _scheduler_cpu_cap()
 
 
 def _n_active_directions(acquisition) -> int:
@@ -98,13 +106,13 @@ def resolve_workers(workers, *, n_tasks=None) -> int:
     override = os.environ.get("ICHOR_GRADIENT_WORKERS")
     value = override if override else workers
     if value is None:
-        resolved = _slurm_cpu_cap()
+        resolved = _scheduler_cpu_cap()
     else:
         try:
             resolved = max(1, int(value))
         except (TypeError, ValueError):
             resolved = 1
-    resolved = min(resolved, _slurm_cpu_cap())
+    resolved = min(resolved, _scheduler_cpu_cap())
     if n_tasks is not None:
         try:
             resolved = min(resolved, max(1, int(n_tasks)))

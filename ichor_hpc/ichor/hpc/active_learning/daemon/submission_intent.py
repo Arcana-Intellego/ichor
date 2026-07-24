@@ -66,6 +66,10 @@ def _validate_job_identity(value: Any, scheduler_identity_kind: str) -> str:
     text = str(value)
     if scheduler_identity_kind == "slurm":
         return validate_parent_job_id(text)
+    if scheduler_identity_kind == "sge":
+        from ..submit.sge import validate_sge_parent_job_id
+
+        return validate_sge_parent_job_id(text)
     if scheduler_identity_kind != "synthetic":
         raise ValueError("submission intent scheduler identity kind is invalid")
     if (
@@ -157,6 +161,11 @@ def _validate_intent_payload(
     expected_name = data.get("expected_job_name")
     if not isinstance(expected_name, str) or not expected_name:
         raise ValueError("submission intent expected_job_name must be non-empty")
+    scheduler_identity_kind = data.get("scheduler_identity_kind")
+    if scheduler_identity_kind not in {"slurm", "sge", "synthetic"}:
+        raise ValueError(
+            "submission intent scheduler_identity_kind must be slurm, sge, or synthetic"
+        )
     recomputed = expected_job_name(
         campaign_uid,
         phase_name,
@@ -164,17 +173,13 @@ def _validate_intent_payload(
         replacement_round=replacement_round,
         attempt_sequence=sequence,
         attempt_id=attempt_id,
+        scheduler_identity_kind=str(scheduler_identity_kind),
     )
     if expected_name != recomputed:
         raise ValueError("submission intent expected job name does not match identity")
     status = data.get("status")
     if status not in INTENT_STATUSES:
         raise ValueError("submission intent status is unknown: " + repr(status))
-    scheduler_identity_kind = data.get("scheduler_identity_kind")
-    if scheduler_identity_kind not in {"slurm", "synthetic"}:
-        raise ValueError(
-            "submission intent scheduler_identity_kind must be slurm or synthetic"
-        )
     job_id = data.get("job_id")
     if job_id is not None and (not isinstance(job_id, str) or not job_id):
         raise ValueError("submission intent job_id must be non-empty or null")
@@ -611,8 +616,9 @@ def expected_job_name(
     replacement_round: int = 0,
     attempt_sequence: Optional[int] = None,
     attempt_id: Optional[str] = None,
+    scheduler_identity_kind: str = "slurm",
 ) -> str:
-    return live_job_name(
+    name = live_job_name(
         campaign_uid,
         phase_name,
         iteration,
@@ -620,6 +626,11 @@ def expected_job_name(
         attempt_sequence=attempt_sequence,
         attempt_id=attempt_id,
     )
+    if str(scheduler_identity_kind) == "sge":
+        from ..submit.sge import sge_safe_job_name
+
+        return sge_safe_job_name(name)
+    return name
 
 
 def load_intent(
@@ -985,6 +996,7 @@ def write_pre_submit_intent(
             replacement_round=round_number,
             attempt_sequence=attempt_sequence,
             attempt_id=attempt_id,
+            scheduler_identity_kind=str(scheduler_identity_kind),
         ),
         "status": "PRE_SUBMIT",
         "submission_kind": submission_kind_for_phase(phase_name),

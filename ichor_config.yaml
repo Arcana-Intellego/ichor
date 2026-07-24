@@ -186,8 +186,44 @@ ffluxlab:
 
   hpc:
 
+    scheduler: sge
+    jobscript_shebang: "#!/bin/bash"
+    max_array_tasks: 75000
+    max_job_log_files_per_directory: 5000
+    memory_per_core_gb: 4
+    memory_per_core_gb_by_partition:
+      serial: 4
+      multicore: 4
+      himem: 16
     parallel_environments:
-      smp: [2, 44]
+      serial: [1, 1]
+      multicore: [2, 44]
+      himem: [1, 44]
+    partitions:
+      serial:
+        min_cpus: 1
+        max_cpus: 1
+        memory_per_core_gb: 4
+        max_walltime_hours: 168
+        daemon_supported: true
+        scheduler_queue: all.q
+        parallel_environment:
+      multicore:
+        min_cpus: 2
+        max_cpus: 44
+        memory_per_core_gb: 4
+        max_walltime_hours: 168
+        daemon_supported: true
+        scheduler_queue: all.q
+        parallel_environment: smp
+      himem:
+        min_cpus: 1
+        max_cpus: 44
+        memory_per_core_gb: 16
+        max_walltime_hours: 168
+        daemon_supported: true
+        scheduler_queue: mem.q
+        parallel_environment: smp
 
   software:
 
@@ -198,6 +234,25 @@ ffluxlab:
     gaussian:
       executable_path: g09
       modules: ["apps/gaussian/g09"]
+
+    ferebus:
+      executable_path: "$HOME/.local/bin/ferebus"
+      pyferebus_platform: "CSF3"
+
+    ariadne_runtime:
+      modules: ["compilers/intel/21.0.3"]
+
+    python:
+      env_name: "ichor-ffluxlab"
+      python_path: "$HOME/.venv/ichor-ffluxlab/bin/python"
+      library_path:
+        - "$HOME/opt/python-3.11.15/lib"
+      modules: []
+
+    plumed:
+      kernel_path: "$HOME/opt/plumed-2.10.0/lib/libplumedKernel.so"
+      library_path: "$HOME/opt/plumed-2.10.0/lib"
+      modules: []
 
     amber:
       modules: ["apps/amber/18-at19"]
@@ -211,9 +266,6 @@ ffluxlab:
 
     pandora:
       modules: ["compilers/intel/18.0.3", "libs/python/pyscf/1.7.4"]
-
-    python:
-      modules: ["apps/anaconda3/3.7.6"]
 
     tyche:
       modules: ["compilers/intel/18.0.3"]

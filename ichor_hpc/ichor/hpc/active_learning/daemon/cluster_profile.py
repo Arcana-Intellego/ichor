@@ -49,14 +49,15 @@ def require_cluster_profile() -> ClusterProfile:
         raise ClusterProfileError("~/ichor_config.yaml is missing or empty")
     if not machine:
         raise ClusterProfileError(
-            "no active ICHOR machine profile resolved; set ICHOR_MACHINE=csf3 "
-            "or use a hostname containing a top-level ~/ichor_config.yaml key"
+            "no active ICHOR machine profile resolved; set ICHOR_MACHINE to "
+            "csf3, csf4, or ffluxlab, or use a hostname containing a "
+            "top-level ~/ichor_config.yaml key"
         )
     if str(machine) == "_default":
         raise ClusterProfileError(
             "_default is a fallback configuration, not a live active-learning "
-            "profile; set ICHOR_MACHINE to a real Slurm profile such as csf3 "
-            "or csf4"
+            "profile; set ICHOR_MACHINE to a live profile such as csf3, csf4, "
+            "or ffluxlab"
         )
     if machine not in config:
         raise ClusterProfileError(
@@ -96,18 +97,30 @@ def validate_cluster_profile(profile: ClusterProfile) -> None:
     software = machine_profile.get("software")
     if not isinstance(hpc, dict) or not isinstance(software, dict):
         raise ClusterProfileError("active profile requires hpc and software mappings")
-    if hpc.get("scheduler") != "slurm":
-        raise ClusterProfileError("active-learning live profiles require hpc.scheduler: slurm")
-    if hpc.get("jobscript_shebang") != "#!/bin/bash --login":
+    scheduler = str(hpc.get("scheduler") or "").strip().lower()
+    if scheduler not in {"slurm", "sge"}:
         raise ClusterProfileError(
-            "active-learning Slurm profiles require jobscript_shebang: "
-            "#!/bin/bash --login"
+            "active-learning live profiles require hpc.scheduler: slurm or sge"
         )
-    _exact_positive_integer(
-        hpc.get("max_array_task_id"),
-        "hpc.max_array_task_id",
-        minimum=0,
-    )
+    expected_shebang = "#!/bin/bash --login" if scheduler == "slurm" else "#!/bin/bash"
+    if hpc.get("jobscript_shebang") != expected_shebang:
+        raise ClusterProfileError(
+            "active-learning "
+            + ("Slurm" if scheduler == "slurm" else "SGE")
+            + " profiles require jobscript_shebang: "
+            + expected_shebang
+        )
+    if scheduler == "slurm":
+        _exact_positive_integer(
+            hpc.get("max_array_task_id"),
+            "hpc.max_array_task_id",
+            minimum=0,
+        )
+    else:
+        _exact_positive_integer(
+            hpc.get("max_array_tasks"),
+            "hpc.max_array_tasks",
+        )
     _exact_positive_integer(
         hpc.get("max_job_log_files_per_directory"),
         "hpc.max_job_log_files_per_directory",
@@ -127,6 +140,19 @@ def validate_cluster_profile(profile: ClusterProfile) -> None:
         _finite_positive(partition.get("max_walltime_hours"), label + ".max_walltime_hours")
         if not isinstance(partition.get("daemon_supported"), bool):
             raise ClusterProfileError(label + ".daemon_supported must be a Boolean")
+        if scheduler == "sge":
+            queue = partition.get("scheduler_queue")
+            if not isinstance(queue, str) or not queue.strip():
+                raise ClusterProfileError(label + ".scheduler_queue must be explicit")
+            pe = partition.get("parallel_environment")
+            if maximum > 1 and (not isinstance(pe, str) or not pe.strip()):
+                raise ClusterProfileError(
+                    label + ".parallel_environment must be explicit for parallel SGE work"
+                )
+            if pe is not None and (not isinstance(pe, str) or not pe.strip()):
+                raise ClusterProfileError(
+                    label + ".parallel_environment must be null or a non-empty string"
+                )
     python = software.get("python")
     if not isinstance(python, dict):
         raise ClusterProfileError("software.python must be a mapping")

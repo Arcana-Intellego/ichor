@@ -98,6 +98,8 @@ def upsert_profile(
     python["python_path"] = str(python_path)
     if machine == "csf3":
         python["library_path"] = str(python_library_path)
+    elif machine == "ffluxlab":
+        python["library_path"] = [str(python_library_path)]
     software.setdefault("aimall", {})["executable_path"] = str(aimall_path)
     software.setdefault("ferebus", {})["executable_path"] = str(ferebus_path)
     plumed = software.setdefault("plumed", {})
@@ -120,7 +122,9 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--destination", required=True, type=Path)
     parser.add_argument("--canonical-config", required=True, type=Path)
-    parser.add_argument("--machine", required=True, choices=("csf3", "csf4"))
+    parser.add_argument(
+        "--machine", required=True, choices=("csf3", "csf4", "ffluxlab")
+    )
     parser.add_argument("--python-path", required=True)
     parser.add_argument("--python-library-path", required=True)
     parser.add_argument("--aimall-path", required=True)

@@ -1497,7 +1497,8 @@ def propose_recovery(
         )
         blocking_artifacts.append("prepared scratch ownership")
         recommended_actions.append(
-            "Inspect the recorded scratch JobIDs with sacct/squeue before recovery."
+            "Inspect the recorded scratch JobIDs with the configured scheduler "
+            "before recovery."
         )
     if retained_scratch:
         unsafe_reasons.append(
@@ -1715,7 +1716,8 @@ def propose_recovery(
             )
             blocking_artifacts.append("pending_jobs")
             recommended_actions.append(
-                "Inspect pending_jobs in state.json and Slurm before applying recovery."
+                "Inspect pending_jobs in state.json and the configured scheduler "
+                "before applying recovery."
             )
     if script_files:
         unsafe_reasons.append(".DATA/SCRIPTS contains sbatch scripts")
