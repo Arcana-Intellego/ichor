@@ -1505,9 +1505,13 @@ build_private_binutils() {
         --disable-sim \
         --disable-werror \
         --enable-static
-    run_in_dir "${build_dir}" make -j "${INSTALL_JOBS}" all-binutils all-ld
+    # ffluxlab does not provide Texinfo, and documentation is not part of the
+    # private linker contract used to consume FEREBUS's bundled OpenBLAS.
+    run_in_dir "${build_dir}" make -j "${INSTALL_JOBS}" \
+        MAKEINFO=true all-binutils all-ld
     backup_existing_path "${BINUTILS_PREFIX}" "private Binutils installation"
-    run_in_dir "${build_dir}" make install-binutils install-ld
+    run_in_dir "${build_dir}" make MAKEINFO=true \
+        install-binutils install-ld
 
     if [[ "${DRY_RUN}" -eq 0 ]]; then
         private_binutils_usable \
@@ -1698,6 +1702,8 @@ final_checks() {
         echo "+ final import checks and ichor-al-daemon preflight"
         return 0
     fi
+    [[ -f "${HOME}/ichor_config.yaml" ]] \
+        || die "ICHOR configuration not found: ${HOME}/ichor_config.yaml. Complete the full installer or run --only config before --only verify."
     export ICHOR_MACHINE="${MACHINE}"
     "${PYTHON}" -c "import ichor.core, ichor.hpc, ichor.cli; print('ICHOR packages OK')"
     "${PYTHON}" -c "import pyferebus.executors.trainer; print('pyferebus OK')"

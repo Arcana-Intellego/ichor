@@ -137,6 +137,22 @@ def test_env_script_default_setup_does_not_smoke_imports():
     assert "plumed.Plumed" not in before_smoke
 
 
+def test_heavy_smoke_requires_generated_ichor_config(tmp_path: Path):
+    _, environment = _make_fake_venv(tmp_path, "csf3")
+    source = f"""
+module() {{ return 0; }}
+hostname() {{ printf 'login1\n'; }}
+source {shlex.quote(SCRIPT.as_posix())} --quiet --no-purge --smoke-heavy
+"""
+
+    result = _run_bash(source, env=environment)
+
+    assert result.returncode != 0
+    assert "ICHOR configuration not found" in result.stderr
+    assert "before --smoke-heavy" in result.stderr
+    assert "xTB runtime smoke failed" not in result.stderr
+
+
 def test_machine_detection_precedes_runtime_environment_mutation():
     text = SCRIPT.read_text(encoding="utf-8")
     detection = 'machine="$(ichor_detect_machine "${machine}")"'

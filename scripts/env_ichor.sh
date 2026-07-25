@@ -347,6 +347,12 @@ _ichor_env_main() {
     esac
     machine="$(ichor_detect_machine "${machine}")" || return 2
 
+    if [[ "${do_smoke_heavy}" -eq 1 && ! -f "${HOME}/ichor_config.yaml" ]]; then
+        _ichor_env_error \
+            "ICHOR configuration not found: ${HOME}/ichor_config.yaml. Complete the full installer or run install_ichor.sh --only config before --smoke-heavy."
+        return 1
+    fi
+
     if [[ "${debug_trace}" -eq 1 ]]; then
         export PS4='+ env_ichor.sh:${LINENO}:${FUNCNAME[0]:-main}: '
         set -x

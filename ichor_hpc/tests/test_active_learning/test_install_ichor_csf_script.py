@@ -141,6 +141,13 @@ def test_install_script_is_present():
     assert "BINUTILS_VERSION=\"2.42\"" in text
     assert "BINUTILS_SHA256=" in text
     assert 'verify_sha256 "${tarball}" "${BINUTILS_SHA256}"' in text
+    assert "MAKEINFO=true all-binutils all-ld" in text
+    assert "MAKEINFO=true \\\n        install-binutils install-ld" in text
+    config_guard = '[[ -f "${HOME}/ichor_config.yaml" ]]'
+    assert config_guard in text
+    assert text.index(config_guard) < text.index(
+        "ensure_xtb_ase_available; ensure_xtb_ase_available(run_energy=True)"
+    )
     assert "build_pinned_openblas" not in text
     assert "OPENBLAS_URL" not in text
     assert "OPENBLAS_SHA256" not in text
@@ -416,6 +423,8 @@ def test_ffluxlab_ferebus_dry_run_preserves_bundled_openblas(
     assert "preserve bundled FEREBUS OpenBLAS archive" in output
     assert "Building private GNU Binutils 2.42 for FEREBUS" in output
     assert "binutils-2.42.tar.xz" in output
+    assert "MAKEINFO=true all-binutils all-ld" in output
+    assert "MAKEINFO=true install-binutils install-ld" in output
     assert "verify gfortran -B" in output
     assert "CMAKE_EXE_LINKER_FLAGS=-B" in output
     assert "OpenBLAS-0.3.29" not in output
