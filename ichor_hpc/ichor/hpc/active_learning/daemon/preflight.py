@@ -35,6 +35,7 @@ from .cluster_profile import (
 )
 from .runtime_environment import (
     SUBMITTED_PYTHON_IMPORTS,
+    ariadne_runtime_command_prefix,
     configured_daemon_runtime_modules,
     configured_python_library_paths,
     native_runtime_setup_lines,
@@ -269,7 +270,13 @@ def _probe_configured_python_details(
                 *native_runtime_setup_lines(),
                 *python_library_path_export_lines(list(library_paths or [])),
             ]
-            + ["exec " + shlex.quote(executable) + " -c " + shlex.quote(probe)]
+            + [
+                "exec "
+                + ariadne_runtime_command_prefix()
+                + shlex.quote(executable)
+                + " -c "
+                + shlex.quote(probe)
+            ]
         )
         completed = _run_login_shell(script, timeout=30)
     except Exception as exc:

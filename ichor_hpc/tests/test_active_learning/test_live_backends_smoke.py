@@ -309,7 +309,9 @@ def test_submitted_environment_smoke_renders_exact_runtime_contract(
     assert body.index("export LD_LIBRARY_PATH=") < body.index(
         "/home/user/.venv/ichor-csf3/bin/python"
     )
+    assert "ICHOR_ARIADNE_LD_PRELOAD" not in body
     assert "pyferebus.executors.trainer" in body
+    assert "probe_ariadne_runtime" in body
     assert "test -x /opt/gaussian/g16" in body
     assert "test -x /home/user/AIMAll/aimqb.ish" in body
     assert SMOKE_SUCCESS_MARKER in body

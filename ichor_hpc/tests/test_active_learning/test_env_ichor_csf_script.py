@@ -98,7 +98,10 @@ def test_env_script_contains_required_runtime_contracts():
     assert "compilers/oneapi/2024.2.0" in text
     assert "mkl/2024.2" in text
     assert "libmkl_intel_lp64.so.1" in text
+    assert "libmkl_sequential.so.1" in text
+    assert "libmkl_core.so.1" in text
     assert "ICHOR_MKL_RUNTIME_DIR" in text
+    assert "ICHOR_ARIADNE_LD_PRELOAD" in text
     assert "libstdc++.so.6" in text
     assert "ICHOR_GCC_RUNTIME_DIR" in text
     assert "unset CC CXX FC F77 F90" in text
@@ -117,6 +120,7 @@ def test_env_script_contains_required_runtime_contracts():
     assert "--debug, --trace" in text
     assert "mktemp" in text
     assert "import ariadne; assert hasattr" in text
+    assert "probe_ariadne_runtime" in text
     assert "plumed.Plumed" in text
     assert "ensure_xtb_ase_available" in text
     assert "ensure_plumed_available" in text

@@ -114,6 +114,37 @@ _ichor_env_import_check() {
     return 1
 }
 
+
+_ichor_env_ariadne_check() {
+    local label="$1"
+    local code="$2"
+    local tmp
+    tmp="$(mktemp "${TMPDIR:-/tmp}/ichor_env_ariadne_check.XXXXXX")" || return 1
+    if [[ "${ICHOR_MACHINE:-}" == "ffluxlab" ]]; then
+        if [[ -z "${ICHOR_ARIADNE_LD_PRELOAD:-}" ]]; then
+            rm -f "${tmp}"
+            _ichor_env_error "ARIADNE MKL preload contract is unavailable"
+            return 1
+        fi
+        if env \
+            LD_PRELOAD="${ICHOR_ARIADNE_LD_PRELOAD}${LD_PRELOAD:+:${LD_PRELOAD}}" \
+            python -c "${code}" >"${tmp}" 2>&1; then
+            _ichor_env_note "${label} OK"
+            rm -f "${tmp}"
+            return 0
+        fi
+    elif python -c "${code}" >"${tmp}" 2>&1; then
+        _ichor_env_note "${label} OK"
+        rm -f "${tmp}"
+        return 0
+    fi
+    cat "${tmp}" >&2
+    rm -f "${tmp}"
+    _ichor_env_error "${label} check failed"
+    return 1
+}
+
+
 _ichor_env_print_env() {
     echo "ICHOR_MACHINE=${ICHOR_MACHINE:-}"
     echo "VIRTUAL_ENV=${VIRTUAL_ENV:-}"
@@ -169,7 +200,8 @@ _ichor_env_load_runtime_modules() {
 
 _ichor_env_ffluxlab_intel_runtime() {
     local configured_root="/home/modules/compilers/intel/21.0.3"
-    local intel_root libimf libmkl runtime_dir mkl_runtime_dir
+    local intel_root libimf libmkl libmkl_sequential libmkl_core
+    local runtime_dir mkl_runtime_dir
     intel_root="$(readlink -f "${configured_root}" 2>/dev/null || true)"
     if [[ -z "${intel_root}" || ! -d "${intel_root}" ]]; then
         _ichor_env_error "ffluxlab Intel module root is unavailable: ${configured_root}"
@@ -200,12 +232,20 @@ _ichor_env_ffluxlab_intel_runtime() {
     fi
     runtime_dir="$(dirname "${libimf}")"
     mkl_runtime_dir="$(dirname "${libmkl}")"
+    libmkl_sequential="${mkl_runtime_dir}/libmkl_sequential.so.1"
+    libmkl_core="${mkl_runtime_dir}/libmkl_core.so.1"
+    if [[ ! -e "${libmkl_sequential}" || ! -e "${libmkl_core}" ]]; then
+        _ichor_env_error \
+            "complete Intel MKL runtime is unavailable beneath ${mkl_runtime_dir}"
+        return 1
+    fi
     _ichor_env_prepend_ld_library_paths_once \
         "${runtime_dir}" \
         "${mkl_runtime_dir}"
     export LIBRARY_PATH="${runtime_dir}:${mkl_runtime_dir}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
     export ICHOR_INTEL_RUNTIME_DIR="${runtime_dir}"
     export ICHOR_MKL_RUNTIME_DIR="${mkl_runtime_dir}"
+    export ICHOR_ARIADNE_LD_PRELOAD="${libmkl}:${libmkl_sequential}:${libmkl_core}"
 }
 
 _ichor_env_ffluxlab_gcc_runtime() {
@@ -414,7 +454,7 @@ _ichor_env_main() {
     fi
 
     if [[ "${do_smoke}" -eq 1 ]]; then
-        _ichor_env_import_check "ARIADNE" "import ariadne; assert hasattr(ariadne, 'Geometric_Trqn') or hasattr(ariadne, 'Ds_Optimiser')" || return 1
+        _ichor_env_ariadne_check "ARIADNE" "import ariadne; assert hasattr(ariadne, 'Geometric_Trqn') or hasattr(ariadne, 'Ds_Optimiser')" || return 1
         _ichor_env_import_check "PLUMED" "import os, plumed; p=plumed.Plumed(kernel=os.environ['PLUMED_KERNEL']); p.finalize()" || return 1
         _ichor_env_import_check "ICHOR packages" "import ichor.core, ichor.hpc, ichor.cli" || return 1
         _ichor_env_import_check "pyferebus" "import pyferebus.executors.trainer" || return 1
@@ -423,6 +463,7 @@ _ichor_env_main() {
     fi
 
     if [[ "${do_smoke_heavy}" -eq 1 ]]; then
+        _ichor_env_ariadne_check "ARIADNE runtime smoke" "import ariadne; from ichor.hpc.active_learning.acquisition.ariadne_local_runner import probe_ariadne_runtime; probe_ariadne_runtime(ariadne)" || return 1
         _ichor_env_import_check "xTB runtime smoke" "from ichor.hpc.runtime_preflight import ensure_xtb_ase_available; ensure_xtb_ase_available(run_energy=True)" || return 1
         _ichor_env_import_check "PLUMED runtime smoke" "from ichor.hpc.runtime_preflight import ensure_plumed_available; ensure_plumed_available(run_ase_smoke=True)" || return 1
     fi
@@ -432,7 +473,8 @@ _ichor_env_main "$@"
 _ichor_env_rc=$?
 unset -f _ichor_env_usage _ichor_env_error _ichor_env_note _ichor_env_module
 unset -f _ichor_env_prepend_ld_library_paths_once
-unset -f _ichor_env_import_check _ichor_env_print_env _ichor_env_load_runtime_modules
+unset -f _ichor_env_import_check _ichor_env_ariadne_check
+unset -f _ichor_env_print_env _ichor_env_load_runtime_modules
 unset -f _ichor_env_ffluxlab_intel_runtime
 unset -f _ichor_env_ffluxlab_gcc_runtime
 unset -f _ichor_env_check_venv_ownership _ichor_env_main

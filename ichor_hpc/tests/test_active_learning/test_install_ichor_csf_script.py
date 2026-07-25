@@ -116,7 +116,10 @@ def test_install_script_is_present():
     assert 'resolve_required_cmd_into ARIADNE_CXX "${cxx_compiler}"' in text
     assert 'resolve_required_cmd_into ARIADNE_FC "${fortran_compiler}"' in text
     assert "libmkl_intel_lp64.so.1" in text
+    assert "libmkl_sequential.so.1" in text
+    assert "libmkl_core.so.1" in text
     assert "ICHOR_MKL_RUNTIME_DIR" in text
+    assert "ICHOR_ARIADNE_LD_PRELOAD" in text
     assert "libstdc++.so.6" in text
     assert "ICHOR_GCC_RUNTIME_DIR" in text
     assert "deactivate_existing_venv" in text
@@ -131,6 +134,7 @@ def test_install_script_is_present():
     assert "write_ariadne_receipt" in text
     assert "print_ariadne_import_info \"ARIADNE before install\"" in text
     assert "print_ariadne_import_info \"ARIADNE after install\"" in text
+    assert "probe_ariadne_runtime" in text
     assert "run_in_dir \"${ariadne_root}\"" in text
     assert "bash -lc" not in text
     assert 'if [[ "${MACHINE}" == "csf3" ]]' in text

@@ -108,6 +108,7 @@ from .runtime_environment import (
     DEFAULT_DAEMON_ARIADNE_RUNTIME_MODULES,
     DEFAULT_DAEMON_PYTHON_MODULES,
     DEFAULT_DAEMON_RUNTIME_MODULES,
+    ariadne_runtime_command_prefix,
     configured_daemon_runtime_modules,
     configured_python_library_paths,
     module_initialisation_lines,
@@ -6939,7 +6940,9 @@ def _ariadne_invocation_block(
         "export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1",
         "cd " + camp_q,
         *_array_task_mapping_lines(array_task_map),
-        python + " -m ichor.hpc.active_learning.acquisition.ariadne_runner \\",
+        ariadne_runtime_command_prefix()
+        + python
+        + " -m ichor.hpc.active_learning.acquisition.ariadne_runner \\",
         "    --array-task-id $ICHOR_LOGICAL_ARRAY_TASK_ID \\",
         "    --iteration " + str(iteration) + " \\",
         "    --campaign-dir " + camp_q,

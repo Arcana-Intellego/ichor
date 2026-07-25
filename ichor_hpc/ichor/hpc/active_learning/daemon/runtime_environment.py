@@ -138,6 +138,16 @@ def python_library_path_export_lines(paths: List[str]) -> List[str]:
     ]
 
 
+def ariadne_runtime_command_prefix() -> str:
+    """Scope the ffluxlab MKL preload to processes which import ARIADNE."""
+    if (active_machine() or "").lower() != "ffluxlab":
+        return ""
+    return (
+        'env LD_PRELOAD="$ICHOR_ARIADNE_LD_PRELOAD'
+        '${LD_PRELOAD:+:$LD_PRELOAD}" '
+    )
+
+
 def native_runtime_setup_lines() -> List[str]:
     """Render machine-specific native runtime discovery for submitted jobs."""
     if (active_machine() or "").lower() != "ffluxlab":
@@ -178,6 +188,20 @@ def native_runtime_setup_lines() -> List[str]:
         'ICHOR_GCC_RUNTIME_DIR="$(dirname "$ICHOR_GCC_LIBSTDCXX")"',
         'ICHOR_INTEL_RUNTIME_DIR="$(dirname "$ICHOR_INTEL_LIBIMF")"',
         'ICHOR_MKL_RUNTIME_DIR="$(dirname "$ICHOR_MKL_LP64")"',
+        'ICHOR_MKL_SEQUENTIAL="$ICHOR_MKL_RUNTIME_DIR/libmkl_sequential.so.1"',
+        'ICHOR_MKL_CORE="$ICHOR_MKL_RUNTIME_DIR/libmkl_core.so.1"',
+        (
+            '[ -e "$ICHOR_MKL_SEQUENTIAL" ] || '
+            "{ echo 'Intel MKL sequential runtime is unavailable' >&2; exit 1; }"
+        ),
+        (
+            '[ -e "$ICHOR_MKL_CORE" ] || '
+            "{ echo 'Intel MKL core runtime is unavailable' >&2; exit 1; }"
+        ),
+        (
+            'export ICHOR_ARIADNE_LD_PRELOAD="$ICHOR_MKL_LP64'
+            ':$ICHOR_MKL_SEQUENTIAL:$ICHOR_MKL_CORE"'
+        ),
         (
             'export LD_LIBRARY_PATH="$ICHOR_GCC_RUNTIME_DIR'
             ':$ICHOR_INTEL_RUNTIME_DIR'
@@ -214,6 +238,7 @@ __all__ = [
     "DEFAULT_DAEMON_PYTHON_MODULES",
     "DEFAULT_DAEMON_RUNTIME_MODULES",
     "SUBMITTED_PYTHON_IMPORTS",
+    "ariadne_runtime_command_prefix",
     "configured_daemon_runtime_modules",
     "configured_python_library_paths",
     "module_initialisation_lines",

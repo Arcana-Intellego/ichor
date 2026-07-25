@@ -565,6 +565,22 @@ python_import_ok() {
     "${PYTHON}" -c "import ${module_name}" >/dev/null 2>&1
 }
 
+run_ariadne_python() {
+    if [[ "${MACHINE}" == "ffluxlab" ]]; then
+        [[ -n "${ICHOR_ARIADNE_LD_PRELOAD:-}" ]] \
+            || die "ffluxlab ARIADNE MKL preload contract is unavailable"
+        env \
+            LD_PRELOAD="${ICHOR_ARIADNE_LD_PRELOAD}${LD_PRELOAD:+:${LD_PRELOAD}}" \
+            "${PYTHON}" "$@"
+    else
+        "${PYTHON}" "$@"
+    fi
+}
+
+ariadne_import_ok() {
+    run_ariadne_python -c "import ariadne" >/dev/null 2>&1
+}
+
 config_path_for_yaml() {
     local path="$1"
     if [[ "${path}" == "${HOME}"/* ]]; then
@@ -601,7 +617,8 @@ load_python_stack() {
 resolve_ffluxlab_intel_runtime() {
     [[ "${MACHINE}" == "ffluxlab" ]] || return 0
     local configured_root="/home/modules/compilers/intel/21.0.3"
-    local intel_root libimf libmkl runtime_dir mkl_runtime_dir
+    local intel_root libimf libmkl libmkl_sequential libmkl_core
+    local runtime_dir mkl_runtime_dir
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         echo "+ resolve 64-bit Intel and MKL runtimes beneath ${configured_root}"
         export ICHOR_INTEL_RUNTIME_DIR="<resolved-intel64-runtime>"
@@ -631,10 +648,15 @@ resolve_ffluxlab_intel_runtime() {
         || die "64-bit libmkl_intel_lp64.so.1 is absent beneath ${intel_root}"
     runtime_dir="$(dirname "${libimf}")"
     mkl_runtime_dir="$(dirname "${libmkl}")"
+    libmkl_sequential="${mkl_runtime_dir}/libmkl_sequential.so.1"
+    libmkl_core="${mkl_runtime_dir}/libmkl_core.so.1"
+    [[ -e "${libmkl_sequential}" && -e "${libmkl_core}" ]] \
+        || die "complete Intel MKL runtime is unavailable beneath ${mkl_runtime_dir}"
     export LD_LIBRARY_PATH="${runtime_dir}:${mkl_runtime_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
     export LIBRARY_PATH="${runtime_dir}:${mkl_runtime_dir}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
     export ICHOR_INTEL_RUNTIME_DIR="${runtime_dir}"
     export ICHOR_MKL_RUNTIME_DIR="${mkl_runtime_dir}"
+    export ICHOR_ARIADNE_LD_PRELOAD="${libmkl}:${libmkl_sequential}:${libmkl_core}"
 }
 
 resolve_ffluxlab_gcc_runtime() {
@@ -1092,15 +1114,24 @@ install_python_packages() {
 
 verify_ariadne_api() {
     if [[ "${DRY_RUN}" -eq 1 ]]; then
-        echo "+ ${PYTHON} -c 'import ariadne; check optimiser API'"
+        echo "+ scoped ARIADNE Python: import module and run ABI/runtime probes"
         return 0
     fi
-    "${PYTHON}" - <<'PY'
+    run_ariadne_python - <<'PY'
 import ariadne
 from ichor.hpc.active_learning.acquisition.ariadne_abi import probe_ariadne_module
+from ichor.hpc.active_learning.acquisition.ariadne_local_runner import (
+    probe_ariadne_runtime,
+)
 
 receipt = probe_ariadne_module(ariadne)
 print("ARIADNE ABI OK:", receipt["contract_version"])
+runtime = probe_ariadne_runtime(ariadne)
+print(
+    "ARIADNE runtime OK:",
+    runtime["trqn"]["status_length"],
+    runtime["ds"]["status_length"],
+)
 PY
 }
 
@@ -1114,7 +1145,7 @@ print_ariadne_import_info() {
         warn "${label}: target Python is not ready"
         return 0
     fi
-    "${PYTHON}" - "${label}" <<'PY' || true
+    run_ariadne_python - "${label}" <<'PY' || true
 import os
 import sys
 import time
@@ -1145,7 +1176,7 @@ assert_ariadne_inside_venv() {
         echo "+ ${PYTHON} -c 'assert ariadne imported from target venv'"
         return 0
     fi
-    "${PYTHON}" - "${VENV}" <<'PY'
+    run_ariadne_python - "${VENV}" <<'PY'
 from pathlib import Path
 import sys
 
@@ -1178,7 +1209,7 @@ write_ariadne_receipt() {
     local ariadne_root="${PROJECTS_DIR}/ARIADNE"
     local repo_commit=""
     repo_commit="$(git -C "${ariadne_root}" rev-parse --short HEAD 2>/dev/null || true)"
-    "${PYTHON}" - "$(ariadne_receipt_path)" "${MACHINE}" "${ariadne_root}" "${repo_commit}" "${PYTHON}" "${VENV}" "${ARIADNE_CC:-}" "${ARIADNE_CXX:-}" "${ARIADNE_FC:-}" <<'PY'
+    run_ariadne_python - "$(ariadne_receipt_path)" "${MACHINE}" "${ariadne_root}" "${repo_commit}" "${PYTHON}" "${VENV}" "${ARIADNE_CC:-}" "${ARIADNE_CXX:-}" "${ARIADNE_FC:-}" <<'PY'
 from __future__ import annotations
 
 import json
@@ -1228,7 +1259,7 @@ doctor_ariadne_receipt() {
     if [[ "${DRY_RUN}" -eq 1 || -z "${PYTHON:-}" || ! -x "${PYTHON}" ]]; then
         return 0
     fi
-    "${PYTHON}" - "${receipt}" "${PROJECTS_DIR}/ARIADNE" <<'PY' || true
+    run_ariadne_python - "${receipt}" "${PROJECTS_DIR}/ARIADNE" <<'PY' || true
 from __future__ import annotations
 
 import json
@@ -1337,7 +1368,7 @@ install_ariadne_if_needed() {
     resolve_ariadne_compilers
     print_ariadne_compiler_paths
     print_ariadne_import_info "ARIADNE before install"
-    if [[ "${reinstall}" -eq 0 && "${DRY_RUN}" -eq 0 ]] && python_import_ok ariadne; then
+    if [[ "${reinstall}" -eq 0 && "${DRY_RUN}" -eq 0 ]] && ariadne_import_ok; then
         echo "ARIADNE already importable"
         verify_ariadne_api
         assert_ariadne_inside_venv

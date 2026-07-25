@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
@@ -490,6 +491,9 @@ def test_sge_scripts_use_native_directives_and_generic_task_identity(
         assert "export ICHOR_SCHEDULER_ARRAY_TASK_ID=0" in body
     assert "module load compilers/intel/21.0.3" in body
     assert "libmkl_intel_lp64.so.1" in body
+    assert "libmkl_sequential.so.1" in body
+    assert "libmkl_core.so.1" in body
+    assert "ICHOR_ARIADNE_LD_PRELOAD" in body
     assert "libstdc++.so.6" in body
     assert "ICHOR_GCC_RUNTIME_DIR" in body
     assert 'ICHOR_MKL_RUNTIME_DIR="$(dirname "$ICHOR_MKL_LP64")"' in body
@@ -501,6 +505,14 @@ def test_sge_scripts_use_native_directives_and_generic_task_identity(
         assert "module load apps/gaussian/g09" in body
     if phase == "INITIAL_AIMALL":
         assert "module load apps/aimall/19.02.13" in body
+    scoped_preload = (
+        'env LD_PRELOAD="$ICHOR_ARIADNE_LD_PRELOAD'
+        '${LD_PRELOAD:+:$LD_PRELOAD}" '
+    )
+    if phase == "ARIADNE_ARRAY":
+        assert scoped_preload + "/home/user/.venv/ichor-ffluxlab/bin/python" in body
+    else:
+        assert scoped_preload not in body
     assert marker in body
 
 
@@ -576,12 +588,77 @@ def test_sge_submitted_environment_smoke_uses_single_core_serial_queue(
     assert "module load apps/gaussian/g09" in body
     assert "module load apps/aimall/19.02.13" in body
     assert "libmkl_intel_lp64.so.1" in body
+    assert "libmkl_sequential.so.1" in body
+    assert "libmkl_core.so.1" in body
+    assert (
+        'env LD_PRELOAD="$ICHOR_ARIADNE_LD_PRELOAD'
+        '${LD_PRELOAD:+:$LD_PRELOAD}" '
+        "/home/user/.venv/ichor-ffluxlab/bin/python"
+    ) in body
     assert "libstdc++.so.6" in body
     assert (
         "$ICHOR_GCC_RUNTIME_DIR:$ICHOR_INTEL_RUNTIME_DIR:"
         "$ICHOR_MKL_RUNTIME_DIR"
     ) in body
     assert "#SBATCH" not in body
+
+
+def test_ffluxlab_python_preflight_scopes_mkl_preload(monkeypatch):
+    from ichor.hpc.active_learning.daemon import preflight
+    from ichor.hpc.active_learning.daemon.runtime_environment import (
+        SUBMITTED_PYTHON_IMPORTS,
+    )
+
+    _install_ffluxlab_profile(monkeypatch)
+    executable = "/home/user/.venv/ichor-ffluxlab/bin/python"
+    monkeypatch.setattr(
+        preflight.os.path,
+        "isfile",
+        lambda value: value == executable,
+    )
+    monkeypatch.setattr(
+        preflight.os,
+        "access",
+        lambda value, _mode: value == executable,
+    )
+    scripts = []
+    statuses = {
+        label: {"ok": True, "error": ""}
+        for label in SUBMITTED_PYTHON_IMPORTS
+    }
+
+    def fake_run(script, *, timeout):
+        scripts.append((script, timeout))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "executable": executable,
+                    "version": [3, 11, 15],
+                    "modules": statuses,
+                }
+            )
+            + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(preflight, "_run_login_shell", fake_run)
+
+    ok, version, error, _imports = preflight._probe_configured_python_details(
+        executable,
+        ["compilers/intel/21.0.3"],
+    )
+
+    assert ok is True
+    assert version == "3.11.15"
+    assert error == ""
+    body = scripts[0][0]
+    assert "export ICHOR_ARIADNE_LD_PRELOAD=" in body
+    assert (
+        'exec env LD_PRELOAD="$ICHOR_ARIADNE_LD_PRELOAD'
+        '${LD_PRELOAD:+:$LD_PRELOAD}" '
+        + executable
+    ) in body
 
 
 def test_sge_preflight_requires_only_sge_scheduler_commands():

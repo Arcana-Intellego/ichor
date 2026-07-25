@@ -25,6 +25,7 @@ from .resource_solver import (
 )
 from .runtime_environment import (
     SUBMITTED_PYTHON_IMPORTS,
+    ariadne_runtime_command_prefix,
     module_initialisation_lines,
     native_runtime_setup_lines,
     normalise_module_list,
@@ -164,6 +165,12 @@ def render_submitted_environment_smoke_script(
             "for names in modules.values():",
             "    for name in names:",
             "        importlib.import_module(name)",
+            "ariadne = importlib.import_module('ariadne')",
+            (
+                "runtime = importlib.import_module("
+                "'ichor.hpc.active_learning.acquisition.ariadne_local_runner')"
+            ),
+            "runtime.probe_ariadne_runtime(ariadne)",
         ]
     )
     lines = [_safe_jobscript_shebang()]
@@ -215,7 +222,10 @@ def render_submitted_environment_smoke_script(
         )
     )
     lines.append(
-        shlex.quote(python_executable) + " -c " + shlex.quote(probe)
+        ariadne_runtime_command_prefix()
+        + shlex.quote(python_executable)
+        + " -c "
+        + shlex.quote(probe)
     )
     for module in gaussian_modules:
         if module not in runtime_modules:
