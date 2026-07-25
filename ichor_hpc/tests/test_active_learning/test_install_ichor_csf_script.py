@@ -111,7 +111,7 @@ def test_install_script_is_present():
     assert "resolve_ariadne_compilers()" in text
     assert "resolve_required_cmd_into ARIADNE_CC icx" in text
     assert "resolve_required_cmd_into ARIADNE_CXX icpx" in text
-    assert "resolve_required_cmd_into ARIADNE_FC ifx" in text
+    assert 'resolve_required_cmd_into ARIADNE_FC "${fortran_compiler}"' in text
     assert "deactivate_existing_venv" in text
     assert "export CC=\"${ARIADNE_CC}\"" in text
     assert "export CXX=\"${ARIADNE_CXX}\"" in text
@@ -318,11 +318,14 @@ def test_install_script_verifies_ariadne_compilers_after_module_load():
 
     helper_start = text.index("ensure_ariadne_compilers_on_path()")
     helper_body = text[helper_start:text.index("\n}\n\nmodule_cmd", helper_start)]
-    assert "for compiler in icx icpx ifx" in helper_body
+    assert 'for compiler in icx icpx "${fortran_compiler}"' in helper_body
     assert "ichor_csf_find_ariadne_compiler_path" in helper_body
     assert "ichor_csf_prepend_path_once" in helper_body
     assert "ARIADNE compiler check after module load" in helper_body
-    assert "ARIADNE compiler modules did not expose icx/icpx/ifx" in helper_body
+    assert (
+        "ARIADNE compiler modules did not expose icx/icpx/${fortran_compiler}"
+        in helper_body
+    )
     assert "module_debug" in helper_body
     assert "known-bin" in lib_text
     assert '*/linux/bin/"${exe}"' in lib_text
@@ -365,6 +368,16 @@ def test_ariadne_compiler_discovery_accepts_ffluxlab_linux_bin(tmp_path):
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip() == f"{compiler}|known-root"
+
+
+def test_ffluxlab_ariadne_dry_run_uses_classic_ifort(tmp_path):
+    result = _run_dry("ffluxlab", tmp_path, "--only", "ariadne")
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "resolve command ifort" in output
+    assert "resolve command ifx" not in output
+    assert "FC=<resolved:ifort>" in output
 
 
 def test_install_script_config_uses_canonical_gaussian_profiles(tmp_path):

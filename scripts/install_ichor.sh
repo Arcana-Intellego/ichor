@@ -304,7 +304,8 @@ resolve_required_cmd_into() {
 
     resolved="$(command -v "${cmd}" || true)"
     if [[ -z "${resolved}" ]]; then
-        if [[ "${cmd}" == "icx" || "${cmd}" == "icpx" || "${cmd}" == "ifx" || "${hint}" == ARIADNE* ]]; then
+        if [[ "${cmd}" == "icx" || "${cmd}" == "icpx" || "${cmd}" == "ifx" \
+            || "${cmd}" == "ifort" || "${hint}" == ARIADNE* ]]; then
             module_debug "compiler resolution failed for ${cmd}"
         fi
         if [[ -n "${hint}" ]]; then
@@ -335,12 +336,22 @@ find_ariadne_compiler_path() {
     printf '%s\n' "${result%%|*}"
 }
 
+ariadne_fortran_compiler_name() {
+    if [[ "${MACHINE}" == "ffluxlab" ]]; then
+        printf 'ifort\n'
+    else
+        printf 'ifx\n'
+    fi
+}
+
 ensure_ariadne_compilers_on_path() {
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         return 0
     fi
     local compiler result resolved method bin_dir missing=0
-    for compiler in icx icpx ifx; do
+    local fortran_compiler
+    fortran_compiler="$(ariadne_fortran_compiler_name)"
+    for compiler in icx icpx "${fortran_compiler}"; do
         result="$(ichor_csf_find_ariadne_compiler_path "${compiler}" || true)"
         resolved="${result%%|*}"
         method="${result#*|}"
@@ -354,13 +365,13 @@ ensure_ariadne_compilers_on_path() {
         case "${compiler}" in
             icx) ARIADNE_CC="${resolved}"; ARIADNE_CC_METHOD="${method}" ;;
             icpx) ARIADNE_CXX="${resolved}"; ARIADNE_CXX_METHOD="${method}" ;;
-            ifx) ARIADNE_FC="${resolved}"; ARIADNE_FC_METHOD="${method}" ;;
+            ifx|ifort) ARIADNE_FC="${resolved}"; ARIADNE_FC_METHOD="${method}" ;;
         esac
     done
     hash -r 2>/dev/null || true
     if [[ "${missing}" -ne 0 ]]; then
         module_debug "ARIADNE compiler check after module load"
-        die "ARIADNE compiler modules did not expose icx/icpx/ifx"
+        die "ARIADNE compiler modules did not expose icx/icpx/${fortran_compiler}"
     fi
 }
 
@@ -609,10 +620,12 @@ load_ariadne_modules() {
 }
 
 resolve_ariadne_compilers() {
+    local fortran_compiler
+    fortran_compiler="$(ariadne_fortran_compiler_name)"
     ensure_ariadne_compilers_on_path
     resolve_required_cmd_into ARIADNE_CC icx "ARIADNE requires the Intel oneAPI C compiler. Run 'module list' and check the oneAPI compiler module."
     resolve_required_cmd_into ARIADNE_CXX icpx "ARIADNE requires the Intel oneAPI C++ compiler. Run 'module list' and check the oneAPI compiler module."
-    resolve_required_cmd_into ARIADNE_FC ifx "ARIADNE requires the Intel oneAPI Fortran compiler. Run 'module list' and check the oneAPI compiler module."
+    resolve_required_cmd_into ARIADNE_FC "${fortran_compiler}" "ARIADNE requires a supported Intel oneAPI Fortran compiler. Run 'module list' and check the oneAPI compiler module."
 }
 
 load_gcc_build_modules() {
