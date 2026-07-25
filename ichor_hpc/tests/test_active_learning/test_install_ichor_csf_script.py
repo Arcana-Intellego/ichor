@@ -14,6 +14,9 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = REPO_ROOT / "scripts" / "install_ichor.sh"
 LIB = REPO_ROOT / "scripts" / "lib_ichor.sh"
+FFLUXLAB_CONSTRAINTS = (
+    REPO_ROOT / "scripts" / "constraints" / "ffluxlab-python311.txt"
+)
 LEGACY_SCRIPT = REPO_ROOT / "scripts" / "install_ichor_csf.sh"
 LEGACY_LIB = REPO_ROOT / "scripts" / "lib_ichor_csf.sh"
 CANONICAL_PROFILE = REPO_ROOT / "ichor_config.yaml"
@@ -142,6 +145,17 @@ def test_install_script_is_present():
     assert '_fsync_parent(path)' in upsert_text
     assert "install_ichor.sh" in LEGACY_SCRIPT.read_text(encoding="utf-8")
     assert "lib_ichor.sh" in LEGACY_LIB.read_text(encoding="utf-8")
+    assert set(
+        FFLUXLAB_CONSTRAINTS.read_text(encoding="utf-8").splitlines()
+    ) >= {
+        "matplotlib==3.11.1",
+        "numpy==1.26.4",
+        "pandas==2.3.2",
+        "pyarrow==19.0.0",
+        "rdkit==2023.9.6",
+        "scipy==1.13.1",
+        "xtb==22.1",
+    }
 
 
 def test_install_script_bash_syntax():
@@ -227,6 +241,34 @@ def test_install_script_dry_run_plans_missing_public_checkouts(tmp_path):
     ) in output
 
 
+def test_ffluxlab_dry_run_uses_compatible_binary_scientific_stack(tmp_path):
+    result = _run_dry("ffluxlab", tmp_path)
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "Installing the ffluxlab-compatible compiled Python stack" in output
+    assert "ffluxlab-python311.txt --only-binary=:all:" in output
+    compiled_packages = (
+        "matplotlib",
+        "numpy",
+        "pandas",
+        "pyarrow",
+        "rdkit",
+        "scipy",
+        "xtb",
+    )
+    for package in compiled_packages:
+        assert package in output
+
+
+def test_csf_dry_run_does_not_use_ffluxlab_python_constraints(tmp_path):
+    result = _run_dry("csf3", tmp_path)
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "ffluxlab-python311.txt" not in output
+
+
 def test_install_script_dry_run_uses_parallel_build_flags(tmp_path):
     result = _run_dry("csf4", tmp_path)
 
@@ -283,7 +325,46 @@ def test_install_script_verifies_ariadne_compilers_after_module_load():
     assert "ARIADNE compiler modules did not expose icx/icpx/ifx" in helper_body
     assert "module_debug" in helper_body
     assert "known-bin" in lib_text
+    assert '*/linux/bin/"${exe}"' in lib_text
     assert "setvars" not in lib_text
+
+
+def test_ariadne_compiler_discovery_accepts_ffluxlab_linux_bin(tmp_path):
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash is not available on this host")
+    compiler = (
+        tmp_path
+        / "intel"
+        / "compiler"
+        / "2021.3.0"
+        / "linux"
+        / "bin"
+        / "icx"
+    )
+    compiler.parent.mkdir(parents=True)
+    compiler.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    compiler.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            bash,
+            "-c",
+            (
+                'source "$1"; PATH=/usr/bin:/bin; ONEAPI_ROOT="$2"; '
+                "ichor_csf_find_ariadne_compiler_path icx"
+            ),
+            "bash",
+            str(LIB),
+            str(tmp_path / "intel"),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == f"{compiler}|known-root"
 
 
 def test_install_script_config_uses_canonical_gaussian_profiles(tmp_path):

@@ -330,6 +330,8 @@ ichor_csf_find_ariadne_compiler_path() {
             continue
         fi
         for candidate in \
+            "${root}"/compiler/*/linux/bin/"${exe}" \
+            "${root}"/compiler/*/linux/bin/intel64/"${exe}" \
             "${root}"/compiler/*/bin/"${exe}" \
             "${root}"/compiler/latest/bin/"${exe}"; do
             if [[ -x "${candidate}" ]]; then
@@ -340,6 +342,7 @@ ichor_csf_find_ariadne_compiler_path() {
     done
 
     for candidate in \
+        /home/modules/compilers/intel/21.0.3/compiler/*/linux/bin/"${exe}" \
         /home/modules/compilers/intel/21.0.3/compiler/*/linux/bin/intel64/"${exe}" \
         /opt/apps/compilers/intel/oneapi/2025.0.1/compiler/2025.0/bin/"${exe}" \
         /opt/apps/compilers/oneapi/2024.2.0/compiler/latest/bin/"${exe}"; do

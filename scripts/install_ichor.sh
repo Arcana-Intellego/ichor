@@ -41,6 +41,7 @@ SQLITE_SHA256="b2809ca53124c19c60f42bf627736eae011afdcc205bb48270a5ee9a38191531"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+FFLUXLAB_PYTHON_CONSTRAINTS="${SCRIPT_DIR}/constraints/ffluxlab-python311.txt"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib_ichor.sh"
 
@@ -945,8 +946,14 @@ prepare_runtime_environment() {
 }
 
 pip_install() {
-    # shellcheck disable=SC2086
-    run_cmd "${PYTHON}" -m pip install "$@"
+    local -a constraint_args=()
+    if [[ "${MACHINE}" == "ffluxlab" ]]; then
+        require_file \
+            "${FFLUXLAB_PYTHON_CONSTRAINTS}" \
+            "ffluxlab Python constraints"
+        constraint_args=(--constraint "${FFLUXLAB_PYTHON_CONSTRAINTS}")
+    fi
+    run_cmd "${PYTHON}" -m pip install "${constraint_args[@]}" "$@"
 }
 
 ensure_private_cmake() {
@@ -978,6 +985,18 @@ install_python_packages() {
 
     pip_install --upgrade pip setuptools wheel
     ensure_private_cmake
+    if [[ "${MACHINE}" == "ffluxlab" ]]; then
+        note "Installing the ffluxlab-compatible compiled Python stack"
+        pip_install \
+            --only-binary=:all: \
+            matplotlib \
+            numpy \
+            pandas \
+            pyarrow \
+            rdkit \
+            scipy \
+            xtb
+    fi
     pip_install pytest
     pip_install -e "${REPO_ROOT}/ichor_core"
     pip_install -e "${REPO_ROOT}/ichor_hpc"
