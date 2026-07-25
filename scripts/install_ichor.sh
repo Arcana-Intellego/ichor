@@ -13,20 +13,20 @@ set -euo pipefail
 
 PYTHON_VERSION="3.11.15"
 PLUMED_VERSION="2.10.0"
-OPENBLAS_VERSION="0.3.29"
+BINUTILS_VERSION="2.42"
 OPENSSL_VERSION="1.1.1w"
 READLINE_VERSION="8.2"
 SQLITE_VERSION="3450300"
 CMAKE_VERSION="3.31.6"
 PYTHON_TARBALL="Python-${PYTHON_VERSION}.tgz"
 PLUMED_TARBALL="plumed-${PLUMED_VERSION}.tgz"
-OPENBLAS_TARBALL="OpenBLAS-${OPENBLAS_VERSION}.tar.gz"
+BINUTILS_TARBALL="binutils-${BINUTILS_VERSION}.tar.xz"
 OPENSSL_TARBALL="openssl-${OPENSSL_VERSION}.tar.gz"
 READLINE_TARBALL="readline-${READLINE_VERSION}.tar.gz"
 SQLITE_TARBALL="sqlite-autoconf-${SQLITE_VERSION}.tar.gz"
 PYTHON_URL="https://www.python.org/ftp/python/${PYTHON_VERSION}/${PYTHON_TARBALL}"
 PLUMED_URL="https://github.com/plumed/plumed2/releases/download/v${PLUMED_VERSION}/${PLUMED_TARBALL}"
-OPENBLAS_URL="https://github.com/OpenMathLib/OpenBLAS/releases/download/v${OPENBLAS_VERSION}/${OPENBLAS_TARBALL}"
+BINUTILS_URL="https://ftp.gnu.org/gnu/binutils/${BINUTILS_TARBALL}"
 OPENSSL_URL="https://github.com/openssl/openssl/releases/download/OpenSSL_1_1_1w/${OPENSSL_TARBALL}"
 READLINE_URL="https://ftp.gnu.org/gnu/readline/${READLINE_TARBALL}"
 SQLITE_URL="https://sqlite.org/2024/${SQLITE_TARBALL}"
@@ -34,9 +34,7 @@ ARIADNE_URL="https://github.com/Arcana-Intellego/ARIADNE.git"
 FEREBUS_URL="https://github.com/Arcana-Intellego/FEREBUS_CPU.git"
 PYTHON_SHA256="f4de1b10bd6c70cbb9fa1cd71fc5038b832747a74ee59d599c69ce4846defb50"
 PLUMED_SHA256="5aaf718ac530a1c8df6e0644c22acc84ad4202778106a1d584477057775f2995"
-OPENBLAS_SHA256="38240eee1b29e2bde47ebb5d61160207dc68668a54cac62c076bb5032013b1eb"
-FFLUXLAB_BINUTILS_COMPAT_FLAG="-Wa,-mrelax-relocations=no"
-OPENBLAS_BUILD_CONTRACT_VERSION=1
+BINUTILS_SHA256="f6e4d41fd5fc778b06b7891457b3620da5ecea1006c6a4a41ae998109f85a800"
 OPENSSL_SHA256="cf3098950cb4d853ad95c0841f1f9c6d3dc102dccfcacd521d93925208b76ac8"
 READLINE_SHA256="3feb7171f16a84ee82ca18a36d7b9be109a52c04f492a053331d7d1095007c35"
 SQLITE_SHA256="b2809ca53124c19c60f42bf627736eae011afdcc205bb48270a5ee9a38191531"
@@ -54,6 +52,7 @@ VENV="${ICHOR_VENV:-}"
 PYTHON_PREFIX="${PYTHON_PREFIX:-${HOME}/opt/python-${PYTHON_VERSION}}"
 PYTHON_DEPS_PREFIX="${ICHOR_PYTHON_DEPS_PREFIX:-${HOME}/opt/ichor-python-deps-${PYTHON_VERSION}}"
 OPENSSL_PREFIX="${ICHOR_OPENSSL_PREFIX:-${HOME}/opt/openssl-${OPENSSL_VERSION}}"
+BINUTILS_PREFIX="${ICHOR_BINUTILS_PREFIX:-${HOME}/opt/binutils-${BINUTILS_VERSION}}"
 AIMALL_PATH="${AIMALL_PATH:-}"
 FEREBUS_PATH="${FEREBUS_PATH:-${HOME}/.local/bin/ferebus}"
 INSTALL_JOBS="${ICHOR_INSTALL_JOBS:-4}"
@@ -103,8 +102,8 @@ Options:
 
 Environment equivalents:
   ICHOR_MACHINE, ICHOR_PROJECTS_DIR, ICHOR_REPO_ROOT, ICHOR_VENV,
-  ICHOR_INSTALL_JOBS, AIMALL_PATH, FEREBUS_PATH, PLUMED_KERNEL,
-  PLUMED_LIBRARY_PATH, PIP_FIND_LINKS.
+  ICHOR_INSTALL_JOBS, ICHOR_BINUTILS_PREFIX, AIMALL_PATH, FEREBUS_PATH,
+  PLUMED_KERNEL, PLUMED_LIBRARY_PATH, PIP_FIND_LINKS.
 EOF
 }
 
@@ -183,6 +182,7 @@ REPO_ROOT="$(expand_path "${REPO_ROOT}")"
 PYTHON_PREFIX="$(expand_path "${PYTHON_PREFIX}")"
 PYTHON_DEPS_PREFIX="$(expand_path "${PYTHON_DEPS_PREFIX}")"
 OPENSSL_PREFIX="$(expand_path "${OPENSSL_PREFIX}")"
+BINUTILS_PREFIX="$(expand_path "${BINUTILS_PREFIX}")"
 if [[ -n "${AIMALL_PATH}" ]]; then
     AIMALL_PATH="$(expand_path "${AIMALL_PATH}")"
 fi
@@ -518,16 +518,20 @@ print_download_readiness() {
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         warn "dry-run: network checks skipped"
     else
-        for label_url in \
+        local -a sources=(
             "PyPI|https://pypi.org/simple/" \
             "Python|${PYTHON_URL}" \
             "PLUMED|${PLUMED_URL}" \
-            "OpenBLAS|${OPENBLAS_URL}" \
             "OpenSSL|${OPENSSL_URL}" \
             "Readline|${READLINE_URL}" \
             "SQLite|${SQLITE_URL}" \
             "ARIADNE|${ARIADNE_URL}" \
-            "FEREBUS_CPU|${FEREBUS_URL}"; do
+            "FEREBUS_CPU|${FEREBUS_URL}"
+        )
+        if [[ "${MACHINE}" == "ffluxlab" ]]; then
+            sources+=("GNU Binutils|${BINUTILS_URL}")
+        fi
+        for label_url in "${sources[@]}"; do
             local label="${label_url%%|*}"
             local url="${label_url#*|}"
             if url_available "${url}"; then
@@ -543,8 +547,10 @@ If online downloads are unavailable and a required source is missing:
   * Python: place ${PYTHON_TARBALL} in ${PROJECTS_DIR}/_sources/
   * PLUMED: place ${PLUMED_TARBALL} in ${PROJECTS_DIR}/_sources/
             (the installer verifies it before extraction)
-  * OpenBLAS/FEREBUS: place ${OPENBLAS_TARBALL} in ${PROJECTS_DIR}/_sources/;
-            the installer verifies its pinned SHA-256 before building the static archive.
+  * FEREBUS: retain the bundled libs/openblas tree from the FEREBUS_CPU
+            checkout; the installer never replaces or rebuilds it.
+  * ffluxlab linker: place ${BINUTILS_TARBALL} in ${PROJECTS_DIR}/_sources/;
+            the installer verifies it before building private linker tools.
   * ffluxlab Python dependencies: place ${OPENSSL_TARBALL},
             ${READLINE_TARBALL}, and ${SQLITE_TARBALL} in
             ${PROJECTS_DIR}/_sources/.
@@ -1417,6 +1423,115 @@ install_plumed_if_needed() {
     fi
 }
 
+private_binutils_usable() {
+    local linker="${BINUTILS_PREFIX}/bin/ld"
+    [[ -x "${linker}" ]] || return 1
+    local version_line
+    version_line="$("${linker}" --version 2>/dev/null | head -n 1 || true)"
+    [[ "${version_line}" == *" ${BINUTILS_VERSION}"* ]]
+}
+
+build_private_binutils() {
+    local tarball="${PROJECTS_DIR}/_sources/${BINUTILS_TARBALL}"
+    local build_parent="${PROJECTS_DIR}/_sources/build"
+    local source_dir="${build_parent}/binutils-${BINUTILS_VERSION}"
+    local build_dir="${build_parent}/binutils-${BINUTILS_VERSION}-build"
+
+    note "Building private GNU Binutils ${BINUTILS_VERSION} for FEREBUS"
+    require_cmd gcc "Load a GCC compiler module before building GNU Binutils."
+    require_cmd make "Load a GCC build environment before building GNU Binutils."
+    require_cmd tar "GNU tar is required to unpack GNU Binutils."
+    if [[ ! -f "${tarball}" ]]; then
+        download_to "${BINUTILS_URL}" "${tarball}" "${BINUTILS_SHA256}"
+    fi
+    verify_sha256 "${tarball}" "${BINUTILS_SHA256}"
+
+    case "${source_dir}" in
+        "${PROJECTS_DIR}/_sources/build/binutils-${BINUTILS_VERSION}") ;;
+        *) die "refusing to replace unexpected Binutils source directory: ${source_dir}" ;;
+    esac
+    case "${build_dir}" in
+        "${PROJECTS_DIR}/_sources/build/binutils-${BINUTILS_VERSION}-build") ;;
+        *) die "refusing to replace unexpected Binutils build directory: ${build_dir}" ;;
+    esac
+    run_cmd mkdir -p "${build_parent}"
+    run_cmd rm -rf "${source_dir}" "${build_dir}"
+    run_cmd tar -xf "${tarball}" -C "${build_parent}"
+    run_cmd mkdir -p "${build_dir}"
+    run_in_dir "${build_dir}" "${source_dir}/configure" \
+        "--prefix=${BINUTILS_PREFIX}" \
+        --disable-gdb \
+        --disable-gdbserver \
+        --disable-gold \
+        --disable-gprofng \
+        --disable-libdecnumber \
+        --disable-nls \
+        --disable-readline \
+        --disable-shared \
+        --disable-sim \
+        --disable-werror \
+        --enable-static
+    run_in_dir "${build_dir}" make -j "${INSTALL_JOBS}" all-binutils all-ld
+    backup_existing_path "${BINUTILS_PREFIX}" "private Binutils installation"
+    run_in_dir "${build_dir}" make install-binutils install-ld
+
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        private_binutils_usable \
+            || die "private GNU Binutils ${BINUTILS_VERSION} installation is unusable at ${BINUTILS_PREFIX}"
+        echo "FEREBUS linker: $("${BINUTILS_PREFIX}/bin/ld" --version | head -n 1)"
+    fi
+}
+
+ensure_ffluxlab_binutils() {
+    [[ "${MACHINE}" == "ffluxlab" ]] || return 0
+    [[ ! -L "${BINUTILS_PREFIX}" ]] \
+        || die "private Binutils prefix must not be a symlink: ${BINUTILS_PREFIX}"
+    if private_binutils_usable; then
+        echo "Private FEREBUS linker already usable: ${BINUTILS_PREFIX}/bin/ld"
+        return 0
+    fi
+    build_private_binutils
+}
+
+verify_ffluxlab_gfortran_linker() {
+    [[ "${MACHINE}" == "ffluxlab" ]] || return 0
+    local linker_flag="-B${BINUTILS_PREFIX}/bin/"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "+ verify gfortran ${linker_flag} selects ${BINUTILS_PREFIX}/bin/ld"
+        return 0
+    fi
+    require_cmd readlink "GNU readlink is required to validate the FEREBUS linker."
+    local expected_linker
+    local selected_linker
+    expected_linker="$(readlink -f "${BINUTILS_PREFIX}/bin/ld")"
+    selected_linker="$(gfortran "${linker_flag}" -print-prog-name=ld)"
+    selected_linker="$(readlink -f "${selected_linker}")"
+    [[ "${selected_linker}" == "${expected_linker}" ]] \
+        || die "gfortran did not select the private FEREBUS linker: expected ${expected_linker}, observed ${selected_linker}"
+    echo "gfortran FEREBUS linker: ${selected_linker}"
+}
+
+resolve_bundled_ferebus_openblas() {
+    local root="$1"
+    local candidate
+    for candidate in \
+        "${root}/libs/openblas/lib64/libopenblas.a" \
+        "${root}/libs/openblas/lib/libopenblas.a"; do
+        if [[ -L "${candidate}" ]]; then
+            die "bundled FEREBUS OpenBLAS archive must not be a symlink: ${candidate}"
+        fi
+        if [[ -f "${candidate}" ]]; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+    done
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        printf '%s\n' "${root}/libs/openblas/lib64/libopenblas.a"
+        return 0
+    fi
+    die "bundled FEREBUS OpenBLAS archive is missing. The installer will not rebuild it. Restore the tracked bundle with: git -C ${root} restore --source=HEAD -- libs/openblas"
+}
+
 install_ferebus_if_needed() {
     local reinstall="${1:-0}"
     note "Checking FEREBUS"
@@ -1431,39 +1546,19 @@ install_ferebus_if_needed() {
     require_dir "${root}" "FEREBUS_CPU source tree"
     load_gcc_build_modules
     require_cmd make "Load a GCC build environment first."
-    local openblas_a=""
-    for candidate in "${root}/libs/openblas/lib64/libopenblas.a" "${root}/libs/openblas/lib/libopenblas.a"; do
-        if [[ -f "${candidate}" ]]; then
-            openblas_a="${candidate}"
-            break
-        fi
-    done
-    if [[ -n "${openblas_a}" && "${MACHINE}" == "ffluxlab" ]]; then
-        local contract="${root}/libs/openblas/.ichor-build-contract"
-        if [[ ! -f "${contract}" || -L "${contract}" ]] \
-            || ! grep -Fxq "schema=${OPENBLAS_BUILD_CONTRACT_VERSION}" "${contract}" \
-            || ! grep -Fxq "openblas_version=${OPENBLAS_VERSION}" "${contract}" \
-            || ! grep -Fxq "assembler_relax_relocations=no" "${contract}"; then
-            echo "Rebuilding the existing OpenBLAS archive for ffluxlab's system linker"
-            openblas_a=""
-        fi
+    local openblas_a
+    openblas_a="$(resolve_bundled_ferebus_openblas "${root}")"
+    local openblas_sha256=""
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        openblas_sha256="$(file_sha256 "${openblas_a}")"
+        echo "Bundled FEREBUS OpenBLAS archive: ${openblas_a}"
+    else
+        echo "+ preserve bundled FEREBUS OpenBLAS archive ${openblas_a}"
     fi
-    if [[ -z "${openblas_a}" ]]; then
-        build_pinned_openblas "${root}/libs/openblas"
-    fi
-    if [[ -z "${openblas_a}" && "${DRY_RUN}" -eq 0 ]]; then
-        for candidate in "${root}/libs/openblas/lib64/libopenblas.a" "${root}/libs/openblas/lib/libopenblas.a"; do
-            if [[ -f "${candidate}" ]]; then
-                openblas_a="${candidate}"
-                break
-            fi
-        done
-    fi
-    if [[ -z "${openblas_a}" && "${DRY_RUN}" -eq 0 ]]; then
-        die "FEREBUS static OpenBLAS is still missing after setup"
-    fi
+    ensure_ffluxlab_binutils
     require_cmd cmake "Load the CSF CMake module first."
     require_cmd gfortran "Load a GCC compiler module first."
+    verify_ffluxlab_gfortran_linker
     local build_dir="${root}/build-ichor-install"
     case "${build_dir}" in
         "${root}/build-ichor-install") ;;
@@ -1483,7 +1578,7 @@ install_ferebus_if_needed() {
     )
     if [[ "${MACHINE}" == "ffluxlab" ]]; then
         cmake_args+=(
-            "-DCMAKE_Fortran_FLAGS=${FFLUXLAB_BINUTILS_COMPAT_FLAG}"
+            "-DCMAKE_EXE_LINKER_FLAGS=-B${BINUTILS_PREFIX}/bin/"
         )
     fi
     run_cmd cmake "${cmake_args[@]}"
@@ -1495,79 +1590,11 @@ install_ferebus_if_needed() {
         run_cmd cmake --install "${build_dir}"
     fi
     [[ "${DRY_RUN}" -eq 1 || -x "${FEREBUS_PATH}" ]] || die "FEREBUS build did not create executable: ${FEREBUS_PATH}"
-    if [[ "${MACHINE}" == "ffluxlab" && "${DRY_RUN}" -eq 0 ]]; then
-        local contract="${root}/libs/openblas/.ichor-build-contract"
-        local temporary="${contract}.tmp.$$"
-        printf '%s\n' \
-            "schema=${OPENBLAS_BUILD_CONTRACT_VERSION}" \
-            "openblas_version=${OPENBLAS_VERSION}" \
-            "assembler_relax_relocations=no" \
-            > "${temporary}"
-        mv -f "${temporary}" "${contract}"
-    fi
-}
-
-build_pinned_openblas() {
-    local prefix="$1"
-    local tarball="${PROJECTS_DIR}/_sources/${OPENBLAS_TARBALL}"
-    local build_parent="${PROJECTS_DIR}/_sources/build"
-    local source_dir="${build_parent}/OpenBLAS-${OPENBLAS_VERSION}"
-
-    note "Building pinned static OpenBLAS ${OPENBLAS_VERSION} for FEREBUS"
-    if [[ ! -f "${tarball}" ]]; then
-        download_to "${OPENBLAS_URL}" "${tarball}" "${OPENBLAS_SHA256}"
-    fi
-    verify_sha256 "${tarball}" "${OPENBLAS_SHA256}"
-
     if [[ "${DRY_RUN}" -eq 0 ]]; then
-        mkdir -p "${build_parent}"
-        case "${source_dir}" in
-            "${PROJECTS_DIR}/_sources/build/OpenBLAS-${OPENBLAS_VERSION}") ;;
-            *) die "refusing to replace unexpected OpenBLAS source directory: ${source_dir}" ;;
-        esac
-        rm -rf "${source_dir}"
-        tar -xzf "${tarball}" -C "${build_parent}"
-        [[ -d "${source_dir}" ]] || die "OpenBLAS archive did not extract the expected directory: ${source_dir}"
-    else
-        echo "+ extract verified ${tarball} -> ${source_dir}"
-    fi
-
-    case "${prefix}" in
-        "${PROJECTS_DIR}/FEREBUS_CPU/libs/openblas") ;;
-        *) die "refusing to replace unexpected OpenBLAS prefix: ${prefix}" ;;
-    esac
-    run_cmd rm -rf "${prefix}"
-
-    local -a make_args=(
-        TARGET=GENERIC
-        DYNAMIC_ARCH=1
-        USE_OPENMP=1
-        NO_AFFINITY=1
-        NO_SHARED=1
-        NUM_THREADS=64
-    )
-    if [[ "${MACHINE}" == "ffluxlab" ]]; then
-        make_args+=(
-            "CFLAGS=${FFLUXLAB_BINUTILS_COMPAT_FLAG}"
-            "FFLAGS=${FFLUXLAB_BINUTILS_COMPAT_FLAG}"
-        )
-    fi
-    run_in_dir "${source_dir}" make -j "${INSTALL_JOBS}" "${make_args[@]}"
-    run_in_dir "${source_dir}" make "PREFIX=${prefix}" install "${make_args[@]}"
-
-    if [[ "${DRY_RUN}" -eq 0 ]]; then
-        local archive=""
-        for candidate in "${prefix}/lib64/libopenblas.a" "${prefix}/lib/libopenblas.a"; do
-            if [[ -f "${candidate}" ]]; then
-                archive="${candidate}"
-                break
-            fi
-        done
-        [[ -n "${archive}" ]] || die "pinned OpenBLAS build did not install libopenblas.a below ${prefix}"
-        if find "${prefix}" -type f \( -name 'libopenblas.so' -o -name 'libopenblas.so.*' \) -print -quit | grep -q .; then
-            die "OpenBLAS build unexpectedly installed a shared library below ${prefix}"
-        fi
-        echo "FEREBUS OpenBLAS archive: ${archive}"
+        local observed_openblas_sha256
+        observed_openblas_sha256="$(file_sha256 "${openblas_a}")"
+        [[ "${observed_openblas_sha256}" == "${openblas_sha256}" ]] \
+            || die "FEREBUS build modified its bundled OpenBLAS archive: ${openblas_a}"
     fi
 }
 
