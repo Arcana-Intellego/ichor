@@ -35,6 +35,8 @@ FEREBUS_URL="https://github.com/Arcana-Intellego/FEREBUS_CPU.git"
 PYTHON_SHA256="f4de1b10bd6c70cbb9fa1cd71fc5038b832747a74ee59d599c69ce4846defb50"
 PLUMED_SHA256="5aaf718ac530a1c8df6e0644c22acc84ad4202778106a1d584477057775f2995"
 OPENBLAS_SHA256="38240eee1b29e2bde47ebb5d61160207dc68668a54cac62c076bb5032013b1eb"
+FFLUXLAB_BINUTILS_COMPAT_FLAG="-Wa,-mrelax-relocations=no"
+OPENBLAS_BUILD_CONTRACT_VERSION=1
 OPENSSL_SHA256="cf3098950cb4d853ad95c0841f1f9c6d3dc102dccfcacd521d93925208b76ac8"
 READLINE_SHA256="3feb7171f16a84ee82ca18a36d7b9be109a52c04f492a053331d7d1095007c35"
 SQLITE_SHA256="b2809ca53124c19c60f42bf627736eae011afdcc205bb48270a5ee9a38191531"
@@ -1436,6 +1438,16 @@ install_ferebus_if_needed() {
             break
         fi
     done
+    if [[ -n "${openblas_a}" && "${MACHINE}" == "ffluxlab" ]]; then
+        local contract="${root}/libs/openblas/.ichor-build-contract"
+        if [[ ! -f "${contract}" || -L "${contract}" ]] \
+            || ! grep -Fxq "schema=${OPENBLAS_BUILD_CONTRACT_VERSION}" "${contract}" \
+            || ! grep -Fxq "openblas_version=${OPENBLAS_VERSION}" "${contract}" \
+            || ! grep -Fxq "assembler_relax_relocations=no" "${contract}"; then
+            echo "Rebuilding the existing OpenBLAS archive for ffluxlab's system linker"
+            openblas_a=""
+        fi
+    fi
     if [[ -z "${openblas_a}" ]]; then
         build_pinned_openblas "${root}/libs/openblas"
     fi
@@ -1457,12 +1469,24 @@ install_ferebus_if_needed() {
         "${root}/build-ichor-install") ;;
         *) die "refusing to clean unexpected FEREBUS build directory: ${build_dir}" ;;
     esac
-    if [[ "${reinstall}" -eq 1 ]]; then
+    if [[ "${reinstall}" -eq 1 || "${MACHINE}" == "ffluxlab" ]]; then
         run_cmd rm -rf "${build_dir}"
+    fi
+    if [[ "${reinstall}" -eq 1 ]]; then
         backup_existing_path "${FEREBUS_PATH}" "FEREBUS executable"
     fi
     run_cmd mkdir -p "${build_dir}" "$(dirname "${FEREBUS_PATH}")"
-    run_cmd cmake -S "${root}" -B "${build_dir}" -DCMAKE_BUILD_TYPE=Release
+    local -a cmake_args=(
+        -S "${root}"
+        -B "${build_dir}"
+        -DCMAKE_BUILD_TYPE=Release
+    )
+    if [[ "${MACHINE}" == "ffluxlab" ]]; then
+        cmake_args+=(
+            "-DCMAKE_Fortran_FLAGS=${FFLUXLAB_BINUTILS_COMPAT_FLAG}"
+        )
+    fi
+    run_cmd cmake "${cmake_args[@]}"
     run_cmd cmake --build "${build_dir}" -j "${INSTALL_JOBS}"
     if [[ -f "${build_dir}/ferebus" ]]; then
         run_cmd cp "${build_dir}/ferebus" "${FEREBUS_PATH}"
@@ -1471,6 +1495,16 @@ install_ferebus_if_needed() {
         run_cmd cmake --install "${build_dir}"
     fi
     [[ "${DRY_RUN}" -eq 1 || -x "${FEREBUS_PATH}" ]] || die "FEREBUS build did not create executable: ${FEREBUS_PATH}"
+    if [[ "${MACHINE}" == "ffluxlab" && "${DRY_RUN}" -eq 0 ]]; then
+        local contract="${root}/libs/openblas/.ichor-build-contract"
+        local temporary="${contract}.tmp.$$"
+        printf '%s\n' \
+            "schema=${OPENBLAS_BUILD_CONTRACT_VERSION}" \
+            "openblas_version=${OPENBLAS_VERSION}" \
+            "assembler_relax_relocations=no" \
+            > "${temporary}"
+        mv -f "${temporary}" "${contract}"
+    fi
 }
 
 build_pinned_openblas() {
@@ -1498,10 +1532,28 @@ build_pinned_openblas() {
         echo "+ extract verified ${tarball} -> ${source_dir}"
     fi
 
-    run_in_dir "${source_dir}" make -j "${INSTALL_JOBS}" \
-        TARGET=GENERIC DYNAMIC_ARCH=1 USE_OPENMP=1 NO_AFFINITY=1 \
-        NO_SHARED=1 NUM_THREADS=64
-    run_in_dir "${source_dir}" make "PREFIX=${prefix}" install
+    case "${prefix}" in
+        "${PROJECTS_DIR}/FEREBUS_CPU/libs/openblas") ;;
+        *) die "refusing to replace unexpected OpenBLAS prefix: ${prefix}" ;;
+    esac
+    run_cmd rm -rf "${prefix}"
+
+    local -a make_args=(
+        TARGET=GENERIC
+        DYNAMIC_ARCH=1
+        USE_OPENMP=1
+        NO_AFFINITY=1
+        NO_SHARED=1
+        NUM_THREADS=64
+    )
+    if [[ "${MACHINE}" == "ffluxlab" ]]; then
+        make_args+=(
+            "CFLAGS=${FFLUXLAB_BINUTILS_COMPAT_FLAG}"
+            "FFLAGS=${FFLUXLAB_BINUTILS_COMPAT_FLAG}"
+        )
+    fi
+    run_in_dir "${source_dir}" make -j "${INSTALL_JOBS}" "${make_args[@]}"
+    run_in_dir "${source_dir}" make "PREFIX=${prefix}" install "${make_args[@]}"
 
     if [[ "${DRY_RUN}" -eq 0 ]]; then
         local archive=""

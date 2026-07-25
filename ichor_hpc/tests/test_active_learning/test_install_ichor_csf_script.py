@@ -139,7 +139,11 @@ def test_install_script_is_present():
     assert "OPENBLAS_SHA256=" in text
     assert 'verify_sha256 "${tarball}" "${OPENBLAS_SHA256}"' in text
     assert "./fetchOpenBlas.sh" not in text
-    assert 'NO_SHARED=1 NUM_THREADS=64' in text
+    assert "NO_SHARED=1" in text
+    assert "NUM_THREADS=64" in text
+    assert 'FFLUXLAB_BINUTILS_COMPAT_FLAG="-Wa,-mrelax-relocations=no"' in text
+    assert "assembler_relax_relocations=no" in text
+    assert "CMAKE_Fortran_FLAGS=" in text
     assert 'scripts/upsert_ichor_config.py' in text
     assert 'canonical = _load_mapping(canonical_config' in upsert_text
     assert 'data[str(machine)] = profile' in upsert_text
@@ -391,6 +395,34 @@ def test_ffluxlab_ariadne_dry_run_uses_classic_intel_toolchain(tmp_path):
     assert "CXX=<resolved:icpc>" in output
     assert "FC=<resolved:ifort>" in output
     assert "resolve 64-bit Intel and MKL runtimes" in output
+
+
+def test_ffluxlab_ferebus_dry_run_rebuilds_linker_compatible_openblas(
+    tmp_path,
+):
+    projects = _make_fake_projects(tmp_path)
+    archive = projects / "FEREBUS_CPU" / "libs" / "openblas" / "lib64"
+    archive.mkdir(parents=True)
+    (archive / "libopenblas.a").write_bytes(b"legacy archive")
+    result = _run_dry("ffluxlab", tmp_path, "--only", "ferebus")
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert (
+        "Rebuilding the existing OpenBLAS archive for ffluxlab's system linker"
+        in output
+    )
+    assert "CFLAGS=-Wa\\,-mrelax-relocations=no" in output
+    assert "FFLAGS=-Wa\\,-mrelax-relocations=no" in output
+    assert "CMAKE_Fortran_FLAGS=-Wa\\,-mrelax-relocations=no" in output
+
+
+def test_csf_ferebus_dry_run_does_not_apply_ffluxlab_linker_flags(tmp_path):
+    result = _run_dry("csf3", tmp_path, "--only", "ferebus")
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "mrelax-relocations" not in output
 
 
 def test_install_script_config_uses_canonical_gaussian_profiles(tmp_path):
