@@ -305,6 +305,7 @@ resolve_required_cmd_into() {
     resolved="$(command -v "${cmd}" || true)"
     if [[ -z "${resolved}" ]]; then
         if [[ "${cmd}" == "icx" || "${cmd}" == "icpx" || "${cmd}" == "ifx" \
+            || "${cmd}" == "icc" || "${cmd}" == "icpc" \
             || "${cmd}" == "ifort" || "${hint}" == ARIADNE* ]]; then
             module_debug "compiler resolution failed for ${cmd}"
         fi
@@ -344,14 +345,32 @@ ariadne_fortran_compiler_name() {
     fi
 }
 
+ariadne_c_compiler_name() {
+    if [[ "${MACHINE}" == "ffluxlab" ]]; then
+        printf 'icc\n'
+    else
+        printf 'icx\n'
+    fi
+}
+
+ariadne_cxx_compiler_name() {
+    if [[ "${MACHINE}" == "ffluxlab" ]]; then
+        printf 'icpc\n'
+    else
+        printf 'icpx\n'
+    fi
+}
+
 ensure_ariadne_compilers_on_path() {
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         return 0
     fi
     local compiler result resolved method bin_dir missing=0
-    local fortran_compiler
+    local c_compiler cxx_compiler fortran_compiler
+    c_compiler="$(ariadne_c_compiler_name)"
+    cxx_compiler="$(ariadne_cxx_compiler_name)"
     fortran_compiler="$(ariadne_fortran_compiler_name)"
-    for compiler in icx icpx "${fortran_compiler}"; do
+    for compiler in "${c_compiler}" "${cxx_compiler}" "${fortran_compiler}"; do
         result="$(ichor_csf_find_ariadne_compiler_path "${compiler}" || true)"
         resolved="${result%%|*}"
         method="${result#*|}"
@@ -363,15 +382,15 @@ ensure_ariadne_compilers_on_path() {
         bin_dir="$(dirname "${resolved}")"
         ichor_csf_prepend_path_once "${bin_dir}"
         case "${compiler}" in
-            icx) ARIADNE_CC="${resolved}"; ARIADNE_CC_METHOD="${method}" ;;
-            icpx) ARIADNE_CXX="${resolved}"; ARIADNE_CXX_METHOD="${method}" ;;
+            icx|icc) ARIADNE_CC="${resolved}"; ARIADNE_CC_METHOD="${method}" ;;
+            icpx|icpc) ARIADNE_CXX="${resolved}"; ARIADNE_CXX_METHOD="${method}" ;;
             ifx|ifort) ARIADNE_FC="${resolved}"; ARIADNE_FC_METHOD="${method}" ;;
         esac
     done
     hash -r 2>/dev/null || true
     if [[ "${missing}" -ne 0 ]]; then
         module_debug "ARIADNE compiler check after module load"
-        die "ARIADNE compiler modules did not expose icx/icpx/${fortran_compiler}"
+        die "ARIADNE compiler modules did not expose ${c_compiler}/${cxx_compiler}/${fortran_compiler}"
     fi
 }
 
@@ -620,11 +639,13 @@ load_ariadne_modules() {
 }
 
 resolve_ariadne_compilers() {
-    local fortran_compiler
+    local c_compiler cxx_compiler fortran_compiler
+    c_compiler="$(ariadne_c_compiler_name)"
+    cxx_compiler="$(ariadne_cxx_compiler_name)"
     fortran_compiler="$(ariadne_fortran_compiler_name)"
     ensure_ariadne_compilers_on_path
-    resolve_required_cmd_into ARIADNE_CC icx "ARIADNE requires the Intel oneAPI C compiler. Run 'module list' and check the oneAPI compiler module."
-    resolve_required_cmd_into ARIADNE_CXX icpx "ARIADNE requires the Intel oneAPI C++ compiler. Run 'module list' and check the oneAPI compiler module."
+    resolve_required_cmd_into ARIADNE_CC "${c_compiler}" "ARIADNE requires a supported Intel oneAPI C compiler. Run 'module list' and check the oneAPI compiler module."
+    resolve_required_cmd_into ARIADNE_CXX "${cxx_compiler}" "ARIADNE requires a supported Intel oneAPI C++ compiler. Run 'module list' and check the oneAPI compiler module."
     resolve_required_cmd_into ARIADNE_FC "${fortran_compiler}" "ARIADNE requires a supported Intel oneAPI Fortran compiler. Run 'module list' and check the oneAPI compiler module."
 }
 
@@ -1693,7 +1714,11 @@ doctor_load_ariadne_modules() {
 
 doctor_print_ariadne_compiler_discovery() {
     local compiler result resolved method
-    for compiler in icx icpx ifx; do
+    local c_compiler cxx_compiler fortran_compiler
+    c_compiler="$(ariadne_c_compiler_name)"
+    cxx_compiler="$(ariadne_cxx_compiler_name)"
+    fortran_compiler="$(ariadne_fortran_compiler_name)"
+    for compiler in "${c_compiler}" "${cxx_compiler}" "${fortran_compiler}"; do
         if [[ "${DRY_RUN}" -eq 1 ]]; then
             echo "${compiler}: <dry-run>"
             continue
