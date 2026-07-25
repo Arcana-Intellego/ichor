@@ -97,6 +97,8 @@ def test_env_script_contains_required_runtime_contracts():
     assert "python/3.11.3-gcccore-12.3.0" in text
     assert "compilers/oneapi/2024.2.0" in text
     assert "mkl/2024.2" in text
+    assert "libmkl_intel_lp64.so.1" in text
+    assert "ICHOR_MKL_RUNTIME_DIR" in text
     assert "unset CC CXX FC F77 F90" in text
     assert 'export ICHOR_MACHINE="${machine}"' in text
     assert "PLUMED_KERNEL" in text

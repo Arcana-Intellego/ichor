@@ -112,6 +112,8 @@ def test_install_script_is_present():
     assert 'resolve_required_cmd_into ARIADNE_CC "${c_compiler}"' in text
     assert 'resolve_required_cmd_into ARIADNE_CXX "${cxx_compiler}"' in text
     assert 'resolve_required_cmd_into ARIADNE_FC "${fortran_compiler}"' in text
+    assert "libmkl_intel_lp64.so.1" in text
+    assert "ICHOR_MKL_RUNTIME_DIR" in text
     assert "deactivate_existing_venv" in text
     assert "export CC=\"${ARIADNE_CC}\"" in text
     assert "export CXX=\"${ARIADNE_CXX}\"" in text
@@ -388,6 +390,7 @@ def test_ffluxlab_ariadne_dry_run_uses_classic_intel_toolchain(tmp_path):
     assert "CC=<resolved:icc>" in output
     assert "CXX=<resolved:icpc>" in output
     assert "FC=<resolved:ifort>" in output
+    assert "resolve 64-bit Intel and MKL runtimes" in output
 
 
 def test_install_script_config_uses_canonical_gaussian_profiles(tmp_path):

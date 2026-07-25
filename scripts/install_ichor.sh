@@ -593,10 +593,11 @@ load_python_stack() {
 resolve_ffluxlab_intel_runtime() {
     [[ "${MACHINE}" == "ffluxlab" ]] || return 0
     local configured_root="/home/modules/compilers/intel/21.0.3"
-    local intel_root libimf runtime_dir
+    local intel_root libimf libmkl runtime_dir mkl_runtime_dir
     if [[ "${DRY_RUN}" -eq 1 ]]; then
-        echo "+ resolve 64-bit Intel runtime beneath ${configured_root}"
+        echo "+ resolve 64-bit Intel and MKL runtimes beneath ${configured_root}"
         export ICHOR_INTEL_RUNTIME_DIR="<resolved-intel64-runtime>"
+        export ICHOR_MKL_RUNTIME_DIR="<resolved-mkl-intel64-runtime>"
         return 0
     fi
     intel_root="$(readlink -f "${configured_root}" 2>/dev/null || true)"
@@ -609,10 +610,23 @@ resolve_ffluxlab_intel_runtime() {
     )"
     [[ -n "${libimf}" ]] \
         || die "64-bit libimf.so is absent beneath ${intel_root}"
+    libmkl="${MKLROOT:+${MKLROOT}/lib/intel64/libmkl_intel_lp64.so.1}"
+    if [[ -z "${libmkl}" || ! -e "${libmkl}" ]]; then
+        libmkl="$(
+            find "${intel_root}" \
+                \( -type f -o -type l \) \
+                -path '*/mkl/*/lib/intel64/libmkl_intel_lp64.so.1' \
+                -print -quit
+        )"
+    fi
+    [[ -n "${libmkl}" ]] \
+        || die "64-bit libmkl_intel_lp64.so.1 is absent beneath ${intel_root}"
     runtime_dir="$(dirname "${libimf}")"
-    export LD_LIBRARY_PATH="${runtime_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-    export LIBRARY_PATH="${runtime_dir}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+    mkl_runtime_dir="$(dirname "${libmkl}")"
+    export LD_LIBRARY_PATH="${runtime_dir}:${mkl_runtime_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    export LIBRARY_PATH="${runtime_dir}:${mkl_runtime_dir}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
     export ICHOR_INTEL_RUNTIME_DIR="${runtime_dir}"
+    export ICHOR_MKL_RUNTIME_DIR="${mkl_runtime_dir}"
 }
 
 load_ariadne_modules() {
@@ -1249,9 +1263,15 @@ EOF
 module load compilers/intel/21.0.3
 intel_root="$(readlink -f /home/modules/compilers/intel/21.0.3)"
 intel_runtime="$(find "$intel_root" \( -type f -o -type l \) -path '*/intel64_lin/libimf.so' -print -quit)"
+intel_mkl="${MKLROOT:+$MKLROOT/lib/intel64/libmkl_intel_lp64.so.1}"
+if [[ -z "$intel_mkl" || ! -e "$intel_mkl" ]]; then
+    intel_mkl="$(find "$intel_root" \( -type f -o -type l \) -path '*/mkl/*/lib/intel64/libmkl_intel_lp64.so.1' -print -quit)"
+fi
+[[ -n "$intel_runtime" && -n "$intel_mkl" ]] || { echo "Intel runtime discovery failed" >&2; exit 1; }
 intel_runtime="$(dirname "$intel_runtime")"
-export LD_LIBRARY_PATH="$intel_runtime:$HOME/opt/python-3.11.15/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export LIBRARY_PATH="$intel_runtime${LIBRARY_PATH:+:$LIBRARY_PATH}"
+intel_mkl="$(dirname "$intel_mkl")"
+export LD_LIBRARY_PATH="$intel_runtime:$intel_mkl:$HOME/opt/python-3.11.15/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LIBRARY_PATH="$intel_runtime:$intel_mkl${LIBRARY_PATH:+:$LIBRARY_PATH}"
 EOF
         echo "source ${VENV:-${HOME}/.venv/ichor-ffluxlab}/bin/activate" >&2
     fi
@@ -1687,7 +1707,7 @@ doctor_load_ariadne_modules() {
             echo "+ module load mkl/2024.2"
         else
             echo "+ module load compilers/intel/21.0.3"
-            echo "+ resolve 64-bit Intel runtime beneath /home/modules/compilers/intel/21.0.3"
+            echo "+ resolve 64-bit Intel and MKL runtimes beneath /home/modules/compilers/intel/21.0.3"
         fi
         return 0
     fi

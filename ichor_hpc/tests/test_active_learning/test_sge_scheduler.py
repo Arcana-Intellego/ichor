@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -484,11 +486,40 @@ def test_sge_scripts_use_native_directives_and_generic_task_identity(
         assert "#$ -t " not in body
         assert "export ICHOR_SCHEDULER_ARRAY_TASK_ID=0" in body
     assert "module load compilers/intel/21.0.3" in body
+    assert "libmkl_intel_lp64.so.1" in body
+    assert 'ICHOR_MKL_RUNTIME_DIR="$(dirname "$ICHOR_MKL_LP64")"' in body
+    assert "$ICHOR_INTEL_RUNTIME_DIR:$ICHOR_MKL_RUNTIME_DIR" in body
     if phase == "INITIAL_GAUSSIAN":
         assert "module load apps/gaussian/g09" in body
     if phase == "INITIAL_AIMALL":
         assert "module load apps/aimall/19.02.13" in body
     assert marker in body
+
+
+def test_sge_script_native_runtime_setup_is_valid_bash(tmp_path, monkeypatch):
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash is not available on this host")
+    _install_ffluxlab_profile(monkeypatch)
+    body = build_scheduler_script(
+        phase_name="ARIADNE_ARRAY",
+        iteration=1,
+        campaign_dir=Path("/scratch/campaign"),
+        config=_explicit_sge_config(),
+        array_size=2,
+        scheduler_kind="sge",
+    )
+    script = tmp_path / "job.sh"
+    script.write_text(body, encoding="utf-8")
+
+    result = subprocess.run(
+        [bash, "-n", str(script)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_sge_serial_resource_translation_uses_no_parallel_environment(monkeypatch):
@@ -533,6 +564,8 @@ def test_sge_submitted_environment_smoke_uses_single_core_serial_queue(
     assert "#$ -pe " not in body
     assert "module load apps/gaussian/g09" in body
     assert "module load apps/aimall/19.02.13" in body
+    assert "libmkl_intel_lp64.so.1" in body
+    assert "$ICHOR_INTEL_RUNTIME_DIR:$ICHOR_MKL_RUNTIME_DIR" in body
     assert "#SBATCH" not in body
 
 

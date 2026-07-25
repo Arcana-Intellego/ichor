@@ -169,7 +169,7 @@ _ichor_env_load_runtime_modules() {
 
 _ichor_env_ffluxlab_intel_runtime() {
     local configured_root="/home/modules/compilers/intel/21.0.3"
-    local intel_root libimf runtime_dir
+    local intel_root libimf libmkl runtime_dir mkl_runtime_dir
     intel_root="$(readlink -f "${configured_root}" 2>/dev/null || true)"
     if [[ -z "${intel_root}" || ! -d "${intel_root}" ]]; then
         _ichor_env_error "ffluxlab Intel module root is unavailable: ${configured_root}"
@@ -184,10 +184,28 @@ _ichor_env_ffluxlab_intel_runtime() {
         _ichor_env_error "64-bit libimf.so is absent beneath ${intel_root}"
         return 1
     fi
+    libmkl="${MKLROOT:+${MKLROOT}/lib/intel64/libmkl_intel_lp64.so.1}"
+    if [[ -z "${libmkl}" || ! -e "${libmkl}" ]]; then
+        libmkl="$(
+            find "${intel_root}" \
+                \( -type f -o -type l \) \
+                -path '*/mkl/*/lib/intel64/libmkl_intel_lp64.so.1' \
+                -print -quit
+        )"
+    fi
+    if [[ -z "${libmkl}" ]]; then
+        _ichor_env_error \
+            "64-bit libmkl_intel_lp64.so.1 is absent beneath ${intel_root}"
+        return 1
+    fi
     runtime_dir="$(dirname "${libimf}")"
-    _ichor_env_prepend_ld_library_paths_once "${runtime_dir}"
-    export LIBRARY_PATH="${runtime_dir}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+    mkl_runtime_dir="$(dirname "${libmkl}")"
+    _ichor_env_prepend_ld_library_paths_once \
+        "${runtime_dir}" \
+        "${mkl_runtime_dir}"
+    export LIBRARY_PATH="${runtime_dir}:${mkl_runtime_dir}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
     export ICHOR_INTEL_RUNTIME_DIR="${runtime_dir}"
+    export ICHOR_MKL_RUNTIME_DIR="${mkl_runtime_dir}"
 }
 
 _ichor_env_check_venv_ownership() {
@@ -328,6 +346,7 @@ _ichor_env_main() {
         _ichor_env_prepend_ld_library_paths_once \
             "${python_prefix}/lib" \
             "${ICHOR_INTEL_RUNTIME_DIR:-}" \
+            "${ICHOR_MKL_RUNTIME_DIR:-}" \
             "${plumed_prefix}/lib"
     else
         _ichor_env_prepend_ld_library_paths_once "${plumed_prefix}/lib"

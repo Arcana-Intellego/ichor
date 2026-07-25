@@ -147,19 +147,38 @@ def native_runtime_setup_lines() -> List[str]:
         (
             'ICHOR_INTEL_LIBIMF="$(find "$ICHOR_INTEL_ROOT" '
             "\\( -type f -o -type l \\) "
-            "-path '*/intel64_lin/libimf.so' -print -quit)"
+            "-path '*/intel64_lin/libimf.so' -print -quit)\""
         ),
         (
             '[ -n "$ICHOR_INTEL_LIBIMF" ] || '
             "{ echo '64-bit Intel runtime is unavailable' >&2; exit 1; }"
         ),
+        (
+            'ICHOR_MKL_LP64="${MKLROOT:+$MKLROOT/lib/intel64/'
+            'libmkl_intel_lp64.so.1}"'
+        ),
+        'if [ -z "$ICHOR_MKL_LP64" ] || [ ! -e "$ICHOR_MKL_LP64" ]; then',
+        (
+            '  ICHOR_MKL_LP64="$(find "$ICHOR_INTEL_ROOT" '
+            "\\( -type f -o -type l \\) "
+            "-path '*/mkl/*/lib/intel64/libmkl_intel_lp64.so.1' "
+            "-print -quit)\""
+        ),
+        "fi",
+        (
+            '[ -n "$ICHOR_MKL_LP64" ] || '
+            "{ echo '64-bit Intel MKL runtime is unavailable' >&2; exit 1; }"
+        ),
         'ICHOR_INTEL_RUNTIME_DIR="$(dirname "$ICHOR_INTEL_LIBIMF")"',
+        'ICHOR_MKL_RUNTIME_DIR="$(dirname "$ICHOR_MKL_LP64")"',
         (
             'export LD_LIBRARY_PATH="$ICHOR_INTEL_RUNTIME_DIR'
+            ':$ICHOR_MKL_RUNTIME_DIR'
             '${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"'
         ),
         (
             'export LIBRARY_PATH="$ICHOR_INTEL_RUNTIME_DIR'
+            ':$ICHOR_MKL_RUNTIME_DIR'
             '${LIBRARY_PATH:+:$LIBRARY_PATH}"'
         ),
     ]
