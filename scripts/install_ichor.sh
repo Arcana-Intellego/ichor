@@ -254,6 +254,10 @@ backup_existing_path() {
 require_dir() {
     local path="$1"
     local label="$2"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        [[ -d "${path}" ]] || warn "dry-run: ${label} not found yet: ${path}"
+        return 0
+    fi
     if [[ ! -d "${path}" ]]; then
         die "${label} not found: ${path}"
     fi

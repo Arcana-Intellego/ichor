@@ -183,6 +183,50 @@ def test_install_script_dry_run_renders_cluster_defaults(machine, venv_name, tmp
     ) in output
 
 
+def test_install_script_dry_run_plans_missing_public_checkouts(tmp_path):
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash is not available on this host")
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+
+    result = subprocess.run(
+        [
+            bash,
+            str(SCRIPT),
+            "--dry-run",
+            "--machine",
+            "ffluxlab",
+            "--projects-dir",
+            str(projects),
+            "--repo-root",
+            str(REPO_ROOT),
+            "--allow-download",
+            "--yes",
+        ],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert (
+        "git clone --branch main --single-branch "
+        "https://github.com/Arcana-Intellego/ARIADNE.git"
+    ) in output
+    assert (
+        "git clone --branch restore-gradient-refinement --single-branch "
+        "https://github.com/Arcana-Intellego/FEREBUS_CPU.git"
+    ) in output
+
+
 def test_install_script_dry_run_uses_parallel_build_flags(tmp_path):
     result = _run_dry("csf4", tmp_path)
 
