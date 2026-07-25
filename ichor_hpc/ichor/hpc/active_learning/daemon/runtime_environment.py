@@ -143,6 +143,12 @@ def native_runtime_setup_lines() -> List[str]:
     if (active_machine() or "").lower() != "ffluxlab":
         return []
     return [
+        'ICHOR_GCC_ROOT="$(readlink -f /home/modules/compilers/gcc/11.1.0)"',
+        'ICHOR_GCC_LIBSTDCXX="$ICHOR_GCC_ROOT/lib64/libstdc++.so.6"',
+        (
+            '[ -e "$ICHOR_GCC_LIBSTDCXX" ] || '
+            "{ echo 'GCC 11 libstdc++ runtime is unavailable' >&2; exit 1; }"
+        ),
         'ICHOR_INTEL_ROOT="$(readlink -f /home/modules/compilers/intel/21.0.3)"',
         (
             'ICHOR_INTEL_LIBIMF="$(find "$ICHOR_INTEL_ROOT" '
@@ -169,15 +175,18 @@ def native_runtime_setup_lines() -> List[str]:
             '[ -n "$ICHOR_MKL_LP64" ] || '
             "{ echo '64-bit Intel MKL runtime is unavailable' >&2; exit 1; }"
         ),
+        'ICHOR_GCC_RUNTIME_DIR="$(dirname "$ICHOR_GCC_LIBSTDCXX")"',
         'ICHOR_INTEL_RUNTIME_DIR="$(dirname "$ICHOR_INTEL_LIBIMF")"',
         'ICHOR_MKL_RUNTIME_DIR="$(dirname "$ICHOR_MKL_LP64")"',
         (
-            'export LD_LIBRARY_PATH="$ICHOR_INTEL_RUNTIME_DIR'
+            'export LD_LIBRARY_PATH="$ICHOR_GCC_RUNTIME_DIR'
+            ':$ICHOR_INTEL_RUNTIME_DIR'
             ':$ICHOR_MKL_RUNTIME_DIR'
             '${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"'
         ),
         (
-            'export LIBRARY_PATH="$ICHOR_INTEL_RUNTIME_DIR'
+            'export LIBRARY_PATH="$ICHOR_GCC_RUNTIME_DIR'
+            ':$ICHOR_INTEL_RUNTIME_DIR'
             ':$ICHOR_MKL_RUNTIME_DIR'
             '${LIBRARY_PATH:+:$LIBRARY_PATH}"'
         ),

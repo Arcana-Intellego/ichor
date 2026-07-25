@@ -45,6 +45,13 @@ def _configured_plumed_exports() -> List[str]:
     exports = []
     kernel_path = _config_value("software", "plumed", "kernel_path")
     library_path = _config_value("software", "plumed", "library_path")
+    loader_paths = [
+        _expand_path(value)
+        for value in _as_list(
+            _config_value("software", "python", "library_path", default=[])
+        )
+        if str(value).strip()
+    ]
 
     if kernel_path:
         expanded_kernel = _expand_path(kernel_path)
@@ -54,9 +61,13 @@ def _configured_plumed_exports() -> List[str]:
 
     if library_path:
         expanded_library = _expand_path(library_path)
+        if expanded_library not in loader_paths:
+            loader_paths.append(expanded_library)
+    if loader_paths:
         exports.append(
             "export LD_LIBRARY_PATH="
-            f"{shlex.quote(expanded_library)}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
+            f"{shlex.quote(':'.join(loader_paths))}"
+            "${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         )
 
     return exports

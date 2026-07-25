@@ -99,7 +99,20 @@ def upsert_profile(
     if machine == "csf3":
         python["library_path"] = str(python_library_path)
     elif machine == "ffluxlab":
-        python["library_path"] = [str(python_library_path)]
+        canonical_paths = python.get("library_path")
+        retained_paths = (
+            [str(value) for value in canonical_paths[1:]]
+            if isinstance(canonical_paths, list)
+            else []
+        )
+        python["library_path"] = [
+            str(python_library_path),
+            *[
+                value
+                for value in retained_paths
+                if value != str(python_library_path)
+            ],
+        ]
     software.setdefault("aimall", {})["executable_path"] = str(aimall_path)
     software.setdefault("ferebus", {})["executable_path"] = str(ferebus_path)
     plumed = software.setdefault("plumed", {})

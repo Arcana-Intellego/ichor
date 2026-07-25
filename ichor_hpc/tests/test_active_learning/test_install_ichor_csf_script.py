@@ -114,6 +114,8 @@ def test_install_script_is_present():
     assert 'resolve_required_cmd_into ARIADNE_FC "${fortran_compiler}"' in text
     assert "libmkl_intel_lp64.so.1" in text
     assert "ICHOR_MKL_RUNTIME_DIR" in text
+    assert "libstdc++.so.6" in text
+    assert "ICHOR_GCC_RUNTIME_DIR" in text
     assert "deactivate_existing_venv" in text
     assert "export CC=\"${ARIADNE_CC}\"" in text
     assert "export CXX=\"${ARIADNE_CXX}\"" in text
@@ -503,6 +505,44 @@ def test_profile_upsert_is_atomic_and_preserves_unrelated_profiles(tmp_path):
     assert not list(tmp_path.glob("ichor_config.yaml.tmp.*"))
 
 
+def test_ffluxlab_profile_upsert_retains_gcc_runtime_path(tmp_path):
+    destination = tmp_path / "ichor_config.yaml"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(UPSERT),
+            "--destination",
+            str(destination),
+            "--canonical-config",
+            str(CANONICAL_PROFILE),
+            "--machine",
+            "ffluxlab",
+            "--python-path",
+            "$HOME/.venv/ichor-ffluxlab/bin/python",
+            "--python-library-path",
+            "$HOME/opt/python-3.11.15/lib",
+            "--aimall-path",
+            "aimall",
+            "--ferebus-path",
+            "$HOME/.local/bin/ferebus",
+            "--plumed-kernel",
+            "$HOME/opt/plumed-2.10.0/lib/libplumedKernel.so",
+            "--plumed-library-path",
+            "$HOME/opt/plumed-2.10.0/lib",
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    installed = yaml.safe_load(destination.read_text(encoding="utf-8"))
+    assert installed["ffluxlab"]["software"]["python"]["library_path"] == [
+        "$HOME/opt/python-3.11.15/lib",
+        "/home/modules/compilers/gcc/11.1.0/lib64",
+    ]
+
+
 def test_canonical_csf_profiles_match_documented_limits(monkeypatch, tmp_path):
     from ichor.hpc.active_learning.daemon.cluster_profile import (
         ClusterProfile,
@@ -513,6 +553,7 @@ def test_canonical_csf_profiles_match_documented_limits(monkeypatch, tmp_path):
     profiles = yaml.safe_load(CANONICAL_PROFILE.read_text(encoding="utf-8"))
     csf3 = profiles["csf3"]
     csf4 = profiles["csf4"]
+    ffluxlab = profiles["ffluxlab"]
 
     assert csf3["hpc"]["jobscript_shebang"] == "#!/bin/bash --login"
     assert csf3["hpc"]["partitions"]["serial"]["memory_per_core_gb"] == 4
@@ -523,8 +564,15 @@ def test_canonical_csf_profiles_match_documented_limits(monkeypatch, tmp_path):
     assert csf4["hpc"]["jobscript_shebang"] == "#!/bin/bash --login"
     assert csf4["hpc"]["partitions"]["multicore"]["max_cpus"] == 40
     assert "multinode" not in csf4["hpc"]["partitions"]
+    assert (
+        "/home/modules/compilers/gcc/11.1.0/lib64"
+        in ffluxlab["software"]["python"]["library_path"]
+    )
     validate_cluster_profile(ClusterProfile(machine="csf3", config=profiles))
     validate_cluster_profile(ClusterProfile(machine="csf4", config=profiles))
+    validate_cluster_profile(
+        ClusterProfile(machine="ffluxlab", config=profiles)
+    )
 
 
 def test_cluster_profile_rejects_relative_submitted_python_path(monkeypatch, tmp_path):

@@ -637,6 +637,35 @@ resolve_ffluxlab_intel_runtime() {
     export ICHOR_MKL_RUNTIME_DIR="${mkl_runtime_dir}"
 }
 
+resolve_ffluxlab_gcc_runtime() {
+    [[ "${MACHINE}" == "ffluxlab" ]] || return 0
+    local configured_root="/home/modules/compilers/gcc/11.1.0"
+    local gcc_root libstdcxx runtime_dir
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "+ resolve GCC 11 libstdc++ runtime beneath ${configured_root}"
+        export ICHOR_GCC_RUNTIME_DIR="<resolved-gcc11-runtime>"
+        return 0
+    fi
+    gcc_root="$(readlink -f "${configured_root}" 2>/dev/null || true)"
+    [[ -n "${gcc_root}" && -d "${gcc_root}" ]] \
+        || die "ffluxlab GCC module root is unavailable: ${configured_root}"
+    libstdcxx="${gcc_root}/lib64/libstdc++.so.6"
+    if [[ ! -e "${libstdcxx}" ]]; then
+        libstdcxx="$(
+            find "${gcc_root}" \
+                \( -type f -o -type l \) \
+                -path '*/lib64/libstdc++.so.6' \
+                -print -quit
+        )"
+    fi
+    [[ -n "${libstdcxx}" && -e "${libstdcxx}" ]] \
+        || die "GCC 11 libstdc++.so.6 is absent beneath ${gcc_root}"
+    runtime_dir="$(dirname "${libstdcxx}")"
+    export LD_LIBRARY_PATH="${runtime_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    export LIBRARY_PATH="${runtime_dir}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+    export ICHOR_GCC_RUNTIME_DIR="${runtime_dir}"
+}
+
 load_ariadne_modules() {
     module_cmd purge
     if [[ "${MACHINE}" == "csf3" ]]; then
@@ -653,6 +682,7 @@ load_ariadne_modules() {
     else
         module_cmd load compilers/intel/21.0.3
         resolve_ffluxlab_intel_runtime
+        resolve_ffluxlab_gcc_runtime
         export LD_LIBRARY_PATH="${PYTHON_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
     fi
     if [[ "${DRY_RUN}" -eq 0 ]]; then
@@ -1278,8 +1308,11 @@ fi
 [[ -n "$intel_runtime" && -n "$intel_mkl" ]] || { echo "Intel runtime discovery failed" >&2; exit 1; }
 intel_runtime="$(dirname "$intel_runtime")"
 intel_mkl="$(dirname "$intel_mkl")"
-export LD_LIBRARY_PATH="$intel_runtime:$intel_mkl:$HOME/opt/python-3.11.15/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export LIBRARY_PATH="$intel_runtime:$intel_mkl${LIBRARY_PATH:+:$LIBRARY_PATH}"
+gcc_root="$(readlink -f /home/modules/compilers/gcc/11.1.0)"
+gcc_runtime="$gcc_root/lib64"
+[[ -e "$gcc_runtime/libstdc++.so.6" ]] || { echo "GCC 11 runtime discovery failed" >&2; exit 1; }
+export LD_LIBRARY_PATH="$gcc_runtime:$intel_runtime:$intel_mkl:$HOME/opt/python-3.11.15/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LIBRARY_PATH="$gcc_runtime:$intel_runtime:$intel_mkl${LIBRARY_PATH:+:$LIBRARY_PATH}"
 EOF
         echo "source ${VENV:-${HOME}/.venv/ichor-ffluxlab}/bin/activate" >&2
     fi
@@ -1308,6 +1341,7 @@ install_ariadne_if_needed() {
         echo "ARIADNE already importable"
         verify_ariadne_api
         assert_ariadne_inside_venv
+        write_ariadne_receipt
         return 0
     fi
     if [[ "${SKIP_ARIADNE_BUILD}" -eq 1 ]]; then
@@ -1808,6 +1842,7 @@ doctor_load_ariadne_modules() {
     else
         ichor_csf_module load compilers/intel/21.0.3 || return 1
         resolve_ffluxlab_intel_runtime || return 1
+        resolve_ffluxlab_gcc_runtime || return 1
     fi
 }
 

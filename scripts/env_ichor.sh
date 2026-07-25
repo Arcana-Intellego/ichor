@@ -208,6 +208,34 @@ _ichor_env_ffluxlab_intel_runtime() {
     export ICHOR_MKL_RUNTIME_DIR="${mkl_runtime_dir}"
 }
 
+_ichor_env_ffluxlab_gcc_runtime() {
+    local configured_root="/home/modules/compilers/gcc/11.1.0"
+    local gcc_root libstdcxx runtime_dir
+    gcc_root="$(readlink -f "${configured_root}" 2>/dev/null || true)"
+    if [[ -z "${gcc_root}" || ! -d "${gcc_root}" ]]; then
+        _ichor_env_error "ffluxlab GCC module root is unavailable: ${configured_root}"
+        return 1
+    fi
+    libstdcxx="${gcc_root}/lib64/libstdc++.so.6"
+    if [[ ! -e "${libstdcxx}" ]]; then
+        libstdcxx="$(
+            find "${gcc_root}" \
+                \( -type f -o -type l \) \
+                -path '*/lib64/libstdc++.so.6' \
+                -print -quit
+        )"
+    fi
+    if [[ -z "${libstdcxx}" || ! -e "${libstdcxx}" ]]; then
+        _ichor_env_error \
+            "GCC 11 libstdc++.so.6 is absent beneath ${gcc_root}"
+        return 1
+    fi
+    runtime_dir="$(dirname "${libstdcxx}")"
+    _ichor_env_prepend_ld_library_paths_once "${runtime_dir}"
+    export LIBRARY_PATH="${runtime_dir}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+    export ICHOR_GCC_RUNTIME_DIR="${runtime_dir}"
+}
+
 _ichor_env_check_venv_ownership() {
     local venv="$1"
     local cmd resolved
@@ -335,6 +363,7 @@ _ichor_env_main() {
     _ichor_env_load_runtime_modules "${machine}" "${do_purge}" || return 1
     if [[ "${machine}" == "ffluxlab" ]]; then
         _ichor_env_ffluxlab_intel_runtime || return 1
+        _ichor_env_ffluxlab_gcc_runtime || return 1
     fi
 
     unset CC CXX FC F77 F90
@@ -345,6 +374,7 @@ _ichor_env_main() {
     if [[ "${machine}" == "csf3" || "${machine}" == "ffluxlab" ]]; then
         _ichor_env_prepend_ld_library_paths_once \
             "${python_prefix}/lib" \
+            "${ICHOR_GCC_RUNTIME_DIR:-}" \
             "${ICHOR_INTEL_RUNTIME_DIR:-}" \
             "${ICHOR_MKL_RUNTIME_DIR:-}" \
             "${plumed_prefix}/lib"
@@ -398,6 +428,7 @@ unset -f _ichor_env_usage _ichor_env_error _ichor_env_note _ichor_env_module
 unset -f _ichor_env_prepend_ld_library_paths_once
 unset -f _ichor_env_import_check _ichor_env_print_env _ichor_env_load_runtime_modules
 unset -f _ichor_env_ffluxlab_intel_runtime
+unset -f _ichor_env_ffluxlab_gcc_runtime
 unset -f _ichor_env_check_venv_ownership _ichor_env_main
 unset ICHOR_ENV_QUIET _ichor_env_script_dir
 return "${_ichor_env_rc}"

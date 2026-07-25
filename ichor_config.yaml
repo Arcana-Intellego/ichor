@@ -247,6 +247,7 @@ ffluxlab:
       python_path: "$HOME/.venv/ichor-ffluxlab/bin/python"
       library_path:
         - "$HOME/opt/python-3.11.15/lib"
+        - "/home/modules/compilers/gcc/11.1.0/lib64"
       modules: []
 
     plumed:

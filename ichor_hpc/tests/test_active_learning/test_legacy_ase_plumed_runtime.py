@@ -106,3 +106,47 @@ def test_python_command_exports_configured_plumed_runtime():
     assert "export PLUMED_KERNEL" in source
     assert "export LD_LIBRARY_PATH" in source
     assert '_configured_modules("python") + _configured_modules("plumed")' in source
+
+
+def test_python_command_exports_native_paths_before_plumed(monkeypatch):
+    from ichor.hpc.submission_commands import python_command
+
+    values = {
+        ("software", "python", "library_path"): [
+            "/home/user/opt/python-3.11.15/lib",
+            "/home/modules/compilers/gcc/11.1.0/lib64",
+        ],
+        ("software", "plumed", "kernel_path"): (
+            "/home/user/opt/plumed-2.10.0/lib/libplumedKernel.so"
+        ),
+        ("software", "plumed", "library_path"): (
+            "/home/user/opt/plumed-2.10.0/lib"
+        ),
+    }
+
+    monkeypatch.setattr(
+        python_command,
+        "_config_value",
+        lambda *keys, default=None: values.get(tuple(keys), default),
+    )
+    monkeypatch.setattr(
+        python_command,
+        "_expand_path",
+        lambda value: str(value),
+    )
+
+    exports = python_command._configured_plumed_exports()
+
+    assert exports == [
+        (
+            "export PLUMED_KERNEL="
+            "/home/user/opt/plumed-2.10.0/lib/libplumedKernel.so"
+        ),
+        (
+            "export LD_LIBRARY_PATH="
+            "/home/user/opt/python-3.11.15/lib:"
+            "/home/modules/compilers/gcc/11.1.0/lib64:"
+            "/home/user/opt/plumed-2.10.0/lib"
+            "${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        ),
+    ]

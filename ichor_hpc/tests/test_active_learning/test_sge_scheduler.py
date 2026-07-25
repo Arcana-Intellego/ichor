@@ -140,7 +140,10 @@ def _install_ffluxlab_profile(monkeypatch):
             "software": {
                 "python": {
                     "python_path": "/home/user/.venv/ichor-ffluxlab/bin/python",
-                    "library_path": ["/home/user/opt/python-3.11.15/lib"],
+                    "library_path": [
+                        "/home/user/opt/python-3.11.15/lib",
+                        "/home/modules/compilers/gcc/11.1.0/lib64",
+                    ],
                     "modules": [],
                 },
                 "ariadne_runtime": {
@@ -487,8 +490,13 @@ def test_sge_scripts_use_native_directives_and_generic_task_identity(
         assert "export ICHOR_SCHEDULER_ARRAY_TASK_ID=0" in body
     assert "module load compilers/intel/21.0.3" in body
     assert "libmkl_intel_lp64.so.1" in body
+    assert "libstdc++.so.6" in body
+    assert "ICHOR_GCC_RUNTIME_DIR" in body
     assert 'ICHOR_MKL_RUNTIME_DIR="$(dirname "$ICHOR_MKL_LP64")"' in body
-    assert "$ICHOR_INTEL_RUNTIME_DIR:$ICHOR_MKL_RUNTIME_DIR" in body
+    assert (
+        "$ICHOR_GCC_RUNTIME_DIR:$ICHOR_INTEL_RUNTIME_DIR:"
+        "$ICHOR_MKL_RUNTIME_DIR"
+    ) in body
     if phase == "INITIAL_GAUSSIAN":
         assert "module load apps/gaussian/g09" in body
     if phase == "INITIAL_AIMALL":
@@ -547,7 +555,10 @@ def test_sge_submitted_environment_smoke_uses_single_core_serial_queue(
     config = _explicit_sge_config()
     availability = SimpleNamespace(
         batch_runtime_modules=("compilers/intel/21.0.3",),
-        batch_python_library_paths=("/home/user/opt/python-3.11.15/lib",),
+        batch_python_library_paths=(
+            "/home/user/opt/python-3.11.15/lib",
+            "/home/modules/compilers/gcc/11.1.0/lib64",
+        ),
         python_executable="/home/user/.venv/ichor-ffluxlab/bin/python",
         gaussian_binary="/home/modules/apps/gaussian/g09/g09",
         aimall_path="/home/modules/apps/aimall/19.02.13/AIMAll/aimall",
@@ -565,7 +576,11 @@ def test_sge_submitted_environment_smoke_uses_single_core_serial_queue(
     assert "module load apps/gaussian/g09" in body
     assert "module load apps/aimall/19.02.13" in body
     assert "libmkl_intel_lp64.so.1" in body
-    assert "$ICHOR_INTEL_RUNTIME_DIR:$ICHOR_MKL_RUNTIME_DIR" in body
+    assert "libstdc++.so.6" in body
+    assert (
+        "$ICHOR_GCC_RUNTIME_DIR:$ICHOR_INTEL_RUNTIME_DIR:"
+        "$ICHOR_MKL_RUNTIME_DIR"
+    ) in body
     assert "#SBATCH" not in body
 
 
