@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -9,6 +10,8 @@ from pathlib import Path
 
 import pytest
 import yaml
+
+from ichor.hpc.active_learning.config import CampaignConfig
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -174,6 +177,23 @@ def test_install_script_is_present():
         "scipy==1.13.1",
         "xtb==22.1",
     }
+
+
+def test_installer_smoke_campaign_matches_current_schema():
+    text = SCRIPT.read_text(encoding="utf-8")
+    match = re.search(
+        r'cat > "\$\{smoke_dir\}/campaign\.yaml" <<\'EOF\'\n'
+        r"(?P<payload>.*?)\nEOF",
+        text,
+        flags=re.DOTALL,
+    )
+    assert match is not None
+
+    config = CampaignConfig.from_dict(yaml.safe_load(match.group("payload")))
+
+    assert config.ferebus.prior_mean_strategy == "physical_atomic_iqa"
+    assert config.ferebus.prior_mean_level_of_theory == "auto"
+    assert config.ferebus.physical_prior_scale == 1.0
 
 
 def test_install_script_bash_syntax():
