@@ -1080,6 +1080,49 @@ def test_cli_status_json_prints_state_payload(tmp_path, capsys):
     assert payload["next_action"] == payload["recommendations"][0]["primary"]
 
 
+def test_cli_status_json_reports_aimall_outputs_as_reusable(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import reconcile as reconcile_module
+
+    campaign = _campaign_with_config(tmp_path)
+    (campaign / DEFAULT_DATA_SUBDIR).mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state(max_iterations=20)
+    state.phase = CampaignPhase.AIMALL
+    state.iteration = 14
+    state.reference_data_version = 13
+    state.models_version = 13
+    write_state(
+        campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME,
+        state,
+    )
+    monkeypatch.setattr(
+        reconcile_module,
+        "inspect_aimall_postprocess_recovery",
+        lambda *_args, **_kwargs: {
+            "phase": CampaignPhase.AIMALL.value,
+            "iteration": 14,
+            "logical_total": 149,
+            "n_complete": 149,
+            "n_reuse": 149,
+            "n_retry": 0,
+            "retry_task_ids": [],
+            "retry_task_file": None,
+            "force_resubmit": False,
+        },
+    )
+
+    rc = main(["status", "--campaign-dir", str(campaign), "--json"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["partial_array_recovery"]["n_reuse"] == 149
+    assert payload["partial_array_recovery"]["n_retry"] == 0
+    assert "_presentation_aimall_postprocess_recovery" not in payload
+
+
 def test_cli_status_reads_recorded_environment_without_live_capture(
     tmp_path,
     capsys,
@@ -2359,6 +2402,45 @@ def test_cli_resume_explicitly_clears_shutdown_flag(tmp_path):
     assert (stop_request_history_dir(campaign) / (request["request_id"] + ".json")).is_file()
 
 
+def test_cli_resume_retains_pending_iteration_stop_during_aimall_recovery(
+    tmp_path,
+    capsys,
+):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=40)
+    state.phase = CampaignPhase.AIMALL
+    state.iteration = 14
+    _write_locked_state(campaign, state)
+    request, _ = install_stop_request(
+        campaign,
+        build_stop_request(state, mode="after_iteration"),
+    )
+
+    rc = main(
+        [
+            "resume",
+            "--campaign-dir",
+            str(campaign),
+            "--mode",
+            "dry_run",
+            "--max-ticks",
+            "0",
+            "--foreground",
+        ]
+    )
+
+    assert rc == 0
+    retained = read_stop_request(
+        campaign,
+        expected_campaign_uid=state.campaign_uid,
+    )
+    assert retained is not None
+    assert retained["request_id"] == request["request_id"]
+    assert retained["status"] == "requested"
+    assert retained["mode"] == "after_iteration"
+    assert "active stop request retained" in capsys.readouterr().out
+
+
 def test_cli_status_reports_pending_stop_request(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     data = campaign / DEFAULT_DATA_SUBDIR
@@ -2874,6 +2956,25 @@ def test_journal_reconcile_summary_reports_ariadne_reuse_without_resubmission():
     assert (
         "reconcile applied; reusing 193 accepted ARIADNE results, "
         "7 rejected tasks excluded, no ARIADNE jobs resubmitted"
+    ) in output
+
+
+def test_journal_reconcile_summary_reports_aimall_local_reuse():
+    event = {
+        "event": "reconcile_applied",
+        "phase": CampaignPhase.AIMALL.value,
+        "iteration": 14,
+        "aimall_completed_outputs": 149,
+        "aimall_tasks_resubmitted": 0,
+    }
+
+    output = cli_mod._format_journal_events([event], verbose=False)
+
+    assert "RECONCILE" in output
+    assert "iter=14" in output
+    assert (
+        "reconcile applied; reusing 149 completed AIMAll outputs for local "
+        "validation, no AIMAll tasks resubmitted"
     ) in output
 
 

@@ -75,6 +75,7 @@ from .state import (
 __all__ = [
     "ReconciliationReport",
     "data_staging_inventory",
+    "inspect_aimall_postprocess_recovery",
     "propose_recovery",
     "restore_archived_bootstrap_handoff",
     "stateful_campaign_artifacts",
@@ -302,6 +303,7 @@ class ReconciliationReport:
     recommended_actions: List[str] = field(default_factory=list)
     recovery_candidates: List[Dict[str, Any]] = field(default_factory=list)
     partial_array_recovery: Optional[Dict[str, Any]] = None
+    aimall_postprocess_recovery: Optional[Dict[str, Any]] = None
     ariadne_results_recovery: Optional[Dict[str, Any]] = None
     ariadne_publication_recovery: Optional[Dict[str, Any]] = None
     ferebus_candidate_recovery: Optional[Dict[str, Any]] = None
@@ -346,6 +348,132 @@ def _append_recovery_candidate(
         if existing_key == key:
             return
     candidates.append(payload)
+
+
+def _inspect_aimall_postprocess_recovery(
+    campaign: Path,
+    *,
+    campaign_uid: str,
+    phase_name: str,
+    iteration: int,
+    replacement_round: int,
+    intent_records: Sequence[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Classify a scheduler-complete AIMAll attempt without reading payloads."""
+    aimall_phases = {
+        CampaignPhase.INITIAL_AIMALL.value,
+        CampaignPhase.AIMALL.value,
+        CampaignPhase.INITIAL_REPLACEMENT_AIMALL.value,
+        CampaignPhase.REPLACEMENT_AIMALL.value,
+    }
+    phase = str(phase_name)
+    if phase not in aimall_phases:
+        return None
+    matching = [
+        dict(record)
+        for record in intent_records
+        if str(record.get("phase") or "") == phase
+        and int(record.get("iteration", -1)) == int(iteration)
+        and int(record.get("replacement_round", -1))
+        == int(replacement_round)
+    ]
+    if len(matching) != 1:
+        return None
+    from .submission_intent import (
+        aimall_intent_claims_completed_array,
+        aimall_postprocess_task_contract,
+        resolve_aimall_postprocess_source,
+    )
+
+    if not aimall_intent_claims_completed_array(matching[0]):
+        return None
+    contract = aimall_postprocess_task_contract(
+        campaign,
+        phase_name=phase,
+        iteration=int(iteration),
+        replacement_round=int(replacement_round),
+        require_unpublished=False,
+    )
+    from . import input_staging as _stg
+
+    staging = Path(str(contract["staging"]))
+    publication = _stg.quantum_acceptance_manifest_path(
+        staging,
+        phase_name=phase,
+    )
+    if publication.exists() or publication.is_symlink():
+        _stg.read_quantum_acceptance_manifest(
+            staging,
+            expected_phase=phase,
+            expected_iteration=int(iteration),
+            require_nonempty=False,
+            points_membership=_stg.POINTS_MEMBERSHIP_ALL_DISPOSITIONS,
+        )
+        return None
+    source = resolve_aimall_postprocess_source(
+        campaign,
+        campaign_uid=str(campaign_uid),
+        phase_name=phase,
+        iteration=int(iteration),
+        replacement_round=int(replacement_round),
+        intent=matching[0],
+    )
+    logical_total = int(source["logical_total"])
+    return {
+        "phase": phase,
+        "iteration": int(iteration),
+        "replacement_round": int(replacement_round),
+        "logical_total": logical_total,
+        "n_complete": logical_total,
+        "n_reuse": logical_total,
+        "n_retry": 0,
+        "retry_task_ids": [],
+        "retry_task_file": None,
+        "force_resubmit": False,
+        "path": str(contract["staging"]),
+        "producer_job_id": str(source["job_id"]),
+        "producer_submission_identity": str(source["submission_identity"]),
+        "source_sha256": str(source["source_sha256"]),
+        "scheduler_jobs_submitted": 0,
+        "validation": "local_postprocess_required",
+    }
+
+
+def inspect_aimall_postprocess_recovery(
+    campaign_dir: Union[str, Path],
+    state: CampaignState,
+) -> Optional[Dict[str, Any]]:
+    """Inspect one current AIMAll postprocess-only boundary from control files."""
+    campaign = Path(campaign_dir)
+    if state.phase.value not in {
+        CampaignPhase.INITIAL_AIMALL.value,
+        CampaignPhase.AIMALL.value,
+        CampaignPhase.INITIAL_REPLACEMENT_AIMALL.value,
+        CampaignPhase.REPLACEMENT_AIMALL.value,
+    }:
+        return None
+    inventory = _submission_intent.inventory_intents(
+        campaign,
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+    errors = list(inventory.get("errors") or [])
+    if errors:
+        raise ValueError(
+            "AIMAll postprocess intent inventory is invalid: "
+            + "; ".join(
+                str(item.get("path")) + ": " + str(item.get("error"))
+                for item in errors[:8]
+                if isinstance(item, Mapping)
+            )
+        )
+    return _inspect_aimall_postprocess_recovery(
+        campaign,
+        campaign_uid=str(state.campaign_uid),
+        phase_name=state.phase.value,
+        iteration=int(state.iteration),
+        replacement_round=int(getattr(state, "replacement_round", 0)),
+        intent_records=tuple(inventory.get("records") or []),
+    )
 
 
 def _needs_trajectory_pool_check(
@@ -552,14 +680,17 @@ def _validate_initial_ferebus_bootstrap(
     *,
     iteration: int,
 ) -> None:
-    from .input_staging import read_quantum_acceptance_manifest
+    from .input_staging import (
+        POINTS_MEMBERSHIP_ALL_DISPOSITIONS,
+        read_quantum_acceptance_manifest,
+    )
 
     read_quantum_acceptance_manifest(
         Path(campaign_dir) / ".DATA" / "STAGING" / "initial",
         expected_phase=CampaignPhase.INITIAL_AIMALL.value,
         expected_iteration=int(iteration),
         require_nonempty=True,
-        require_points_file_membership=True,
+        points_membership=POINTS_MEMBERSHIP_ALL_DISPOSITIONS,
     )
 
 
@@ -571,6 +702,9 @@ def _read_bootstrap_handoff_at(
     verification_level: str = "authority",
 ) -> Optional[Dict[str, Any]]:
     from .input_staging import (
+        POINTS_MEMBERSHIP_ALL_DISPOSITIONS,
+        POINTS_MEMBERSHIP_NONE,
+        POINTS_MEMBERSHIP_PRODUCER_OR_ACCEPTED,
         QUANTUM_ACCEPTANCE_SCHEMA_VERSION,
         _validate_pointdir_basename,
         quantum_acceptance_manifest_path,
@@ -670,7 +804,13 @@ def _read_bootstrap_handoff_at(
             expected_phase=phase,
             expected_iteration=int(expected_iteration),
             require_nonempty=True,
-            require_points_file_membership=not archived,
+            points_membership=(
+                POINTS_MEMBERSHIP_NONE
+                if archived
+                else POINTS_MEMBERSHIP_PRODUCER_OR_ACCEPTED
+                if phase == CampaignPhase.INITIAL_GAUSSIAN.value
+                else POINTS_MEMBERSHIP_ALL_DISPOSITIONS
+            ),
         )
     except Exception:
         return None
@@ -2190,6 +2330,7 @@ def propose_recovery(
         blocking_artifacts.append("active-learning handoff inventory")
 
     partial_array_recovery: Optional[Dict[str, Any]] = None
+    aimall_postprocess_recovery: Optional[Dict[str, Any]] = None
     ariadne_publication_recovery: Optional[Dict[str, Any]] = None
     partial_array_decision: Optional[RecoveryDecision] = None
     preferred_phase = last_phase
@@ -2197,7 +2338,30 @@ def propose_recovery(
     if existing is not None and supports_partial_array_recovery(existing.phase):
         preferred_phase = existing.phase.value
         preferred_iteration = int(existing.iteration)
-    if preferred_phase is not None and supports_partial_array_recovery(preferred_phase):
+    if preferred_phase is not None and preferred_iteration is not None:
+        try:
+            aimall_postprocess_recovery = _inspect_aimall_postprocess_recovery(
+                campaign,
+                campaign_uid=str(recovered.campaign_uid),
+                phase_name=str(preferred_phase),
+                iteration=int(preferred_iteration),
+                replacement_round=int(
+                    getattr(recovered, "replacement_round", 0)
+                ),
+                intent_records=tuple(intent_records),
+            )
+        except Exception as exc:
+            unsafe_reasons.append(
+                "scheduler-complete AIMAll recovery evidence is invalid: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:180]
+            )
+            blocking_artifacts.append("AIMAll postprocess producer evidence")
+            aimall_postprocess_recovery = None
+    if isinstance(aimall_postprocess_recovery, dict):
+        partial_array_recovery = dict(aimall_postprocess_recovery)
+    elif preferred_phase is not None and supports_partial_array_recovery(preferred_phase):
         try:
             partial_array_recovery = discover_partial_array_recovery(
                 campaign,
@@ -2224,17 +2388,41 @@ def propose_recovery(
                 phase=partial_phase,
                 iteration=partial_iteration,
                 reason=(
-                    "partial array recovery available: "
-                    + str(int(partial_array_recovery.get("n_complete") or 0))
-                    + "/"
-                    + str(int(partial_array_recovery.get("logical_total") or 0))
-                    + " logical tasks already complete"
+                    (
+                        "scheduler-complete AIMAll outputs require local "
+                        "postprocessing; no array tasks will be resubmitted"
+                    )
+                    if isinstance(aimall_postprocess_recovery, dict)
+                    else (
+                        "partial array recovery available: "
+                        + str(
+                            int(
+                                partial_array_recovery.get("n_complete")
+                                or 0
+                            )
+                        )
+                        + "/"
+                        + str(
+                            int(
+                                partial_array_recovery.get("logical_total")
+                                or 0
+                            )
+                        )
+                        + " logical tasks already complete"
+                    )
                 ),
                 trusted_artifact=str(partial_array_recovery.get("path") or ""),
+                replacement_round=int(
+                    partial_array_recovery.get("replacement_round") or 0
+                ),
             )
             _append_recovery_candidate(recovery_candidates, partial_array_decision)
             trusted_artifacts.append(
-                "partial array recovery ledger for "
+                (
+                    "scheduler-complete AIMAll producer for "
+                    if isinstance(aimall_postprocess_recovery, dict)
+                    else "partial array recovery ledger for "
+                )
                 + partial_phase.value
                 + "@"
                 + str(partial_iteration)
@@ -2760,6 +2948,11 @@ def propose_recovery(
         partial_array_recovery=(
             compact_array_recovery_summary(partial_array_recovery)
             if isinstance(partial_array_recovery, dict)
+            else None
+        ),
+        aimall_postprocess_recovery=(
+            dict(aimall_postprocess_recovery)
+            if isinstance(aimall_postprocess_recovery, dict)
             else None
         ),
         ariadne_results_recovery=ariadne_results_recovery,

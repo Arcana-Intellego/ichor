@@ -7,6 +7,7 @@ import json
 import pytest
 
 from ichor.hpc.active_learning.daemon.submission_intent import (
+    aimall_postprocess_task_contract,
     classify_completed_unsubmitted_intents,
     intent_path,
     load_intent,
@@ -15,6 +16,9 @@ from ichor.hpc.active_learning.daemon.submission_intent import (
     mark_superseded,
     write_pre_submit_intent,
 )
+from ichor.hpc.active_learning.daemon import input_staging
+from ichor.hpc.active_learning.layout import staging_phase_dir
+from ichor.hpc.active_learning.replacement_sampling import replacement_round_dir
 from ichor.hpc.active_learning.daemon.completion_receipts import (
     inventory_completion_receipts,
     write_completion_receipt,
@@ -35,6 +39,78 @@ def test_submission_intent_rejects_fractional_task_count(tmp_path):
             iteration=1,
             expected_tasks=1.5,
         )
+
+
+@pytest.mark.parametrize(
+    (
+        "phase",
+        "gaussian_phase",
+        "iteration",
+        "replacement_round",
+        "context",
+    ),
+    [
+        ("INITIAL_AIMALL", "INITIAL_GAUSSIAN", 0, 0, None),
+        ("AIMALL", "GAUSSIAN", 3, 0, None),
+        (
+            "INITIAL_REPLACEMENT_AIMALL",
+            "INITIAL_REPLACEMENT_GAUSSIAN",
+            0,
+            2,
+            "bootstrap",
+        ),
+        (
+            "REPLACEMENT_AIMALL",
+            "REPLACEMENT_GAUSSIAN",
+            3,
+            2,
+            "active",
+        ),
+    ],
+)
+def test_aimall_postprocess_task_contract_covers_all_aimall_phases(
+    tmp_path,
+    phase,
+    gaussian_phase,
+    iteration,
+    replacement_round,
+    context,
+):
+    if context is None:
+        staging = staging_phase_dir(tmp_path, phase, iteration)
+    else:
+        staging = replacement_round_dir(
+            tmp_path,
+            context=context,
+            iteration=iteration,
+            replacement_round=replacement_round,
+        )
+    accepted = [
+        staging / "POINT_0001.pointdir",
+        staging / "POINT_0003.pointdir",
+    ]
+    for pointdir in accepted:
+        pointdir.mkdir(parents=True, exist_ok=True)
+    input_staging.write_quantum_acceptance_manifest(
+        staging,
+        phase_name=gaussian_phase,
+        iteration=iteration,
+        accepted=accepted,
+        rejected=[("POINT_0002.pointdir", "fixture rejection")],
+    )
+    input_staging.write_points_file(staging, accepted)
+
+    contract = aimall_postprocess_task_contract(
+        tmp_path,
+        phase_name=phase,
+        iteration=iteration,
+        replacement_round=replacement_round,
+    )
+
+    assert contract["phase"] == phase
+    assert contract["gaussian_phase"] == gaussian_phase
+    assert contract["logical_total"] == 2
+    assert contract["gaussian_n_total"] == 3
 
 
 def test_submission_intent_rejects_unknown_status_on_read(tmp_path):

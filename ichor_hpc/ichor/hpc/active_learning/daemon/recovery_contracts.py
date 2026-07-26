@@ -312,7 +312,7 @@ def _require_replacement_gaussian_handoff(
             expected_phase=phase.value,
             expected_iteration=int(iteration),
             require_nonempty=False,
-            require_points_file_membership=True,
+            points_membership=_stg.POINTS_MEMBERSHIP_PRODUCER_OR_ACCEPTED,
         )
 
 
@@ -337,7 +337,11 @@ def _require_initial_quantum(
             expected_phase=phase.value,
             expected_iteration=int(iteration),
             require_nonempty=True,
-            require_points_file_membership=True,
+            points_membership=(
+                _stg.POINTS_MEMBERSHIP_PRODUCER_OR_ACCEPTED
+                if phase is CampaignPhase.INITIAL_GAUSSIAN
+                else _stg.POINTS_MEMBERSHIP_ALL_DISPOSITIONS
+            ),
         )
 
 
@@ -399,7 +403,11 @@ def _require_iter_quantum(
             expected_phase=phase.value,
             expected_iteration=int(iteration),
             require_nonempty=True,
-            require_points_file_membership=True,
+            points_membership=(
+                _stg.POINTS_MEMBERSHIP_PRODUCER_OR_ACCEPTED
+                if phase is CampaignPhase.GAUSSIAN
+                else _stg.POINTS_MEMBERSHIP_ALL_DISPOSITIONS
+            ),
         )
 
 
@@ -1121,7 +1129,7 @@ def _allocation_recovery_decision(
         expected_phase=gaussian_phase.value,
         expected_iteration=int(iteration),
         require_nonempty=False,
-        require_points_file_membership=True,
+        points_membership=_stg.POINTS_MEMBERSHIP_PRODUCER_OR_ACCEPTED,
     ):
         return RecoveryDecision(
             aimall_phase,

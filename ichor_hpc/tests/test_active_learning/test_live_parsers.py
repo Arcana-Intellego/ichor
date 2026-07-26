@@ -87,6 +87,63 @@ def _make_executor(tmp_path, failure_threshold=0.5):
     )
 
 
+def test_aimall_postprocess_source_bypasses_staging_and_scheduler_submission(
+    tmp_path,
+    monkeypatch,
+):
+    executor = _make_executor(tmp_path)
+    state = SimpleNamespace(
+        campaign_uid="aimall-postprocess-test",
+        iteration=14,
+        replacement_round=0,
+    )
+    source = {
+        "logical_total": 149,
+        "job_id": "17888108",
+    }
+    monkeypatch.setattr(
+        submission_intent,
+        "load_active_intent",
+        lambda *_args, **_kwargs: {"postprocess_source": {"source": "fixture"}},
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "resolve_aimall_postprocess_source",
+        lambda *_args, **_kwargs: dict(source),
+    )
+    expected = PhaseResult(is_complete=True)
+    monkeypatch.setattr(
+        executor,
+        "postprocess",
+        lambda observed_state, observed_phase, observations: (
+            expected
+            if (
+                observed_state is state
+                and observed_phase is CampaignPhase.AIMALL
+                and observations == []
+            )
+            else (_ for _ in ()).throw(
+                AssertionError("unexpected postprocess invocation")
+            )
+        ),
+    )
+    executor.sbatch_runner = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("scheduler submission must not run")
+    )
+    monkeypatch.setattr(
+        executor,
+        "_stage_phase_inputs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("AIMAll input staging must not run")
+        ),
+        raising=False,
+    )
+
+    result = executor.submit_or_run(state, CampaignPhase.AIMALL)
+
+    assert result is expected
+
+
 def _bind_staging(ex, fixture_subdir):
     source = Path(fixture_subdir)
     if source.is_dir():
@@ -529,11 +586,12 @@ def test_aimall_visibility_lag_retries_before_publishing_scientific_evidence(
     )
 
 
-def test_stage_aimall_inputs_writes_resolved_naat_metadata(tmp_path):
+def test_stage_aimall_inputs_writes_resolved_naat_metadata(tmp_path, monkeypatch):
     campaign = tmp_path / "campaign"
     staging = campaign / ".DATA" / "STAGING" / "initial"
     shutil.copytree(str(FIXTURES / "initial_quantum"), str(staging))
-    accepted = sorted(staging.glob("POINT_*.pointdir"))[:1]
+    all_pointdirs = sorted(staging.glob("POINT_*.pointdir"))
+    accepted = all_pointdirs[1:2]
     source_gjf = next(accepted[0].glob("*.gjf"))
     source_wfn = next(accepted[0].glob("*.wfn"))
     shutil.copy2(
@@ -561,7 +619,7 @@ def test_stage_aimall_inputs_writes_resolved_naat_metadata(tmp_path):
         subspace_dimension=0,
         subspace_eigenvalues=[],
     )
-    stg.write_points_file(staging, sorted(staging.glob("POINT_*.pointdir")))
+    stg.write_points_file(staging, all_pointdirs)
     stg.write_quantum_acceptance_manifest(
         staging,
         phase_name="INITIAL_GAUSSIAN",
@@ -569,7 +627,8 @@ def test_stage_aimall_inputs_writes_resolved_naat_metadata(tmp_path):
         accepted=accepted,
         rejected=[
             (pointdir.name, "fixture_not_selected")
-            for pointdir in sorted(staging.glob("POINT_*.pointdir"))[1:]
+            for pointdir in all_pointdirs
+            if pointdir not in accepted
         ],
     )
     cfg = CampaignConfig()
@@ -598,9 +657,45 @@ def test_stage_aimall_inputs_writes_resolved_naat_metadata(tmp_path):
         accepted[0],
         phase_name="INITIAL_GAUSSIAN",
         iteration=0,
-        logical_task_id=0,
+        logical_task_id=1,
     )
 
+    original_atomic_write_json = stg.atomic_write_json
+    interrupted = {"raised": False}
+
+    def interrupt_before_task_metadata(path, payload):
+        if (
+            Path(path).name == stg.AIMALL_TASK_METADATA
+            and not interrupted["raised"]
+        ):
+            interrupted["raised"] = True
+            raise OSError("injected AIMAll task-metadata interruption")
+        return original_atomic_write_json(path, payload)
+
+    monkeypatch.setattr(stg, "atomic_write_json", interrupt_before_task_metadata)
+    with pytest.raises(
+        OSError,
+        match="injected AIMAll task-metadata interruption",
+    ):
+        stg.stage_aimall_inputs(
+            campaign,
+            cfg,
+            "INITIAL_AIMALL",
+            0,
+        )
+    assert [
+        Path(line).name
+        for line in (staging / "POINTS.txt").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip()
+    ] == [pointdir.name for pointdir in all_pointdirs]
+    prepared_before_replay = {
+        name: (accepted[0] / name).read_bytes()
+        for name in ("input.wfn", stg.WFN_METHOD_RECEIPT)
+    }
+
+    monkeypatch.setattr(stg, "atomic_write_json", original_atomic_write_json)
     progress = []
     staged_dir, n_points = stg.stage_aimall_inputs(
         campaign,
@@ -612,12 +707,17 @@ def test_stage_aimall_inputs_writes_resolved_naat_metadata(tmp_path):
 
     assert staged_dir == staging
     assert n_points == 1
+    assert {
+        name: (accepted[0] / name).read_bytes()
+        for name in prepared_before_replay
+    } == prepared_before_replay
     task = json.loads(
         (accepted[0] / stg.AIMALL_TASK_METADATA).read_text(encoding="utf-8")
     )
     assert task["atom_count"] == 3
     assert task["nproc"] == 8
     assert task["naat"] == 3
+    assert task["gaussian_logical_task_id"] == 1
     assert task["electronic_method"] == "B3LYP"
     assert task["wfn_sha256"]
     assert task["wfn_method_receipt"]["path"] == stg.WFN_METHOD_RECEIPT
@@ -645,6 +745,68 @@ def test_stage_aimall_inputs_writes_resolved_naat_metadata(tmp_path):
     ]
     assert [record["completed"] for record in progress] == [0, 1, 0, 1]
 
+    immutable_before = {
+        name: (accepted[0] / name).read_bytes()
+        for name in (
+            "input.wfn",
+            stg.WFN_METHOD_RECEIPT,
+            stg.AIMALL_TASK_METADATA,
+        )
+    }
+    stg.write_points_file(staging, all_pointdirs)
+
+    def refuse_task_metadata_rewrite(path, payload):
+        if Path(path).name == stg.AIMALL_TASK_METADATA:
+            raise AssertionError("valid AIMAll task metadata was rewritten")
+        return original_atomic_write_json(path, payload)
+
+    monkeypatch.setattr(stg, "atomic_write_json", refuse_task_metadata_rewrite)
+    replay_dir, replay_count = stg.stage_aimall_inputs(
+        campaign,
+        cfg,
+        "INITIAL_AIMALL",
+        0,
+    )
+    assert replay_dir == staged_dir
+    assert replay_count == 1
+    assert {
+        name: (accepted[0] / name).read_bytes()
+        for name in immutable_before
+    } == immutable_before
+    assert [
+        Path(line).name
+        for line in (staging / "POINTS.txt").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip()
+    ] == [pointdir.name for pointdir in accepted]
+
+    task_metadata_path = accepted[0] / stg.AIMALL_TASK_METADATA
+    task_metadata_path.unlink()
+    with pytest.raises(ValueError, match="lacks task metadata"):
+        stg.stage_aimall_inputs(
+            campaign,
+            cfg,
+            "INITIAL_AIMALL",
+            0,
+        )
+
+    task_metadata_path.write_bytes(
+        immutable_before[stg.AIMALL_TASK_METADATA]
+    )
+    (accepted[0] / stg.WFN_METHOD_RECEIPT).unlink()
+    stg.write_points_file(staging, all_pointdirs)
+    with pytest.raises(
+        ValueError,
+        match="task metadata exists without its WFN method receipt",
+    ):
+        stg.stage_aimall_inputs(
+            campaign,
+            cfg,
+            "INITIAL_AIMALL",
+            0,
+        )
+
 
 def test_aimall_parser_only_consumes_gaussian_accepted_pointdirs(tmp_path):
     ex = _make_executor(tmp_path)
@@ -666,6 +828,7 @@ def test_aimall_parser_only_consumes_gaussian_accepted_pointdirs(tmp_path):
             ("POINT_0003.pointdir", "wfn_gjf_geometry_mismatch"),
         ],
     )
+    stg.write_points_file(staging, accepted)
     state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
 
     result = _parse_quantum_fixture(ex, state, CampaignPhase("INITIAL_AIMALL"))

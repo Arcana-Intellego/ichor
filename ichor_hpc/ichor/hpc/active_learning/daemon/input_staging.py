@@ -44,6 +44,7 @@ from ichor.core.files import PointDirectory, WFN
 from ichor.core.files.xyz import Trajectory
 
 from .resource_solver import (
+    prepared_quantum_resource_evidence,
     resolve_phase_resources,
     wfn_primitive_count,
 )
@@ -68,6 +69,16 @@ from ..versioning.manifest import sha256_file
 
 QUANTUM_ACCEPTANCE_MANIFEST = "accepted_pointdirs.json"
 QUANTUM_ACCEPTANCE_SCHEMA_VERSION = 2
+POINTS_MEMBERSHIP_NONE = "none"
+POINTS_MEMBERSHIP_ALL_DISPOSITIONS = "all_dispositions"
+POINTS_MEMBERSHIP_ACCEPTED_ONLY = "accepted_only"
+POINTS_MEMBERSHIP_PRODUCER_OR_ACCEPTED = "producer_or_accepted"
+POINTS_MEMBERSHIP_MODES = frozenset({
+    POINTS_MEMBERSHIP_NONE,
+    POINTS_MEMBERSHIP_ALL_DISPOSITIONS,
+    POINTS_MEMBERSHIP_ACCEPTED_ONLY,
+    POINTS_MEMBERSHIP_PRODUCER_OR_ACCEPTED,
+})
 AIMALL_TASK_METADATA = "AIMALL_TASK.json"
 AIMALL_TASK_METADATA_SCHEMA_VERSION = 2
 WFN_METHOD_RECEIPT = "WFN_METHOD_RECEIPT.json"
@@ -158,6 +169,310 @@ def rewrite_wfn_for_aimall(
     receipt_path = wfn.parent / WFN_METHOD_RECEIPT
     atomic_write_json(receipt_path, payload)
     return receipt_path, payload
+
+
+def _read_existing_wfn_method_receipt(
+    pointdir: Path,
+    *,
+    phase_name: str,
+    iteration: int,
+    task_index: int,
+    method: str,
+    source_acceptance_sha256: str,
+) -> Tuple[Path, Dict[str, Any]]:
+    """Validate one already-staged WFN without rewriting scientific input."""
+    from .quantum_quality import canonicalise_aimall_method
+
+    root = Path(pointdir)
+    receipt_path = root / WFN_METHOD_RECEIPT
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise ValueError(
+            "filtered AIMAll staging lacks a regular WFN method receipt: "
+            + str(receipt_path)
+        )
+    try:
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            "filtered AIMAll WFN method receipt is unreadable: "
+            + str(receipt_path)
+        ) from exc
+    expected_identity = (
+        WFN_METHOD_RECEIPT_SCHEMA_VERSION,
+        str(phase_name),
+        int(iteration),
+        int(task_index),
+        root.name,
+        canonicalise_aimall_method(method),
+        str(source_acceptance_sha256),
+    )
+    observed_identity = (
+        payload.get("schema_version") if isinstance(payload, dict) else None,
+        payload.get("phase") if isinstance(payload, dict) else None,
+        payload.get("iteration") if isinstance(payload, dict) else None,
+        payload.get("task_index") if isinstance(payload, dict) else None,
+        payload.get("pointdir") if isinstance(payload, dict) else None,
+        payload.get("method") if isinstance(payload, dict) else None,
+        (
+            payload.get("source_gaussian_acceptance_sha256")
+            if isinstance(payload, dict)
+            else None
+        ),
+    )
+    if observed_identity != expected_identity:
+        raise ValueError(
+            "filtered AIMAll WFN method receipt identity mismatch: "
+            + root.name
+        )
+    wfn_binding = payload.get("wfn")
+    wfn = root / "input.wfn"
+    if (
+        not isinstance(wfn_binding, dict)
+        or wfn_binding.get("path") != wfn.name
+        or wfn.is_symlink()
+        or not wfn.is_file()
+        or wfn_binding.get("after_sha256") != sha256_file(wfn)
+        or wfn_binding.get("size_bytes") != int(wfn.stat().st_size)
+    ):
+        raise ValueError(
+            "filtered AIMAll WFN differs from its method receipt: " + root.name
+        )
+    return receipt_path, dict(payload)
+
+
+def _read_gaussian_receipt_for_aimall_replay(
+    pointdir: Path,
+    *,
+    phase_name: str,
+    iteration: int,
+    logical_task_id: int,
+    wfn_method_payload: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Validate Gaussian evidence across the intentional AIMAll WFN rewrite."""
+    from .quantum_task_receipts import (
+        GAUSSIAN_TASK_RECEIPT,
+        QUANTUM_TASK_RECEIPT_SCHEMA_VERSION,
+    )
+
+    root = Path(pointdir)
+    receipt_path = root / GAUSSIAN_TASK_RECEIPT
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise ValueError(
+            "filtered AIMAll staging lacks a regular Gaussian task receipt: "
+            + str(receipt_path)
+        )
+    try:
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            "filtered AIMAll Gaussian task receipt is unreadable: "
+            + str(receipt_path)
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ValueError("filtered AIMAll Gaussian task receipt must be an object")
+    expected_identity = (
+        QUANTUM_TASK_RECEIPT_SCHEMA_VERSION,
+        str(phase_name),
+        int(iteration),
+        int(logical_task_id),
+        root.name,
+    )
+    observed_identity = (
+        payload.get("schema_version"),
+        payload.get("phase"),
+        payload.get("iteration"),
+        payload.get("logical_task_id"),
+        payload.get("pointdir"),
+    )
+    if observed_identity != expected_identity:
+        raise ValueError(
+            "filtered AIMAll Gaussian task receipt identity mismatch: "
+            + root.name
+        )
+    for key in ("campaign_uid", "attempt_id", "submission_identity", "job_id"):
+        if not isinstance(payload.get(key), str) or not payload[key]:
+            raise ValueError(
+                "filtered AIMAll Gaussian task receipt "
+                + key
+                + " is empty"
+            )
+
+    gjfs = sorted(root.glob("*.gjf"))
+    logs = sorted([*root.glob("*.gau"), *root.glob("*.gaussianoutput")])
+    wfns = sorted(root.glob("*.wfn"))
+    if len(gjfs) != 1 or len(logs) != 1 or len(wfns) != 1:
+        raise ValueError(
+            "filtered AIMAll Gaussian task artefact set is incomplete: "
+            + root.name
+        )
+    expected_paths = {
+        "inputs": {gjfs[0].name},
+        "outputs": {logs[0].name, wfns[0].name},
+    }
+    method_wfn = wfn_method_payload.get("wfn")
+    if not isinstance(method_wfn, Mapping):
+        raise ValueError("filtered AIMAll WFN method receipt binding is missing")
+
+    def validate_current_binding(record: Mapping[str, Any]) -> None:
+        relative = record.get("path")
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or Path(relative).is_absolute()
+            or ".." in Path(relative).parts
+            or Path(relative).as_posix() != relative
+        ):
+            raise ValueError(
+                "filtered AIMAll Gaussian receipt path is invalid"
+            )
+        path = root / relative
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(
+                "filtered AIMAll Gaussian receipt artefact is unavailable: "
+                + relative
+            )
+        if (
+            record.get("size") != int(path.stat().st_size)
+            or record.get("sha256") != sha256_file(path)
+        ):
+            raise ValueError(
+                "filtered AIMAll Gaussian receipt artefact binding mismatch: "
+                + relative
+            )
+
+    for group in ("inputs", "outputs"):
+        records = payload.get(group)
+        if not isinstance(records, list) or not records:
+            raise ValueError(
+                "filtered AIMAll Gaussian task receipt "
+                + group
+                + " are missing"
+            )
+        seen = set()
+        for record in records:
+            if (
+                not isinstance(record, Mapping)
+                or set(record) != {"path", "size", "sha256"}
+            ):
+                raise ValueError(
+                    "filtered AIMAll Gaussian task receipt binding is invalid"
+                )
+            relative = record.get("path")
+            if not isinstance(relative, str) or relative in seen:
+                raise ValueError(
+                    "filtered AIMAll Gaussian task receipt path is duplicated"
+                )
+            seen.add(relative)
+            if relative == wfns[0].name:
+                if (
+                    record.get("sha256") != method_wfn.get("before_sha256")
+                    or isinstance(record.get("size"), bool)
+                    or not isinstance(record.get("size"), int)
+                    or int(record["size"]) < 0
+                ):
+                    raise ValueError(
+                        "Gaussian receipt does not bind the pre-AIMAll WFN"
+                    )
+            else:
+                validate_current_binding(record)
+        if seen != expected_paths[group]:
+            raise ValueError(
+                "filtered AIMAll Gaussian receipt does not bind the complete "
+                + group
+                + " set"
+            )
+    return dict(payload)
+
+
+def _read_existing_aimall_task_metadata(
+    pointdir: Path,
+    *,
+    phase_name: str,
+    iteration: int,
+    task_index: int,
+    gaussian_logical_task_id: int,
+    atom_count: int,
+    primitive_count: int,
+    expected_atom_names: Sequence[str],
+    wfn_method_receipt: Path,
+    wfn_method_payload: Mapping[str, Any],
+    gaussian_receipt_path: Path,
+) -> Dict[str, Any]:
+    """Validate immutable AIMAll staging metadata on filtered-list replay."""
+    root = Path(pointdir)
+    path = root / AIMALL_TASK_METADATA
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(
+            "filtered AIMAll staging lacks regular task metadata: " + str(path)
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            "filtered AIMAll task metadata is unreadable: " + str(path)
+        ) from exc
+    expected_identity = (
+        AIMALL_TASK_METADATA_SCHEMA_VERSION,
+        root.name,
+        int(task_index),
+        int(gaussian_logical_task_id),
+        int(atom_count),
+        list(expected_atom_names),
+        int(primitive_count),
+        str(wfn_method_payload["method"]),
+        str(wfn_method_payload["wfn"]["after_sha256"]),
+    )
+    observed_identity = (
+        payload.get("schema_version") if isinstance(payload, dict) else None,
+        payload.get("pointdir") if isinstance(payload, dict) else None,
+        payload.get("task_index") if isinstance(payload, dict) else None,
+        (
+            payload.get("gaussian_logical_task_id")
+            if isinstance(payload, dict)
+            else None
+        ),
+        payload.get("atom_count") if isinstance(payload, dict) else None,
+        payload.get("expected_atom_names") if isinstance(payload, dict) else None,
+        payload.get("primitive_count") if isinstance(payload, dict) else None,
+        payload.get("electronic_method") if isinstance(payload, dict) else None,
+        payload.get("wfn_sha256") if isinstance(payload, dict) else None,
+    )
+    if observed_identity != expected_identity:
+        raise ValueError(
+            "filtered AIMAll task metadata identity mismatch: " + root.name
+        )
+    receipt_binding = payload.get("wfn_method_receipt")
+    gaussian_binding = payload.get("gaussian_task_receipt")
+    if (
+        not isinstance(receipt_binding, dict)
+        or receipt_binding.get("path") != wfn_method_receipt.name
+        or receipt_binding.get("sha256") != sha256_file(wfn_method_receipt)
+        or not isinstance(gaussian_binding, dict)
+        or gaussian_binding.get("path") != gaussian_receipt_path.name
+        or gaussian_binding.get("sha256") != sha256_file(gaussian_receipt_path)
+        or payload.get("gjf_sha256") != sha256_file(root / "input.gjf")
+    ):
+        raise ValueError(
+            "filtered AIMAll task metadata evidence mismatch: " + root.name
+        )
+    return dict(payload)
+
+
+def _stable_resource_resolution_for_replay(value: Any) -> Any:
+    """Remove observational free-space telemetry from a resource contract."""
+    if not isinstance(value, Mapping):
+        return value
+    payload = dict(value)
+    extra = payload.get("extra")
+    if isinstance(extra, Mapping):
+        extra_payload = dict(extra)
+        filesystem = extra_payload.get("campaign_filesystem")
+        if isinstance(filesystem, Mapping):
+            filesystem_payload = dict(filesystem)
+            filesystem_payload.pop("free_bytes_at_resolution", None)
+            extra_payload["campaign_filesystem"] = filesystem_payload
+        payload["extra"] = extra_payload
+    return payload
 
 
 def _pointdir_name(pointdir: Any) -> str:
@@ -351,6 +666,7 @@ def read_quantum_acceptance_manifest(
     expected_iteration: int,
     require_nonempty: bool = True,
     require_points_file_membership: bool = False,
+    points_membership: Optional[str] = None,
 ) -> Tuple[List[Path], Dict[str, Any]]:
     """Read and validate the live quantum acceptance manifest.
 
@@ -399,18 +715,43 @@ def read_quantum_acceptance_manifest(
     if n_total != len(accepted) + len(rejected):
         raise ValueError("quantum acceptance manifest n_total does not match payload lengths")
 
+    membership_mode = (
+        POINTS_MEMBERSHIP_ALL_DISPOSITIONS
+        if bool(require_points_file_membership)
+        else POINTS_MEMBERSHIP_NONE
+    )
+    if points_membership is not None:
+        if require_points_file_membership:
+            raise ValueError(
+                "points_membership cannot be combined with "
+                "require_points_file_membership=True"
+            )
+        membership_mode = str(points_membership)
+    if membership_mode not in POINTS_MEMBERSHIP_MODES:
+        raise ValueError(
+            "unknown quantum acceptance POINTS.txt membership mode: "
+            + repr(membership_mode)
+        )
+
     seen = set()
     resolved: List[Path] = []
-    points_names = set(_points_file_names(staging)) if require_points_file_membership else None
+    accepted_names: List[str] = []
+    points_name_list = (
+        _points_file_names(staging)
+        if membership_mode != POINTS_MEMBERSHIP_NONE
+        else None
+    )
+    points_names = (
+        set(points_name_list) if points_name_list is not None else None
+    )
     for raw_name in accepted:
         if not isinstance(raw_name, str):
             raise ValueError("accepted pointdir name is not a string")
         name = _validate_pointdir_basename(raw_name)
         if name in seen:
             raise ValueError("duplicate accepted pointdir in manifest: " + name)
-        if points_names is not None and name not in points_names:
-            raise ValueError("accepted pointdir is not present in POINTS.txt: " + name)
         seen.add(name)
+        accepted_names.append(name)
         pointdir = staging / name
         if not pointdir.is_dir():
             raise FileNotFoundError(
@@ -429,16 +770,43 @@ def read_quantum_acceptance_manifest(
             raise ValueError("quantum rejection reason must be a non-empty string")
         if name in seen:
             raise ValueError("duplicate or contradictory pointdir disposition: " + name)
-        if points_names is not None and name not in points_names:
-            raise ValueError("rejected pointdir is not present in POINTS.txt: " + name)
         seen.add(name)
         normalised_rejected.append({"pointdir": name, "reason": reason.strip()})
-    if points_names is not None and seen != points_names:
-        missing = sorted(points_names - seen)
-        raise ValueError(
-            "quantum acceptance does not cover every POINTS.txt task: "
-            + repr(missing[:8])
-        )
+    membership_state = POINTS_MEMBERSHIP_NONE
+    if membership_mode == POINTS_MEMBERSHIP_ALL_DISPOSITIONS:
+        if seen != points_names:
+            missing = sorted((points_names or set()) - seen)
+            unexpected = sorted(seen - (points_names or set()))
+            raise ValueError(
+                "quantum acceptance dispositions do not exactly cover POINTS.txt; "
+                "missing="
+                + repr(missing[:8])
+                + ", unexpected="
+                + repr(unexpected[:8])
+            )
+        membership_state = POINTS_MEMBERSHIP_ALL_DISPOSITIONS
+    elif membership_mode == POINTS_MEMBERSHIP_ACCEPTED_ONLY:
+        if points_name_list != accepted_names:
+            raise ValueError(
+                "POINTS.txt does not exactly match accepted pointdirs in "
+                "authoritative order"
+            )
+        membership_state = POINTS_MEMBERSHIP_ACCEPTED_ONLY
+    elif membership_mode == POINTS_MEMBERSHIP_PRODUCER_OR_ACCEPTED:
+        if points_name_list == accepted_names:
+            membership_state = POINTS_MEMBERSHIP_ACCEPTED_ONLY
+        elif seen == points_names:
+            membership_state = POINTS_MEMBERSHIP_ALL_DISPOSITIONS
+        else:
+            missing = sorted((points_names or set()) - seen)
+            unexpected = sorted(seen - (points_names or set()))
+            raise ValueError(
+                "POINTS.txt matches neither the complete producer task set nor "
+                "the accepted pointdir sequence; missing="
+                + repr(missing[:8])
+                + ", unexpected="
+                + repr(unexpected[:8])
+            )
     if require_nonempty and not resolved:
         raise ValueError("quantum acceptance manifest accepted_pointdirs is empty: " + str(path))
     out = dict(data)
@@ -446,6 +814,7 @@ def read_quantum_acceptance_manifest(
     out["rejections_by_pointdir"] = {
         record["pointdir"]: record["reason"] for record in normalised_rejected
     }
+    out["points_membership_state"] = membership_state
     return resolved, out
 
 
@@ -1526,12 +1895,12 @@ def stage_aimall_inputs(
         expected_gaussian_phase
         or ("INITIAL_GAUSSIAN" if phase_name.startswith("INITIAL_") else "GAUSSIAN")
     )
-    pointdirs, _manifest = read_quantum_acceptance_manifest(
+    pointdirs, gaussian_manifest = read_quantum_acceptance_manifest(
         staging,
         expected_phase=expected_phase,
         expected_iteration=int(iteration),
         require_nonempty=False,
-        require_points_file_membership=True,
+        points_membership=POINTS_MEMBERSHIP_PRODUCER_OR_ACCEPTED,
     )
 
     def report(stage: str, completed: int) -> None:
@@ -1560,8 +1929,13 @@ def stage_aimall_inputs(
     )
     feature_contract_file = feature_contract_path(Path(campaign_dir))
     gaussian_task_names = _points_file_names(staging)
+    filtered_replay = bool(gaussian_manifest.get("rejected")) and (
+        gaussian_manifest.get("points_membership_state")
+        == POINTS_MEMBERSHIP_ACCEPTED_ONLY
+    )
     acceptance_sha256 = sha256_file(staging / QUANTUM_ACCEPTANCE_MANIFEST)
     dimensions = []
+    gaussian_logical_task_ids = set()
     report("aimall_input_validation", 0)
     for task_index, pointdir in enumerate(pointdirs):
         wfn = pointdir / "input.wfn"
@@ -1581,46 +1955,143 @@ def stage_aimall_inputs(
         expected_atom_names = [str(atom.name) for atom in expected_atoms]
         if len(expected_atom_names) != len(set(expected_atom_names)):
             raise ValueError("AIMAll pointdir geometry has duplicate atom identities")
-        try:
-            gaussian_logical_task_id = gaussian_task_names.index(pointdir.name)
-        except ValueError as exc:
-            raise ValueError("Gaussian acceptance point is absent from POINTS.txt") from exc
         from .quantum_task_receipts import (
             GAUSSIAN_TASK_RECEIPT,
             read_quantum_task_receipt,
         )
 
-        read_quantum_task_receipt(
-            pointdir,
-            phase_name=expected_phase,
-            iteration=int(iteration),
-            logical_task_id=int(gaussian_logical_task_id),
-        )
+        if filtered_replay:
+            gaussian_receipt_path = pointdir / GAUSSIAN_TASK_RECEIPT
+            if (
+                gaussian_receipt_path.is_symlink()
+                or not gaussian_receipt_path.is_file()
+            ):
+                raise ValueError(
+                    "filtered AIMAll staging lacks a regular Gaussian task "
+                    "receipt: "
+                    + str(gaussian_receipt_path)
+                )
+            gaussian_receipt_payload = json.loads(
+                gaussian_receipt_path.read_text(encoding="utf-8")
+            )
+            if not isinstance(gaussian_receipt_payload, dict):
+                raise ValueError(
+                    "filtered AIMAll Gaussian task receipt must be an object"
+                )
+            gaussian_logical_task_id = gaussian_receipt_payload.get(
+                "logical_task_id"
+            )
+            if (
+                isinstance(gaussian_logical_task_id, bool)
+                or not isinstance(gaussian_logical_task_id, int)
+                or gaussian_logical_task_id < 0
+                or gaussian_logical_task_id >= int(gaussian_manifest["n_total"])
+            ):
+                raise ValueError(
+                    "Gaussian task receipt logical identity is invalid for "
+                    + pointdir.name
+                )
+        else:
+            try:
+                gaussian_logical_task_id = gaussian_task_names.index(pointdir.name)
+            except ValueError as exc:
+                raise ValueError(
+                    "Gaussian acceptance point is absent from POINTS.txt"
+                ) from exc
+        if int(gaussian_logical_task_id) in gaussian_logical_task_ids:
+            raise ValueError(
+                "Gaussian task receipt logical identity is duplicated in "
+                "accepted AIMAll inputs"
+            )
+        gaussian_logical_task_ids.add(int(gaussian_logical_task_id))
         gaussian_receipt_path = pointdir / GAUSSIAN_TASK_RECEIPT
-        receipt_path, receipt = rewrite_wfn_for_aimall(
-            wfn,
-            method=str(config.gaussian.method),
-            phase_name=str(phase_name),
-            iteration=int(iteration),
-            task_index=int(task_index),
-            source_acceptance_sha256=acceptance_sha256,
-        )
+        primitive_count = wfn_primitive_count(wfn)
+        existing_task_metadata = None
+        existing_method_receipt = pointdir / WFN_METHOD_RECEIPT
+        task_metadata_path = pointdir / AIMALL_TASK_METADATA
+        if existing_method_receipt.exists() or existing_method_receipt.is_symlink():
+            receipt_path, receipt = _read_existing_wfn_method_receipt(
+                pointdir,
+                phase_name=str(phase_name),
+                iteration=int(iteration),
+                task_index=int(task_index),
+                method=str(config.gaussian.method),
+                source_acceptance_sha256=acceptance_sha256,
+            )
+            _read_gaussian_receipt_for_aimall_replay(
+                pointdir,
+                phase_name=expected_phase,
+                iteration=int(iteration),
+                logical_task_id=int(gaussian_logical_task_id),
+                wfn_method_payload=receipt,
+            )
+            if task_metadata_path.exists() or task_metadata_path.is_symlink():
+                existing_task_metadata = _read_existing_aimall_task_metadata(
+                    pointdir,
+                    phase_name=str(phase_name),
+                    iteration=int(iteration),
+                    task_index=int(task_index),
+                    gaussian_logical_task_id=int(gaussian_logical_task_id),
+                    atom_count=int(atom_count),
+                    primitive_count=int(primitive_count),
+                    expected_atom_names=expected_atom_names,
+                    wfn_method_receipt=receipt_path,
+                    wfn_method_payload=receipt,
+                    gaussian_receipt_path=gaussian_receipt_path,
+                )
+            elif filtered_replay:
+                raise ValueError(
+                    "filtered AIMAll staging lacks task metadata: "
+                    + pointdir.name
+                )
+        else:
+            if task_metadata_path.exists() or task_metadata_path.is_symlink():
+                raise ValueError(
+                    "AIMAll task metadata exists without its WFN method receipt: "
+                    + pointdir.name
+                )
+            if filtered_replay:
+                raise ValueError(
+                    "filtered AIMAll staging lacks prepared WFN evidence: "
+                    + pointdir.name
+                )
+            read_quantum_task_receipt(
+                pointdir,
+                phase_name=expected_phase,
+                iteration=int(iteration),
+                logical_task_id=int(gaussian_logical_task_id),
+            )
+            receipt_path, receipt = rewrite_wfn_for_aimall(
+                wfn,
+                method=str(config.gaussian.method),
+                phase_name=str(phase_name),
+                iteration=int(iteration),
+                task_index=int(task_index),
+                source_acceptance_sha256=acceptance_sha256,
+            )
         dimensions.append(
             (
                 pointdir,
                 atom_count,
-                wfn_primitive_count(wfn),
+                primitive_count,
                 receipt_path,
                 receipt,
                 expected_atom_names,
                 gaussian_logical_task_id,
                 gaussian_receipt_path,
+                existing_task_metadata,
             )
         )
         completed = task_index + 1
         if completed == len(pointdirs) or completed % 16 == 0:
             report("aimall_input_validation", completed)
-    write_points_file(staging, pointdirs)
+    prepared_resource_evidence = prepared_quantum_resource_evidence(
+        campaign_dir,
+        phase_name=str(phase_name),
+        iteration=int(iteration),
+        staging_dir=staging,
+        pointdirs=pointdirs,
+    )
     aimall_resources = resolve_phase_resources(
         phase_name=str(phase_name),
         config=config,
@@ -1630,6 +2101,7 @@ def stage_aimall_inputs(
         array_size=len(pointdirs),
         staging_dir=staging,
         require_evidence=True,
+        evidence_override=prepared_resource_evidence,
     )
     aimall_cpus = int(aimall_resources.cpus_per_task)
     raw_naat = getattr(config.aimall, "naat", "auto")
@@ -1650,6 +2122,7 @@ def stage_aimall_inputs(
         expected_atom_names,
         gaussian_logical_task_id,
         gaussian_receipt_path,
+        existing_task_metadata,
     ) in enumerate(dimensions):
         if isinstance(raw_naat, str) and raw_naat.strip().lower() == "auto":
             resolved_naat = int(snapshotted_naat[task_index])
@@ -1659,9 +2132,7 @@ def stage_aimall_inputs(
                 raise ValueError(
                     "aimall.naat must be in [1, resolved resources.aimall.cpus_per_task]"
                 )
-        atomic_write_json(
-            pointdir / AIMALL_TASK_METADATA,
-            {
+        task_payload = {
                 "schema_version": AIMALL_TASK_METADATA_SCHEMA_VERSION,
                 "pointdir": pointdir.name,
                 "task_index": int(task_index),
@@ -1701,11 +2172,45 @@ def stage_aimall_inputs(
                         Path(campaign_dir).resolve()
                     ).as_posix(),
                 },
-            },
-        )
+            }
+        if existing_task_metadata is not None:
+            replay_fields = {
+                "nproc": int(aimall_cpus),
+                "naat": int(resolved_naat),
+                "ferebus_feature_contract": task_payload[
+                    "ferebus_feature_contract"
+                ],
+                "ferebus_row_shard": task_payload["ferebus_row_shard"],
+            }
+            mismatched = [
+                key
+                for key, value in replay_fields.items()
+                if existing_task_metadata.get(key) != value
+            ]
+            if _stable_resource_resolution_for_replay(
+                existing_task_metadata.get("resource_resolution")
+            ) != _stable_resource_resolution_for_replay(
+                task_payload["resource_resolution"]
+            ):
+                mismatched.append("resource_resolution")
+            if mismatched:
+                raise ValueError(
+                    "filtered AIMAll task metadata no longer matches resolved "
+                    "resources or feature provenance: "
+                    + pointdir.name
+                    + "; fields="
+                    + ",".join(mismatched)
+                )
+        else:
+            atomic_write_json(
+                pointdir / AIMALL_TASK_METADATA,
+                task_payload,
+            )
         completed = task_index + 1
         if completed == len(dimensions) or completed % 16 == 0:
             report("aimall_task_staging", completed)
+    if not filtered_replay:
+        write_points_file(staging, pointdirs)
     return staging, len(pointdirs)
 
 
@@ -1742,7 +2247,7 @@ def record_allocation_quantum_results(
         expected_phase=str(gaussian_phase),
         expected_iteration=int(iteration),
         require_nonempty=False,
-        require_points_file_membership=True,
+        points_membership=POINTS_MEMBERSHIP_PRODUCER_OR_ACCEPTED,
     )
     pending_ids = {str(record["candidate_id"]) for record in pending}
     attempts_by_id = {
@@ -1776,7 +2281,7 @@ def record_allocation_quantum_results(
             expected_phase=str(aimall_phase),
             expected_iteration=int(iteration),
             require_nonempty=False,
-            require_points_file_membership=False,
+            points_membership=POINTS_MEMBERSHIP_ALL_DISPOSITIONS,
         )
     except FileNotFoundError:
         if gaussian_accepted:

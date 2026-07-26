@@ -106,17 +106,66 @@ def write_quantum_task_receipt(
     if root.is_symlink() or not root.is_dir():
         raise ValueError("quantum task pointdir is missing or symlinked")
     intent = load_intent(campaign_dir, phase_name, iteration_value)
-    if not isinstance(intent, dict) or str(intent.get("status")) not in {
-        "SUBMITTED",
-        "ADOPTED",
-    }:
+    if not isinstance(intent, dict):
+        raise ValueError("quantum task receipt requires a submission intent")
+    status = str(intent.get("status") or "")
+    producer: Mapping[str, Any] = intent
+    if (
+        status == "PRE_SUBMIT"
+        and isinstance(intent.get("postprocess_source"), Mapping)
+        and "AIMALL" in str(phase_name)
+    ):
+        from .submission_intent import resolve_aimall_postprocess_source
+
+        source = resolve_aimall_postprocess_source(
+            campaign_dir,
+            campaign_uid=str(intent.get("campaign_uid") or ""),
+            phase_name=str(phase_name),
+            iteration=iteration_value,
+            replacement_round=int(intent.get("replacement_round", 0)),
+            intent=intent,
+        )
+        if logical_task_value >= int(source["logical_total"]):
+            raise ValueError(
+                "quantum task receipt logical identity exceeds its producer task set"
+            )
+        producer = source
+    elif status not in {"SUBMITTED", "ADOPTED"}:
         raise ValueError("quantum task receipt requires an active submitted intent")
+    target = root / _receipt_name(phase_name)
+    if target.exists() or target.is_symlink():
+        existing = read_quantum_task_receipt(
+            root,
+            phase_name=str(phase_name),
+            iteration=iteration_value,
+            logical_task_id=logical_task_value,
+        )
+        expected_identity = (
+            str(producer["campaign_uid"]),
+            str(producer["attempt_id"]),
+            str(producer["submission_identity"]),
+            str(producer["job_id"]),
+        )
+        observed_identity = tuple(
+            str(existing[key])
+            for key in (
+                "campaign_uid",
+                "attempt_id",
+                "submission_identity",
+                "job_id",
+            )
+        )
+        if observed_identity != expected_identity:
+            raise ValueError(
+                "existing quantum task receipt belongs to another producer"
+            )
+        return target
     return _write_quantum_task_receipt(
         root,
         phase_name=phase_name,
         iteration=iteration_value,
         logical_task_id=logical_task_value,
-        intent=intent,
+        intent=producer,
     )
 
 

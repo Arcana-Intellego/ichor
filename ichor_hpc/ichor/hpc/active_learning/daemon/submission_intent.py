@@ -56,6 +56,16 @@ _POSTPROCESS_SOURCE_KEYS = frozenset({
     "decision_contract",
     "source_sha256",
 })
+_AIMALL_POSTPROCESS_PHASES = frozenset({
+    CampaignPhase.INITIAL_AIMALL.value,
+    CampaignPhase.AIMALL.value,
+    CampaignPhase.INITIAL_REPLACEMENT_AIMALL.value,
+    CampaignPhase.REPLACEMENT_AIMALL.value,
+})
+_POSTPROCESS_SOURCE_PHASES = (
+    frozenset({CampaignPhase.ARIADNE_ARRAY.value})
+    | _AIMALL_POSTPROCESS_PHASES
+)
 
 
 def submission_kind_for_phase(phase_name: str) -> str:
@@ -256,19 +266,21 @@ def _validate_intent_payload(
         source = _validated_postprocess_source(
             postprocess_source
         )
-        if str(phase_name) != CampaignPhase.ARIADNE_ARRAY.value:
+        if str(phase_name) not in _POSTPROCESS_SOURCE_PHASES:
             raise ValueError(
-                "postprocess_source is valid only for an ARIADNE_ARRAY intent"
+                "postprocess_source is invalid for this submission phase"
             )
+        if str(source["phase"]) != str(phase_name):
+            raise ValueError("postprocess source phase differs from its intent")
         if data.get("job_id") is not None:
-            raise ValueError("ARIADNE postprocess intent must remain jobless")
+            raise ValueError("postprocess intent must remain jobless")
         if data.get("expected_tasks") != int(source["logical_total"]):
             raise ValueError(
-                "ARIADNE postprocess intent expected_tasks mismatch"
+                "postprocess intent expected_tasks mismatch"
             )
         if data.get("decision_contract") != source["decision_contract"]:
             raise ValueError(
-                "ARIADNE postprocess intent decision contract differs from its producer"
+                "postprocess intent decision contract differs from its producer"
             )
         data["postprocess_source"] = source
     return data
@@ -336,8 +348,8 @@ def _validated_postprocess_source(value: Any) -> Dict[str, Any]:
     campaign_uid = source.get("campaign_uid")
     if not isinstance(campaign_uid, str) or not campaign_uid:
         raise ValueError("postprocess source campaign_uid must be non-empty")
-    if source.get("phase") != CampaignPhase.ARIADNE_ARRAY.value:
-        raise ValueError("postprocess source phase must be ARIADNE_ARRAY")
+    if source.get("phase") not in _POSTPROCESS_SOURCE_PHASES:
+        raise ValueError("postprocess source phase is unsupported")
     source["iteration"] = _exact_int(
         source.get("iteration"), "postprocess source iteration"
     )
@@ -533,6 +545,265 @@ def resolve_ariadne_postprocess_source(
         raise ValueError(
             "postprocess source does not match the current ARIADNE task set"
         )
+    _validate_postprocess_source_environment(campaign_dir, source)
+    return source
+
+
+def aimall_postprocess_task_contract(
+    campaign_dir: Union[str, Path],
+    *,
+    phase_name: str,
+    iteration: int,
+    replacement_round: int = 0,
+    require_unpublished: bool = True,
+) -> Dict[str, Any]:
+    """Validate the filtered Gaussian handoff owned by one AIMAll attempt."""
+    phase = str(phase_name)
+    if phase not in _AIMALL_POSTPROCESS_PHASES:
+        raise ValueError("AIMAll postprocess phase is unsupported: " + phase)
+    iteration_value = _exact_int(iteration, "AIMAll postprocess iteration")
+    replacement_value = _exact_int(
+        replacement_round,
+        "AIMAll postprocess replacement round",
+    )
+    campaign = Path(campaign_dir)
+    if "REPLACEMENT" in phase:
+        from ..replacement_sampling import replacement_round_dir
+
+        context = "bootstrap" if phase.startswith("INITIAL_") else "active"
+        staging = replacement_round_dir(
+            campaign,
+            context=context,
+            iteration=(0 if context == "bootstrap" else iteration_value),
+            replacement_round=replacement_value,
+        )
+    else:
+        from ..layout import staging_phase_dir
+
+        staging = staging_phase_dir(campaign, phase, iteration_value)
+    gaussian_phase = (
+        CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN.value
+        if phase == CampaignPhase.INITIAL_REPLACEMENT_AIMALL.value
+        else CampaignPhase.REPLACEMENT_GAUSSIAN.value
+        if phase == CampaignPhase.REPLACEMENT_AIMALL.value
+        else CampaignPhase.INITIAL_GAUSSIAN.value
+        if phase == CampaignPhase.INITIAL_AIMALL.value
+        else CampaignPhase.GAUSSIAN.value
+    )
+    from . import input_staging as _stg
+
+    accepted, manifest = _stg.read_quantum_acceptance_manifest(
+        staging,
+        expected_phase=gaussian_phase,
+        expected_iteration=iteration_value,
+        require_nonempty=False,
+        points_membership=_stg.POINTS_MEMBERSHIP_ACCEPTED_ONLY,
+    )
+    if not accepted:
+        raise ValueError("AIMAll postprocess source has no accepted Gaussian tasks")
+    aimall_publication = _stg.quantum_acceptance_manifest_path(
+        staging,
+        phase_name=phase,
+    )
+    if (
+        bool(require_unpublished)
+        and (aimall_publication.exists() or aimall_publication.is_symlink())
+    ):
+        raise ValueError(
+            "AIMAll postprocess source already has an acceptance publication"
+        )
+    logical_total = len(accepted)
+    task_digest = hashlib.sha256(
+        ",".join(str(task_id) for task_id in range(logical_total)).encode(
+            "ascii"
+        )
+    ).hexdigest()
+    return {
+        "phase": phase,
+        "iteration": iteration_value,
+        "replacement_round": replacement_value,
+        "staging": str(Path(staging)),
+        "gaussian_phase": gaussian_phase,
+        "gaussian_n_total": int(manifest["n_total"]),
+        "logical_total": int(logical_total),
+        "logical_task_set_sha256": task_digest,
+    }
+
+
+def aimall_intent_claims_completed_array(intent: Mapping[str, Any]) -> bool:
+    """Return whether an AIMAll intent claims a complete producer array."""
+    if str(intent.get("phase") or "") not in _AIMALL_POSTPROCESS_PHASES:
+        return False
+    if isinstance(intent.get("postprocess_source"), Mapping):
+        return True
+    expected = intent.get("expected_tasks")
+    lifecycle = intent.get("queue_lifecycle")
+    if (
+        isinstance(expected, bool)
+        or not isinstance(expected, int)
+        or expected < 1
+        or not isinstance(lifecycle, Mapping)
+    ):
+        return False
+    return (
+        str(lifecycle.get("terminal_status") or "") == "COMPLETED"
+        and lifecycle.get("n_expected") == expected
+        and lifecycle.get("n_observed") == expected
+        and lifecycle.get("n_missing") == 0
+    )
+
+
+def resolve_aimall_postprocess_source(
+    campaign_dir: Union[str, Path],
+    *,
+    campaign_uid: str,
+    phase_name: str,
+    iteration: int,
+    replacement_round: int = 0,
+    intent: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Resolve one scheduler-complete AIMAll producer for local postprocessing."""
+    contract = aimall_postprocess_task_contract(
+        campaign_dir,
+        phase_name=str(phase_name),
+        iteration=int(iteration),
+        replacement_round=int(replacement_round),
+    )
+    phase = str(contract["phase"])
+    expected_iteration = int(contract["iteration"])
+    expected_round = int(contract["replacement_round"])
+    expected_total = int(contract["logical_total"])
+    expected_task_digest = str(contract["logical_task_set_sha256"])
+    current = (
+        dict(intent)
+        if isinstance(intent, Mapping)
+        else load_intent(
+            campaign_dir,
+            phase,
+            expected_iteration,
+            expected_campaign_uid=str(campaign_uid),
+        )
+    )
+    if not current:
+        raise ValueError("scheduler-complete AIMAll producer intent is unavailable")
+    observed_identity = (
+        str(current.get("campaign_uid") or ""),
+        str(current.get("phase") or ""),
+        int(current.get("iteration", -1)),
+        int(current.get("replacement_round", -1)),
+    )
+    expected_identity = (
+        str(campaign_uid),
+        phase,
+        expected_iteration,
+        expected_round,
+    )
+    if observed_identity != expected_identity:
+        raise ValueError("scheduler-complete AIMAll producer identity mismatch")
+
+    status = str(current.get("status") or "")
+    reason = str(current.get("reason") or "")
+    nested = current.get("postprocess_source")
+    if nested is not None:
+        if status not in {"PRE_SUBMIT", "FAILED", "SUPERSEDED"}:
+            raise ValueError(
+                "AIMAll postprocess source wrapper has an unsupported status"
+            )
+        if status == "SUPERSEDED" and reason != "reconcile_apply_retry":
+            raise ValueError(
+                "superseded AIMAll postprocess wrapper has an unsupported reason"
+            )
+        if current.get("job_id") is not None:
+            raise ValueError("AIMAll postprocess wrapper unexpectedly owns a JobID")
+        source = _validated_postprocess_source(nested)
+    else:
+        if status != "FAILED" and not (
+            status == "SUPERSEDED" and reason == "reconcile_apply_retry"
+        ):
+            raise ValueError(
+                "scheduler-complete AIMAll producer must be FAILED or "
+                "SUPERSEDED by reconcile_apply_retry"
+            )
+        scheduler_kind = str(
+            current.get("scheduler_identity_kind") or ""
+        ).strip().lower()
+        job_id = _validate_job_identity(current.get("job_id"), scheduler_kind)
+        if current.get("submission_kind") != "array":
+            raise ValueError("scheduler-complete AIMAll producer is not an array")
+        if current.get("expected_tasks") != expected_total:
+            raise ValueError(
+                "scheduler-complete AIMAll producer expected-task count mismatch"
+            )
+        metadata = current.get("submission_metadata")
+        if (
+            not isinstance(metadata, Mapping)
+            or str(metadata.get("logical_task_set_sha256") or "")
+            != expected_task_digest
+        ):
+            raise ValueError(
+                "scheduler-complete AIMAll producer task-set digest mismatch"
+            )
+        lifecycle = current.get("queue_lifecycle")
+        if not isinstance(lifecycle, Mapping):
+            raise ValueError(
+                "scheduler-complete AIMAll producer lacks queue lifecycle evidence"
+            )
+        terminal_identity = (
+            str(lifecycle.get("terminal_status") or ""),
+            lifecycle.get("n_expected"),
+            lifecycle.get("n_observed"),
+            lifecycle.get("n_missing"),
+        )
+        if terminal_identity != (
+            "COMPLETED",
+            expected_total,
+            expected_total,
+            0,
+        ):
+            raise ValueError(
+                "AIMAll scheduler lifecycle does not prove complete task ownership"
+            )
+        source = {
+            "campaign_uid": str(campaign_uid),
+            "phase": phase,
+            "iteration": expected_iteration,
+            "attempt_id": str(current.get("attempt_id") or ""),
+            "submission_identity": str(
+                current.get("submission_identity") or ""
+            ),
+            "job_id": str(job_id),
+            "environment_generation": current.get("environment_generation"),
+            "environment_generation_digest_sha256": current.get(
+                "environment_generation_digest_sha256"
+            ),
+            "logical_total": expected_total,
+            "logical_task_set_sha256": expected_task_digest,
+            "decision_contract": current.get("decision_contract"),
+        }
+        source["source_sha256"] = _canonical_postprocess_source_sha256(source)
+        source = _validated_postprocess_source(source)
+
+    source_identity = (
+        str(source["campaign_uid"]),
+        str(source["phase"]),
+        int(source["iteration"]),
+        int(source["logical_total"]),
+        str(source["logical_task_set_sha256"]),
+    )
+    if source_identity != (
+        str(campaign_uid),
+        phase,
+        expected_iteration,
+        expected_total,
+        expected_task_digest,
+    ):
+        raise ValueError(
+            "AIMAll postprocess source does not match the filtered task set"
+        )
+    if current.get("expected_tasks") != expected_total:
+        raise ValueError("AIMAll postprocess wrapper expected-task count mismatch")
+    if current.get("decision_contract") != source["decision_contract"]:
+        raise ValueError("AIMAll postprocess wrapper decision contract mismatch")
     _validate_postprocess_source_environment(campaign_dir, source)
     return source
 

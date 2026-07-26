@@ -1091,6 +1091,89 @@ def test_ariadne_postprocess_intent_copies_original_decision_contract(
     assert captured[0]["environment_generation"] == 7
 
 
+def test_failed_aimall_array_without_complete_scheduler_evidence_retries_normally(
+    tmp_path,
+    monkeypatch,
+):
+    d = _make_daemon(tmp_path)
+    state = fresh_campaign_state(max_iterations=2)
+    state.phase = CampaignPhase.AIMALL
+    state.iteration = 1
+    intent = {
+        "phase": CampaignPhase.AIMALL.value,
+        "status": "FAILED",
+        "reason": "scheduler task failed",
+        "expected_tasks": 3,
+        "queue_lifecycle": {
+            "terminal_status": "FAILED",
+            "n_expected": 3,
+            "n_observed": 3,
+            "n_missing": 0,
+        },
+    }
+    monkeypatch.setattr(
+        submission_intent,
+        "load_intent",
+        lambda *_args, **_kwargs: dict(intent),
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "resolve_aimall_postprocess_source",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ordinary AIMAll retry entered postprocess-only recovery")
+        ),
+    )
+
+    assert (
+        d._aimall_postprocess_source_if_complete(
+            state,
+            CampaignPhase.AIMALL,
+        )
+        is None
+    )
+
+
+def test_active_completed_aimall_intent_stays_on_normal_adoption_path(
+    tmp_path,
+    monkeypatch,
+):
+    d = _make_daemon(tmp_path)
+    state = fresh_campaign_state(max_iterations=2)
+    state.phase = CampaignPhase.AIMALL
+    state.iteration = 1
+    intent = {
+        "phase": CampaignPhase.AIMALL.value,
+        "status": "SUBMITTED",
+        "expected_tasks": 3,
+        "queue_lifecycle": {
+            "terminal_status": "COMPLETED",
+            "n_expected": 3,
+            "n_observed": 3,
+            "n_missing": 0,
+        },
+    }
+    monkeypatch.setattr(
+        submission_intent,
+        "load_intent",
+        lambda *_args, **_kwargs: dict(intent),
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "resolve_aimall_postprocess_source",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("active AIMAll ownership entered failed-intent recovery")
+        ),
+    )
+
+    assert (
+        d._aimall_postprocess_source_if_complete(
+            state,
+            CampaignPhase.AIMALL,
+        )
+        is None
+    )
+
+
 def test_scheduler_free_completion_retires_pre_submit_intent(tmp_path):
     d = _make_daemon(tmp_path)
     state = fresh_campaign_state(max_iterations=1)

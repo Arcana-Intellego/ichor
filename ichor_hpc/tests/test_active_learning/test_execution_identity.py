@@ -39,6 +39,8 @@ from ichor.hpc.active_learning.daemon.submission_intent import (
     mark_failed,
     mark_submitted,
     mark_superseded,
+    record_queue_lifecycle,
+    resolve_aimall_postprocess_source,
     resolve_ariadne_postprocess_source,
     write_pre_submit_intent,
 )
@@ -639,6 +641,374 @@ def _write_full_ariadne_producer_intent(
         int(state.iteration),
         expected_campaign_uid=str(state.campaign_uid),
     )
+
+
+def _write_aimall_producer_intent(campaign, state, *, logical_total=2):
+    from ichor.hpc.active_learning.daemon import input_staging as staging
+
+    staging_root = (
+        campaign
+        / ".DATA"
+        / "STAGING"
+        / ("iter_" + str(int(state.iteration)))
+    )
+    accepted = []
+    for logical_task_id in range(int(logical_total)):
+        pointdir = staging_root / (
+            "POINT_" + str(logical_task_id).zfill(4) + ".pointdir"
+        )
+        pointdir.mkdir(parents=True, exist_ok=True)
+        accepted.append(pointdir)
+    staging.write_quantum_acceptance_manifest(
+        staging_root,
+        phase_name=CampaignPhase.GAUSSIAN.value,
+        iteration=int(state.iteration),
+        accepted=accepted,
+        rejected=[("POINT_9999.pointdir", "gaussian_failed")],
+    )
+    staging.write_points_file(staging_root, accepted)
+    task_digest = hashlib.sha256(
+        ",".join(str(index) for index in range(int(logical_total))).encode(
+            "ascii"
+        )
+    ).hexdigest()
+    active = read_active_environment_generation(
+        campaign,
+        expected_campaign_uid=str(state.campaign_uid),
+    )["generation"]
+    write_pre_submit_intent(
+        campaign,
+        campaign_uid=str(state.campaign_uid),
+        phase_name=CampaignPhase.AIMALL.value,
+        iteration=int(state.iteration),
+        expected_tasks=int(logical_total),
+        decision_contract={
+            "failure_threshold_fraction": 0.25,
+            "config_sha256": "c" * 64,
+        },
+        environment_generation=int(active["generation"]),
+        environment_generation_digest_sha256=str(active["digest_sha256"]),
+    )
+    mark_submitted(
+        campaign,
+        CampaignPhase.AIMALL.value,
+        int(state.iteration),
+        "17888108",
+        expected_tasks=int(logical_total),
+        submission_metadata={
+            "logical_task_set_sha256": task_digest,
+        },
+    )
+    record_queue_lifecycle(
+        campaign,
+        CampaignPhase.AIMALL.value,
+        int(state.iteration),
+        "terminal",
+        job_id="17888108",
+        status="COMPLETED",
+        n_expected=int(logical_total),
+        n_observed=int(logical_total),
+        n_missing=0,
+    )
+    mark_failed(
+        campaign,
+        CampaignPhase.AIMALL.value,
+        int(state.iteration),
+        "prior_gaussian_acceptance_manifest_invalid",
+    )
+    return load_intent(
+        campaign,
+        CampaignPhase.AIMALL.value,
+        int(state.iteration),
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+
+
+def _patch_aimall_transition(monkeypatch, *, current_version=0):
+    from ichor.hpc.active_learning.versioning.reference_data import (
+        ReferenceDataVersioning,
+    )
+    from ichor.hpc.active_learning.versioning.trained_models import (
+        TrainedModelVersioning,
+    )
+
+    monkeypatch.setattr(
+        ReferenceDataVersioning,
+        "current_version",
+        lambda _self: int(current_version),
+    )
+    monkeypatch.setattr(
+        TrainedModelVersioning,
+        "current_version",
+        lambda _self: int(current_version),
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.recovery_contracts."
+        "phase_recovery_contract_error",
+        lambda *_args, **_kwargs: None,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "phase",
+        "iteration",
+        "committed_version",
+        "current_version",
+        "replacement_round",
+    ),
+    [
+        (CampaignPhase.INITIAL_AIMALL, 0, -1, None, 0),
+        (CampaignPhase.INITIAL_REPLACEMENT_AIMALL, 0, -1, None, 1),
+        (CampaignPhase.AIMALL, 2, 1, 1, 0),
+        (CampaignPhase.REPLACEMENT_AIMALL, 2, 1, 1, 1),
+    ],
+)
+def test_aimall_postprocess_environment_boundary_covers_all_phases(
+    tmp_path,
+    monkeypatch,
+    phase,
+    iteration,
+    committed_version,
+    current_version,
+    replacement_round,
+):
+    from ichor.hpc.active_learning.versioning.reference_data import (
+        ReferenceDataVersioning,
+    )
+    from ichor.hpc.active_learning.versioning.trained_models import (
+        TrainedModelVersioning,
+    )
+
+    state = fresh_campaign_state(max_iterations=3)
+    state.phase = phase
+    state.iteration = iteration
+    state.replacement_round = replacement_round
+    state.reference_data_version = committed_version
+    state.models_version = committed_version
+    monkeypatch.setattr(
+        ReferenceDataVersioning,
+        "current_version",
+        lambda _self: current_version,
+    )
+    monkeypatch.setattr(
+        TrainedModelVersioning,
+        "current_version",
+        lambda _self: current_version,
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.recovery_contracts."
+        "phase_recovery_contract_error",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.submission_intent."
+        "resolve_aimall_postprocess_source",
+        lambda *_args, **_kwargs: {
+            "logical_total": 2,
+            "submission_identity": "r0000-a0001-fixture",
+            "job_id": "17888108",
+            "environment_generation": 4,
+            "environment_generation_digest_sha256": "d" * 64,
+        },
+    )
+
+    result = (
+        execution_identity_module._validate_aimall_postprocess_transition_boundary(
+            tmp_path,
+            state,
+        )
+    )
+
+    assert result["transition_kind"] == "aimall_postprocess_only"
+    assert result["logical_total"] == 2
+
+
+def test_initial_aimall_postprocess_boundary_rejects_committed_current_pointer(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.versioning.reference_data import (
+        ReferenceDataVersioning,
+    )
+    from ichor.hpc.active_learning.versioning.trained_models import (
+        TrainedModelVersioning,
+    )
+
+    state = fresh_campaign_state(max_iterations=3)
+    state.phase = CampaignPhase.INITIAL_AIMALL
+    state.iteration = 0
+    state.reference_data_version = -1
+    state.models_version = -1
+    monkeypatch.setattr(
+        ReferenceDataVersioning,
+        "current_version",
+        lambda _self: 0,
+    )
+    monkeypatch.setattr(
+        TrainedModelVersioning,
+        "current_version",
+        lambda _self: 0,
+    )
+
+    with pytest.raises(
+        execution_identity_module.ExecutionIdentityError,
+        match="requires no committed current",
+    ):
+        execution_identity_module._validate_aimall_postprocess_transition_boundary(
+            tmp_path,
+            state,
+        )
+
+
+def test_rebind_accepts_scheduler_complete_aimall_postprocess_boundary(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.AIMALL
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    producer = _write_aimall_producer_intent(campaign, state, logical_total=2)
+    mark_superseded(
+        campaign,
+        CampaignPhase.AIMALL.value,
+        1,
+        "reconcile_apply_retry",
+    )
+    _patch_aimall_transition(monkeypatch)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
+
+    result = rebind_environment(
+        campaign,
+        config=config,
+        scheduler_ownership_clear=True,
+    )
+
+    assert result["changed"] is True
+    assert result["transition_kind"] == "aimall_postprocess_only"
+    assert result["logical_total"] == 2
+    assert result["producer_job_id"] == "17888108"
+    assert (
+        result["postprocess_source"]["submission_identity"]
+        == producer["submission_identity"]
+    )
+
+
+def test_aimall_postprocess_source_survives_local_failure_wrapper(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, _config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.AIMALL
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    producer = _write_aimall_producer_intent(campaign, state, logical_total=2)
+    source = resolve_aimall_postprocess_source(
+        campaign,
+        campaign_uid=str(state.campaign_uid),
+        phase_name=CampaignPhase.AIMALL.value,
+        iteration=1,
+    )
+    mark_superseded(
+        campaign,
+        CampaignPhase.AIMALL.value,
+        1,
+        "reconcile_apply_retry",
+    )
+    active = read_active_environment_generation(
+        campaign,
+        expected_campaign_uid=str(state.campaign_uid),
+    )["generation"]
+    write_pre_submit_intent(
+        campaign,
+        campaign_uid=str(state.campaign_uid),
+        phase_name=CampaignPhase.AIMALL.value,
+        iteration=1,
+        expected_tasks=2,
+        decision_contract=dict(source["decision_contract"]),
+        postprocess_source=dict(source),
+        environment_generation=int(active["generation"]),
+        environment_generation_digest_sha256=str(active["digest_sha256"]),
+    )
+    mark_failed(
+        campaign,
+        CampaignPhase.AIMALL.value,
+        1,
+        "second local postprocess failure",
+    )
+
+    repeated = resolve_aimall_postprocess_source(
+        campaign,
+        campaign_uid=str(state.campaign_uid),
+        phase_name=CampaignPhase.AIMALL.value,
+        iteration=1,
+    )
+
+    assert repeated == source
+    assert repeated["attempt_id"] == producer["attempt_id"]
+    assert repeated["job_id"] == "17888108"
+
+
+def test_aimall_postprocess_source_rejects_incomplete_scheduler_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, _config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.AIMALL
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    producer = _write_aimall_producer_intent(campaign, state, logical_total=2)
+    invalid = dict(producer)
+    invalid["queue_lifecycle"] = dict(producer["queue_lifecycle"])
+    invalid["queue_lifecycle"]["n_missing"] = 1
+
+    with pytest.raises(
+        ValueError,
+        match="does not prove complete task ownership",
+    ):
+        resolve_aimall_postprocess_source(
+            campaign,
+            campaign_uid=str(state.campaign_uid),
+            phase_name=CampaignPhase.AIMALL.value,
+            iteration=1,
+            intent=invalid,
+        )
+
+
+def test_aimall_postprocess_source_rejects_task_set_mismatch(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, _config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.AIMALL
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    producer = _write_aimall_producer_intent(campaign, state, logical_total=2)
+    invalid = dict(producer)
+    invalid["submission_metadata"] = dict(producer["submission_metadata"])
+    invalid["submission_metadata"]["logical_task_set_sha256"] = "0" * 64
+
+    with pytest.raises(ValueError, match="task-set digest mismatch"):
+        resolve_aimall_postprocess_source(
+            campaign,
+            campaign_uid=str(state.campaign_uid),
+            phase_name=CampaignPhase.AIMALL.value,
+            iteration=1,
+            intent=invalid,
+        )
 
 
 def test_rebind_accepts_fully_retryable_ariadne_boundary(

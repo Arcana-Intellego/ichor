@@ -832,6 +832,27 @@ def _phase_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusReco
             why="state phase is DONE",
             command=_journal_cmd(campaign),
         )
+    aimall_recovery = payload.get(
+        "_presentation_aimall_postprocess_recovery"
+    )
+    if isinstance(aimall_recovery, dict):
+        total = int(aimall_recovery.get("logical_total") or 0)
+        return StatusRecommendation(
+            code="phase_" + phase.lower() + "_ready",
+            severity="info",
+            primary=(
+                "resume the daemon to validate "
+                + str(total)
+                + " existing AIMAll output"
+                + ("" if total == 1 else "s")
+                + " locally; no AIMAll array will be resubmitted"
+            ),
+            why=(
+                "the original scheduler lifecycle proves every AIMAll task "
+                "completed, while local acceptance publication is still pending"
+            ),
+            command=_resume_cmd(campaign),
+        )
     action = _PHASE_ACTIONS.get(phase)
     if action is not None:
         primary, why = action
@@ -1038,6 +1059,24 @@ def build_status_recommendations(
     if ownership:
         return ownership
 
+    stale_pid = _stale_pid_recommendation(campaign, payload)
+    transaction_recovery = _reconcile_transaction_recommendation(
+        campaign,
+        payload,
+    )
+    if transaction_recovery is not None:
+        return [transaction_recovery] + stale_pid
+
+    scheduler_uncertain = _scheduler_uncertain_resume_recommendation(
+        campaign,
+        payload,
+    )
+    if scheduler_uncertain is not None:
+        return [scheduler_uncertain] + stale_pid
+
+    if _phase(payload) == CampaignPhase.HALTED.value:
+        return [_halt_recommendation(campaign, payload)] + stale_pid
+
     stop_request = payload.get("stop_request")
     if isinstance(stop_request, dict) and not payload.get("shutdown_requested"):
         from .stop_control import describe_stop_request
@@ -1066,6 +1105,30 @@ def build_status_recommendations(
             stop_request,
             completed=request_completed,
         )
+        aimall_recovery = payload.get(
+            "_presentation_aimall_postprocess_recovery"
+        )
+        if isinstance(aimall_recovery, dict):
+            total = int(aimall_recovery.get("logical_total") or 0)
+            return [
+                StatusRecommendation(
+                    code="user_stop_draining",
+                    severity="required",
+                    primary=(
+                        "resume the daemon to validate "
+                        + str(total)
+                        + " existing AIMAll output"
+                        + ("" if total == 1 else "s")
+                        + " locally; no AIMAll array will be resubmitted"
+                    ),
+                    why=(
+                        stop_description
+                        + "; the request remains active and will be honoured "
+                        "after this iteration genuinely completes"
+                    ),
+                    command=_cmd(campaign, "resume"),
+                )
+            ]
         return [
             StatusRecommendation(
                 code="user_stop_draining",
@@ -1091,8 +1154,6 @@ def build_status_recommendations(
                 ],
             )
         ]
-
-    stale_pid = _stale_pid_recommendation(campaign, payload)
 
     if payload.get("shutdown_requested"):
         context = payload.get("lifecycle_context")
@@ -1120,23 +1181,6 @@ def build_status_recommendations(
                 ),
             )
         ] + stale_pid
-
-    transaction_recovery = _reconcile_transaction_recommendation(
-        campaign,
-        payload,
-    )
-    if transaction_recovery is not None:
-        return [transaction_recovery] + stale_pid
-
-    scheduler_uncertain = _scheduler_uncertain_resume_recommendation(
-        campaign,
-        payload,
-    )
-    if scheduler_uncertain is not None:
-        return [scheduler_uncertain] + stale_pid
-
-    if _phase(payload) == CampaignPhase.HALTED.value:
-        return [_halt_recommendation(campaign, payload)] + stale_pid
 
     if _state_contract_problem(payload):
         return [_contract_recommendation(campaign, payload)] + stale_pid

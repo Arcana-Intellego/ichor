@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -2611,6 +2611,48 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             raise RuntimeError(
                 "phase " + phase_name + " classified as neither INLINE nor SBATCH"
             )
+        if "AIMALL" in phase_name:
+            from . import submission_intent as _submission_intent
+
+            postprocess_intent = _submission_intent.load_active_intent(
+                self.campaign_dir,
+                phase_name,
+                int(getattr(state, "iteration", 0)),
+                expected_campaign_uid=str(state.campaign_uid),
+            )
+            if (
+                isinstance(postprocess_intent, dict)
+                and isinstance(
+                    postprocess_intent.get("postprocess_source"),
+                    Mapping,
+                )
+            ):
+                source = _submission_intent.resolve_aimall_postprocess_source(
+                    self.campaign_dir,
+                    campaign_uid=str(state.campaign_uid),
+                    phase_name=phase_name,
+                    iteration=int(getattr(state, "iteration", 0)),
+                    replacement_round=int(
+                        getattr(state, "replacement_round", 0)
+                    ),
+                    intent=postprocess_intent,
+                )
+                self._journal_event(
+                    "partial_array_recovery_postprocess_only",
+                    phase=phase_name,
+                    iteration=int(getattr(state, "iteration", 0)),
+                    logical_total=int(source["logical_total"]),
+                    n_complete=int(source["logical_total"]),
+                    n_retry=0,
+                    producer_job_id=str(source["job_id"]),
+                )
+                self._report_runtime_progress(
+                    "output_visibility",
+                    completed=0,
+                    total=int(source["logical_total"]),
+                    unit="tasks",
+                )
+                return self.postprocess(state, phase, [])
         try:
             self._report_runtime_progress("handoff_validation")
             self._report_runtime_progress("input_staging")
@@ -3303,7 +3345,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     staging_root,
                     expected_phase=expected_phase,
                     expected_iteration=int(state.iteration),
-                    require_points_file_membership=True,
+                    points_membership=(
+                        _stg.POINTS_MEMBERSHIP_PRODUCER_OR_ACCEPTED
+                    ),
                 )
             except Exception as exc:
                 return PhaseResult(

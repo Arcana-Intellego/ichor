@@ -714,6 +714,48 @@ def _strict_pointdirs(
     return points_path, pointdirs
 
 
+def _strict_pointdir_sequence(
+    campaign_dir: Path,
+    staging: Path,
+    required_file: str,
+    pointdirs: Sequence[Path],
+) -> List[Path]:
+    """Validate a prepared point sequence before POINTS.txt publication."""
+    root = campaign_owned_path(campaign_dir, Path(staging))
+    resolved_pointdirs: List[Path] = []
+    seen = set()
+    for task_index, raw_pointdir in enumerate(pointdirs):
+        pointdir = Path(raw_pointdir)
+        if not pointdir.is_absolute():
+            pointdir = root / pointdir
+        resolved = pointdir.resolve(strict=False)
+        if resolved.parent != root:
+            raise ValueError(
+                "prepared quantum pointdir is not a direct staging child at "
+                "task "
+                + str(task_index)
+            )
+        if resolved in seen:
+            raise ValueError("prepared quantum pointdirs contain a duplicate")
+        seen.add(resolved)
+        if pointdir.is_symlink() or resolved.is_symlink() or not resolved.is_dir():
+            raise ValueError(
+                "prepared quantum pointdir is not a regular directory: "
+                + str(pointdir)
+            )
+        required = resolved / required_file
+        if required.is_symlink() or not required.is_file():
+            raise FileNotFoundError(
+                required_file
+                + " is missing from prepared pointdir: "
+                + str(resolved)
+            )
+        resolved_pointdirs.append(resolved)
+    if not resolved_pointdirs:
+        raise ValueError("prepared quantum pointdir sequence is empty")
+    return resolved_pointdirs
+
+
 def _gjf_atom_order(path: Path) -> Tuple[str, ...]:
     lines = path.read_text(encoding="utf-8").splitlines()
     start: Optional[int] = None
@@ -781,6 +823,9 @@ def _quantum_evidence(
     *,
     replacement_round: int,
     staging_dir: Optional[Path],
+    pointdirs_override: Optional[Sequence[Path]] = None,
+    points_evidence_override: Optional[Dict[str, Any]] = None,
+    inspect_aimall_task_metadata: bool = True,
 ) -> Dict[str, Any]:
     staging = _staging_dir(
         campaign_dir,
@@ -792,11 +837,33 @@ def _quantum_evidence(
     if staging is None:
         raise FileNotFoundError("quantum staging directory cannot be resolved")
     required = "input.wfn" if "AIMALL" in str(phase_name) else "input.gjf"
-    points_path, pointdirs = _strict_pointdirs(
-        campaign_dir,
-        staging,
-        required,
-    )
+    if pointdirs_override is None:
+        points_path, pointdirs = _strict_pointdirs(
+            campaign_dir,
+            staging,
+            required,
+        )
+        points_evidence = _file_evidence(points_path)
+    else:
+        points_path = Path(staging) / "POINTS.txt"
+        pointdirs = _strict_pointdir_sequence(
+            campaign_dir,
+            staging,
+            required,
+            pointdirs_override,
+        )
+        points_evidence = dict(points_evidence_override or {})
+        expected_points_path = str(points_path.resolve())
+        if (
+            set(points_evidence) != {"path", "size", "sha256"}
+            or points_evidence.get("path") != expected_points_path
+            or isinstance(points_evidence.get("size"), bool)
+            or not isinstance(points_evidence.get("size"), int)
+            or int(points_evidence["size"]) < 0
+            or not isinstance(points_evidence.get("sha256"), str)
+            or len(str(points_evidence["sha256"])) != 64
+        ):
+            raise ValueError("prepared POINTS.txt resource evidence is invalid")
     atom_orders = []
     primitive_counts = []
     aimall_task_naat = []
@@ -821,7 +888,7 @@ def _quantum_evidence(
     evidence: Dict[str, Any] = {
         "source": "quantum_staging_points",
         "staging_root": str(Path(staging).resolve()),
-        "points": _file_evidence(points_path),
+        "points": points_evidence,
         "n_tasks": len(pointdirs),
         "max_n_atoms": int(max_atoms),
         "atom_orders": [list(order) for order in atom_orders],
@@ -832,11 +899,12 @@ def _quantum_evidence(
         evidence["max_n_primitives"] = max(primitive_counts)
         task_paths = [pointdir / "AIMALL_TASK.json" for pointdir in pointdirs]
         task_exists = [path.is_file() and not path.is_symlink() for path in task_paths]
-        if any(task_exists) and not all(task_exists):
-            raise ValueError(
-                "AIMAll task metadata is only present for part of the staged array"
-            )
-        if all(task_exists):
+        if inspect_aimall_task_metadata:
+            if any(task_exists) and not all(task_exists):
+                raise ValueError(
+                    "AIMAll task metadata is only present for part of the staged array"
+                )
+        if inspect_aimall_task_metadata and all(task_exists):
             for index, task_path in enumerate(task_paths):
                 try:
                     task_payload = json.loads(task_path.read_text(encoding="utf-8"))
@@ -907,6 +975,37 @@ def _quantum_evidence(
             _file_evidence(path) for path in acceptance
         ]
     return evidence
+
+
+def prepared_quantum_resource_evidence(
+    campaign_dir: Union[str, Path],
+    *,
+    phase_name: str,
+    iteration: int,
+    replacement_round: int = 0,
+    staging_dir: Path,
+    pointdirs: Sequence[Path],
+) -> Dict[str, Any]:
+    """Build resource evidence before publishing a filtered POINTS.txt."""
+    encoded = (
+        "\n".join(str(Path(pointdir).resolve()) for pointdir in pointdirs) + "\n"
+    ).encode("utf-8")
+    points_path = Path(staging_dir) / "POINTS.txt"
+    points_evidence = {
+        "path": str(points_path.resolve()),
+        "size": len(encoded),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+    return _quantum_evidence(
+        Path(campaign_dir),
+        str(phase_name),
+        int(iteration),
+        replacement_round=int(replacement_round),
+        staging_dir=Path(staging_dir),
+        pointdirs_override=pointdirs,
+        points_evidence_override=points_evidence,
+        inspect_aimall_task_metadata=False,
+    )
 
 
 def _directory_bytes(root: Path) -> int:

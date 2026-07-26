@@ -295,6 +295,65 @@ def test_stop_and_invalid_artifacts_override_daemon_running_recommendation(tmp_p
     assert invalid[0].code == "stop_check_no_committed_pair"
 
 
+def test_halted_recovery_precedes_pending_iteration_stop(tmp_path):
+    campaign = tmp_path / "campaign"
+    result = recommendations.build_status_recommendations(
+        campaign,
+        {
+            "phase": CampaignPhase.HALTED.value,
+            "latest_halt_event": {
+                "reason": (
+                    "prior_gaussian_acceptance_manifest_invalid: rejected "
+                    "pointdir is not present in POINTS.txt"
+                )
+            },
+            "stop_request": {
+                "status": "requested",
+                "request_id": "request-14",
+                "mode": "after_iteration",
+                "target_iteration": 14,
+            },
+        },
+    )
+
+    assert result[0].code.startswith("halted_")
+    assert "reconcile" in str(result[0].command)
+
+
+def test_aimall_postprocess_recovery_explains_local_reuse_and_pending_stop(
+    tmp_path,
+):
+    campaign = tmp_path / "campaign"
+    recovery = {
+        "phase": CampaignPhase.AIMALL.value,
+        "iteration": 14,
+        "logical_total": 149,
+        "n_complete": 149,
+        "n_reuse": 149,
+        "n_retry": 0,
+    }
+    payload = {
+        "phase": CampaignPhase.AIMALL.value,
+        "iteration": 14,
+        "lock_held": False,
+        "_presentation_aimall_postprocess_recovery": recovery,
+        "stop_request": {
+            "status": "requested",
+            "request_id": "request-14",
+            "mode": "after_iteration",
+            "target_iteration": 14,
+        },
+    }
+
+    result = recommendations.build_status_recommendations(campaign, payload)
+
+    assert result[0].code == "user_stop_draining"
+    assert "149 existing AIMAll outputs" in result[0].primary
+    assert "no AIMAll array will be resubmitted" in result[0].primary
+    assert "honoured after this iteration genuinely completes" in result[0].why
+    assert "149 completed AIMAll outputs" in cli._status_current_activity(payload)
+
+
 def test_stopped_scheduler_progress_is_explicitly_historical():
     payload = _active_ariadne_payload()
     payload["lock_held"] = False

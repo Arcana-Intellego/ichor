@@ -2410,6 +2410,9 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
     runtime_progress = _runtime_progress_record(payload)
     progress = _seed_selection_progress_record(payload)
     scheduler_name = _status_scheduler_display_name(payload)
+    aimall_recovery = payload.get(
+        "_presentation_aimall_postprocess_recovery"
+    )
     if str(payload.get("background_startup_state") or "") in {
         "prepared",
         "spawned",
@@ -2419,6 +2422,23 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
         return "The background process is still starting (" + stage + ")."
     if phase == CampaignPhase.SEED_SELECT.value and progress is not None:
         return _format_seed_selection_progress(progress)
+    if isinstance(aimall_recovery, Mapping):
+        total = int(aimall_recovery.get("logical_total") or 0)
+        if daemon_active:
+            return (
+                "The daemon is validating "
+                + str(total)
+                + " existing AIMAll output"
+                + ("" if total == 1 else "s")
+                + " locally; no AIMAll array is being resubmitted."
+            )
+        return (
+            str(total)
+            + " completed AIMAll output"
+            + ("" if total == 1 else "s")
+            + " are ready for local validation; no AIMAll array will be "
+            "resubmitted."
+        )
     if runtime_progress is not None:
         if str(runtime_progress.get("producer_kind") or "") == "scheduler":
             count = max(active_jobs, scheduler_intents, 1)
@@ -2973,6 +2993,15 @@ def _status_progress_so_far_rows(payload: Dict[str, Any]) -> List[Tuple[str, str
 def _status_phase_outcome(payload: Dict[str, Any]) -> str:
     phase = str(payload.get("phase") or "")
     iteration = int(payload.get("iteration") or 0)
+    if isinstance(
+        payload.get("_presentation_aimall_postprocess_recovery"),
+        Mapping,
+    ):
+        return (
+            "after validating the existing AIMAll outputs locally, the daemon "
+            "will update point allocation; only genuinely vacant slots may "
+            "require replacement calculations"
+        )
     if phase == CampaignPhase.REFERENCE_COMMIT.value and iteration == 0:
         return (
             "after publishing the bootstrap QM data, the daemon will train the "
@@ -4178,6 +4207,22 @@ def _journal_operator_summary(
                 + rejected_text
                 + ", "
                 + resubmitted_text
+            )
+        aimall_completed = _event_int(event, "aimall_completed_outputs")
+        aimall_resubmitted = _event_int(event, "aimall_tasks_resubmitted")
+        if aimall_completed is not None and aimall_resubmitted is not None:
+            resubmission = (
+                "no AIMAll tasks resubmitted"
+                if aimall_resubmitted == 0
+                else str(aimall_resubmitted) + " AIMAll tasks resubmitted"
+            )
+            return (
+                "reconcile applied; reusing "
+                + str(aimall_completed)
+                + " completed AIMAll output"
+                + ("" if aimall_completed == 1 else "s")
+                + " for local validation, "
+                + resubmission
             )
     if raw in {"user_stop_requested", "user_stop_boundary_reached"}:
         from .daemon.stop_control import describe_stop_request
@@ -6986,6 +7031,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         ),
         None,
     )
+    aimall_postprocess_recovery_status = None
     try:
         if supports_partial_array_recovery(state.phase):
             ledger = read_array_ledger(campaign, state.phase, int(state.iteration))
@@ -7003,6 +7049,19 @@ def cmd_status(args: argparse.Namespace) -> int:
         payload["partial_array_recovery_error"] = (
             type(exc).__name__ + ": " + str(exc)
         )
+    try:
+        from .daemon.reconcile import inspect_aimall_postprocess_recovery
+
+        aimall_postprocess_recovery_status = (
+            inspect_aimall_postprocess_recovery(campaign, state)
+        )
+    except Exception:
+        aimall_postprocess_recovery_status = None
+    if isinstance(aimall_postprocess_recovery_status, Mapping):
+        payload["partial_array_recovery"] = compact_array_recovery_summary(
+            dict(aimall_postprocess_recovery_status)
+        )
+        payload.pop("partial_array_recovery_error", None)
     try:
         cfg = CampaignConfig.from_yaml(campaign / "campaign.yaml")
         payload["campaign_config_status"] = {"ok": True}
@@ -7056,6 +7115,10 @@ def cmd_status(args: argparse.Namespace) -> int:
             "errors": [type(exc).__name__ + ": " + str(exc)],
         }
     presentation_payload = dict(payload)
+    if isinstance(aimall_postprocess_recovery_status, Mapping):
+        presentation_payload[
+            "_presentation_aimall_postprocess_recovery"
+        ] = dict(aimall_postprocess_recovery_status)
     try:
         profile = require_cluster_profile()
         presentation_payload["_presentation_scheduler_kind"] = str(
@@ -7096,6 +7159,13 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
     )
     payload["next_action"] = payload["recommendations"][0]["primary"]
+    if (
+        not bool(getattr(args, "json", False))
+        and isinstance(aimall_postprocess_recovery_status, Mapping)
+    ):
+        payload["_presentation_aimall_postprocess_recovery"] = dict(
+            aimall_postprocess_recovery_status
+        )
     if (
         not bool(getattr(args, "json", False))
         and bool(getattr(args, "verbose", False))
@@ -9358,8 +9428,33 @@ def _reconcile_presentation(
         )
         reason_parts.append("existing AIMAll results can be corrected without rerunning them")
 
+    aimall_postprocess = getattr(
+        report,
+        "aimall_postprocess_recovery",
+        None,
+    )
+    if isinstance(aimall_postprocess, Mapping) and aimall_postprocess:
+        completed = int(aimall_postprocess.get("logical_total") or 0)
+        planned.append(
+            (
+                "AIMAll results",
+                "reuse "
+                + str(completed)
+                + " completed output"
+                + ("" if completed == 1 else "s")
+                + " for local validation after resume; resubmit none",
+            )
+        )
+        reason_parts.append(
+            "completed AIMAll outputs are awaiting local validation"
+        )
+
     partial = getattr(report, "partial_array_recovery", None)
-    if isinstance(partial, Mapping) and partial:
+    if (
+        isinstance(partial, Mapping)
+        and partial
+        and not isinstance(aimall_postprocess, Mapping)
+    ):
         reuse = int(partial.get("n_reuse") or partial.get("n_complete") or 0)
         retry = int(partial.get("n_retry") or 0)
         planned.append(
@@ -10456,6 +10551,24 @@ def _print_reconcile_applied_operator_report(
                 + " task(s) for resubmission after resume",
             )
         )
+    aimall_postprocess = getattr(
+        report,
+        "aimall_postprocess_recovery",
+        None,
+    )
+    if isinstance(aimall_postprocess, Mapping):
+        completed = int(aimall_postprocess.get("logical_total") or 0)
+        applied_rows.append(
+            (
+                "AIMAll results",
+                "retained "
+                + str(completed)
+                + " completed output"
+                + ("" if completed == 1 else "s")
+                + " for local validation; no AIMAll tasks prepared for "
+                "resubmission",
+            )
+        )
     applied_rows.extend(("array output", "archived " + _reconcile_relative_path(campaign, item)) for item in archived_array_outputs)
     for change in list(getattr(config_review, "allowed_changes", []) or []):
         applied_rows.append(
@@ -10526,16 +10639,26 @@ def _print_reconcile_applied_operator_report(
         CampaignPhase.HALTED,
         CampaignPhase.DONE,
     }:
+        effect = (
+            (
+                "validate "
+                + str(int(aimall_postprocess.get("logical_total") or 0))
+                + " existing AIMAll outputs locally without resubmitting "
+                "their array, then continue from "
+            )
+            if isinstance(aimall_postprocess, Mapping)
+            else (
+                "clear the completed pause and continue from "
+                if intentionally_stopped
+                else "continue the campaign from "
+            )
+        )
         _print_reconcile_key_values(
             [
                 ("run", _campaign_command(campaign, "resume")),
                 (
                     "effect",
-                    (
-                        "clear the completed pause and continue from "
-                        if intentionally_stopped
-                        else "continue the campaign from "
-                    )
+                    effect
                     + _reconcile_phase_display(
                         report.proposed_state.phase,
                         report.proposed_state.iteration,
@@ -12544,6 +12667,21 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             if isinstance(ariadne_recovery, Mapping)
             else {}
         )
+        aimall_recovery = getattr(
+            report,
+            "aimall_postprocess_recovery",
+            None,
+        )
+        aimall_event_fields = (
+            {
+                "aimall_completed_outputs": int(
+                    aimall_recovery.get("logical_total") or 0
+                ),
+                "aimall_tasks_resubmitted": 0,
+            }
+            if isinstance(aimall_recovery, Mapping)
+            else {}
+        )
         append_event(
             campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
             "reconcile_applied",
@@ -12585,6 +12723,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             recovery_selected_phase=report.proposed_state.phase.value,
             recovery_reason=str(report.decision or ""),
             **ariadne_event_fields,
+            **aimall_event_fields,
         )
     except Exception:
         pass

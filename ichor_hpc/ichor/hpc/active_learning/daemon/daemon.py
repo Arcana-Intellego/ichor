@@ -1661,6 +1661,26 @@ class Daemon:
                     + ": "
                     + str(exc)[:180],
                 )
+        elif phase.value in {
+            CampaignPhase.INITIAL_AIMALL.value,
+            CampaignPhase.AIMALL.value,
+            CampaignPhase.INITIAL_REPLACEMENT_AIMALL.value,
+            CampaignPhase.REPLACEMENT_AIMALL.value,
+        }:
+            try:
+                postprocess_source = self._aimall_postprocess_source_if_complete(
+                    state,
+                    phase,
+                )
+            except Exception as exc:
+                return self._halt(
+                    state,
+                    phase,
+                    "aimall_postprocess_source_invalid: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)[:180],
+                )
         active_intent = None
         if phase_name in SBATCH_PHASES:
             try:
@@ -2756,6 +2776,43 @@ class Daemon:
                 "all-complete ARIADNE recovery has no producer source contract"
             )
         return dict(source)
+
+    def _aimall_postprocess_source_if_complete(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve a scheduler-complete AIMAll attempt for local replay."""
+        from .submission_intent import (
+            ACTIVE_STATUSES,
+            aimall_intent_claims_completed_array,
+            load_intent,
+            resolve_aimall_postprocess_source,
+        )
+
+        current = load_intent(
+            self.campaign_dir,
+            phase.value,
+            int(state.iteration),
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        if not isinstance(current, dict):
+            return None
+        if not aimall_intent_claims_completed_array(current):
+            return None
+        if (
+            str(current.get("status") or "") in ACTIVE_STATUSES
+            and not isinstance(current.get("postprocess_source"), Mapping)
+        ):
+            return None
+        return resolve_aimall_postprocess_source(
+            self.campaign_dir,
+            campaign_uid=str(state.campaign_uid),
+            phase_name=phase.value,
+            iteration=int(state.iteration),
+            replacement_round=int(getattr(state, "replacement_round", 0)),
+            intent=current,
+        )
 
     def _collect_terminal_resource_usage(
         self,

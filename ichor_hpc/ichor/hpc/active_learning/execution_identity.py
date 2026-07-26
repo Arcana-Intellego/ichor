@@ -268,6 +268,110 @@ def _validate_ariadne_retry_transition_boundary(
     }
 
 
+def _validate_aimall_postprocess_transition_boundary(
+    campaign: Path,
+    state: Any,
+) -> Dict[str, Any]:
+    """Validate scheduler-free replay of one completed AIMAll array."""
+    from .daemon.recovery_contracts import phase_recovery_contract_error
+    from .daemon.submission_intent import resolve_aimall_postprocess_source
+    from .layout import qm_reference_data_dir, trained_models_dir
+    from .versioning.reference_data import ReferenceDataVersioning
+    from .versioning.trained_models import TrainedModelVersioning
+
+    phase = CampaignPhase(state.phase)
+    if phase.value not in {
+        CampaignPhase.INITIAL_AIMALL.value,
+        CampaignPhase.AIMALL.value,
+        CampaignPhase.INITIAL_REPLACEMENT_AIMALL.value,
+        CampaignPhase.REPLACEMENT_AIMALL.value,
+    }:
+        raise ExecutionIdentityError(
+            "invalid AIMAll postprocess environment-transition phase"
+        )
+    iteration = int(state.iteration)
+    reference_current = ReferenceDataVersioning(
+        qm_reference_data_dir(campaign)
+    ).current_version()
+    model_current = TrainedModelVersioning(
+        trained_models_dir(campaign)
+    ).current_version()
+    if phase in {
+        CampaignPhase.INITIAL_AIMALL,
+        CampaignPhase.INITIAL_REPLACEMENT_AIMALL,
+    }:
+        if (
+            iteration != 0
+            or int(state.reference_data_version) != -1
+            or int(state.models_version) != -1
+        ):
+            raise ExecutionIdentityError(
+                "initial AIMAll postprocess recovery requires bootstrap iteration "
+                "zero with no committed reference-data or model version"
+            )
+        if (reference_current, model_current) != (None, None):
+            raise ExecutionIdentityError(
+                "initial AIMAll postprocess recovery requires no committed "
+                "current reference-data or model pointer"
+            )
+    else:
+        expected_version = iteration - 1
+        if iteration < 1 or (
+            int(state.reference_data_version),
+            int(state.models_version),
+        ) != (expected_version, expected_version):
+            raise ExecutionIdentityError(
+                "AIMAll postprocess recovery requires iteration N with "
+                "reference-data and model versions N-1"
+            )
+        if (reference_current, model_current) != (
+            expected_version,
+            expected_version,
+        ):
+            raise ExecutionIdentityError(
+                "AIMAll postprocess recovery requires committed current pointers "
+                "to match campaign state"
+            )
+
+    contract_error = phase_recovery_contract_error(
+        campaign,
+        state,
+        verification="authority",
+    )
+    if contract_error is not None:
+        raise ExecutionIdentityError(
+            "AIMAll postprocess recovery failed its phase contract: "
+            + str(contract_error)
+        )
+    try:
+        source = resolve_aimall_postprocess_source(
+            campaign,
+            campaign_uid=str(state.campaign_uid),
+            phase_name=phase.value,
+            iteration=iteration,
+            replacement_round=int(getattr(state, "replacement_round", 0)),
+        )
+    except Exception as exc:
+        raise ExecutionIdentityError(
+            "AIMAll postprocess recovery could not validate the completed "
+            "producer contract: "
+            + type(exc).__name__
+            + ": "
+            + str(exc)[:200]
+        ) from exc
+    return {
+        "transition_kind": "aimall_postprocess_only",
+        "logical_total": int(source["logical_total"]),
+        "producer_submission_identity": str(source["submission_identity"]),
+        "producer_job_id": str(source["job_id"]),
+        "producer_environment_generation": int(source["environment_generation"]),
+        "producer_environment_generation_digest_sha256": str(
+            source["environment_generation_digest_sha256"]
+        ),
+        "postprocess_source": dict(source),
+    }
+
+
 def _validate_phase_b_transition_boundary(
     campaign: Path,
     state: Any,
@@ -1373,6 +1477,7 @@ def advance_environment_generation(
         "transition_kind": "idle_boundary",
     }
     phase_b_transition_pending = False
+    aimall_transition_pending = False
     if state.phase is CampaignPhase.REFERENCE_COMMIT:
         from .daemon.reference_commit import classify_reference_commit
 
@@ -1425,6 +1530,13 @@ def advance_environment_generation(
             campaign,
             state,
         )
+    elif state.phase in {
+        CampaignPhase.INITIAL_AIMALL,
+        CampaignPhase.AIMALL,
+        CampaignPhase.INITIAL_REPLACEMENT_AIMALL,
+        CampaignPhase.REPLACEMENT_AIMALL,
+    }:
+        aimall_transition_pending = True
     elif state.phase is CampaignPhase.PHASE_B_DIVERSITY:
         phase_b_transition_pending = True
     elif state.phase not in {
@@ -1437,7 +1549,8 @@ def advance_environment_generation(
             "boundary, "
             "a verified unpublished REFERENCE_COMMIT recovery transaction, or a "
             "clean pre-submission FEREBUS retry boundary, or a fully retryable "
-            "ARIADNE retry or postprocess-only recovery boundary, or a clean "
+            "ARIADNE retry or postprocess-only recovery boundary, a "
+            "scheduler-complete AIMAll postprocess boundary, or a clean "
             "pre-submission Phase B recovery boundary"
         )
     if any(value is not None for value in state.pending_jobs.values()):
@@ -1515,6 +1628,11 @@ def advance_environment_generation(
             state,
             intent_records=inventory["records"],
         )
+    if aimall_transition_pending:
+        transition_context = _validate_aimall_postprocess_transition_boundary(
+            campaign,
+            state,
+        )
 
     generation_number = int(candidate["generation"])
     generations_root = environment_generations_dir(campaign)
@@ -1536,6 +1654,23 @@ def advance_environment_generation(
             campaign,
             state,
             intent_records=refreshed_intents["records"],
+        )
+    if aimall_transition_pending:
+        refreshed_intents = inventory_intents(
+            campaign,
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        if refreshed_intents["errors"] or any(
+            str(record.get("status")) in ACTIVE_STATUSES
+            for record in refreshed_intents["records"]
+        ):
+            raise ExecutionIdentityError(
+                "AIMAll postprocess environment transition found submission-intent "
+                "ownership after its safety check"
+            )
+        transition_context = _validate_aimall_postprocess_transition_boundary(
+            campaign,
+            state,
         )
     while True:
         generation_path = generations_root / (

@@ -2032,6 +2032,149 @@ def test_propose_recovery_protects_active_gaussian_handoff(tmp_path, monkeypatch
     assert any("protected active staging handoff" in item for item in report.trusted_artifacts)
 
 
+def test_propose_recovery_reuses_scheduler_complete_aimall_outputs(
+    tmp_path,
+    monkeypatch,
+):
+    import hashlib
+
+    from ichor.hpc.active_learning.daemon.submission_intent import (
+        inventory_intents,
+        mark_failed,
+        mark_submitted,
+        record_queue_lifecycle,
+        write_pre_submit_intent,
+    )
+
+    _trust_marker_models(monkeypatch)
+    monkeypatch.setattr(
+        reconcile_mod,
+        "_validate_recovered_state_contract",
+        lambda *_args, **_kwargs: None,
+    )
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0])
+    state = fresh_campaign_state(max_iterations=3)
+    state.campaign_uid = _FIXTURE_CAMPAIGN_UID
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+
+    staging = campaign / ".DATA" / "STAGING" / "iter_1"
+    accepted = []
+    for task_id in range(149):
+        pointdir = staging / (
+            "POINT_" + str(task_id).zfill(4) + ".pointdir"
+        )
+        pointdir.mkdir(parents=True, exist_ok=True)
+        accepted.append(pointdir)
+    stg.write_quantum_acceptance_manifest(
+        staging,
+        phase_name=CampaignPhase.GAUSSIAN.value,
+        iteration=1,
+        accepted=accepted,
+        rejected=[("POINT_0149.pointdir", "gaussian_failed")],
+    )
+    stg.write_points_file(staging, accepted)
+    task_digest = hashlib.sha256(
+        ",".join(str(task_id) for task_id in range(149)).encode("ascii")
+    ).hexdigest()
+    write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=CampaignPhase.AIMALL.value,
+        iteration=1,
+        expected_tasks=149,
+        decision_contract={
+            "failure_threshold_fraction": 0.25,
+            "config_sha256": "c" * 64,
+        },
+    )
+    mark_submitted(
+        campaign,
+        CampaignPhase.AIMALL.value,
+        1,
+        "17888108",
+        expected_tasks=149,
+        submission_metadata={
+            "logical_task_set_sha256": task_digest,
+        },
+    )
+    record_queue_lifecycle(
+        campaign,
+        CampaignPhase.AIMALL.value,
+        1,
+        "terminal",
+        job_id="17888108",
+        status="COMPLETED",
+        n_expected=149,
+        n_observed=149,
+        n_missing=0,
+    )
+    mark_failed(
+        campaign,
+        CampaignPhase.AIMALL.value,
+        1,
+        "prior_gaussian_acceptance_manifest_invalid",
+    )
+    append_event(
+        data / "journal.ndjson",
+        "halt",
+        phase=CampaignPhase.HALTED.value,
+        from_phase=CampaignPhase.AIMALL.value,
+        iteration=1,
+        reason="prior_gaussian_acceptance_manifest_invalid",
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.submission_intent."
+        "resolve_aimall_postprocess_source",
+        lambda *_args, **_kwargs: {
+            "logical_total": 149,
+            "job_id": "17888108",
+            "submission_identity": "r0000-a0001-fixture",
+            "source_sha256": "d" * 64,
+        },
+    )
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.AIMALL
+    assert report.proposed_state.iteration == 1
+    assert report.aimall_postprocess_recovery is not None
+    assert report.aimall_postprocess_recovery["n_reuse"] == 149
+    assert report.aimall_postprocess_recovery["n_retry"] == 0
+    assert report.partial_array_recovery["n_reuse"] == 149
+    assert report.partial_array_recovery["n_retry"] == 0
+    assert "no array tasks will be resubmitted" in report.decision
+    assert ".DATA/STAGING is non-empty" not in report.unsafe_reasons
+
+    stg.write_quantum_acceptance_manifest(
+        staging,
+        phase_name=CampaignPhase.AIMALL.value,
+        iteration=1,
+        accepted=accepted,
+        rejected=[],
+    )
+    inventory = inventory_intents(
+        campaign,
+        expected_campaign_uid=state.campaign_uid,
+    )
+    assert (
+        reconcile_mod._inspect_aimall_postprocess_recovery(
+            campaign,
+            campaign_uid=state.campaign_uid,
+            phase_name=CampaignPhase.AIMALL.value,
+            iteration=1,
+            replacement_round=0,
+            intent_records=tuple(inventory["records"]),
+        )
+        is None
+    )
+
+
 def test_propose_recovery_finds_staging_handoff_in_later_iteration(tmp_path, monkeypatch):
     _trust_marker_models(monkeypatch)
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)

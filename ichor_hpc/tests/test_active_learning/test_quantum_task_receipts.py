@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+import ichor.hpc.active_learning.daemon.quantum_task_receipts as receipts_module
+import ichor.hpc.active_learning.daemon.submission_intent as intent_module
 from ichor.hpc.active_learning.daemon.quantum_task_receipts import (
     read_quantum_task_receipt,
     write_quantum_task_receipt,
@@ -150,3 +152,77 @@ def test_quantum_task_receipt_can_be_reconstructed_from_completed_intent(tmp_pat
     assert payload["attempt_id"] == intent["attempt_id"]
     assert payload["submission_identity"] == intent["submission_identity"]
     assert payload["job_id"] == "12345"
+
+
+def test_aimall_postprocess_receipt_uses_original_scheduler_producer(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = tmp_path / "campaign"
+    pointdir = (
+        campaign
+        / ".DATA"
+        / "STAGING"
+        / "iter_14"
+        / "POINT_0000.pointdir"
+    )
+    pointdir.mkdir(parents=True)
+    for name in (
+        "input.wfn",
+        "AIMALL_TASK.json",
+        "WFN_METHOD_RECEIPT.json",
+        "GAUSSIAN_TASK_RECEIPT.json",
+        "o1.int",
+    ):
+        (pointdir / name).write_text(name + "\n", encoding="utf-8")
+    wrapper = {
+        "status": "PRE_SUBMIT",
+        "campaign_uid": "receipt-test",
+        "replacement_round": 0,
+        "postprocess_source": {"source": "fixture"},
+    }
+    producer = {
+        "campaign_uid": "receipt-test",
+        "attempt_id": "original-attempt",
+        "submission_identity": "r0000-a0001-original",
+        "job_id": "17888108",
+        "logical_total": 149,
+    }
+    monkeypatch.setattr(
+        receipts_module,
+        "load_intent",
+        lambda *_args, **_kwargs: dict(wrapper),
+    )
+    monkeypatch.setattr(
+        intent_module,
+        "resolve_aimall_postprocess_source",
+        lambda *_args, **_kwargs: dict(producer),
+    )
+
+    receipt_path = write_quantum_task_receipt(
+        campaign,
+        pointdir,
+        phase_name="AIMALL",
+        iteration=14,
+        logical_task_id=0,
+    )
+    original_bytes = receipt_path.read_bytes()
+    repeated = write_quantum_task_receipt(
+        campaign,
+        pointdir,
+        phase_name="AIMALL",
+        iteration=14,
+        logical_task_id=0,
+    )
+    payload = read_quantum_task_receipt(
+        pointdir,
+        phase_name="AIMALL",
+        iteration=14,
+        logical_task_id=0,
+    )
+
+    assert repeated == receipt_path
+    assert repeated.read_bytes() == original_bytes
+    assert payload["attempt_id"] == "original-attempt"
+    assert payload["submission_identity"] == "r0000-a0001-original"
+    assert payload["job_id"] == "17888108"
