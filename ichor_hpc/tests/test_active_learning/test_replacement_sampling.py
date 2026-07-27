@@ -31,6 +31,8 @@ from ichor.hpc.active_learning.replacement_sampling import (
     _active_frame,
     _bootstrap_frames,
     _write_xyz,
+    ensure_replacement_sample_strict,
+    inspect_replacement_sample_recovery,
     prepare_replacement_round,
     read_replacement_sample,
     read_replacement_sample_strict,
@@ -295,6 +297,156 @@ def test_strict_replacement_reader_joins_current_pending_attempts(tmp_path):
 
     assert loaded["records"] == payload["records"]
     assert loaded["records"][0]["pointdir_index"] == 1
+
+
+def test_missing_replacement_sample_is_classified_and_rebuilt_without_reallocation(
+    tmp_path,
+):
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    allocation_path, _payload = _canonical_bootstrap_replacement(campaign)
+    round_dir = replacement_round_dir(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        replacement_round=1,
+    )
+    (round_dir / "replacement-SAMPLE.xyz").unlink()
+    (round_dir / "REPLACEMENT_SAMPLE.json").unlink()
+    before = allocation_path.read_bytes()
+
+    inspected = inspect_replacement_sample_recovery(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        replacement_round=1,
+        expected_campaign_uid="replacement-test",
+    )
+
+    assert inspected["state"] == "missing_rebuildable"
+    assert inspected["n_candidates"] == 1
+    assert not (round_dir / "replacement-SAMPLE.xyz").exists()
+    assert not (round_dir / "REPLACEMENT_SAMPLE.json").exists()
+
+    rebuilt = ensure_replacement_sample_strict(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        replacement_round=1,
+        expected_campaign_uid="replacement-test",
+    )
+
+    assert rebuilt["n_candidates"] == 1
+    assert allocation_path.read_bytes() == before
+    assert (round_dir / "replacement-SAMPLE.xyz").is_file()
+    assert (round_dir / "REPLACEMENT_SAMPLE.json").is_file()
+
+
+def test_partial_replacement_sample_rebuild_preserves_exact_surviving_file(tmp_path):
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    _allocation_path, _payload = _canonical_bootstrap_replacement(campaign)
+    round_dir = replacement_round_dir(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        replacement_round=1,
+    )
+    sample = round_dir / "replacement-SAMPLE.xyz"
+    manifest = round_dir / "REPLACEMENT_SAMPLE.json"
+    sample_before = sample.read_bytes()
+    manifest.unlink()
+
+    inspected = inspect_replacement_sample_recovery(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        replacement_round=1,
+        expected_campaign_uid="replacement-test",
+    )
+    rebuilt = ensure_replacement_sample_strict(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        replacement_round=1,
+        expected_campaign_uid="replacement-test",
+    )
+
+    assert inspected["state"] == "partial_rebuildable"
+    assert sample.read_bytes() == sample_before
+    assert manifest.is_file()
+    assert rebuilt["n_candidates"] == 1
+
+
+def test_conflicting_partial_replacement_sample_is_not_overwritten(tmp_path):
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    _allocation_path, _payload = _canonical_bootstrap_replacement(campaign)
+    round_dir = replacement_round_dir(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        replacement_round=1,
+    )
+    sample = round_dir / "replacement-SAMPLE.xyz"
+    manifest = round_dir / "REPLACEMENT_SAMPLE.json"
+    manifest.unlink()
+    sample.write_text(
+        sample.read_text(encoding="utf-8").replace(
+            "0.100000000000",
+            "0.200000000000",
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+    conflicting = sample.read_bytes()
+
+    inspected = inspect_replacement_sample_recovery(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        replacement_round=1,
+        expected_campaign_uid="replacement-test",
+    )
+
+    assert inspected["state"] == "conflicting"
+    with pytest.raises(ValueError, match="conflicts with pending allocation"):
+        ensure_replacement_sample_strict(
+            campaign,
+            context="bootstrap",
+            iteration=0,
+            replacement_round=1,
+            expected_campaign_uid="replacement-test",
+        )
+    assert sample.read_bytes() == conflicting
+    assert not manifest.exists()
+
+
+def test_allocation_check_contract_accepts_missing_exactly_rebuildable_sample(
+    tmp_path,
+):
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    _allocation_path, _payload = _canonical_bootstrap_replacement(campaign)
+    round_dir = replacement_round_dir(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        replacement_round=1,
+    )
+    (round_dir / "replacement-SAMPLE.xyz").unlink()
+    (round_dir / "REPLACEMENT_SAMPLE.json").unlink()
+    state = fresh_campaign_state(campaign_uid="replacement-test")
+    state.phase = CampaignPhase.INITIAL_ALLOCATION_CHECK
+    state.iteration = 0
+    state.replacement_round = 1
+
+    assert phase_recovery_contract_error(campaign, state) is None
+
+    state.replacement_round = 2
+    assert "does not match pending point allocation" in str(
+        phase_recovery_contract_error(campaign, state)
+    )
 
 
 @pytest.mark.parametrize("verification", ["metadata", "authority", "deep"])

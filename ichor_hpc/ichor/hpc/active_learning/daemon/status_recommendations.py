@@ -208,6 +208,59 @@ def _phase(payload: Dict[str, Any]) -> str:
     return str(payload.get("phase") or "")
 
 
+def _allocation_check_transition_recommendation(
+    campaign_dir: Path,
+    payload: Dict[str, Any],
+) -> Optional[StatusRecommendation]:
+    if _phase(payload) not in {
+        CampaignPhase.INITIAL_ALLOCATION_CHECK.value,
+        CampaignPhase.ALLOCATION_CHECK.value,
+    }:
+        return None
+    evidence = payload.get("_presentation_allocation_check_transition")
+    if not isinstance(evidence, dict):
+        return None
+    if not bool(evidence.get("safe", False)):
+        return StatusRecommendation(
+            code="allocation_check_environment_blocked",
+            severity="required",
+            primary="preview recovery before attempting to resume",
+            why=(
+                "the allocation-check recovery boundary is not safe: "
+                + _short_error(evidence.get("reason"))
+            ),
+            command=_reconcile_cmd(campaign_dir),
+        )
+    if not (
+        str(payload.get("background_startup_state") or "") == "failed"
+        and str(payload.get("background_startup_stage") or "")
+        == "environment_transition"
+    ):
+        return None
+    pending = int(evidence.get("pending_tasks") or 0)
+    sample_state = str(evidence.get("replacement_sample_state") or "")
+    if sample_state in {"missing_rebuildable", "partial_rebuildable"}:
+        work = (
+            "rebuild the missing replacement sample and continue with "
+            + str(pending)
+            + " pending replacement task"
+            + ("" if pending == 1 else "s")
+        )
+    else:
+        work = "continue the verified allocation check"
+    return StatusRecommendation(
+        code="allocation_check_environment_retry",
+        severity="required",
+        primary="resume the daemon; the allocation-check boundary is safe",
+        why=(
+            "the previous start stopped while changing software environments; "
+            "the next start can "
+            + work
+        ),
+        command=_resume_cmd(campaign_dir),
+    )
+
+
 def _phase_name(value: str) -> str:
     try:
         return CampaignPhase(value).value
@@ -1076,6 +1129,13 @@ def build_status_recommendations(
 
     if _phase(payload) == CampaignPhase.HALTED.value:
         return [_halt_recommendation(campaign, payload)] + stale_pid
+
+    allocation_transition = _allocation_check_transition_recommendation(
+        campaign,
+        payload,
+    )
+    if allocation_transition is not None:
+        return [allocation_transition] + stale_pid
 
     stop_request = payload.get("stop_request")
     if isinstance(stop_request, dict) and not payload.get("shutdown_requested"):

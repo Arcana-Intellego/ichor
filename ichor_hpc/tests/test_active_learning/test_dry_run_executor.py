@@ -330,6 +330,24 @@ def test_active_allocation_replaces_failed_candidate_from_finite_reserve(tmp_pat
     assert replacement.next_phase_override == CampaignPhase.REPLACEMENT_GAUSSIAN.value
     assert replacement.state_updates == {"replacement_round": 1}
     state.replacement_round = 1
+    pending_before = read_point_allocation(allocation_path)
+    round_dir = (
+        e.campaign_dir
+        / ".DATA"
+        / "STAGING"
+        / "iter_1"
+        / "replacement_round_0001"
+    )
+    (round_dir / "replacement-SAMPLE.xyz").unlink()
+    (round_dir / "REPLACEMENT_SAMPLE.json").unlink()
+
+    replay = e.submit_or_run(state, CampaignPhase.ALLOCATION_CHECK)
+
+    pending_after = read_point_allocation(allocation_path)
+    assert replay.next_phase_override == CampaignPhase.REPLACEMENT_GAUSSIAN.value
+    assert pending_after == pending_before
+    assert (round_dir / "replacement-SAMPLE.xyz").is_file()
+    assert (round_dir / "REPLACEMENT_SAMPLE.json").is_file()
     _submit_dry_phase(e, state, CampaignPhase.REPLACEMENT_GAUSSIAN)
     e.postprocess(state, CampaignPhase.REPLACEMENT_GAUSSIAN, observations=[])
     _submit_dry_phase(e, state, CampaignPhase.REPLACEMENT_AIMALL)

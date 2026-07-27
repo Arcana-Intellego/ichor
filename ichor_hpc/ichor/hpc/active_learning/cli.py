@@ -1929,6 +1929,7 @@ _STATUS_BLOCKED_RECOMMENDATIONS = frozenset(
         "halted_scheduler_hard_failure",
         "halted_seed_pool_exhausted",
         "reconcile_transaction_manual_review",
+        "allocation_check_environment_blocked",
     }
 )
 
@@ -1990,6 +1991,8 @@ _STATUS_PRESENTATION_RECOMMENDATIONS = frozenset(
         "shutdown_requested",
         "reconcile_transaction_recoverable",
         "reconcile_transaction_manual_review",
+        "allocation_check_environment_blocked",
+        "allocation_check_environment_retry",
     }
     | {
         "phase_" + phase.value.lower() + "_ready"
@@ -2585,6 +2588,10 @@ def _status_overall(payload: Dict[str, Any]) -> str:
         return "blocked"
     if code == "reconcile_transaction_recoverable":
         return "needs attention"
+    if code == "allocation_check_environment_blocked":
+        return "needs attention"
+    if code == "allocation_check_environment_retry":
+        return "stopped and ready to continue"
     if _status_control_problem(payload) or _status_artifact_problem(payload):
         return "blocked" if code in _STATUS_BLOCKED_RECOMMENDATIONS else "needs attention"
     if phase == CampaignPhase.HALTED.value:
@@ -7122,6 +7129,25 @@ def cmd_status(args: argparse.Namespace) -> int:
             "errors": [type(exc).__name__ + ": " + str(exc)],
         }
     presentation_payload = dict(payload)
+    if state.phase in {
+        CampaignPhase.INITIAL_ALLOCATION_CHECK,
+        CampaignPhase.ALLOCATION_CHECK,
+    }:
+        try:
+            from .execution_identity import (
+                inspect_allocation_check_transition_boundary,
+            )
+
+            presentation_payload[
+                "_presentation_allocation_check_transition"
+            ] = inspect_allocation_check_transition_boundary(campaign, state)
+        except Exception as exc:
+            presentation_payload[
+                "_presentation_allocation_check_transition"
+            ] = {
+                "safe": False,
+                "reason": type(exc).__name__ + ": " + str(exc),
+            }
     if isinstance(aimall_postprocess_recovery_status, Mapping):
         presentation_payload[
             "_presentation_aimall_postprocess_recovery"
@@ -9400,6 +9426,25 @@ def _reconcile_presentation(
     )
     scheduler_name = _scheduler_display_name(intents=active_intents)
     proposed = report.proposed_state
+    allocation_transition: Optional[Dict[str, Any]] = None
+    if proposed.phase in {
+        CampaignPhase.INITIAL_ALLOCATION_CHECK,
+        CampaignPhase.ALLOCATION_CHECK,
+    }:
+        try:
+            from .execution_identity import (
+                inspect_allocation_check_transition_boundary,
+            )
+
+            allocation_transition = inspect_allocation_check_transition_boundary(
+                campaign,
+                proposed,
+            )
+        except Exception as exc:
+            allocation_transition = {
+                "safe": False,
+                "reason": type(exc).__name__ + ": " + str(exc),
+            }
     target_phase, target_iteration, target_round = _reconcile_display_target(report)
     raw_blockers = _reconcile_hard_blockers(report, contract_status)
     explicit_staging_cleanup = _reconcile_has_only_explicit_cleanup_blockers(
@@ -9411,6 +9456,14 @@ def _reconcile_presentation(
         str(item)
         for item in (runtime_status or {}).get("reconcile_apply_blockers", []) or []
     )
+    if (
+        isinstance(allocation_transition, Mapping)
+        and not bool(allocation_transition.get("safe", False))
+    ):
+        blockers.append(
+            "allocation-check recovery is unsafe: "
+            + str(allocation_transition.get("reason") or "unknown allocation evidence")
+        )
     blocked_changes = list(getattr(config_review, "blocked_changes", []) or [])
     blockers.extend(
         "configuration change is locked: " + str(change.path)
@@ -9608,11 +9661,21 @@ def _reconcile_presentation(
         reason = _reconcile_plain_text(_reconcile_latest_human_reason(report))
     else:
         result = "no reconcile changes needed"
-        reason = (
-            "the deliberate pause remains valid"
-            if _is_intentionally_stopped_state(proposed)
-            else "campaign state, configuration and authority records already agree"
-        )
+        if (
+            isinstance(allocation_transition, Mapping)
+            and str(allocation_transition.get("replacement_sample_state") or "")
+            in {"missing_rebuildable", "partial_rebuildable"}
+        ):
+            reason = (
+                "campaign authority is coherent; the daemon can rebuild the "
+                "missing replacement sample when it resumes"
+            )
+        else:
+            reason = (
+                "the deliberate pause remains valid"
+                if _is_intentionally_stopped_state(proposed)
+                else "campaign state, configuration and authority records already agree"
+            )
 
     state_rows: List[Tuple[str, str]] = [
         ("status", _reconcile_state_summary(current, current_error)),
@@ -9680,11 +9743,25 @@ def _reconcile_presentation(
     elif result == "no reconcile changes needed":
         next_label = "run"
         next_command = _campaign_command(campaign, "resume")
-        next_effect = "continue the campaign from " + _reconcile_phase_display(
-            target_phase,
-            target_iteration,
-            replacement_round=target_round,
-        )
+        if (
+            isinstance(allocation_transition, Mapping)
+            and str(allocation_transition.get("replacement_sample_state") or "")
+            in {"missing_rebuildable", "partial_rebuildable"}
+        ):
+            pending = int(allocation_transition.get("pending_tasks") or 0)
+            next_effect = (
+                "advance the software environment, rebuild the missing replacement "
+                "sample and continue with "
+                + str(pending)
+                + " pending replacement task"
+                + ("" if pending == 1 else "s")
+            )
+        else:
+            next_effect = "continue the campaign from " + _reconcile_phase_display(
+                target_phase,
+                target_iteration,
+                replacement_round=target_round,
+            )
     elif result == "no recovery needed":
         next_label = "review"
         next_command = _campaign_command(campaign, "status")

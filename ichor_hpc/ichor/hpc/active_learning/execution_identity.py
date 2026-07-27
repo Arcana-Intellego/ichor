@@ -109,6 +109,151 @@ def _validate_ferebus_transition_boundary(campaign: Path, state: Any) -> None:
         )
 
 
+def inspect_allocation_check_transition_boundary(
+    campaign: Path,
+    state: Any,
+) -> Dict[str, Any]:
+    """Inspect a scheduler-free allocation-check recovery boundary."""
+    from .daemon.recovery_contracts import phase_recovery_contract_error
+    from .layout import qm_reference_data_dir, trained_models_dir
+    from .point_allocation import (
+        pending_attempts,
+        point_allocation_path,
+        read_point_allocation,
+    )
+    from .replacement_sampling import inspect_replacement_sample_recovery
+    from .versioning.reference_data import ReferenceDataVersioning
+    from .versioning.trained_models import TrainedModelVersioning
+
+    try:
+        phase = CampaignPhase(state.phase)
+        if phase not in {
+            CampaignPhase.INITIAL_ALLOCATION_CHECK,
+            CampaignPhase.ALLOCATION_CHECK,
+        }:
+            raise ValueError("phase is not an allocation check")
+        iteration = int(state.iteration)
+        context = (
+            "bootstrap"
+            if phase is CampaignPhase.INITIAL_ALLOCATION_CHECK
+            else "active"
+        )
+        reference_current = ReferenceDataVersioning(
+            qm_reference_data_dir(campaign)
+        ).current_version()
+        model_current = TrainedModelVersioning(
+            trained_models_dir(campaign)
+        ).current_version()
+        if context == "bootstrap":
+            observed = (
+                iteration,
+                int(state.reference_data_version),
+                int(state.validation_set_version),
+                int(state.models_version),
+                reference_current,
+                model_current,
+            )
+            if observed != (0, -1, -1, -1, None, None):
+                raise ValueError(
+                    "bootstrap allocation check requires iteration zero with no "
+                    "committed data or model pointer"
+                )
+        else:
+            expected_version = iteration - 1
+            observed = (
+                int(state.reference_data_version),
+                int(state.validation_set_version),
+                int(state.models_version),
+                reference_current,
+                model_current,
+            )
+            if iteration < 1 or observed != (expected_version,) * 5:
+                raise ValueError(
+                    "active allocation check requires reference data, validation "
+                    "data and models through iteration N-1"
+                )
+
+        contract_error = phase_recovery_contract_error(
+            campaign,
+            state,
+            verification="authority",
+        )
+        if contract_error is not None:
+            raise ValueError(str(contract_error))
+        allocation = read_point_allocation(
+            point_allocation_path(
+                campaign,
+                context=context,
+                iteration=iteration,
+            ),
+            expected_campaign_uid=str(state.campaign_uid),
+            expected_context=context,
+            expected_iteration=iteration,
+        )
+        pending = pending_attempts(allocation)
+        sample_state = "not_required"
+        replacement_round = int(getattr(state, "replacement_round", 0))
+        if pending:
+            rounds = {int(record.get("round", -1)) for record in pending}
+            if len(rounds) != 1 or min(rounds) <= 0:
+                raise ValueError(
+                    "point allocation has incompatible pending replacement rounds"
+                )
+            pending_round = next(iter(rounds))
+            if replacement_round != pending_round:
+                raise ValueError(
+                    "campaign replacement round does not match pending point allocation"
+                )
+            sample = inspect_replacement_sample_recovery(
+                campaign,
+                context=context,
+                iteration=iteration,
+                replacement_round=pending_round,
+                expected_campaign_uid=str(state.campaign_uid),
+            )
+            sample_state = str(sample.get("state") or "")
+            if sample_state == "conflicting":
+                raise ValueError(
+                    "replacement sample evidence conflicts with pending allocation: "
+                    + str(sample.get("reason") or "unknown conflict")
+                )
+        return {
+            "safe": True,
+            "reason": None,
+            "transition_kind": "allocation_check_recovery",
+            "context": context,
+            "replacement_round": replacement_round,
+            "pending_tasks": int(len(pending)),
+            "replacement_sample_state": sample_state,
+            "allocation_complete": bool(
+                (allocation.get("summary") or {}).get("complete", False)
+            ),
+        }
+    except Exception as exc:
+        return {
+            "safe": False,
+            "reason": str(exc),
+            "transition_kind": "allocation_check_recovery",
+        }
+
+
+def _validate_allocation_check_transition_boundary(
+    campaign: Path,
+    state: Any,
+) -> Dict[str, Any]:
+    result = inspect_allocation_check_transition_boundary(campaign, state)
+    if not bool(result.get("safe", False)):
+        raise ExecutionIdentityError(
+            "environment transition at allocation check is unsafe: "
+            + str(result.get("reason") or "unknown allocation evidence")
+        )
+    return {
+        key: value
+        for key, value in result.items()
+        if key not in {"safe", "reason"}
+    }
+
+
 def _validate_ariadne_retry_transition_boundary(
     campaign: Path,
     state: Any,
@@ -1580,6 +1725,7 @@ def advance_environment_generation(
     phase_b_transition_pending = False
     aimall_transition_pending = False
     gaussian_transition_pending = False
+    allocation_check_transition_pending = False
     if state.phase is CampaignPhase.REFERENCE_COMMIT:
         from .daemon.reference_commit import classify_reference_commit
 
@@ -1632,6 +1778,11 @@ def advance_environment_generation(
             campaign,
             state,
         )
+    elif state.phase in {
+        CampaignPhase.INITIAL_ALLOCATION_CHECK,
+        CampaignPhase.ALLOCATION_CHECK,
+    }:
+        allocation_check_transition_pending = True
     elif state.phase in {
         CampaignPhase.INITIAL_GAUSSIAN,
         CampaignPhase.GAUSSIAN,
@@ -1697,7 +1848,8 @@ def advance_environment_generation(
             "ARIADNE retry or postprocess-only recovery boundary, a "
             "scheduler-complete AIMAll postprocess boundary, or a clean "
             "scheduler-complete Gaussian postprocess boundary, or a clean "
-            "pre-submission Phase B recovery boundary"
+            "pre-submission Phase B recovery boundary, or a verified "
+            "allocation-check recovery boundary"
         )
     if any(value is not None for value in state.pending_jobs.values()):
         raise ExecutionIdentityError(
@@ -1784,6 +1936,11 @@ def advance_environment_generation(
             campaign,
             state,
         )
+    if allocation_check_transition_pending:
+        transition_context = _validate_allocation_check_transition_boundary(
+            campaign,
+            state,
+        )
 
     generation_number = int(candidate["generation"])
     generations_root = environment_generations_dir(campaign)
@@ -1837,6 +1994,23 @@ def advance_environment_generation(
                 "ownership after its safety check"
             )
         transition_context = _validate_gaussian_postprocess_transition_boundary(
+            campaign,
+            state,
+        )
+    if allocation_check_transition_pending:
+        refreshed_intents = inventory_intents(
+            campaign,
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        if refreshed_intents["errors"] or any(
+            str(record.get("status")) in ACTIVE_STATUSES
+            for record in refreshed_intents["records"]
+        ):
+            raise ExecutionIdentityError(
+                "allocation-check environment transition found submission-intent "
+                "ownership after its safety check"
+            )
+        transition_context = _validate_allocation_check_transition_boundary(
             campaign,
             state,
         )
@@ -1948,6 +2122,7 @@ __all__ = [
     "environment_current_path",
     "environment_generations_dir",
     "execution_identity_path",
+    "inspect_allocation_check_transition_boundary",
     "read_active_environment_generation",
     "read_execution_identity",
 ]

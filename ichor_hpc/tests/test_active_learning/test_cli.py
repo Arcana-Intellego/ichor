@@ -3337,6 +3337,59 @@ def test_reconcile_preview_clean_pause_recommends_resume_without_apply(
     assert "--apply" not in output
 
 
+def test_reconcile_preview_describes_rebuildable_allocation_sample(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    state = fresh_campaign_state(campaign_uid="allocation-recovery")
+    state.phase = CampaignPhase.ALLOCATION_CHECK
+    state.iteration = 14
+    state.reference_data_version = 13
+    state.validation_set_version = 13
+    state.models_version = 13
+    state.replacement_round = 1
+    data = tmp_path / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True)
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    report = SimpleNamespace(
+        proposed_state=state,
+        unsafe_reasons=[],
+        blocking_artifacts=[],
+        active_submission_intents=[],
+        decision="ALLOCATION_CHECK: pending replacement allocation needs sample repair",
+    )
+    contract = {
+        "contract_ok": True,
+        "selected_phase": CampaignPhase.ALLOCATION_CHECK.value,
+        "missing_or_invalid_inputs": [],
+        "protected_artifacts": [],
+    }
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.execution_identity."
+        "inspect_allocation_check_transition_boundary",
+        lambda *_args, **_kwargs: {
+            "safe": True,
+            "pending_tasks": 1,
+            "replacement_sample_state": "missing_rebuildable",
+        },
+    )
+
+    cli_mod._print_reconcile_operator_report(
+        tmp_path,
+        report,
+        contract,
+        mode="dry_run",
+        proposed_state_path=data / "state.json.proposed",
+    )
+    output = capsys.readouterr().out
+
+    assert "Preview result: no reconcile changes needed" in output
+    assert "can rebuild the missing replacement sample" in output
+    assert "continue with 1 pending replacement task" in output
+    assert "--apply" not in output
+
+
 def test_preflight_describes_completed_stop_as_pause_not_backend_failure(tmp_path):
     payload = {
         "ready": False,

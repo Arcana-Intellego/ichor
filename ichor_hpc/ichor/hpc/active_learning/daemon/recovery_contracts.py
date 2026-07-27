@@ -373,9 +373,11 @@ def _require_allocation_check_ready(
     *,
     context: str,
     iteration: int,
+    expected_replacement_round: int = 0,
     expected_campaign_uid: Optional[str] = None,
 ) -> None:
     from ..point_allocation import pending_attempts
+    from ..replacement_sampling import inspect_replacement_sample_recovery
 
     payload = _require_point_allocation(
         campaign,
@@ -389,6 +391,27 @@ def _require_allocation_check_ready(
         if rounds == {0}:
             raise RecoveryContractError(
                 "primary QM outcomes have not yet been recorded in point allocation"
+            )
+        if len(rounds) != 1 or min(rounds) <= 0:
+            raise RecoveryContractError(
+                "point allocation has pending attempts from incompatible replacement rounds"
+            )
+        replacement_round = next(iter(rounds))
+        if int(expected_replacement_round) != int(replacement_round):
+            raise RecoveryContractError(
+                "campaign replacement round does not match pending point allocation"
+            )
+        sample = inspect_replacement_sample_recovery(
+            campaign,
+            context=str(context),
+            iteration=int(iteration),
+            replacement_round=int(replacement_round),
+            expected_campaign_uid=expected_campaign_uid,
+        )
+        if str(sample.get("state") or "") == "conflicting":
+            raise RecoveryContractError(
+                "replacement sample evidence conflicts with pending allocation: "
+                + str(sample.get("reason") or "unknown conflict")
             )
 
 
@@ -1251,15 +1274,17 @@ def _allocation_recovery_decision(
     replacement_round = next(iter(rounds))
     if replacement_round <= 0:
         return None
-    try:
-        round_dir = _require_replacement_sample(
-            campaign,
-            context=str(context),
-            iteration=int(iteration),
-            replacement_round=int(replacement_round),
-            expected_campaign_uid=expected_campaign_uid,
-        )
-    except Exception:
+    from ..replacement_sampling import inspect_replacement_sample_recovery
+
+    sample = inspect_replacement_sample_recovery(
+        campaign,
+        context=str(context),
+        iteration=int(iteration),
+        replacement_round=int(replacement_round),
+        expected_campaign_uid=expected_campaign_uid,
+    )
+    sample_state = str(sample.get("state") or "")
+    if sample_state in {"missing_rebuildable", "partial_rebuildable"}:
         return RecoveryDecision(
             CampaignPhase.INITIAL_ALLOCATION_CHECK
             if context == "bootstrap"
@@ -1269,6 +1294,17 @@ def _allocation_recovery_decision(
             allocation_artifact,
             replacement_round=int(replacement_round),
         )
+    if sample_state != "valid":
+        return RecoveryDecision(
+            CampaignPhase.INITIAL_ALLOCATION_CHECK
+            if context == "bootstrap"
+            else CampaignPhase.ALLOCATION_CHECK,
+            int(iteration),
+            "point-allocation check: replacement sample evidence requires review",
+            allocation_artifact,
+            replacement_round=int(replacement_round),
+        )
+    round_dir = Path(str(sample["round_dir"]))
     gaussian_phase = (
         CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN
         if context == "bootstrap"
@@ -1649,6 +1685,9 @@ def _phase_contract_checks(
                     campaign,
                     context="bootstrap",
                     iteration=0,
+                    expected_replacement_round=int(
+                        getattr(state, "replacement_round", 0)
+                    ),
                     expected_campaign_uid=str(state.campaign_uid),
                 ),
             ),
@@ -1788,6 +1827,9 @@ def _phase_contract_checks(
                     campaign,
                     context="active",
                     iteration=iteration,
+                    expected_replacement_round=int(
+                        getattr(state, "replacement_round", 0)
+                    ),
                     expected_campaign_uid=str(state.campaign_uid),
                 ),
             ),

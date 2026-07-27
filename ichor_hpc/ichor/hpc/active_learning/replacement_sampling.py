@@ -651,7 +651,7 @@ def read_replacement_sample_strict(
     return data
 
 
-def ensure_replacement_sample_strict(
+def _replacement_sample_repair_plan(
     campaign_dir: str | Path,
     *,
     context: str,
@@ -659,7 +659,7 @@ def ensure_replacement_sample_strict(
     replacement_round: int,
     expected_campaign_uid: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Recreate only missing derived sample evidence from pending allocation."""
+    """Classify derived replacement evidence against pending allocation."""
     campaign = Path(campaign_dir)
     round_dir = replacement_round_dir(
         campaign,
@@ -669,67 +669,169 @@ def ensure_replacement_sample_strict(
     )
     sample_path = round_dir / "replacement-SAMPLE.xyz"
     manifest_path = replacement_sample_manifest_path(round_dir)
+    if sample_path.is_symlink() or manifest_path.is_symlink():
+        return {
+            "state": "conflicting",
+            "reason": "replacement sample evidence must not be symlinked",
+            "round_dir": round_dir,
+            "sample_path": sample_path,
+            "manifest_path": manifest_path,
+        }
     try:
-        return read_replacement_sample_strict(
+        loaded = read_replacement_sample_strict(
             campaign,
             context=str(context),
             iteration=int(iteration),
             replacement_round=int(replacement_round),
             expected_campaign_uid=expected_campaign_uid,
         )
-    except (FileNotFoundError, ValueError):
-        sample_present = sample_path.exists() or sample_path.is_symlink()
-        manifest_present = manifest_path.exists() or manifest_path.is_symlink()
+    except (FileNotFoundError, OSError, ValueError) as strict_error:
+        sample_present = sample_path.exists()
+        manifest_present = manifest_path.exists()
         if sample_present and manifest_present:
-            raise
-        if sample_path.is_symlink() or manifest_path.is_symlink():
-            raise ValueError("replacement sample evidence must not be symlinked")
+            return {
+                "state": "conflicting",
+                "reason": str(strict_error),
+                "round_dir": round_dir,
+                "sample_path": sample_path,
+                "manifest_path": manifest_path,
+            }
+    else:
+        return {
+            "state": "valid",
+            "reason": None,
+            "round_dir": round_dir,
+            "sample_path": sample_path,
+            "manifest_path": manifest_path,
+            "n_candidates": int(loaded["n_candidates"]),
+            "loaded": loaded,
+        }
 
-    allocation_path, allocation, attempts, frames = _replacement_material(
-        campaign,
+    try:
+        allocation_path, allocation, attempts, frames = _replacement_material(
+            campaign,
+            context=str(context),
+            iteration=int(iteration),
+            replacement_round=int(replacement_round),
+            allow_allocate=False,
+            expected_campaign_uid=expected_campaign_uid,
+        )
+        sample_text = _render_xyz(frames)
+        expected_manifest = _replacement_payload(
+            allocation_path=allocation_path,
+            allocation=allocation,
+            attempts=attempts,
+            sample_text=sample_text,
+            context=str(context),
+            iteration=int(iteration),
+            replacement_round=int(replacement_round),
+        )
+        if sample_present:
+            if not sample_path.is_file() or sample_path.read_text(
+                encoding="utf-8"
+            ) != sample_text:
+                raise ValueError(
+                    "existing replacement sample conflicts with pending allocation"
+                )
+        if manifest_present:
+            try:
+                existing_manifest = json.loads(
+                    manifest_path.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError) as exc:
+                raise ValueError(
+                    "existing replacement sample manifest is unreadable"
+                ) from exc
+            if existing_manifest != expected_manifest:
+                raise ValueError(
+                    "existing replacement sample manifest conflicts with pending allocation"
+                )
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        return {
+            "state": "conflicting",
+            "reason": str(exc),
+            "round_dir": round_dir,
+            "sample_path": sample_path,
+            "manifest_path": manifest_path,
+        }
+
+    return {
+        "state": (
+            "missing_rebuildable"
+            if not sample_present and not manifest_present
+            else "partial_rebuildable"
+        ),
+        "reason": None,
+        "round_dir": round_dir,
+        "sample_path": sample_path,
+        "manifest_path": manifest_path,
+        "sample_text": sample_text,
+        "expected_manifest": expected_manifest,
+        "n_candidates": int(len(attempts)),
+    }
+
+
+def inspect_replacement_sample_recovery(
+    campaign_dir: str | Path,
+    *,
+    context: str,
+    iteration: int,
+    replacement_round: int,
+    expected_campaign_uid: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return a read-only classification of replacement-sample evidence."""
+    plan = _replacement_sample_repair_plan(
+        campaign_dir,
         context=str(context),
         iteration=int(iteration),
         replacement_round=int(replacement_round),
-        allow_allocate=False,
         expected_campaign_uid=expected_campaign_uid,
     )
-    sample_text = _render_xyz(frames)
-    expected_manifest = _replacement_payload(
-        allocation_path=allocation_path,
-        allocation=allocation,
-        attempts=attempts,
-        sample_text=sample_text,
+    return {
+        key: (
+            str(value)
+            if key in {"round_dir", "sample_path", "manifest_path"}
+            else value
+        )
+        for key, value in plan.items()
+        if key not in {"loaded", "sample_text", "expected_manifest"}
+    }
+
+
+def ensure_replacement_sample_strict(
+    campaign_dir: str | Path,
+    *,
+    context: str,
+    iteration: int,
+    replacement_round: int,
+    expected_campaign_uid: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Recreate only missing derived sample evidence from pending allocation."""
+    plan = _replacement_sample_repair_plan(
+        campaign_dir,
         context=str(context),
         iteration=int(iteration),
         replacement_round=int(replacement_round),
+        expected_campaign_uid=expected_campaign_uid,
     )
-    if sample_path.exists():
-        if not sample_path.is_file() or sample_path.read_text(
-            encoding="utf-8"
-        ) != sample_text:
-            raise ValueError(
-                "existing replacement sample conflicts with pending allocation"
-            )
-    if manifest_path.exists():
-        try:
-            existing_manifest = json.loads(
-                manifest_path.read_text(encoding="utf-8")
-            )
-        except (OSError, ValueError) as exc:
-            raise ValueError(
-                "existing replacement sample manifest is unreadable"
-            ) from exc
-        if existing_manifest != expected_manifest:
-            raise ValueError(
-                "existing replacement sample manifest conflicts with pending allocation"
-            )
+    state = str(plan["state"])
+    if state == "valid":
+        return dict(plan["loaded"])
+    if state not in {"missing_rebuildable", "partial_rebuildable"}:
+        raise ValueError(
+            "replacement sample evidence conflicts with pending allocation: "
+            + str(plan.get("reason") or "unknown conflict")
+        )
+    round_dir = Path(plan["round_dir"])
+    sample_path = Path(plan["sample_path"])
+    manifest_path = Path(plan["manifest_path"])
     round_dir.mkdir(parents=True, exist_ok=True)
     if not sample_path.exists():
-        atomic_write_text(sample_path, sample_text)
+        atomic_write_text(sample_path, str(plan["sample_text"]))
     if not manifest_path.exists():
-        atomic_write_json(manifest_path, expected_manifest)
+        atomic_write_json(manifest_path, dict(plan["expected_manifest"]))
     return read_replacement_sample_strict(
-        campaign,
+        campaign_dir,
         context=str(context),
         iteration=int(iteration),
         replacement_round=int(replacement_round),
@@ -741,6 +843,7 @@ __all__ = [
     "REPLACEMENT_SAMPLE_FILENAME",
     "replacement_round_dir",
     "ensure_replacement_sample_strict",
+    "inspect_replacement_sample_recovery",
     "prepare_replacement_round",
     "read_replacement_sample",
     "read_replacement_sample_strict",

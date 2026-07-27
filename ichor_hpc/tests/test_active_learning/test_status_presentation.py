@@ -320,6 +320,60 @@ def test_halted_recovery_precedes_pending_iteration_stop(tmp_path):
     assert "reconcile" in str(result[0].command)
 
 
+def test_allocation_environment_retry_precedes_pending_iteration_stop(tmp_path):
+    campaign = tmp_path / "campaign"
+    payload = {
+        "phase": CampaignPhase.ALLOCATION_CHECK.value,
+        "iteration": 14,
+        "background_startup_state": "failed",
+        "background_startup_stage": "environment_transition",
+        "_presentation_allocation_check_transition": {
+            "safe": True,
+            "pending_tasks": 1,
+            "replacement_sample_state": "missing_rebuildable",
+        },
+        "stop_request": {
+            "status": "requested",
+            "request_id": "request-14",
+            "mode": "after_iteration",
+            "target_iteration": 14,
+        },
+    }
+
+    result = recommendations.build_status_recommendations(campaign, payload)
+    payload["recommendations"] = [result[0].to_dict()]
+
+    assert result[0].code == "allocation_check_environment_retry"
+    assert "rebuild the missing replacement sample" in result[0].why
+    assert str(result[0].command).startswith("ichor-al-daemon resume")
+    assert cli._status_overall(payload) == "stopped and ready to continue"
+
+
+def test_conflicting_allocation_evidence_precedes_pending_stop(tmp_path):
+    campaign = tmp_path / "campaign"
+    payload = {
+        "phase": CampaignPhase.ALLOCATION_CHECK.value,
+        "iteration": 14,
+        "_presentation_allocation_check_transition": {
+            "safe": False,
+            "reason": "replacement sample manifest conflicts with pending allocation",
+        },
+        "stop_request": {
+            "status": "requested",
+            "request_id": "request-14",
+            "mode": "after_iteration",
+            "target_iteration": 14,
+        },
+    }
+
+    result = recommendations.build_status_recommendations(campaign, payload)
+    payload["recommendations"] = [result[0].to_dict()]
+
+    assert result[0].code == "allocation_check_environment_blocked"
+    assert "reconcile" in str(result[0].command)
+    assert cli._status_overall(payload) == "needs attention"
+
+
 def test_aimall_postprocess_recovery_explains_local_reuse_and_pending_stop(
     tmp_path,
 ):

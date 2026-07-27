@@ -579,6 +579,189 @@ def test_phase_b_transition_accepts_only_jobless_reconcile_retry_intent(
         )
 
 
+def _active_pending_replacement_allocation(campaign, state):
+    from ichor.hpc.active_learning.point_allocation import (
+        allocate_replacements,
+        create_point_allocation,
+        pending_attempts,
+        point_allocation_path,
+        record_quantum_results,
+    )
+
+    path = point_allocation_path(
+        campaign,
+        context="active",
+        iteration=int(state.iteration),
+    )
+    allocation = create_point_allocation(
+        path,
+        campaign_uid=str(state.campaign_uid),
+        context="active",
+        iteration=int(state.iteration),
+        targets={"train": 1, "int_val": 0, "ext_val": 0, "total": 1},
+        primary_candidates=[{"candidate_id": "primary"}],
+        reserve_candidates=[
+            {"candidate_id": "reserve", "reserve_rank": 0},
+        ],
+    )
+    primary = pending_attempts(allocation)[0]
+    rejected = record_quantum_results(
+        path,
+        [
+            {
+                "candidate_id": str(primary["candidate_id"]),
+                "accepted": False,
+                "pointdir": "/synthetic/primary.pointdir",
+                "reason": "fixture rejection",
+            }
+        ],
+    )
+    return allocate_replacements(
+        path,
+        replacement_round=1,
+        expected_generation=int(rejected["generation"]),
+    )
+
+
+def _patch_active_allocation_transition(monkeypatch, *, sample_state):
+    from ichor.hpc.active_learning.versioning.reference_data import (
+        ReferenceDataVersioning,
+    )
+    from ichor.hpc.active_learning.versioning.trained_models import (
+        TrainedModelVersioning,
+    )
+
+    monkeypatch.setattr(
+        ReferenceDataVersioning,
+        "current_version",
+        lambda _self: 0,
+    )
+    monkeypatch.setattr(
+        TrainedModelVersioning,
+        "current_version",
+        lambda _self: 0,
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.replacement_sampling."
+        "inspect_replacement_sample_recovery",
+        lambda *_args, **_kwargs: {
+            "state": sample_state,
+            "reason": (
+                "fixture conflict" if sample_state == "conflicting" else None
+            ),
+            "n_candidates": 1,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("stop_mode", "phase_started"),
+    [
+        ("immediate", False),
+        ("after_phase", False),
+        ("after_phase", True),
+        ("after_iteration", False),
+    ],
+)
+def test_rebind_accepts_rebuildable_active_allocation_check_and_preserves_stop(
+    tmp_path,
+    monkeypatch,
+    stop_mode,
+    phase_started,
+):
+    from ichor.hpc.active_learning.daemon.stop_control import (
+        build_stop_request,
+        install_stop_request,
+        stop_request_path,
+    )
+
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.ALLOCATION_CHECK
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.validation_set_version = 0
+    state.models_version = 0
+    state.replacement_round = 1
+    _active_pending_replacement_allocation(campaign, state)
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    request, _status = install_stop_request(
+        campaign,
+        build_stop_request(
+            state,
+            mode=stop_mode,
+            target_iteration=1 if stop_mode == "after_iteration" else None,
+            phase_started=phase_started,
+        ),
+    )
+    stop_before = stop_request_path(campaign).read_bytes()
+    _patch_active_allocation_transition(
+        monkeypatch,
+        sample_state="missing_rebuildable",
+    )
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
+
+    result = rebind_environment(
+        campaign,
+        config=config,
+        scheduler_ownership_clear=True,
+    )
+
+    assert result["changed"] is True
+    assert result["transition_kind"] == "allocation_check_recovery"
+    assert result["pending_tasks"] == 1
+    assert result["replacement_sample_state"] == "missing_rebuildable"
+    rebound = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
+    assert rebound.phase is CampaignPhase.ALLOCATION_CHECK
+    assert rebound.iteration == 1
+    assert rebound.replacement_round == 1
+    assert stop_request_path(campaign).read_bytes() == stop_before
+    assert request["status"] == "requested"
+
+
+def test_rebind_rejects_conflicting_allocation_sample_before_generation_write(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.ALLOCATION_CHECK
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.validation_set_version = 0
+    state.models_version = 0
+    state.replacement_round = 1
+    _active_pending_replacement_allocation(campaign, state)
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    _patch_active_allocation_transition(
+        monkeypatch,
+        sample_state="conflicting",
+    )
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
+
+    with pytest.raises(
+        ExecutionIdentityError,
+        match="replacement sample evidence conflicts",
+    ):
+        rebind_environment(
+            campaign,
+            config=config,
+            scheduler_ownership_clear=True,
+        )
+
+    active = read_active_environment_generation(
+        campaign,
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+    assert active["generation"]["generation"] == 0
+
+
 def _write_full_ariadne_producer_intent(
     campaign,
     state,

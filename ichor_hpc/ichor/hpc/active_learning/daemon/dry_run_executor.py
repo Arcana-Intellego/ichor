@@ -1318,7 +1318,10 @@ class DryRunPhaseExecutor:
 
     def _allocation_check(self, state, *, context: str) -> PhaseResult:
         from ..point_allocation import pending_attempts, point_allocation_path, read_point_allocation
-        from ..replacement_sampling import prepare_replacement_round
+        from ..replacement_sampling import (
+            ensure_replacement_sample_strict,
+            prepare_replacement_round,
+        )
 
         iteration = 0 if str(context) == "bootstrap" else int(state.iteration)
         path = point_allocation_path(
@@ -1383,12 +1386,22 @@ class DryRunPhaseExecutor:
             unit="points",
         )
         try:
-            replacement = prepare_replacement_round(
-                self.campaign_dir,
-                context=str(context),
-                iteration=int(iteration),
-                replacement_round=int(replacement_round),
-                expected_campaign_uid=str(state.campaign_uid),
+            replacement = (
+                ensure_replacement_sample_strict(
+                    self.campaign_dir,
+                    context=str(context),
+                    iteration=int(iteration),
+                    replacement_round=int(replacement_round),
+                    expected_campaign_uid=str(state.campaign_uid),
+                )
+                if pending
+                else prepare_replacement_round(
+                    self.campaign_dir,
+                    context=str(context),
+                    iteration=int(iteration),
+                    replacement_round=int(replacement_round),
+                    expected_campaign_uid=str(state.campaign_uid),
+                )
             )
         except Exception as exc:
             raise BackendSubmissionError(
