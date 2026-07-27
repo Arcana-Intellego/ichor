@@ -97,6 +97,73 @@ def _trust_marker_models(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("verification", ["metadata", "authority", "deep"])
+def test_all_rejected_gaussian_handoff_is_recoverable(
+    tmp_path,
+    verification,
+):
+    campaign, _data, _training, _models = _campaign_dirs(tmp_path)
+    _write_pending_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        n=2,
+    )
+    staging = campaign / ".DATA" / "STAGING" / "initial"
+    staging.mkdir(parents=True)
+    stg.write_points_file(staging, [])
+    stg.write_quantum_acceptance_manifest(
+        staging,
+        phase_name=CampaignPhase.INITIAL_GAUSSIAN.value,
+        iteration=0,
+        accepted=[],
+        rejected=[
+            ("POINT_0000.pointdir", "submitted_pointdir_missing"),
+            ("POINT_0001.pointdir", "scf_nonconvergence_or_crash"),
+        ],
+    )
+
+    recovery_contracts_mod._require_initial_quantum(
+        campaign,
+        CampaignPhase.INITIAL_GAUSSIAN,
+        0,
+        verification=verification,
+    )
+
+
+def test_all_rejected_gaussian_handoff_requires_exact_producer_order(tmp_path):
+    campaign, _data, _training, _models = _campaign_dirs(tmp_path)
+    _write_pending_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        n=2,
+    )
+    staging = campaign / ".DATA" / "STAGING" / "initial"
+    staging.mkdir(parents=True)
+    stg.write_points_file(staging, [])
+    stg.write_quantum_acceptance_manifest(
+        staging,
+        phase_name=CampaignPhase.INITIAL_GAUSSIAN.value,
+        iteration=0,
+        accepted=[],
+        rejected=[
+            ("POINT_0001.pointdir", "submitted_pointdir_missing"),
+            ("POINT_0000.pointdir", "submitted_pointdir_missing"),
+        ],
+    )
+
+    with pytest.raises(
+        recovery_contracts_mod.RecoveryContractError,
+        match="does not exactly cover",
+    ):
+        recovery_contracts_mod._require_initial_quantum(
+            campaign,
+            CampaignPhase.INITIAL_GAUSSIAN,
+            0,
+        )
+
+
 def _campaign_dirs(tmp_path):
     campaign = tmp_path / "campaign"
     data = campaign / ".DATA" / "ACTIVE_LEARNING"
@@ -726,6 +793,60 @@ def test_script_inventory_accepts_submission_intent_records(tmp_path):
     assert inventory["attempt_bundles"][0]["submission_identity"] == identity
 
 
+def test_reconcile_prefers_scheduler_complete_gaussian_postprocessing(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import submission_intent
+
+    campaign = tmp_path / "campaign"
+    staging = campaign / ".DATA" / "STAGING" / "iter_4"
+    staging.mkdir(parents=True)
+    monkeypatch.setattr(
+        submission_intent,
+        "gaussian_intent_claims_completed_array",
+        lambda _intent: True,
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "gaussian_postprocess_task_contract",
+        lambda *_args, **_kwargs: {
+            "staging": str(staging),
+            "logical_total": 3,
+        },
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "resolve_gaussian_postprocess_source",
+        lambda *_args, **_kwargs: {
+            "logical_total": 3,
+            "job_id": "17888108",
+            "submission_identity": "r0000-a0001-fixture",
+            "source_sha256": "a" * 64,
+        },
+    )
+
+    recovery = reconcile_mod._inspect_gaussian_postprocess_recovery(
+        campaign,
+        campaign_uid=_FIXTURE_CAMPAIGN_UID,
+        phase_name=CampaignPhase.GAUSSIAN.value,
+        iteration=4,
+        replacement_round=0,
+        intent_records=[
+            {
+                "phase": CampaignPhase.GAUSSIAN.value,
+                "iteration": 4,
+                "replacement_round": 0,
+            }
+        ],
+    )
+
+    assert recovery is not None
+    assert recovery["n_complete"] == 3
+    assert recovery["n_retry"] == 0
+    assert recovery["scheduler_jobs_submitted"] == 0
+
+
 def test_active_replacement_recovery_advances_only_with_durable_handoffs(tmp_path):
     campaign, _, _, _ = _campaign_dirs(tmp_path)
     iter_dir = _write_ariadne_handoff(campaign, 1, n=2)
@@ -782,6 +903,7 @@ def test_active_replacement_recovery_advances_only_with_durable_handoffs(tmp_pat
         ],
     )
     state = fresh_campaign_state(max_iterations=3)
+    state.campaign_uid = _FIXTURE_CAMPAIGN_UID
     state.iteration = 1
     state.reference_data_version = 0
     state.models_version = 0

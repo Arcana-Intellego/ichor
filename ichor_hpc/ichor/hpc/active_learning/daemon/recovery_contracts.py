@@ -205,11 +205,114 @@ def _require_quantum_acceptance_authority(
         raise RecoveryContractError("quantum acceptance dispositions are duplicated")
 
 
+def _require_all_rejected_gaussian_coverage(
+    campaign: Path,
+    staging: Path,
+    *,
+    expected_phase: str,
+    expected_iteration: int,
+    context: str,
+    replacement_round: int = 0,
+    expected_campaign_uid: Optional[str] = None,
+) -> None:
+    """Bind a zero-accepted Gaussian publication to its allocation tasks."""
+    from .input_staging import (
+        _validate_pointdir_basename,
+        quantum_acceptance_manifest_path,
+    )
+    from ..layout import staging_pointdir_name
+    from ..point_allocation import point_allocation_path, read_point_allocation
+
+    path = quantum_acceptance_manifest_path(
+        staging,
+        phase_name=expected_phase,
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"), source=path)
+    accepted = list(payload.get("accepted_pointdirs") or [])
+    if accepted:
+        return
+    allocation_iteration = 0 if str(context) == "bootstrap" else int(
+        expected_iteration
+    )
+    allocation = read_point_allocation(
+        point_allocation_path(
+            campaign,
+            context=str(context),
+            iteration=allocation_iteration,
+        ),
+        expected_campaign_uid=expected_campaign_uid,
+        expected_context=str(context),
+        expected_iteration=allocation_iteration,
+    )
+    if int(replacement_round) > 0:
+        from ..replacement_sampling import (
+            read_replacement_sample_strict,
+            replacement_round_dir,
+        )
+
+        sample = read_replacement_sample_strict(
+            campaign,
+            context=str(context),
+            iteration=allocation_iteration,
+            replacement_round=int(replacement_round),
+            expected_campaign_uid=str(allocation["campaign_uid"]),
+        )
+        expected_staging = replacement_round_dir(
+            campaign,
+            context=str(context),
+            iteration=allocation_iteration,
+            replacement_round=int(replacement_round),
+        )
+        if expected_staging.resolve(strict=False) != staging.resolve(strict=False):
+            raise RecoveryContractError(
+                "Gaussian replacement publication uses the wrong staging bucket"
+            )
+        expected_names = [
+            staging_pointdir_name(int(record["pointdir_index"]))
+            for record in sample["records"]
+        ]
+    else:
+        expected_names = []
+        for task_index, slot in enumerate(allocation["slots"]):
+            attempts = [
+                attempt
+                for attempt in list(slot.get("attempts") or [])
+                if int(attempt.get("round", -1)) == 0
+            ]
+            if len(attempts) != 1:
+                raise RecoveryContractError(
+                    "Gaussian allocation does not contain one primary task per slot"
+                )
+            expected_name = staging_pointdir_name(int(task_index))
+            recorded_name = str(attempts[0].get("pointdir_name") or "")
+            if recorded_name and (
+                _validate_pointdir_basename(recorded_name) != expected_name
+            ):
+                raise RecoveryContractError(
+                    "Gaussian allocation primary task identity is inconsistent"
+                )
+            expected_names.append(expected_name)
+    rejected_names = [
+        _validate_pointdir_basename(str(record.get("pointdir") or ""))
+        for record in list(payload.get("rejected") or [])
+        if isinstance(record, dict)
+    ]
+    if (
+        int(payload.get("n_total", -1)) != len(expected_names)
+        or rejected_names != expected_names
+    ):
+        raise RecoveryContractError(
+            "all-rejected Gaussian publication does not exactly cover its "
+            "allocation producer tasks"
+        )
+
+
 def _require_point_allocation(
     campaign: Path,
     *,
     context: str,
     iteration: int,
+    expected_campaign_uid: Optional[str] = None,
     complete: Optional[bool] = None,
 ) -> Dict[str, Any]:
     from ..point_allocation import point_allocation_path, read_point_allocation
@@ -219,7 +322,12 @@ def _require_point_allocation(
         context=str(context),
         iteration=int(iteration),
     )
-    payload = read_point_allocation(path)
+    payload = read_point_allocation(
+        path,
+        expected_campaign_uid=expected_campaign_uid,
+        expected_context=str(context),
+        expected_iteration=int(iteration),
+    )
     is_complete = bool((payload.get("summary") or {}).get("complete", False))
     if complete is not None and is_complete != bool(complete):
         raise RecoveryContractError(
@@ -237,6 +345,7 @@ def _require_replacement_sample(
     context: str,
     iteration: int,
     replacement_round: int,
+    expected_campaign_uid: Optional[str] = None,
 ) -> Path:
     from ..replacement_sampling import (
         read_replacement_sample_strict,
@@ -254,6 +363,7 @@ def _require_replacement_sample(
         context=str(context),
         iteration=int(iteration),
         replacement_round=int(replacement_round),
+        expected_campaign_uid=expected_campaign_uid,
     )
     return path
 
@@ -263,6 +373,7 @@ def _require_allocation_check_ready(
     *,
     context: str,
     iteration: int,
+    expected_campaign_uid: Optional[str] = None,
 ) -> None:
     from ..point_allocation import pending_attempts
 
@@ -270,6 +381,7 @@ def _require_allocation_check_ready(
         campaign,
         context=str(context),
         iteration=int(iteration),
+        expected_campaign_uid=expected_campaign_uid,
     )
     pending = pending_attempts(payload)
     if pending:
@@ -287,12 +399,14 @@ def _require_replacement_gaussian_handoff(
     iteration: int,
     replacement_round: int,
     verification: str = "metadata",
+    expected_campaign_uid: Optional[str] = None,
 ) -> None:
     round_dir = _require_replacement_sample(
         campaign,
         context=str(context),
         iteration=int(iteration),
         replacement_round=int(replacement_round),
+        expected_campaign_uid=expected_campaign_uid,
     )
     phase = (
         CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN
@@ -314,6 +428,15 @@ def _require_replacement_gaussian_handoff(
             require_nonempty=False,
             points_membership=_stg.POINTS_MEMBERSHIP_PRODUCER_OR_ACCEPTED,
         )
+    _require_all_rejected_gaussian_coverage(
+        campaign,
+        round_dir,
+        expected_phase=phase.value,
+        expected_iteration=int(iteration),
+        context=str(context),
+        replacement_round=int(replacement_round),
+        expected_campaign_uid=expected_campaign_uid,
+    )
 
 
 def _require_initial_quantum(
@@ -322,26 +445,37 @@ def _require_initial_quantum(
     iteration: int,
     *,
     verification: str = "metadata",
+    expected_campaign_uid: Optional[str] = None,
 ) -> None:
     staging = campaign / ".DATA" / "STAGING" / "initial"
+    require_nonempty = phase is not CampaignPhase.INITIAL_GAUSSIAN
     if verification == "authority":
         _require_quantum_acceptance_authority(
             staging,
             expected_phase=phase.value,
             expected_iteration=int(iteration),
-            require_nonempty=True,
+            require_nonempty=require_nonempty,
         )
     else:
         _stg.read_quantum_acceptance_manifest(
             staging,
             expected_phase=phase.value,
             expected_iteration=int(iteration),
-            require_nonempty=True,
+            require_nonempty=require_nonempty,
             points_membership=(
                 _stg.POINTS_MEMBERSHIP_PRODUCER_OR_ACCEPTED
                 if phase is CampaignPhase.INITIAL_GAUSSIAN
                 else _stg.POINTS_MEMBERSHIP_ALL_DISPOSITIONS
             ),
+        )
+    if phase is CampaignPhase.INITIAL_GAUSSIAN:
+        _require_all_rejected_gaussian_coverage(
+            campaign,
+            staging,
+            expected_phase=phase.value,
+            expected_iteration=int(iteration),
+            context="bootstrap",
+            expected_campaign_uid=expected_campaign_uid,
         )
 
 
@@ -388,26 +522,37 @@ def _require_iter_quantum(
     iteration: int,
     *,
     verification: str = "metadata",
+    expected_campaign_uid: Optional[str] = None,
 ) -> None:
     staging = campaign / ".DATA" / "STAGING" / ("iter_" + str(int(iteration)))
+    require_nonempty = phase is not CampaignPhase.GAUSSIAN
     if verification == "authority":
         _require_quantum_acceptance_authority(
             staging,
             expected_phase=phase.value,
             expected_iteration=int(iteration),
-            require_nonempty=True,
+            require_nonempty=require_nonempty,
         )
     else:
         _stg.read_quantum_acceptance_manifest(
             staging,
             expected_phase=phase.value,
             expected_iteration=int(iteration),
-            require_nonempty=True,
+            require_nonempty=require_nonempty,
             points_membership=(
                 _stg.POINTS_MEMBERSHIP_PRODUCER_OR_ACCEPTED
                 if phase is CampaignPhase.GAUSSIAN
                 else _stg.POINTS_MEMBERSHIP_ALL_DISPOSITIONS
             ),
+        )
+    if phase is CampaignPhase.GAUSSIAN:
+        _require_all_rejected_gaussian_coverage(
+            campaign,
+            staging,
+            expected_phase=phase.value,
+            expected_iteration=int(iteration),
+            context="active",
+            expected_campaign_uid=expected_campaign_uid,
         )
 
 
@@ -780,6 +925,8 @@ def _require_phase_b_authority(
     allocation_payload = read_point_allocation(
         allocation_path,
         expected_campaign_uid=campaign_uid,
+        expected_context="active",
+        expected_iteration=int(iteration),
     )
     if str(allocation.get("slot_assignment_sha256") or "") != str(
         allocation_payload.get("slot_assignment_sha256") or ""
@@ -903,7 +1050,12 @@ def _require_phase_b(
     )
 
 
-def _require_split(campaign: Path, iteration: int) -> None:
+def _require_split(
+    campaign: Path,
+    iteration: int,
+    *,
+    expected_campaign_uid: Optional[str] = None,
+) -> None:
     from ..layout import active_allocation_dir
     from ..point_allocation import point_allocation_path
 
@@ -927,6 +1079,7 @@ def _require_split(campaign: Path, iteration: int) -> None:
         campaign,
         context="active",
         iteration=int(iteration),
+        expected_campaign_uid=expected_campaign_uid,
     )
     slots = data.get("slots")
     if not isinstance(slots, list) or len(slots) != int(allocation["targets"]["total"]):
@@ -1041,6 +1194,7 @@ def _allocation_recovery_decision(
     *,
     context: str,
     iteration: int,
+    expected_campaign_uid: Optional[str] = None,
     verification: str = "metadata",
     artifact_snapshot: Optional[Any] = None,
 ) -> Optional[RecoveryDecision]:
@@ -1051,6 +1205,7 @@ def _allocation_recovery_decision(
             campaign,
             context=str(context),
             iteration=int(iteration),
+            expected_campaign_uid=expected_campaign_uid,
         )
     except Exception:
         return None
@@ -1102,6 +1257,7 @@ def _allocation_recovery_decision(
             context=str(context),
             iteration=int(iteration),
             replacement_round=int(replacement_round),
+            expected_campaign_uid=expected_campaign_uid,
         )
     except Exception:
         return RecoveryDecision(
@@ -1162,6 +1318,7 @@ def protected_staging_handoff(
     campaign_dir: Union[str, Path],
     *,
     iteration: int,
+    expected_campaign_uid: Optional[str] = None,
     verification: str = "metadata",
     artifact_snapshot: Optional[Any] = None,
 ) -> Optional[RecoveryDecision]:
@@ -1171,6 +1328,7 @@ def protected_staging_handoff(
         campaign,
         context="active",
         iteration=int(iteration),
+        expected_campaign_uid=expected_campaign_uid,
         verification=verification,
         artifact_snapshot=artifact_snapshot,
     )
@@ -1235,6 +1393,7 @@ def staging_handoff_decisions(
             campaign,
             context="bootstrap",
             iteration=0,
+            expected_campaign_uid=str(state.campaign_uid),
             verification=verification,
             artifact_snapshot=artifact_snapshot,
         )
@@ -1294,6 +1453,7 @@ def staging_handoff_decisions(
         decision = protected_staging_handoff(
             campaign,
             iteration=iteration,
+            expected_campaign_uid=str(state.campaign_uid),
             verification=verification,
             artifact_snapshot=artifact_snapshot,
         )
@@ -1306,6 +1466,7 @@ def _best_active_iteration_handoff(
     campaign: Path,
     iteration: int,
     *,
+    expected_campaign_uid: Optional[str] = None,
     verification: str = "metadata",
     artifact_snapshot: Optional[Any] = None,
 ) -> Optional[RecoveryHandoff]:
@@ -1313,6 +1474,7 @@ def _best_active_iteration_handoff(
         campaign,
         context="active",
         iteration=int(iteration),
+        expected_campaign_uid=expected_campaign_uid,
         verification=verification,
         artifact_snapshot=artifact_snapshot,
     )
@@ -1322,7 +1484,12 @@ def _best_active_iteration_handoff(
             50,
             "point_allocation",
         )
-    if _ok(_require_split, campaign, int(iteration)):
+    if _ok(
+        _require_split,
+        campaign,
+        int(iteration),
+        expected_campaign_uid=expected_campaign_uid,
+    ):
         from ..layout import active_allocation_dir
 
         return RecoveryHandoff(
@@ -1342,6 +1509,7 @@ def _best_active_iteration_handoff(
         _require_phase_b,
         campaign,
         int(iteration),
+        expected_campaign_uid=expected_campaign_uid,
         verification=verification,
     ):
         from ..handoff_manifests import phase_b_selection_path
@@ -1422,6 +1590,7 @@ def active_iteration_handoff_decisions(
         handoff = _best_active_iteration_handoff(
             campaign,
             iteration,
+            expected_campaign_uid=str(state.campaign_uid),
             verification=verification,
             artifact_snapshot=artifact_snapshot,
         )
@@ -1469,6 +1638,7 @@ def _phase_contract_checks(
                     CampaignPhase.INITIAL_GAUSSIAN,
                     iteration,
                     verification=verification,
+                    expected_campaign_uid=str(state.campaign_uid),
                 ),
             ),
         ],
@@ -1479,6 +1649,7 @@ def _phase_contract_checks(
                     campaign,
                     context="bootstrap",
                     iteration=0,
+                    expected_campaign_uid=str(state.campaign_uid),
                 ),
             ),
         ],
@@ -1490,7 +1661,7 @@ def _phase_contract_checks(
                     context="bootstrap",
                     iteration=0,
                     replacement_round=int(getattr(state, "replacement_round", 0)),
-                    verification=verification,
+                    expected_campaign_uid=str(state.campaign_uid),
                 ),
             ),
         ],
@@ -1502,6 +1673,8 @@ def _phase_contract_checks(
                     context="bootstrap",
                     iteration=0,
                     replacement_round=int(getattr(state, "replacement_round", 0)),
+                    verification=verification,
+                    expected_campaign_uid=str(state.campaign_uid),
                 ),
             ),
         ],
@@ -1523,6 +1696,7 @@ def _phase_contract_checks(
                     campaign,
                     context="bootstrap" if iteration == 0 else "active",
                     iteration=iteration,
+                    expected_campaign_uid=str(state.campaign_uid),
                     complete=True,
                 ),
             ),
@@ -1586,7 +1760,14 @@ def _phase_contract_checks(
                     verification=verification,
                 ),
             ),
-            ("allocation/SPLIT_RECEIPT.json", lambda: _require_split(campaign, iteration)),
+            (
+                "allocation/SPLIT_RECEIPT.json",
+                lambda: _require_split(
+                    campaign,
+                    iteration,
+                    expected_campaign_uid=str(state.campaign_uid),
+                ),
+            ),
         ],
         CampaignPhase.AIMALL: [
             (
@@ -1596,6 +1777,7 @@ def _phase_contract_checks(
                     CampaignPhase.GAUSSIAN,
                     iteration,
                     verification=verification,
+                    expected_campaign_uid=str(state.campaign_uid),
                 ),
             ),
         ],
@@ -1606,6 +1788,7 @@ def _phase_contract_checks(
                     campaign,
                     context="active",
                     iteration=iteration,
+                    expected_campaign_uid=str(state.campaign_uid),
                 ),
             ),
         ],
@@ -1617,7 +1800,7 @@ def _phase_contract_checks(
                     context="active",
                     iteration=iteration,
                     replacement_round=int(getattr(state, "replacement_round", 0)),
-                    verification=verification,
+                    expected_campaign_uid=str(state.campaign_uid),
                 ),
             ),
         ],
@@ -1629,6 +1812,8 @@ def _phase_contract_checks(
                     context="active",
                     iteration=iteration,
                     replacement_round=int(getattr(state, "replacement_round", 0)),
+                    verification=verification,
+                    expected_campaign_uid=str(state.campaign_uid),
                 ),
             ),
         ],
@@ -1725,6 +1910,7 @@ def select_recovery_phase(
             campaign,
             context="bootstrap",
             iteration=0,
+            expected_campaign_uid=str(state.campaign_uid),
             verification=verification,
             artifact_snapshot=artifact_snapshot,
         )
@@ -1886,6 +2072,7 @@ def select_recovery_phase(
     current_handoff = _best_active_iteration_handoff(
         campaign,
         iteration,
+        expected_campaign_uid=str(state.campaign_uid),
         verification=verification,
         artifact_snapshot=artifact_snapshot,
     )

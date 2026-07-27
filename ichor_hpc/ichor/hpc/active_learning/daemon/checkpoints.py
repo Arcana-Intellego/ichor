@@ -133,7 +133,79 @@ def _excluded_relative_path(relative: Path) -> bool:
     return False
 
 
-def _campaign_files(campaign_dir: Path) -> List[Path]:
+def _is_managed_current_symlink(
+    campaign_dir: Path,
+    relative: Path,
+    *,
+    reference_data_version: int,
+    models_version: int,
+) -> bool:
+    specifications = {
+        Path("QM_REFERENCE_DATA") / "current": (
+            "reference data",
+            int(reference_data_version),
+            "reference",
+        ),
+        Path("TRAINED_MODELS") / "current": (
+            "trained models",
+            int(models_version),
+            "models",
+        ),
+    }
+    specification = specifications.get(relative)
+    if specification is None:
+        return False
+    label, expected_version, kind = specification
+    if expected_version < 0:
+        raise ValueError(
+            "checkpoint source has a managed "
+            + label
+            + " pointer without a committed state version"
+        )
+    if kind == "reference":
+        from ..versioning.reference_data import ReferenceDataVersioning
+
+        versioning = ReferenceDataVersioning(
+            campaign_dir / "QM_REFERENCE_DATA"
+        )
+    else:
+        from ..versioning.trained_models import TrainedModelVersioning
+
+        versioning = TrainedModelVersioning(campaign_dir / "TRAINED_MODELS")
+    if versioning.current_version() != expected_version:
+        raise ValueError(
+            "checkpoint source "
+            + label
+            + " pointer does not match campaign state"
+        )
+    target = versioning.iteration_path(expected_version)
+    if target.is_symlink() or not target.is_dir():
+        raise ValueError(
+            "checkpoint source managed pointer target is not a regular "
+            "version directory: "
+            + str(target)
+        )
+    link = campaign_dir / relative
+    try:
+        target_name = os.readlink(str(link))
+    except OSError as exc:
+        raise ValueError(
+            "checkpoint source managed pointer is unreadable: " + str(link)
+        ) from exc
+    if target_name != target.name:
+        raise ValueError(
+            "checkpoint source managed pointer target is non-canonical: "
+            + str(link)
+        )
+    return True
+
+
+def _campaign_files(
+    campaign_dir: Path,
+    *,
+    reference_data_version: int,
+    models_version: int,
+) -> List[Path]:
     root = lexical_absolute_path(campaign_dir)
     reject_symlink_components(root)
     if root.is_symlink() or not root.is_dir():
@@ -147,6 +219,13 @@ def _campaign_files(campaign_dir: Path) -> List[Path]:
             child = current / name
             relative = relative_directory / name
             if child.is_symlink():
+                if _is_managed_current_symlink(
+                    root,
+                    relative,
+                    reference_data_version=int(reference_data_version),
+                    models_version=int(models_version),
+                ):
+                    continue
                 raise ValueError("checkpoint source contains a symlink: " + str(child))
             if not _excluded_relative_path(relative):
                 kept_directories.append(name)
@@ -155,6 +234,13 @@ def _campaign_files(campaign_dir: Path) -> List[Path]:
             source = current / name
             relative = source.relative_to(root)
             if source.is_symlink():
+                if _is_managed_current_symlink(
+                    root,
+                    relative,
+                    reference_data_version=int(reference_data_version),
+                    models_version=int(models_version),
+                ):
+                    continue
                 raise ValueError("checkpoint source contains a symlink: " + str(source))
             if _excluded_relative_path(relative):
                 continue
@@ -336,7 +422,11 @@ def create_checkpoint(
             return
 
     report("checkpoint_copy", completed=0, unit="files")
-    files = _campaign_files(campaign)
+    files = _campaign_files(
+        campaign,
+        reference_data_version=int(state.reference_data_version),
+        models_version=int(state.models_version),
+    )
     records: List[Dict[str, Any]] = []
     missing_bytes = 0
     hashed_bytes = 0
@@ -700,6 +790,18 @@ def restore_checkpoint(
             temporary,
             expected_campaign_uid=str(restored_state.campaign_uid),
         )
+        if int(restored_state.reference_data_version) >= 0:
+            from ..versioning.reference_data import ReferenceDataVersioning
+
+            ReferenceDataVersioning(
+                temporary / "QM_REFERENCE_DATA"
+            ).ensure_current(int(restored_state.reference_data_version))
+        if int(restored_state.models_version) >= 0:
+            from ..versioning.trained_models import TrainedModelVersioning
+
+            TrainedModelVersioning(
+                temporary / "TRAINED_MODELS"
+            ).ensure_current(int(restored_state.models_version))
         verify_state_referenced_artifacts(temporary, restored_state, strict_models=True)
         if int(restored_state.reference_data_version) >= 0:
             from .ferebus_row_cache import ensure_cumulative_row_caches

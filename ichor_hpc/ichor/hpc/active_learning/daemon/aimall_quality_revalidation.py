@@ -430,6 +430,8 @@ def has_aimall_quality_revalidation_candidates(campaign_dir: Path) -> bool:
                 iteration=int(state.iteration),
             ),
             expected_campaign_uid=str(state.campaign_uid),
+            expected_context="active",
+            expected_iteration=int(state.iteration),
         )
         return bool(_vacant_parser_rejections(allocation))
     except Exception:
@@ -612,6 +614,8 @@ def inspect_aimall_quality_revalidation(
         allocation = read_point_allocation(
             allocation_path,
             expected_campaign_uid=str(state.campaign_uid),
+            expected_context="active",
+            expected_iteration=int(state.iteration),
         )
         candidates = _vacant_parser_rejections(allocation)
         if not candidates:
@@ -972,6 +976,8 @@ def apply_aimall_quality_revalidation(
     current_allocation = read_point_allocation(
         allocation_path,
         expected_campaign_uid=str(ledger["campaign_uid"]),
+        expected_context="active",
+        expected_iteration=int(ledger["iteration"]),
     )
     matching_source_batches = [
         record
@@ -1071,6 +1077,7 @@ def apply_aimall_quality_revalidation(
             acceptance = read_quantum_acceptance_receipt(
                 campaign,
                 pointdir,
+                expected_campaign_uid=str(ledger["campaign_uid"]),
                 expected_phase=str(ledger["phase"]),
                 expected_iteration=int(ledger["iteration"]),
                 expected_candidate_id=str(candidate["candidate_id"]),
@@ -1090,6 +1097,7 @@ def apply_aimall_quality_revalidation(
             acceptance = read_quantum_acceptance_receipt(
                 campaign,
                 pointdir,
+                expected_campaign_uid=str(ledger["campaign_uid"]),
                 expected_phase=str(ledger["phase"]),
                 expected_iteration=int(ledger["iteration"]),
                 expected_candidate_id=str(candidate["candidate_id"]),
@@ -1136,6 +1144,8 @@ def apply_aimall_quality_revalidation(
     current = read_point_allocation(
         allocation_path,
         expected_campaign_uid=str(ledger["campaign_uid"]),
+        expected_context="active",
+        expected_iteration=int(ledger["iteration"]),
     )
     matching_batches = [
         record
@@ -1204,6 +1214,7 @@ def apply_aimall_quality_revalidation(
         reference_data_version=int(ledger["iteration"]),
         context="active",
         iteration=int(ledger["iteration"]),
+        expected_campaign_uid=str(ledger["campaign_uid"]),
     )
     ledger["reference_commit_ledger"] = reference_ledger.relative_to(
         campaign

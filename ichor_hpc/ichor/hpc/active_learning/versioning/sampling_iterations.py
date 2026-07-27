@@ -479,6 +479,8 @@ def finalise_bootstrap(campaign_dir: Path, campaign_uid: str) -> Path:
     allocation = read_point_allocation(
         point_allocation_path(campaign, context="bootstrap", iteration=0),
         expected_campaign_uid=campaign_uid,
+        expected_context="bootstrap",
+        expected_iteration=0,
     )
     if not bool((allocation.get("summary") or {}).get("complete", False)):
         raise SamplingIterationError("bootstrap allocation is incomplete")
@@ -565,6 +567,8 @@ def finalise_active_iteration(
     allocation = read_point_allocation(
         point_allocation_path(campaign, context="active", iteration=value),
         expected_campaign_uid=campaign_uid,
+        expected_context="active",
+        expected_iteration=value,
     )
     if not bool((allocation.get("summary") or {}).get("complete", False)):
         raise SamplingIterationError("active point allocation is incomplete")

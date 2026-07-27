@@ -81,6 +81,17 @@ def test_quantum_acceptance_receipt_detects_late_pointdir_mutation(tmp_path):
         )
 
 
+def test_quantum_acceptance_receipt_binds_campaign_uid(tmp_path):
+    campaign, pointdir, _quality = _accepted_fixture(tmp_path)
+
+    with pytest.raises(ValueError, match="campaign UID"):
+        read_quantum_acceptance_receipt(
+            campaign,
+            pointdir,
+            expected_campaign_uid="foreign-campaign",
+        )
+
+
 def test_quantum_acceptance_hashes_and_fsyncs_each_artefact_once(
     tmp_path,
     monkeypatch,

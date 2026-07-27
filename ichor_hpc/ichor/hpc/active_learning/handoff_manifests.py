@@ -1507,8 +1507,13 @@ def write_phase_a_sample_manifest(initial_dir: Any, payload: Dict[str, Any]) -> 
         allocation_binding.get("manifest", ""),
         kind="Phase A point-allocation manifest",
     )
-    allocation_payload = read_point_allocation(allocation_path)
     supplied_uid = str(data.get("campaign_uid") or "")
+    allocation_payload = read_point_allocation(
+        allocation_path,
+        expected_campaign_uid=supplied_uid or None,
+        expected_context="bootstrap",
+        expected_iteration=0,
+    )
     allocation_uid = str(allocation_payload["campaign_uid"])
     if supplied_uid and supplied_uid != allocation_uid:
         raise HandoffManifestError("Phase A sample manifest campaign UID mismatch")
@@ -1719,6 +1724,8 @@ def read_phase_a_sample_manifest(
     allocation_payload = read_point_allocation(
         allocation_manifest,
         expected_campaign_uid=expected_campaign_uid,
+        expected_context="bootstrap",
+        expected_iteration=0,
     )
     if str(data.get("campaign_uid") or allocation_payload["campaign_uid"]) != str(
         allocation_payload["campaign_uid"]
@@ -1983,6 +1990,8 @@ def read_phase_b_selection_manifest(
     allocation_payload = read_point_allocation(
         allocation_manifest,
         expected_campaign_uid=expected_campaign_uid,
+        expected_context="active",
+        expected_iteration=iteration,
     )
     if str(allocation.get("slot_assignment_sha256") or "") != str(
         allocation_payload.get("slot_assignment_sha256") or ""
@@ -2165,6 +2174,7 @@ def validate_phase_b_handoff(
     manifest = read_phase_b_selection_manifest(
         iter_dir,
         expected_iteration=expected_iteration,
+        expected_campaign_uid=expected_campaign_uid,
         require_nonempty=True,
     )
     campaign_uid = str(manifest.get("campaign_uid") or "")

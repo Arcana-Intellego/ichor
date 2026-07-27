@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -214,11 +215,40 @@ def _build_parser_rejection_campaign(
                 iteration=1,
                 logical_task_id=logical_task_id,
             )
-    array_ledger = refresh_array_ledger(
-        campaign,
-        CampaignPhase.AIMALL.value,
-        1,
+    task_contract = SimpleNamespace(
+        campaign_uid=_CAMPAIGN_UID,
+        staging_dir=staging,
+        logical_total=n_total,
+        pointdir_names=tuple(path.name for path in pointdirs),
+        tasks=tuple(
+            SimpleNamespace(
+                logical_task_id=logical_task_id,
+                pointdir=pointdir,
+                pointdir_name=pointdir.name,
+                producer_logical_task_id=logical_task_id,
+                candidate_id=str(attempts[logical_task_id]["candidate_id"]),
+            )
+            for logical_task_id, pointdir in enumerate(pointdirs)
+        ),
     )
+    with patch(
+        "ichor.hpc.active_learning.daemon.array_recovery.logical_task_ids",
+        return_value=list(range(n_total)),
+    ), patch(
+        "ichor.hpc.active_learning.daemon.array_recovery._pointdir_for_task",
+        side_effect=lambda _campaign, _phase, _iteration, task_id: (
+            pointdirs[int(task_id)]
+        ),
+    ), patch(
+        "ichor.hpc.active_learning.daemon.quantum_task_contracts."
+        "quantum_task_contract",
+        return_value=task_contract,
+    ):
+        array_ledger = refresh_array_ledger(
+            campaign,
+            CampaignPhase.AIMALL.value,
+            1,
+        )
     assert array_ledger["all_complete"] is False
     assert array_ledger["retry_task_ids"] == list(
         range(int(n_accepted), n_total)

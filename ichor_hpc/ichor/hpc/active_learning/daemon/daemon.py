@@ -1662,6 +1662,26 @@ class Daemon:
                     + str(exc)[:180],
                 )
         elif phase.value in {
+            CampaignPhase.INITIAL_GAUSSIAN.value,
+            CampaignPhase.GAUSSIAN.value,
+            CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN.value,
+            CampaignPhase.REPLACEMENT_GAUSSIAN.value,
+        }:
+            try:
+                postprocess_source = self._gaussian_postprocess_source_if_complete(
+                    state,
+                    phase,
+                )
+            except Exception as exc:
+                return self._halt(
+                    state,
+                    phase,
+                    "gaussian_postprocess_source_invalid: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)[:180],
+                )
+        elif phase.value in {
             CampaignPhase.INITIAL_AIMALL.value,
             CampaignPhase.AIMALL.value,
             CampaignPhase.INITIAL_REPLACEMENT_AIMALL.value,
@@ -2805,7 +2825,73 @@ class Daemon:
             and not isinstance(current.get("postprocess_source"), Mapping)
         ):
             return None
-        return resolve_aimall_postprocess_source(
+        source = resolve_aimall_postprocess_source(
+            self.campaign_dir,
+            campaign_uid=str(state.campaign_uid),
+            phase_name=phase.value,
+            iteration=int(state.iteration),
+            replacement_round=int(getattr(state, "replacement_round", 0)),
+            intent=current,
+        )
+        from .quantum_task_contracts import quantum_task_contract
+        from .quantum_task_receipts import AIMALL_TASK_RECEIPT
+
+        contract = quantum_task_contract(
+            self.campaign_dir,
+            phase.value,
+            int(state.iteration),
+            replacement_round=int(getattr(state, "replacement_round", 0)),
+            expected_campaign_uid=str(state.campaign_uid),
+            validate_points_file=False,
+        )
+        receipt_count = sum(
+            1
+            for task in contract.tasks
+            if (task.pointdir / AIMALL_TASK_RECEIPT).is_file()
+            and not (task.pointdir / AIMALL_TASK_RECEIPT).is_symlink()
+        )
+        if receipt_count:
+            from .live_executor import _aimall_visibility_issue
+
+            unsettled = any(
+                _aimall_visibility_issue(task.pointdir) is not None
+                for task in contract.tasks
+            )
+            if unsettled:
+                return None
+        return source
+
+    def _gaussian_postprocess_source_if_complete(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve a scheduler-complete Gaussian attempt for local replay."""
+        from .submission_intent import (
+            ACTIVE_STATUSES,
+            gaussian_intent_claims_completed_array,
+            load_intent,
+            resolve_gaussian_postprocess_source,
+        )
+
+        current = load_intent(
+            self.campaign_dir,
+            phase.value,
+            int(state.iteration),
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        if not isinstance(current, dict):
+            return None
+        if str(current.get("status") or "") == "COMPLETED":
+            return None
+        if not gaussian_intent_claims_completed_array(current):
+            return None
+        if (
+            str(current.get("status") or "") in ACTIVE_STATUSES
+            and not isinstance(current.get("postprocess_source"), Mapping)
+        ):
+            return None
+        return resolve_gaussian_postprocess_source(
             self.campaign_dir,
             campaign_uid=str(state.campaign_uid),
             phase_name=phase.value,

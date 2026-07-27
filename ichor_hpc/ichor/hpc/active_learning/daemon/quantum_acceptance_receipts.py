@@ -239,6 +239,7 @@ def read_quantum_acceptance_receipt(
     campaign_dir: Path,
     pointdir: Path,
     *,
+    expected_campaign_uid: Optional[str] = None,
     expected_phase: Optional[str] = None,
     expected_iteration: Optional[int] = None,
     expected_candidate_id: Optional[str] = None,
@@ -275,6 +276,14 @@ def read_quantum_acceptance_receipt(
         raise ValueError("quantum acceptance receipt timestamp lacks a timezone")
     if schema_version == 3 and payload.get("integrity_policy") != "sha256_inventory":
         raise ValueError("quantum acceptance receipt integrity policy is invalid")
+    campaign_uid = str(payload.get("campaign_uid") or "")
+    if not campaign_uid:
+        raise ValueError("quantum acceptance receipt campaign UID is empty")
+    if (
+        expected_campaign_uid is not None
+        and campaign_uid != str(expected_campaign_uid)
+    ):
+        raise ValueError("quantum acceptance receipt campaign UID mismatch")
     iteration = _exact_int(payload.get("iteration"), "quantum acceptance iteration")
     source_pointdir = str(payload.get("source_pointdir") or "")
     if not source_pointdir:

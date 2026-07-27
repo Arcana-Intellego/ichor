@@ -680,6 +680,8 @@ def read_point_allocation(
     *,
     history_dir: Optional[str | Path] = None,
     expected_campaign_uid: Optional[str] = None,
+    expected_context: Optional[str] = None,
+    expected_iteration: Optional[int] = None,
 ) -> Dict[str, Any]:
     manifest = Path(path)
     payload = _read_payload_file(manifest)
@@ -692,6 +694,14 @@ def read_point_allocation(
         expected_campaign_uid
     ):
         raise ValueError("point-allocation campaign UID mismatch")
+    if expected_context is not None and str(payload["context"]) != str(
+        expected_context
+    ):
+        raise ValueError("point-allocation context mismatch")
+    if expected_iteration is not None and int(payload["iteration"]) != int(
+        expected_iteration
+    ):
+        raise ValueError("point-allocation iteration mismatch")
     return payload
 
 

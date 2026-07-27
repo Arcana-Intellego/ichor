@@ -181,6 +181,8 @@ def verify_state_referenced_artifacts(
                     iteration=0,
                 ),
                 expected_campaign_uid=str(state.campaign_uid),
+                expected_context="bootstrap",
+                expected_iteration=0,
             )
             if not bool((allocation.get("summary") or {}).get("complete", False)):
                 raise ValueError("bootstrap point allocation is incomplete")

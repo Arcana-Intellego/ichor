@@ -824,6 +824,87 @@ def test_aimall_postprocess_environment_boundary_covers_all_phases(
     assert result["logical_total"] == 2
 
 
+@pytest.mark.parametrize(
+    (
+        "phase",
+        "iteration",
+        "committed_version",
+        "current_version",
+        "replacement_round",
+    ),
+    [
+        (CampaignPhase.INITIAL_GAUSSIAN, 0, -1, None, 0),
+        (
+            CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN,
+            0,
+            -1,
+            None,
+            1,
+        ),
+        (CampaignPhase.GAUSSIAN, 2, 1, 1, 0),
+        (CampaignPhase.REPLACEMENT_GAUSSIAN, 2, 1, 1, 1),
+    ],
+)
+def test_gaussian_postprocess_environment_boundary_covers_all_phases(
+    tmp_path,
+    monkeypatch,
+    phase,
+    iteration,
+    committed_version,
+    current_version,
+    replacement_round,
+):
+    from ichor.hpc.active_learning.versioning.reference_data import (
+        ReferenceDataVersioning,
+    )
+    from ichor.hpc.active_learning.versioning.trained_models import (
+        TrainedModelVersioning,
+    )
+
+    state = fresh_campaign_state(max_iterations=3)
+    state.phase = phase
+    state.iteration = iteration
+    state.replacement_round = replacement_round
+    state.reference_data_version = committed_version
+    state.models_version = committed_version
+    monkeypatch.setattr(
+        ReferenceDataVersioning,
+        "current_version",
+        lambda _self: current_version,
+    )
+    monkeypatch.setattr(
+        TrainedModelVersioning,
+        "current_version",
+        lambda _self: current_version,
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.recovery_contracts."
+        "phase_recovery_contract_error",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.submission_intent."
+        "resolve_gaussian_postprocess_source",
+        lambda *_args, **_kwargs: {
+            "logical_total": 2,
+            "submission_identity": "r0000-a0001-fixture",
+            "job_id": "17888108",
+            "environment_generation": 4,
+            "environment_generation_digest_sha256": "d" * 64,
+        },
+    )
+
+    result = (
+        execution_identity_module._validate_gaussian_postprocess_transition_boundary(
+            tmp_path,
+            state,
+        )
+    )
+
+    assert result["transition_kind"] == "gaussian_postprocess_only"
+    assert result["logical_total"] == 2
+
+
 def test_initial_aimall_postprocess_boundary_rejects_committed_current_pointer(
     tmp_path,
     monkeypatch,

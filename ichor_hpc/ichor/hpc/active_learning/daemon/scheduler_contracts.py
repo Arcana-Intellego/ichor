@@ -31,47 +31,49 @@ def infer_expected_tasks_from_artifacts(
         return 1
     try:
         if phase_name in {
+            "INITIAL_GAUSSIAN",
+            "INITIAL_AIMALL",
             "INITIAL_REPLACEMENT_GAUSSIAN",
             "INITIAL_REPLACEMENT_AIMALL",
+            "GAUSSIAN",
+            "AIMALL",
             "REPLACEMENT_GAUSSIAN",
             "REPLACEMENT_AIMALL",
         }:
-            from ..replacement_sampling import (
-                read_replacement_sample_strict,
-                replacement_round_dir,
+            from .quantum_task_contracts import (
+                AIMALL_PHASES,
+                gaussian_phase_for_aimall,
+                quantum_task_contract,
             )
 
-            context = "bootstrap" if phase_name.startswith("INITIAL_") else "active"
-            effective_iteration = 0 if context == "bootstrap" else int(iteration)
-            manifest = read_replacement_sample_strict(
+            contract = quantum_task_contract(
                 campaign,
-                context=context,
-                iteration=effective_iteration,
+                phase_name,
+                int(iteration),
                 replacement_round=int(replacement_round),
+                validate_points_file=False,
             )
-            round_dir = replacement_round_dir(
-                campaign,
-                context=context,
-                iteration=effective_iteration,
-                replacement_round=int(replacement_round),
-            )
-            staged_count = _count_nonempty_lines(round_dir / "POINTS.txt")
-            manifest_count = int(manifest.get("n_candidates", 0))
-            if staged_count != manifest_count or manifest_count <= 0:
-                raise ValueError(
-                    "replacement POINTS.txt count does not match its strict sample manifest"
-                )
-            return manifest_count
-        if phase_name in {"INITIAL_GAUSSIAN", "INITIAL_AIMALL"}:
-            return _count_nonempty_lines(
-                staging_phase_dir(campaign, phase_name, int(iteration))
-                / "POINTS.txt"
-            )
-        if phase_name in {"GAUSSIAN", "AIMALL"}:
-            return _count_nonempty_lines(
-                staging_phase_dir(campaign, phase_name, int(iteration))
-                / "POINTS.txt"
-            )
+            points_file = contract.staging_dir / "POINTS.txt"
+            if points_file.exists() or points_file.is_symlink():
+                from .input_staging import _points_file_names
+
+                listed = tuple(_points_file_names(contract.staging_dir))
+                permitted = {contract.pointdir_names}
+                if phase_name in AIMALL_PHASES:
+                    gaussian = quantum_task_contract(
+                        campaign,
+                        gaussian_phase_for_aimall(phase_name),
+                        int(iteration),
+                        replacement_round=int(replacement_round),
+                        validate_points_file=False,
+                    )
+                    permitted.add(gaussian.pointdir_names)
+                if listed not in permitted:
+                    raise ValueError(
+                        phase_name
+                        + " POINTS.txt does not match its authoritative task set"
+                    )
+            return contract.logical_total if contract.logical_total > 0 else None
         if phase_name in {"INITIAL_FEREBUS", "FEREBUS"}:
             manifest = trained_models_dir(campaign) / "iteration-staging" / "FEREBUS_TASKS.json"
             if manifest.is_file():

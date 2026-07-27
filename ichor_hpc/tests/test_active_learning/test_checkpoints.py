@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -173,6 +174,60 @@ def test_checkpoint_deduplicates_verifies_and_restores(tmp_path, monkeypatch):
         restored_path = target.joinpath(*Path(record["path"]).parts)
         assert restored_path.stat().st_size == int(record["size"])
         assert checkpoints._sha256_file(restored_path) == record["sha256"]
+
+
+def test_checkpoint_recreates_validated_managed_current_symlinks(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = _idle_campaign(tmp_path, monkeypatch)
+    state = fresh_campaign_state(campaign_uid="abc123")
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    for root_name in ("QM_REFERENCE_DATA", "TRAINED_MODELS"):
+        root = campaign / root_name
+        version = root / "iteration-000000"
+        version.mkdir(parents=True)
+        try:
+            (root / "current").symlink_to(
+                version.name,
+                target_is_directory=True,
+            )
+        except (OSError, NotImplementedError):
+            pytest.skip("directory symlink creation is unavailable")
+
+    destination = tmp_path / "checkpoint-store"
+    destination.mkdir()
+    created = checkpoints.create_checkpoint(campaign, destination)
+    relative_paths = {item["path"] for item in created["manifest"]["files"]}
+
+    assert "QM_REFERENCE_DATA/current" not in relative_paths
+    assert "TRAINED_MODELS/current" not in relative_paths
+
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.versioning.reference_data."
+        "ReferenceDataVersioning.resolve",
+        lambda *_args, **_kwargs: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.ferebus_row_cache."
+        "ensure_cumulative_row_caches",
+        lambda *_args, **_kwargs: None,
+    )
+    restored = tmp_path / "restored"
+    checkpoints.restore_checkpoint(
+        created["checkpoint"],
+        restored,
+        apply=True,
+    )
+
+    for root_name in ("QM_REFERENCE_DATA", "TRAINED_MODELS"):
+        current = restored / root_name / "current"
+        assert current.is_symlink()
+        assert os.readlink(current) == "iteration-000000"
 
 
 def test_checkpoint_reports_copy_and_verification_progress(tmp_path, monkeypatch):

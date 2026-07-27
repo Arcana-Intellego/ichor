@@ -17,7 +17,13 @@ from ichor.hpc.active_learning.point_allocation import (
 )
 
 
-def _write_allocation(campaign_dir: Path, config: CampaignConfig, iteration: int):
+def _write_allocation(
+    campaign_dir: Path,
+    config: CampaignConfig,
+    iteration: int,
+    *,
+    campaign_uid: str,
+):
     iter_dir = active_iteration_dir(campaign_dir, iteration)
     targets = allocation_targets(config, "active")
     create_point_allocation(
@@ -26,7 +32,7 @@ def _write_allocation(campaign_dir: Path, config: CampaignConfig, iteration: int
             context="active",
             iteration=iteration,
         ),
-        campaign_uid="split-test",
+        campaign_uid=str(campaign_uid),
         context="active",
         iteration=iteration,
         targets=targets,
@@ -51,7 +57,12 @@ def test_inline_split_projects_exact_allocation_slots(tmp_path):
     ex = DryRunPhaseExecutor(campaign_dir=tmp_path / "c", config=cfg)
     state = fresh_campaign_state(max_iterations=1)
     state.iteration = 1
-    iter_dir = _write_allocation(tmp_path / "c", cfg, 1)
+    iter_dir = _write_allocation(
+        tmp_path / "c",
+        cfg,
+        1,
+        campaign_uid=str(state.campaign_uid),
+    )
 
     ex._inline_split(state)
 

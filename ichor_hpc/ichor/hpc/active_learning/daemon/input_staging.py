@@ -23,6 +23,7 @@ import platform
 import re
 import shutil
 import hashlib
+import uuid
 from pathlib import Path
 from typing import (
     Any,
@@ -384,6 +385,59 @@ def _read_gaussian_receipt_for_aimall_replay(
     return dict(payload)
 
 
+def read_gaussian_task_receipt_after_aimall(
+    pointdir: Path,
+    *,
+    gaussian_phase: str,
+    aimall_phase: str,
+    iteration: int,
+    logical_task_id: int,
+) -> Dict[str, Any]:
+    """Validate Gaussian evidence across one recorded AIMAll WFN rewrite."""
+    root = Path(pointdir)
+    receipt_path = root / WFN_METHOD_RECEIPT
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise ValueError("AIMAll WFN method receipt is missing")
+    try:
+        method_payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError("AIMAll WFN method receipt is unreadable") from exc
+    if not isinstance(method_payload, dict):
+        raise ValueError("AIMAll WFN method receipt must be an object")
+    expected_identity = (
+        WFN_METHOD_RECEIPT_SCHEMA_VERSION,
+        str(aimall_phase),
+        int(iteration),
+        root.name,
+    )
+    observed_identity = (
+        method_payload.get("schema_version"),
+        method_payload.get("phase"),
+        method_payload.get("iteration"),
+        method_payload.get("pointdir"),
+    )
+    if observed_identity != expected_identity:
+        raise ValueError("AIMAll WFN method receipt identity mismatch")
+    wfn_binding = method_payload.get("wfn")
+    wfn = root / "input.wfn"
+    if (
+        not isinstance(wfn_binding, dict)
+        or wfn_binding.get("path") != wfn.name
+        or wfn.is_symlink()
+        or not wfn.is_file()
+        or wfn_binding.get("after_sha256") != sha256_file(wfn)
+        or wfn_binding.get("size_bytes") != int(wfn.stat().st_size)
+    ):
+        raise ValueError("AIMAll WFN method receipt payload binding mismatch")
+    return _read_gaussian_receipt_for_aimall_replay(
+        root,
+        phase_name=str(gaussian_phase),
+        iteration=int(iteration),
+        logical_task_id=int(logical_task_id),
+        wfn_method_payload=method_payload,
+    )
+
+
 def _read_existing_aimall_task_metadata(
     pointdir: Path,
     *,
@@ -667,6 +721,7 @@ def read_quantum_acceptance_manifest(
     require_nonempty: bool = True,
     require_points_file_membership: bool = False,
     points_membership: Optional[str] = None,
+    require_accepted_payloads: bool = True,
 ) -> Tuple[List[Path], Dict[str, Any]]:
     """Read and validate the live quantum acceptance manifest.
 
@@ -753,7 +808,7 @@ def read_quantum_acceptance_manifest(
         seen.add(name)
         accepted_names.append(name)
         pointdir = staging / name
-        if not pointdir.is_dir():
+        if bool(require_accepted_payloads) and not pointdir.is_dir():
             raise FileNotFoundError(
                 "accepted pointdir listed in manifest is missing: " + str(pointdir)
             )
@@ -816,6 +871,658 @@ def read_quantum_acceptance_manifest(
     }
     out["points_membership_state"] = membership_state
     return resolved, out
+
+
+def publish_completed_aimall_sibling_receipts(
+    campaign_dir: Path,
+    *,
+    gaussian_phase: str,
+    aimall_phase: str,
+    iteration: int,
+    replacement_round: int,
+) -> int:
+    """Bind reusable AIMAll siblings before a Gaussian membership replay."""
+    from ichor.core.files.point_directory import PointDirectory
+
+    from .live_executor import validate_aimall_completed
+    from .quantum_task_contracts import quantum_task_contract
+    from .quantum_task_receipts import (
+        write_quantum_task_receipt_from_postprocess_source,
+    )
+    from .submission_intent import (
+        aimall_intent_claims_completed_array,
+        load_intent,
+        resolve_aimall_postprocess_source,
+    )
+
+    campaign = Path(campaign_dir)
+    from .filesystem import operational_path
+    from .state import read_state
+
+    state = read_state(operational_path(campaign, "state.json"))
+    intent = load_intent(
+        campaign,
+        str(aimall_phase),
+        int(iteration),
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+    if (
+        not isinstance(intent, Mapping)
+        or not aimall_intent_claims_completed_array(intent)
+    ):
+        return 0
+    source = resolve_aimall_postprocess_source(
+        campaign,
+        campaign_uid=str(state.campaign_uid),
+        phase_name=str(aimall_phase),
+        iteration=int(iteration),
+        replacement_round=int(replacement_round),
+        intent=intent,
+    )
+    contract = quantum_task_contract(
+        campaign,
+        str(aimall_phase),
+        int(iteration),
+        replacement_round=int(replacement_round),
+        expected_campaign_uid=str(state.campaign_uid),
+        validate_points_file=False,
+    )
+    if int(source["logical_total"]) != int(contract.logical_total):
+        raise ValueError(
+            "AIMAll postprocess source and task contract counts differ"
+        )
+    published = 0
+    for task in contract.tasks:
+        pointdir = task.pointdir
+        if pointdir.is_symlink() or not pointdir.is_dir():
+            continue
+        ok, _reason = validate_aimall_completed(PointDirectory(pointdir))
+        if not ok:
+            continue
+        write_quantum_task_receipt_from_postprocess_source(
+            pointdir,
+            phase_name=str(aimall_phase),
+            iteration=int(iteration),
+            logical_task_id=int(task.logical_task_id),
+            source=source,
+        )
+        published += 1
+    return int(published)
+
+
+def _membership_archive_payload_sha256(payload: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            dict(payload),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _membership_archive_root(
+    campaign_dir: Path,
+    *,
+    gaussian_phase: str,
+    aimall_phase: str,
+    iteration: int,
+    replacement_round: int,
+    previous_acceptance_sha256: str,
+    replacement_acceptance_sha256: str,
+    replacement_accepted: Sequence[str],
+) -> Path:
+    from .filesystem import operational_path
+
+    identity = _membership_archive_payload_sha256(
+        {
+            "gaussian_phase": str(gaussian_phase),
+            "aimall_phase": str(aimall_phase),
+            "iteration": int(iteration),
+            "replacement_round": int(replacement_round),
+            "previous_acceptance_sha256": str(
+                previous_acceptance_sha256
+            ),
+            "replacement_acceptance_sha256": str(
+                replacement_acceptance_sha256
+            ),
+            "replacement_accepted": [str(name) for name in replacement_accepted],
+        }
+    )[:24]
+    return campaign_owned_path(
+        campaign_dir,
+        operational_path(
+            campaign_dir,
+            "arr",
+            "AIMALL_MEMBERSHIP",
+            str(gaussian_phase)
+            + "-"
+            + str(int(iteration)).zfill(6)
+            + "-"
+            + identity,
+        ),
+    )
+
+
+def _copy_regular_file_atomically(source: Path, destination: Path) -> None:
+    if source.is_symlink() or not source.is_file():
+        raise ValueError(
+            "membership archive source is not a regular file: " + str(source)
+        )
+    if destination.exists() or destination.is_symlink():
+        if (
+            destination.is_symlink()
+            or not destination.is_file()
+            or sha256_file(destination) != sha256_file(source)
+        ):
+            raise ValueError(
+                "membership archive copy conflicts with existing evidence: "
+                + str(destination)
+            )
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        "." + destination.name + ".tmp." + uuid.uuid4().hex
+    )
+    try:
+        with source.open("rb") as source_handle, temporary.open("xb") as target:
+            shutil.copyfileobj(source_handle, target)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, destination)
+        _fsync_parent_dir(destination)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    if sha256_file(destination) != sha256_file(source):
+        raise ValueError("membership archive copy digest mismatch")
+
+
+def _move_membership_evidence(source: Path, destination: Path) -> bool:
+    source_exists = source.exists() or source.is_symlink()
+    destination_exists = destination.exists() or destination.is_symlink()
+    if source_exists and destination_exists:
+        raise ValueError(
+            "membership archive source and destination both exist: "
+            + str(source)
+        )
+    if destination_exists:
+        return False
+    if not source_exists:
+        return False
+    if source.is_symlink():
+        raise ValueError(
+            "membership archive source must not be a symlink: " + str(source)
+        )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(source, destination)
+    _fsync_parent_dir(source)
+    _fsync_parent_dir(destination)
+    return True
+
+
+def _read_membership_archive(path: Path) -> Dict[str, Any]:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(
+            "AIMAll membership archive receipt is missing or symlinked"
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            "AIMAll membership archive receipt is unreadable"
+        ) from exc
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise ValueError("AIMAll membership archive receipt is invalid")
+    return dict(payload)
+
+
+def archive_aimall_membership_change(
+    campaign_dir: Path,
+    *,
+    staging_dir: Path,
+    gaussian_phase: str,
+    aimall_phase: str,
+    iteration: int,
+    replacement_round: int,
+    previous_manifest: Mapping[str, Any],
+    replacement_accepted: Sequence[str],
+    replacement_rejected: Sequence[Tuple[str, str]],
+) -> Optional[Path]:
+    """Archive AIMAll-derived evidence before Gaussian membership changes."""
+    campaign = Path(campaign_dir)
+    staging = Path(staging_dir)
+    previous_accepted = [
+        _validate_pointdir_basename(str(name))
+        for name in list(previous_manifest.get("accepted_pointdirs") or [])
+    ]
+    replacement_names = [
+        _validate_pointdir_basename(str(name))
+        for name in replacement_accepted
+    ]
+    replacement_rejected_payload = [
+        {
+            "pointdir": _validate_pointdir_basename(str(name)),
+            "reason": str(reason).strip(),
+        }
+        for name, reason in replacement_rejected
+    ]
+    if any(not record["reason"] for record in replacement_rejected_payload):
+        raise ValueError("replacement Gaussian rejection reason is empty")
+    replacement_payload = {
+        "schema_version": QUANTUM_ACCEPTANCE_SCHEMA_VERSION,
+        "phase": str(gaussian_phase),
+        "iteration": int(iteration),
+        "accepted_pointdirs": replacement_names,
+        "rejected": replacement_rejected_payload,
+        "n_total": int(
+            len(replacement_names) + len(replacement_rejected_payload)
+        ),
+    }
+    previous_payload = {
+        key: previous_manifest.get(key)
+        for key in (
+            "schema_version",
+            "phase",
+            "iteration",
+            "accepted_pointdirs",
+            "rejected",
+            "n_total",
+        )
+    }
+    if previous_payload == replacement_payload:
+        return None
+    replacement_sha256 = _membership_archive_payload_sha256(
+        replacement_payload
+    )
+    previous_path = quantum_acceptance_manifest_path(
+        staging,
+        phase_name=str(gaussian_phase),
+    )
+    if previous_path.is_symlink() or not previous_path.is_file():
+        raise ValueError(
+            "previous Gaussian acceptance manifest is unavailable"
+        )
+    previous_sha256 = sha256_file(previous_path)
+    archive_root = _membership_archive_root(
+        campaign,
+        gaussian_phase=str(gaussian_phase),
+        aimall_phase=str(aimall_phase),
+        iteration=int(iteration),
+        replacement_round=int(replacement_round),
+        previous_acceptance_sha256=previous_sha256,
+        replacement_acceptance_sha256=replacement_sha256,
+        replacement_accepted=replacement_names,
+    )
+    archive_root.mkdir(parents=True, exist_ok=True)
+    if archive_root.is_symlink() or not archive_root.is_dir():
+        raise ValueError("AIMAll membership archive root is invalid")
+    receipt_path = archive_root / "ARCHIVE.json"
+    previous_copy = archive_root / "previous_gaussian_acceptance.json"
+    _copy_regular_file_atomically(previous_path, previous_copy)
+    moved: List[str] = []
+    if receipt_path.exists() or receipt_path.is_symlink():
+        receipt = _read_membership_archive(receipt_path)
+        expected_identity = (
+            str(gaussian_phase),
+            str(aimall_phase),
+            int(iteration),
+            int(replacement_round),
+            previous_sha256,
+            replacement_sha256,
+            previous_accepted,
+            replacement_names,
+        )
+        observed_identity = (
+            receipt.get("gaussian_phase"),
+            receipt.get("aimall_phase"),
+            receipt.get("iteration"),
+            receipt.get("replacement_round", 0),
+            receipt.get("previous_acceptance_sha256"),
+            receipt.get("planned_replacement_acceptance_sha256"),
+            receipt.get("previous_accepted"),
+            receipt.get("replacement_accepted"),
+        )
+        if observed_identity != expected_identity:
+            raise ValueError("AIMAll membership archive identity mismatch")
+        moved = [str(value) for value in list(receipt.get("moved") or [])]
+    else:
+        receipt = {
+            "schema_version": 1,
+            "status": "moving",
+            "gaussian_phase": str(gaussian_phase),
+            "aimall_phase": str(aimall_phase),
+            "iteration": int(iteration),
+            "replacement_round": int(replacement_round),
+            "previous_acceptance_sha256": previous_sha256,
+            "planned_replacement_acceptance_sha256": replacement_sha256,
+            "previous_accepted": previous_accepted,
+            "replacement_accepted": replacement_names,
+            "replacement_acceptance_sha256": None,
+            "moved": [],
+            "rebound_wfn_receipts": [],
+        }
+        atomic_write_json(receipt_path, receipt)
+
+    def record_move(source: Path, destination: Path) -> None:
+        if _move_membership_evidence(source, destination):
+            moved.append(str(destination.resolve(strict=False)))
+            receipt["moved"] = list(moved)
+            atomic_write_json(receipt_path, receipt)
+
+    aimall_manifest = quantum_acceptance_manifest_path(
+        staging,
+        phase_name=str(aimall_phase),
+    )
+    record_move(
+        aimall_manifest,
+        archive_root / "control" / aimall_manifest.name,
+    )
+    generic_acceptance = quantum_acceptance_manifest_path(staging)
+    if generic_acceptance.exists() or generic_acceptance.is_symlink():
+        if generic_acceptance.is_symlink():
+            raise ValueError(
+                "generic quantum acceptance manifest must not be a symlink"
+            )
+        generic_payload = json.loads(
+            generic_acceptance.read_text(encoding="utf-8")
+        )
+        if (
+            isinstance(generic_payload, dict)
+            and generic_payload.get("phase") == str(aimall_phase)
+        ):
+            record_move(
+                generic_acceptance,
+                archive_root / "control" / generic_acceptance.name,
+            )
+    quality_path = staging / "quantum_quality.json"
+    if quality_path.exists() or quality_path.is_symlink():
+        if quality_path.is_symlink():
+            raise ValueError("quantum quality manifest must not be a symlink")
+        quality_payload = json.loads(quality_path.read_text(encoding="utf-8"))
+        if (
+            isinstance(quality_payload, dict)
+            and quality_payload.get("phase") == str(aimall_phase)
+        ):
+            record_move(
+                quality_path,
+                archive_root / "control" / quality_path.name,
+            )
+
+    from ..versioning.provenance import PROVENANCE_FILENAME
+    from .quantum_task_receipts import GAUSSIAN_TASK_RECEIPT
+
+    for old_index, name in enumerate(previous_accepted):
+        pointdir = staging / name
+        if not pointdir.exists() and not pointdir.is_symlink():
+            continue
+        if pointdir.is_symlink() or not pointdir.is_dir():
+            raise ValueError(
+                "previous AIMAll pointdir is not a regular directory: "
+                + str(pointdir)
+            )
+        method_receipt_path = pointdir / WFN_METHOD_RECEIPT
+        try:
+            method_receipt_payload = json.loads(
+                method_receipt_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                "previous AIMAll WFN method receipt is unreadable: "
+                + str(method_receipt_path)
+            ) from exc
+        if not isinstance(method_receipt_payload, dict):
+            raise ValueError(
+                "previous AIMAll WFN method receipt must be an object"
+            )
+        method_path, method_payload = _read_existing_wfn_method_receipt(
+            pointdir,
+            phase_name=str(aimall_phase),
+            iteration=int(iteration),
+            task_index=int(old_index),
+            method=str(method_receipt_payload.get("method") or ""),
+            source_acceptance_sha256=previous_sha256,
+        )
+        gaussian_receipt = _read_gaussian_receipt_for_aimall_replay(
+            pointdir,
+            phase_name=str(gaussian_phase),
+            iteration=int(iteration),
+            logical_task_id=int(
+                json.loads(
+                    (pointdir / GAUSSIAN_TASK_RECEIPT).read_text(
+                        encoding="utf-8"
+                    )
+                )["logical_task_id"]
+            ),
+            wfn_method_payload=method_payload,
+        )
+        preserve = {
+            WFN_METHOD_RECEIPT,
+            GAUSSIAN_TASK_RECEIPT,
+            PROVENANCE_FILENAME,
+            ".provenance.lock",
+        }
+        for group in ("inputs", "outputs"):
+            preserve.update(
+                str(record["path"])
+                for record in list(gaussian_receipt.get(group) or [])
+            )
+        _copy_regular_file_atomically(
+            method_path,
+            archive_root / "wfn_receipts" / (name + ".json"),
+        )
+        for child in sorted(pointdir.iterdir(), key=lambda item: item.name):
+            if child.name in preserve:
+                continue
+            record_move(
+                child,
+                archive_root / "pointdirs" / name / child.name,
+            )
+        row_shard = (
+            staging / "ferebus_row_shards" / (name + ".row-shard")
+        )
+        record_move(
+            row_shard,
+            archive_root / "row_shards" / row_shard.name,
+        )
+    receipt["status"] = "awaiting_gaussian_publication"
+    receipt["moved"] = list(moved)
+    atomic_write_json(receipt_path, receipt)
+    return archive_root
+
+
+def finalise_aimall_membership_change(
+    campaign_dir: Path,
+    *,
+    staging_dir: Path,
+    archive_root: Path,
+    gaussian_phase: str,
+    aimall_phase: str,
+    iteration: int,
+) -> None:
+    """Rebind preserved WFN preprocessing after Gaussian publication."""
+    staging = Path(staging_dir)
+    receipt_path = Path(archive_root) / "ARCHIVE.json"
+    receipt = _read_membership_archive(receipt_path)
+    if (
+        receipt.get("gaussian_phase") != str(gaussian_phase)
+        or receipt.get("aimall_phase") != str(aimall_phase)
+        or receipt.get("iteration") != int(iteration)
+    ):
+        raise ValueError("AIMAll membership archive phase identity mismatch")
+    current_path = quantum_acceptance_manifest_path(
+        staging,
+        phase_name=str(gaussian_phase),
+    )
+    _accepted_paths, current = read_quantum_acceptance_manifest(
+        staging,
+        expected_phase=str(gaussian_phase),
+        expected_iteration=int(iteration),
+        require_nonempty=False,
+        points_membership=POINTS_MEMBERSHIP_NONE,
+        require_accepted_payloads=False,
+    )
+    current_names = [str(name) for name in current["accepted_pointdirs"]]
+    if current_names != list(receipt["replacement_accepted"]):
+        raise ValueError(
+            "published Gaussian acceptance does not match membership archive"
+        )
+    current_identity_payload = {
+        key: current.get(key)
+        for key in (
+            "schema_version",
+            "phase",
+            "iteration",
+            "accepted_pointdirs",
+            "rejected",
+            "n_total",
+        )
+    }
+    if _membership_archive_payload_sha256(current_identity_payload) != str(
+        receipt.get("planned_replacement_acceptance_sha256") or ""
+    ):
+        raise ValueError(
+            "published Gaussian dispositions do not match membership archive"
+        )
+    current_sha256 = sha256_file(current_path)
+    recorded_current = receipt.get("replacement_acceptance_sha256")
+    if recorded_current not in {None, current_sha256}:
+        raise ValueError(
+            "AIMAll membership archive replacement digest mismatch"
+        )
+    previous_names = [str(name) for name in receipt["previous_accepted"]]
+    previous_sha256 = str(receipt["previous_acceptance_sha256"])
+    rebound = {
+        str(name) for name in list(receipt.get("rebound_wfn_receipts") or [])
+    }
+    from .quantum_task_contracts import quantum_task_contract
+
+    replacement_round = int(receipt.get("replacement_round", 0))
+    gaussian = quantum_task_contract(
+        campaign_dir,
+        str(gaussian_phase),
+        int(iteration),
+        replacement_round=int(replacement_round),
+        validate_points_file=False,
+    )
+    gaussian_id_by_name = {
+        task.pointdir_name: int(task.logical_task_id)
+        for task in gaussian.tasks
+    }
+    for new_index, name in enumerate(current_names):
+        if name not in previous_names:
+            continue
+        pointdir = staging / name
+        old_index = previous_names.index(name)
+        method_path = pointdir / WFN_METHOD_RECEIPT
+        if not method_path.exists() and not method_path.is_symlink():
+            continue
+        if name in rebound:
+            _read_existing_wfn_method_receipt(
+                pointdir,
+                phase_name=str(aimall_phase),
+                iteration=int(iteration),
+                task_index=int(new_index),
+                method=str(
+                    json.loads(method_path.read_text(encoding="utf-8"))[
+                        "method"
+                    ]
+                ),
+                source_acceptance_sha256=current_sha256,
+            )
+            continue
+        method_payload = json.loads(method_path.read_text(encoding="utf-8"))
+        old_path, old_payload = _read_existing_wfn_method_receipt(
+            pointdir,
+            phase_name=str(aimall_phase),
+            iteration=int(iteration),
+            task_index=int(old_index),
+            method=str(method_payload["method"]),
+            source_acceptance_sha256=previous_sha256,
+        )
+        _read_gaussian_receipt_for_aimall_replay(
+            pointdir,
+            phase_name=str(gaussian_phase),
+            iteration=int(iteration),
+            logical_task_id=int(gaussian_id_by_name[name]),
+            wfn_method_payload=old_payload,
+        )
+        replacement_payload = dict(old_payload)
+        replacement_payload["task_index"] = int(new_index)
+        replacement_payload[
+            "source_gaussian_acceptance_sha256"
+        ] = current_sha256
+        atomic_write_json(old_path, replacement_payload)
+        _read_existing_wfn_method_receipt(
+            pointdir,
+            phase_name=str(aimall_phase),
+            iteration=int(iteration),
+            task_index=int(new_index),
+            method=str(replacement_payload["method"]),
+            source_acceptance_sha256=current_sha256,
+        )
+        rebound.add(name)
+        receipt["rebound_wfn_receipts"] = sorted(rebound)
+        receipt["replacement_acceptance_sha256"] = current_sha256
+        atomic_write_json(receipt_path, receipt)
+    receipt["replacement_acceptance_sha256"] = current_sha256
+    receipt["rebound_wfn_receipts"] = sorted(rebound)
+    receipt["status"] = "complete"
+    atomic_write_json(receipt_path, receipt)
+
+
+def resume_aimall_membership_changes(
+    campaign_dir: Path,
+    *,
+    staging_dir: Path,
+    gaussian_phase: str,
+    aimall_phase: str,
+    iteration: int,
+) -> None:
+    """Finish any membership archive left after Gaussian publication."""
+    from .filesystem import operational_path
+
+    root = operational_path(
+        campaign_dir,
+        "arr",
+        "AIMALL_MEMBERSHIP",
+    )
+    if not root.exists():
+        return
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("AIMAll membership archive root is invalid")
+    prefix = str(gaussian_phase) + "-" + str(int(iteration)).zfill(6) + "-"
+    candidates = sorted(
+        path
+        for path in root.iterdir()
+        if path.name.startswith(prefix)
+    )
+    for archive_root in candidates:
+        receipt = _read_membership_archive(archive_root / "ARCHIVE.json")
+        if receipt.get("status") == "complete":
+            continue
+        current_path = quantum_acceptance_manifest_path(
+            Path(staging_dir),
+            phase_name=str(gaussian_phase),
+        )
+        if current_path.is_symlink() or not current_path.is_file():
+            continue
+        current_payload = json.loads(current_path.read_text(encoding="utf-8"))
+        if (
+            isinstance(current_payload, dict)
+            and current_payload.get("accepted_pointdirs")
+            == receipt.get("replacement_accepted")
+        ):
+            finalise_aimall_membership_change(
+                campaign_dir,
+                staging_dir=staging_dir,
+                archive_root=archive_root,
+                gaussian_phase=str(gaussian_phase),
+                aimall_phase=str(aimall_phase),
+                iteration=int(iteration),
+            )
 
 
 def ferebus_manifest_path(staging_dir: Path) -> Path:
@@ -1549,7 +2256,7 @@ def stage_gaussian_inputs(
         "REPLACEMENT_GAUSSIAN",
     }
     if is_replacement:
-        from ..replacement_sampling import read_replacement_sample_strict
+        from ..replacement_sampling import ensure_replacement_sample_strict
 
         replacement_context = (
             "bootstrap"
@@ -1560,17 +2267,23 @@ def stage_gaussian_inputs(
             replacement_round = int(Path(sample_xyz).parent.name.rsplit("_", 1)[1])
         except (IndexError, ValueError) as exc:
             raise ValueError("replacement sample is outside a numbered round directory") from exc
-        replacement_manifest = read_replacement_sample_strict(
+        replacement_manifest = ensure_replacement_sample_strict(
             campaign_dir,
             context=replacement_context,
             iteration=(0 if replacement_context == "bootstrap" else int(iteration)),
             replacement_round=replacement_round,
+            expected_campaign_uid=expected_campaign_uid(),
         )
         allocation_records = list(replacement_manifest["records"])
         from ..point_allocation import read_point_allocation
 
         replacement_allocation = read_point_allocation(
-            replacement_manifest["point_allocation_manifest"]
+            replacement_manifest["point_allocation_manifest"],
+            expected_campaign_uid=expected_campaign_uid(),
+            expected_context=str(replacement_context),
+            expected_iteration=(
+                0 if replacement_context == "bootstrap" else int(iteration)
+            ),
         )
         allocation_assignment_hash = str(
             replacement_allocation["slot_assignment_sha256"]
@@ -1654,7 +2367,10 @@ def stage_gaussian_inputs(
                 from ..point_allocation import read_point_allocation
 
                 bootstrap_allocation = read_point_allocation(
-                    phase_a_manifest["point_allocation"]["manifest"]
+                    phase_a_manifest["point_allocation"]["manifest"],
+                    expected_campaign_uid=expected_campaign_uid(),
+                    expected_context="bootstrap",
+                    expected_iteration=0,
                 )
                 allocation_assignment_hash = str(
                     bootstrap_allocation["slot_assignment_sha256"]
@@ -1720,14 +2436,28 @@ def stage_gaussian_inputs(
             )
         except Exception:
             preserve_existing_layout = False
-    # Keep only an exact task layout. Individual task products survive only
-    # while their rendered GJF bytes remain unchanged.
+    # Replacement roots also contain producer handoff evidence, so only their
+    # task-owned pointdirs may be refreshed. Primary roots remain exact layouts.
     if staging.exists() and not preserve_existing_layout:
-        _checked_rmtree(
-            staging,
-            campaign_dir=Path(campaign_dir),
-            allowed_roots=[staging_root(campaign_dir)],
-        )
+        if not is_replacement:
+            _checked_rmtree(
+                staging,
+                campaign_dir=Path(campaign_dir),
+                allowed_roots=[staging_root(campaign_dir)],
+            )
+        else:
+            actual_names = {
+                child.name
+                for child in staging.iterdir()
+                if child.name.endswith(".pointdir")
+            }
+            unexpected = sorted(actual_names - set(expected_pointdir_names))
+            if unexpected:
+                raise ValueError(
+                    "Gaussian staging contains pointdirs outside its authoritative "
+                    "replacement sample: "
+                    + ", ".join(unexpected[:8])
+                )
     staging.mkdir(parents=True, exist_ok=True)
 
     keywords = ["nosymm", "output=wfn", "force", "geom=notest"]
@@ -2223,6 +2953,8 @@ def record_allocation_quantum_results(
     gaussian_phase: str,
     aimall_phase: str,
     expected_method: Optional[str] = None,
+    expected_campaign_uid: Optional[str] = None,
+    replacement_round: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Join Gaussian and AIMAll outcomes into one exact allocation update."""
     from ..point_allocation import (
@@ -2232,15 +2964,31 @@ def record_allocation_quantum_results(
         record_quantum_results,
     )
     from ..versioning.provenance import read_provenance, validate_provenance
+    from .filesystem import operational_path
+    from .state import read_state
 
     campaign = Path(campaign_dir)
     staging = Path(staging_dir)
+    campaign_uid = (
+        str(expected_campaign_uid)
+        if expected_campaign_uid is not None
+        else str(
+            read_state(
+                operational_path(campaign, "state.json")
+            ).campaign_uid
+        )
+    )
     allocation_path = point_allocation_path(
         campaign,
         context=str(context),
         iteration=int(iteration),
     )
-    allocation = read_point_allocation(allocation_path)
+    allocation = read_point_allocation(
+        allocation_path,
+        expected_campaign_uid=campaign_uid,
+        expected_context=str(context),
+        expected_iteration=int(iteration),
+    )
     pending = pending_attempts(allocation)
     gaussian_accepted, gaussian_manifest = read_quantum_acceptance_manifest(
         staging,
@@ -2259,21 +3007,64 @@ def record_allocation_quantum_results(
         for slot in allocation["slots"]
         for attempt in list(slot.get("attempts") or [])
     }
-    submitted_names = [Path(path).name for path in gaussian_accepted]
-    submitted_names.extend(
+    from .quantum_task_contracts import quantum_task_contract
+
+    resolved_replacement_round = 0
+    if "REPLACEMENT" in str(gaussian_phase):
+        if replacement_round is not None:
+            resolved_replacement_round = int(replacement_round)
+        else:
+            match = re.fullmatch(r"replacement_round_([0-9]+)", staging.name)
+            if match is None:
+                raise ValueError(
+                    "replacement quantum staging has no canonical round identity"
+                )
+            resolved_replacement_round = int(match.group(1))
+        if resolved_replacement_round < 1:
+            raise ValueError("replacement quantum staging round must be positive")
+    task_contract = quantum_task_contract(
+        campaign,
+        str(gaussian_phase),
+        int(iteration),
+        replacement_round=resolved_replacement_round,
+        expected_campaign_uid=campaign_uid,
+        validate_points_file=False,
+        staging_override=staging,
+    )
+    if task_contract.staging_dir.resolve(strict=False) != staging.resolve(strict=False):
+        raise ValueError("Gaussian task contract uses a different staging directory")
+    task_by_name = {
+        task.pointdir_name: task for task in task_contract.tasks
+    }
+    manifested_names = [Path(path).name for path in gaussian_accepted]
+    manifested_names.extend(
         str(record.get("pointdir"))
         for record in list(gaussian_manifest.get("rejected") or [])
         if isinstance(record, dict)
     )
-    if len(submitted_names) != len(set(submitted_names)):
+    if len(manifested_names) != len(set(manifested_names)):
         raise ValueError("Gaussian allocation handoff contains duplicate pointdirs")
-    if pending_ids and len(submitted_names) != len(pending_ids):
+    if (
+        len(manifested_names) != task_contract.logical_total
+        or set(manifested_names) != set(task_contract.pointdir_names)
+    ):
         raise ValueError(
-            "quantum staging task count does not match pending point allocation: "
-            + str(len(submitted_names))
-            + " staged, "
-            + str(len(pending_ids))
-            + " pending"
+            "Gaussian acceptance does not cover exactly the allocation producer tasks"
+        )
+    submitted_names = list(task_contract.pointdir_names)
+    submitted_ids = {
+        str(task.candidate_id) for task in task_contract.tasks
+    }
+    if (
+        len(submitted_ids) != task_contract.logical_total
+        or not submitted_ids.issubset(attempts_by_id)
+    ):
+        raise ValueError(
+            "Gaussian task contract does not match point-allocation candidates"
+        )
+    if pending_ids and submitted_ids != pending_ids:
+        raise ValueError(
+            "quantum staging tasks do not match the pending point allocation"
         )
     try:
         aimall_accepted, aimall_manifest = read_quantum_acceptance_manifest(
@@ -2331,11 +3122,8 @@ def record_allocation_quantum_results(
     pending_by_id = {str(record["candidate_id"]): record for record in pending}
     for name in submitted_names:
         pointdir = staging / name
-        provenance = read_provenance(pointdir)
-        allocation_provenance = provenance.get("point_allocation")
-        if not isinstance(allocation_provenance, dict):
-            raise ValueError("staged pointdir lacks allocation provenance: " + name)
-        candidate_id = str(allocation_provenance.get("candidate_id") or "")
+        task = task_by_name[name]
+        candidate_id = str(task.candidate_id)
         if candidate_id not in attempts_by_id or candidate_id in observed_ids:
             raise ValueError(
                 "staged pointdir candidate does not match point allocation: " + name
@@ -2343,18 +3131,37 @@ def record_allocation_quantum_results(
         attempt = attempts_by_id[candidate_id]
         if pending_ids and candidate_id not in pending_by_id:
             raise ValueError("staged pointdir does not belong to the pending allocation round: " + name)
-        validate_provenance(
-            pointdir,
-            campaign_uid=str(allocation["campaign_uid"]),
-            iteration=int(iteration),
-            allocation_candidate_id=candidate_id,
-            allocation_context=str(context),
-            allocation_slot_id=int(attempt["slot_id"]),
-            allocation_split=str(attempt["split"]),
-            allocation_slot_assignment_sha256=str(
-                allocation["slot_assignment_sha256"]
-            ),
-        )
+        if pointdir.exists() or pointdir.is_symlink():
+            if pointdir.is_symlink() or not pointdir.is_dir():
+                raise ValueError(
+                    "staged pointdir is not a regular directory: " + name
+                )
+            provenance = read_provenance(pointdir)
+            allocation_provenance = provenance.get("point_allocation")
+            if (
+                not isinstance(allocation_provenance, dict)
+                or str(allocation_provenance.get("candidate_id") or "")
+                != candidate_id
+            ):
+                raise ValueError(
+                    "staged pointdir lacks matching allocation provenance: " + name
+                )
+            validate_provenance(
+                pointdir,
+                campaign_uid=str(allocation["campaign_uid"]),
+                iteration=int(iteration),
+                allocation_candidate_id=candidate_id,
+                allocation_context=str(context),
+                allocation_slot_id=int(attempt["slot_id"]),
+                allocation_split=str(attempt["split"]),
+                allocation_slot_assignment_sha256=str(
+                    allocation["slot_assignment_sha256"]
+                ),
+            )
+        elif name not in gaussian_rejected:
+            raise FileNotFoundError(
+                "non-rejected staged pointdir is missing: " + str(pointdir)
+            )
         observed_ids.add(candidate_id)
         if name in aimall_accepted_names:
             accepted = True
@@ -2374,7 +3181,7 @@ def record_allocation_quantum_results(
         result = {
             "candidate_id": candidate_id,
             "accepted": bool(accepted),
-            "pointdir": str(pointdir.resolve()),
+            "pointdir": str(pointdir.resolve(strict=False)),
             "reason": reason,
         }
         if name in aimall_task_names:
@@ -2393,6 +3200,7 @@ def record_allocation_quantum_results(
             acceptance_receipt = read_quantum_acceptance_receipt(
                 campaign,
                 pointdir,
+                expected_campaign_uid=str(allocation["campaign_uid"]),
                 expected_phase=str(aimall_phase),
                 expected_iteration=int(iteration),
                 expected_candidate_id=candidate_id,
@@ -2464,6 +3272,7 @@ def accepted_allocation_pointdirs(
     *,
     context: str,
     iteration: int,
+    expected_campaign_uid: Optional[str] = None,
 ) -> Tuple[List[Path], Dict[str, Any]]:
     """Resolve and verify the exact accepted slot set for a commit."""
     from ..point_allocation import (
@@ -2472,14 +3281,18 @@ def accepted_allocation_pointdirs(
         read_point_allocation,
     )
     from ..versioning.provenance import validate_provenance
-
     campaign = Path(campaign_dir).resolve(strict=False)
     allocation_path = point_allocation_path(
         campaign,
         context=str(context),
         iteration=int(iteration),
     )
-    allocation = read_point_allocation(allocation_path)
+    allocation = read_point_allocation(
+        allocation_path,
+        expected_campaign_uid=expected_campaign_uid,
+        expected_context=str(context),
+        expected_iteration=int(iteration),
+    )
     if not bool((allocation.get("summary") or {}).get("complete", False)):
         raise ValueError("point allocation is incomplete: " + str(allocation_path))
     attempts = sorted(accepted_attempts(allocation), key=lambda row: int(row["slot_id"]))
@@ -2524,6 +3337,7 @@ def accepted_allocation_pointdirs(
         receipt = read_quantum_acceptance_receipt(
             campaign,
             resolved,
+            expected_campaign_uid=str(allocation["campaign_uid"]),
             expected_iteration=int(iteration),
             expected_candidate_id=str(attempt["candidate_id"]),
             expected_assignment_sha256=str(allocation["slot_assignment_sha256"]),
@@ -2556,6 +3370,7 @@ def commit_reference_data_delta(
     context: str,
     iteration: int,
     progress_callback=None,
+    expected_campaign_uid: Optional[str] = None,
 ) -> Tuple[Any, List[str], bool]:
     """Publish one accepted allocation through the transactional move path."""
     from .reference_commit import commit_reference_data_delta as _commit
@@ -2566,6 +3381,7 @@ def commit_reference_data_delta(
         context=str(context),
         iteration=int(iteration),
         progress_callback=progress_callback,
+        expected_campaign_uid=expected_campaign_uid,
     )
 
 
@@ -2884,7 +3700,12 @@ def stage_ferebus_inputs(
         context=allocation_context,
         iteration=allocation_iteration,
     )
-    allocation_payload = read_point_allocation(allocation_path)
+    allocation_payload = read_point_allocation(
+        allocation_path,
+        expected_campaign_uid=str(view.campaign_uid),
+        expected_context=allocation_context,
+        expected_iteration=int(allocation_iteration),
+    )
     if not bool((allocation_payload.get("summary") or {}).get("complete", False)):
         raise ValueError(
             "FEREBUS staging requires a complete point allocation: "

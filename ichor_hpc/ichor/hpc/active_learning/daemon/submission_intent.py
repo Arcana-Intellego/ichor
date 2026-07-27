@@ -13,7 +13,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence, Union
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 from ..strict_json import strict_json as json
 from ..submit.slurm_contracts import validate_parent_job_id
@@ -62,9 +62,16 @@ _AIMALL_POSTPROCESS_PHASES = frozenset({
     CampaignPhase.INITIAL_REPLACEMENT_AIMALL.value,
     CampaignPhase.REPLACEMENT_AIMALL.value,
 })
+_GAUSSIAN_POSTPROCESS_PHASES = frozenset({
+    CampaignPhase.INITIAL_GAUSSIAN.value,
+    CampaignPhase.GAUSSIAN.value,
+    CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN.value,
+    CampaignPhase.REPLACEMENT_GAUSSIAN.value,
+})
 _POSTPROCESS_SOURCE_PHASES = (
     frozenset({CampaignPhase.ARIADNE_ARRAY.value})
     | _AIMALL_POSTPROCESS_PHASES
+    | _GAUSSIAN_POSTPROCESS_PHASES
 )
 
 
@@ -549,6 +556,224 @@ def resolve_ariadne_postprocess_source(
     return source
 
 
+def gaussian_postprocess_task_contract(
+    campaign_dir: Union[str, Path],
+    *,
+    phase_name: str,
+    iteration: int,
+    replacement_round: int = 0,
+    require_unpublished: bool = True,
+) -> Dict[str, Any]:
+    """Validate one Gaussian producer task set without reading task payloads."""
+    phase = str(phase_name)
+    if phase not in _GAUSSIAN_POSTPROCESS_PHASES:
+        raise ValueError("Gaussian postprocess phase is unsupported: " + phase)
+    from .quantum_task_contracts import quantum_task_contract
+
+    contract = quantum_task_contract(
+        campaign_dir,
+        phase,
+        int(iteration),
+        replacement_round=int(replacement_round),
+        validate_points_file=True,
+    )
+    if contract.logical_total < 1:
+        raise ValueError("Gaussian postprocess source has no logical tasks")
+    if bool(require_unpublished):
+        from .input_staging import quantum_acceptance_manifest_path
+
+        publication = quantum_acceptance_manifest_path(
+            contract.staging_dir,
+            phase_name=phase,
+        )
+        if publication.exists() or publication.is_symlink():
+            raise ValueError(
+                "Gaussian postprocess source already has an acceptance publication"
+            )
+    task_digest = hashlib.sha256(
+        ",".join(
+            str(task.logical_task_id) for task in contract.tasks
+        ).encode("ascii")
+    ).hexdigest()
+    return {
+        "campaign_uid": str(contract.campaign_uid),
+        "phase": phase,
+        "iteration": int(iteration),
+        "replacement_round": int(replacement_round),
+        "logical_total": int(contract.logical_total),
+        "logical_task_set_sha256": task_digest,
+        "staging": str(contract.staging_dir),
+    }
+
+
+def gaussian_intent_claims_completed_array(intent: Mapping[str, Any]) -> bool:
+    if str(intent.get("phase") or "") not in _GAUSSIAN_POSTPROCESS_PHASES:
+        return False
+    if isinstance(intent.get("postprocess_source"), Mapping):
+        return True
+    expected = intent.get("expected_tasks")
+    lifecycle = intent.get("queue_lifecycle")
+    return bool(
+        isinstance(expected, int)
+        and not isinstance(expected, bool)
+        and expected > 0
+        and isinstance(lifecycle, Mapping)
+        and str(lifecycle.get("terminal_status") or "") == "COMPLETED"
+        and lifecycle.get("n_expected") == expected
+        and lifecycle.get("n_observed") == expected
+        and lifecycle.get("n_missing") == 0
+    )
+
+
+def resolve_gaussian_postprocess_source(
+    campaign_dir: Union[str, Path],
+    *,
+    campaign_uid: str,
+    phase_name: str,
+    iteration: int,
+    replacement_round: int = 0,
+    intent: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Resolve one scheduler-complete Gaussian producer for local parsing."""
+    contract = gaussian_postprocess_task_contract(
+        campaign_dir,
+        phase_name=str(phase_name),
+        iteration=int(iteration),
+        replacement_round=int(replacement_round),
+    )
+    expected_identity = (
+        str(campaign_uid),
+        str(contract["phase"]),
+        int(contract["iteration"]),
+        int(contract["replacement_round"]),
+    )
+    current = (
+        dict(intent)
+        if isinstance(intent, Mapping)
+        else load_intent(
+            campaign_dir,
+            str(contract["phase"]),
+            int(contract["iteration"]),
+            expected_campaign_uid=str(campaign_uid),
+        )
+    )
+    if not current:
+        raise ValueError(
+            "scheduler-complete Gaussian producer intent is unavailable"
+        )
+    observed_identity = (
+        str(current.get("campaign_uid") or ""),
+        str(current.get("phase") or ""),
+        int(current.get("iteration", -1)),
+        int(current.get("replacement_round", -1)),
+    )
+    if observed_identity != expected_identity:
+        raise ValueError("scheduler-complete Gaussian producer identity mismatch")
+    expected_total = int(contract["logical_total"])
+    expected_digest = str(contract["logical_task_set_sha256"])
+    status = str(current.get("status") or "")
+    reason = str(current.get("reason") or "")
+    nested = current.get("postprocess_source")
+    if nested is not None:
+        if status not in {"PRE_SUBMIT", "FAILED", "SUPERSEDED"}:
+            raise ValueError(
+                "Gaussian postprocess wrapper has an unsupported status"
+            )
+        if status == "SUPERSEDED" and reason != "reconcile_apply_retry":
+            raise ValueError(
+                "superseded Gaussian postprocess wrapper has an unsupported reason"
+            )
+        if current.get("job_id") is not None:
+            raise ValueError(
+                "Gaussian postprocess wrapper unexpectedly owns a JobID"
+            )
+        source = _validated_postprocess_source(nested)
+    else:
+        if status != "FAILED" and not (
+            status == "SUPERSEDED" and reason == "reconcile_apply_retry"
+        ):
+            raise ValueError(
+                "scheduler-complete Gaussian producer must be FAILED or "
+                "SUPERSEDED by reconcile_apply_retry"
+            )
+        scheduler_kind = str(
+            current.get("scheduler_identity_kind") or ""
+        ).strip().lower()
+        job_id = _validate_job_identity(current.get("job_id"), scheduler_kind)
+        if current.get("submission_kind") != "array":
+            raise ValueError(
+                "scheduler-complete Gaussian producer is not an array"
+            )
+        if current.get("expected_tasks") != expected_total:
+            raise ValueError(
+                "scheduler-complete Gaussian producer task count mismatch"
+            )
+        metadata = current.get("submission_metadata")
+        if (
+            not isinstance(metadata, Mapping)
+            or str(metadata.get("logical_task_set_sha256") or "")
+            != expected_digest
+        ):
+            raise ValueError(
+                "scheduler-complete Gaussian producer task-set digest mismatch"
+            )
+        lifecycle = current.get("queue_lifecycle")
+        terminal_identity = (
+            str(lifecycle.get("terminal_status") or "")
+            if isinstance(lifecycle, Mapping)
+            else "",
+            lifecycle.get("n_expected") if isinstance(lifecycle, Mapping) else None,
+            lifecycle.get("n_observed") if isinstance(lifecycle, Mapping) else None,
+            lifecycle.get("n_missing") if isinstance(lifecycle, Mapping) else None,
+        )
+        if terminal_identity != ("COMPLETED", expected_total, expected_total, 0):
+            raise ValueError(
+                "Gaussian scheduler lifecycle does not prove complete task ownership"
+            )
+        source = {
+            "campaign_uid": str(campaign_uid),
+            "phase": str(contract["phase"]),
+            "iteration": int(contract["iteration"]),
+            "attempt_id": str(current.get("attempt_id") or ""),
+            "submission_identity": str(
+                current.get("submission_identity") or ""
+            ),
+            "job_id": str(job_id),
+            "environment_generation": current.get("environment_generation"),
+            "environment_generation_digest_sha256": current.get(
+                "environment_generation_digest_sha256"
+            ),
+            "logical_total": expected_total,
+            "logical_task_set_sha256": expected_digest,
+            "decision_contract": current.get("decision_contract"),
+        }
+        source["source_sha256"] = _canonical_postprocess_source_sha256(source)
+        source = _validated_postprocess_source(source)
+    source_identity = (
+        str(source["campaign_uid"]),
+        str(source["phase"]),
+        int(source["iteration"]),
+        int(source["logical_total"]),
+        str(source["logical_task_set_sha256"]),
+    )
+    if source_identity != (
+        str(campaign_uid),
+        str(contract["phase"]),
+        int(contract["iteration"]),
+        expected_total,
+        expected_digest,
+    ):
+        raise ValueError(
+            "Gaussian postprocess source does not match the current task set"
+        )
+    if current.get("expected_tasks") != expected_total:
+        raise ValueError("Gaussian postprocess wrapper task count mismatch")
+    if current.get("decision_contract") != source["decision_contract"]:
+        raise ValueError("Gaussian postprocess wrapper decision contract mismatch")
+    _validate_postprocess_source_environment(campaign_dir, source)
+    return source
+
+
 def aimall_postprocess_task_contract(
     campaign_dir: Union[str, Path],
     *,
@@ -597,7 +822,8 @@ def aimall_postprocess_task_contract(
         expected_phase=gaussian_phase,
         expected_iteration=iteration_value,
         require_nonempty=False,
-        points_membership=_stg.POINTS_MEMBERSHIP_ACCEPTED_ONLY,
+        points_membership=_stg.POINTS_MEMBERSHIP_PRODUCER_OR_ACCEPTED,
+        require_accepted_payloads=False,
     )
     if not accepted:
         raise ValueError("AIMAll postprocess source has no accepted Gaussian tasks")
@@ -951,6 +1177,209 @@ def load_intent(
         ):
             raise ValueError("submission intent " + key + " is invalid")
     return data
+
+
+def intent_attempt_records(
+    campaign_dir: Union[str, Path],
+    phase_name: str,
+    iteration: int,
+    *,
+    expected_campaign_uid: str,
+) -> Sequence[Dict[str, Any]]:
+    """Read bounded current and historical attempts for one phase instance."""
+    root = intent_dir(campaign_dir)
+    safe_phase = str(phase_name).replace("/", "_").replace("\\", "_")
+    prefix = safe_phase + "-" + str(int(iteration)).zfill(6)
+    paths = []
+    current = intent_path(campaign_dir, phase_name, int(iteration))
+    if current.exists() or current.is_symlink():
+        paths.append(current)
+    history = root / INTENT_HISTORY_DIR_NAME
+    if history.is_dir() and not history.is_symlink():
+        paths.extend(sorted(history.glob(prefix + "-*.json")))
+    records: Dict[str, Dict[str, Any]] = {}
+    for path in paths:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(
+                "submission intent attempt evidence is missing or symlinked: "
+                + str(path)
+            )
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                "submission intent attempt evidence is unreadable: " + str(path)
+            ) from exc
+        validated = _validate_intent_payload(
+            payload,
+            path=path,
+            phase_name=str(phase_name),
+            iteration=int(iteration),
+            expected_campaign_uid=str(expected_campaign_uid),
+        )
+        attempt_id = str(validated["attempt_id"])
+        previous = records.get(attempt_id)
+        if previous is not None and previous != validated:
+            raise ValueError(
+                "submission intent history conflicts for attempt " + attempt_id
+            )
+        records[attempt_id] = validated
+    return tuple(
+        sorted(
+            records.values(),
+            key=lambda item: (
+                int(item["attempt_sequence"]),
+                str(item["attempt_id"]),
+            ),
+        )
+    )
+
+
+def resolve_quantum_task_receipt_producer(
+    campaign_dir: Union[str, Path],
+    receipt: Mapping[str, Any],
+    *,
+    expected_campaign_uid: str,
+    phase_name: str,
+    iteration: int,
+    logical_task_id: int,
+    replacement_round: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Bind one reusable task receipt to its exact scheduler attempt."""
+    campaign_uid = str(receipt.get("campaign_uid") or "")
+    if not campaign_uid:
+        raise ValueError("quantum task receipt has no campaign UID")
+    if campaign_uid != str(expected_campaign_uid):
+        raise ValueError("quantum task receipt campaign UID mismatch")
+    expected_identity = (
+        campaign_uid,
+        str(phase_name),
+        int(iteration),
+        int(logical_task_id),
+    )
+    observed_identity = (
+        str(receipt.get("campaign_uid") or ""),
+        str(receipt.get("phase") or ""),
+        receipt.get("iteration"),
+        receipt.get("logical_task_id"),
+    )
+    if observed_identity != expected_identity:
+        raise ValueError("quantum task receipt phase identity mismatch")
+    matches = []
+    for intent in intent_attempt_records(
+        campaign_dir,
+        str(phase_name),
+        int(iteration),
+        expected_campaign_uid=campaign_uid,
+    ):
+        if (
+            str(intent.get("attempt_id") or "")
+            == str(receipt.get("attempt_id") or "")
+            and str(intent.get("submission_identity") or "")
+            == str(receipt.get("submission_identity") or "")
+            and str(intent.get("job_id") or "")
+            == str(receipt.get("job_id") or "")
+        ):
+            matches.append(intent)
+    if len(matches) != 1:
+        raise ValueError(
+            "quantum task receipt does not resolve to one scheduler producer"
+        )
+    producer = dict(matches[0])
+    if str(producer.get("status") or "") == "PRE_SUBMIT":
+        raise ValueError("quantum task receipt producer was never submitted")
+    if producer.get("submission_kind") != "array":
+        raise ValueError("quantum task receipt producer is not an array")
+    if (
+        replacement_round is not None
+        and int(producer.get("replacement_round", -1))
+        != int(replacement_round)
+    ):
+        raise ValueError("quantum task receipt replacement round mismatch")
+    submitted_task_ids = intent_submitted_logical_task_ids(
+        campaign_dir,
+        producer,
+    )
+    if int(logical_task_id) not in set(submitted_task_ids):
+        raise ValueError(
+            "quantum task receipt logical identity is outside its producer array"
+        )
+    return producer
+
+
+def intent_submitted_logical_task_ids(
+    campaign_dir: Union[str, Path],
+    intent: Mapping[str, Any],
+) -> Tuple[int, ...]:
+    """Resolve the immutable logical task IDs owned by one array intent."""
+    if intent.get("submission_kind") != "array":
+        raise ValueError("submission intent is not an array")
+    expected_tasks = intent.get("expected_tasks")
+    if (
+        isinstance(expected_tasks, bool)
+        or not isinstance(expected_tasks, int)
+        or expected_tasks < 1
+    ):
+        raise ValueError("submission intent expected task count is invalid")
+    metadata = intent.get("submission_metadata")
+    bundle_raw = (
+        metadata.get("script_bundle")
+        if isinstance(metadata, Mapping)
+        else None
+    )
+    recovery = (
+        metadata.get("array_recovery")
+        if isinstance(metadata, Mapping)
+        else None
+    )
+    requires_task_map = bool(
+        isinstance(recovery, Mapping)
+        and isinstance(recovery.get("n_retry"), int)
+        and not isinstance(recovery.get("n_retry"), bool)
+        and int(recovery["n_retry"]) > 0
+    )
+    if isinstance(bundle_raw, str) and bundle_raw:
+        from .filesystem import campaign_owned_path
+        from .script_bundles import read_array_task_map
+
+        bundle = campaign_owned_path(campaign_dir, Path(bundle_raw))
+        map_path = campaign_owned_path(
+            campaign_dir,
+            bundle / "array_task_map.json",
+        )
+        if map_path.exists() or map_path.is_symlink():
+            task_ids = tuple(
+                int(task_id) for task_id in read_array_task_map(map_path)
+            )
+        elif requires_task_map:
+            raise ValueError(
+                "partial-array submission intent lacks its immutable task map"
+            )
+        else:
+            task_ids = tuple(range(int(expected_tasks)))
+    elif requires_task_map:
+        raise ValueError(
+            "partial-array submission intent lacks its immutable script bundle"
+        )
+    else:
+        task_ids = tuple(range(int(expected_tasks)))
+    if (
+        len(task_ids) != int(expected_tasks)
+        or len(set(task_ids)) != len(task_ids)
+        or any(task_id < 0 for task_id in task_ids)
+    ):
+        raise ValueError("submission intent array task map is invalid")
+    task_digest = hashlib.sha256(
+        ",".join(str(task_id) for task_id in task_ids).encode("ascii")
+    ).hexdigest()
+    recorded_digest = (
+        str(metadata.get("logical_task_set_sha256") or "")
+        if isinstance(metadata, Mapping)
+        else ""
+    )
+    if recorded_digest and recorded_digest != task_digest:
+        raise ValueError("submission intent logical task-set digest mismatch")
+    return task_ids
 
 
 def load_active_intent(

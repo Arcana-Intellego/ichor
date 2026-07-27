@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
@@ -113,18 +114,29 @@ def write_quantum_task_receipt(
     if (
         status == "PRE_SUBMIT"
         and isinstance(intent.get("postprocess_source"), Mapping)
-        and "AIMALL" in str(phase_name)
     ):
-        from .submission_intent import resolve_aimall_postprocess_source
+        if "AIMALL" in str(phase_name):
+            from .submission_intent import resolve_aimall_postprocess_source
 
-        source = resolve_aimall_postprocess_source(
-            campaign_dir,
-            campaign_uid=str(intent.get("campaign_uid") or ""),
-            phase_name=str(phase_name),
-            iteration=iteration_value,
-            replacement_round=int(intent.get("replacement_round", 0)),
-            intent=intent,
-        )
+            source = resolve_aimall_postprocess_source(
+                campaign_dir,
+                campaign_uid=str(intent.get("campaign_uid") or ""),
+                phase_name=str(phase_name),
+                iteration=iteration_value,
+                replacement_round=int(intent.get("replacement_round", 0)),
+                intent=intent,
+            )
+        else:
+            from .submission_intent import resolve_gaussian_postprocess_source
+
+            source = resolve_gaussian_postprocess_source(
+                campaign_dir,
+                campaign_uid=str(intent.get("campaign_uid") or ""),
+                phase_name=str(phase_name),
+                iteration=iteration_value,
+                replacement_round=int(intent.get("replacement_round", 0)),
+                intent=intent,
+            )
         if logical_task_value >= int(source["logical_total"]):
             raise ValueError(
                 "quantum task receipt logical identity exceeds its producer task set"
@@ -132,34 +144,78 @@ def write_quantum_task_receipt(
         producer = source
     elif status not in {"SUBMITTED", "ADOPTED"}:
         raise ValueError("quantum task receipt requires an active submitted intent")
+    else:
+        from .submission_intent import intent_submitted_logical_task_ids
+
+        submitted_ids = set(
+            intent_submitted_logical_task_ids(campaign_dir, intent)
+        )
+        if logical_task_value not in submitted_ids:
+            producer = {}
     target = root / _receipt_name(phase_name)
     if target.exists() or target.is_symlink():
-        existing = read_quantum_task_receipt(
-            root,
-            phase_name=str(phase_name),
-            iteration=iteration_value,
-            logical_task_id=logical_task_value,
-        )
-        expected_identity = (
-            str(producer["campaign_uid"]),
-            str(producer["attempt_id"]),
-            str(producer["submission_identity"]),
-            str(producer["job_id"]),
-        )
-        observed_identity = tuple(
-            str(existing[key])
-            for key in (
-                "campaign_uid",
-                "attempt_id",
-                "submission_identity",
-                "job_id",
+        try:
+            existing = read_quantum_task_receipt(
+                root,
+                phase_name=str(phase_name),
+                iteration=iteration_value,
+                logical_task_id=logical_task_value,
             )
+        except ValueError:
+            if "GAUSSIAN" not in str(phase_name):
+                raise
+            from .input_staging import (
+                read_gaussian_task_receipt_after_aimall,
+            )
+            from .quantum_task_contracts import aimall_phase_for_gaussian
+
+            existing = read_gaussian_task_receipt_after_aimall(
+                root,
+                gaussian_phase=str(phase_name),
+                aimall_phase=aimall_phase_for_gaussian(str(phase_name)),
+                iteration=iteration_value,
+                logical_task_id=logical_task_value,
+            )
+        observed_identity = (
+            str(existing["campaign_uid"]),
+            str(existing["attempt_id"]),
+            str(existing["submission_identity"]),
+            str(existing["job_id"]),
         )
-        if observed_identity != expected_identity:
+        if producer:
+            producer_identity = (
+                str(producer["campaign_uid"]),
+                str(producer["attempt_id"]),
+                str(producer["submission_identity"]),
+                str(producer["job_id"]),
+            )
+        else:
+            from .submission_intent import resolve_quantum_task_receipt_producer
+
+            historical_producer = resolve_quantum_task_receipt_producer(
+                campaign_dir,
+                existing,
+                expected_campaign_uid=str(intent["campaign_uid"]),
+                phase_name=str(phase_name),
+                iteration=iteration_value,
+                logical_task_id=logical_task_value,
+                replacement_round=int(intent.get("replacement_round", 0)),
+            )
+            producer_identity = (
+                str(historical_producer["campaign_uid"]),
+                str(historical_producer["attempt_id"]),
+                str(historical_producer["submission_identity"]),
+                str(historical_producer["job_id"]),
+            )
+        if observed_identity != producer_identity:
             raise ValueError(
-                "existing quantum task receipt belongs to another producer"
+                "existing quantum task receipt producer identity mismatch"
             )
         return target
+    if not producer:
+        raise ValueError(
+            "reused quantum task has no producer-bound completion receipt"
+        )
     return _write_quantum_task_receipt(
         root,
         phase_name=phase_name,
@@ -230,12 +286,81 @@ def write_quantum_task_receipt_from_terminal_intent(
     )
 
 
+def write_quantum_task_receipt_from_postprocess_source(
+    pointdir: Path,
+    *,
+    phase_name: str,
+    iteration: int,
+    logical_task_id: int,
+    source: Mapping[str, Any],
+) -> Path:
+    """Publish a missing receipt from an authenticated postprocess source."""
+    from .submission_intent import _validated_postprocess_source
+
+    producer = _validated_postprocess_source(source)
+    iteration_value = _exact_int(
+        iteration,
+        "quantum task receipt iteration",
+    )
+    logical_task_value = _exact_int(
+        logical_task_id,
+        "quantum task receipt logical_task_id",
+    )
+    if (
+        str(producer["phase"]) != str(phase_name)
+        or int(producer["iteration"]) != iteration_value
+        or logical_task_value >= int(producer["logical_total"])
+    ):
+        raise ValueError(
+            "quantum task postprocess source identity does not cover this task"
+        )
+    expected_digest = hashlib.sha256(
+        ",".join(
+            str(task_id)
+            for task_id in range(int(producer["logical_total"]))
+        ).encode("ascii")
+    ).hexdigest()
+    if str(producer["logical_task_set_sha256"]) != expected_digest:
+        raise ValueError(
+            "quantum task postprocess source task-set digest mismatch"
+        )
+    root = Path(pointdir)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("quantum task pointdir is missing or symlinked")
+    target = root / _receipt_name(str(phase_name))
+    if target.exists() or target.is_symlink():
+        existing = read_quantum_task_receipt(
+            root,
+            phase_name=str(phase_name),
+            iteration=iteration_value,
+            logical_task_id=logical_task_value,
+            expected_campaign_uid=str(producer["campaign_uid"]),
+            expected_attempt_id=str(producer["attempt_id"]),
+            expected_submission_identity=str(producer["submission_identity"]),
+            expected_job_id=str(producer["job_id"]),
+        )
+        if not existing:
+            raise ValueError("existing quantum task receipt is invalid")
+        return target
+    return _write_quantum_task_receipt(
+        root,
+        phase_name=str(phase_name),
+        iteration=iteration_value,
+        logical_task_id=logical_task_value,
+        intent=producer,
+    )
+
+
 def read_quantum_task_receipt(
     pointdir: Path,
     *,
     phase_name: str,
     iteration: int,
     logical_task_id: int,
+    expected_campaign_uid: Optional[str] = None,
+    expected_attempt_id: Optional[str] = None,
+    expected_submission_identity: Optional[str] = None,
+    expected_job_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     root = Path(pointdir)
     target = root / _receipt_name(phase_name)
@@ -258,6 +383,15 @@ def read_quantum_task_receipt(
     for key in ("campaign_uid", "attempt_id", "submission_identity", "job_id"):
         if not isinstance(payload.get(key), str) or not payload[key]:
             raise ValueError("quantum task receipt " + key + " is empty")
+    expected_identity = {
+        "campaign_uid": expected_campaign_uid,
+        "attempt_id": expected_attempt_id,
+        "submission_identity": expected_submission_identity,
+        "job_id": expected_job_id,
+    }
+    for key, expected in expected_identity.items():
+        if expected is not None and str(payload[key]) != str(expected):
+            raise ValueError("quantum task receipt " + key + " mismatch")
     current_inputs, current_outputs = _task_files(root, str(phase_name))
     current_paths = {
         "inputs": {path.relative_to(root).as_posix() for path in current_inputs},
@@ -292,5 +426,6 @@ __all__ = [
     "QUANTUM_TASK_RECEIPT_SCHEMA_VERSION",
     "read_quantum_task_receipt",
     "write_quantum_task_receipt",
+    "write_quantum_task_receipt_from_postprocess_source",
     "write_quantum_task_receipt_from_terminal_intent",
 ]

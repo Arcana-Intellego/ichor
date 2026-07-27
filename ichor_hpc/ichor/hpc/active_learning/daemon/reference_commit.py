@@ -129,13 +129,32 @@ def _atomic_copy_small(source: Path, destination: Path) -> Tuple[str, int]:
     return digest, len(data)
 
 
-def _allocation(campaign: Path, *, context: str, iteration: int) -> Tuple[Path, Dict[str, Any]]:
+def _allocation(
+    campaign: Path,
+    *,
+    context: str,
+    iteration: int,
+    expected_campaign_uid: Optional[str] = None,
+) -> Tuple[Path, Dict[str, Any]]:
     path = point_allocation_path(
         campaign,
         context=str(context),
         iteration=int(iteration),
     )
-    payload = read_point_allocation(path)
+    campaign_uid = expected_campaign_uid
+    if campaign_uid is None:
+        unbound = read_point_allocation(
+            path,
+            expected_context=str(context),
+            expected_iteration=int(iteration),
+        )
+        campaign_uid = str(unbound["campaign_uid"])
+    payload = read_point_allocation(
+        path,
+        expected_campaign_uid=str(campaign_uid),
+        expected_context=str(context),
+        expected_iteration=int(iteration),
+    )
     if not bool((payload.get("summary") or {}).get("complete", False)):
         raise ValueError("reference commit requires a complete point allocation")
     attempts = accepted_attempts(payload)
@@ -170,6 +189,7 @@ def _new_ledger(
         receipt = read_quantum_acceptance_receipt(
             campaign,
             source,
+            expected_campaign_uid=str(allocation["campaign_uid"]),
             expected_iteration=int(iteration),
             expected_candidate_id=str(attempt["candidate_id"]),
             expected_assignment_sha256=str(allocation["slot_assignment_sha256"]),
@@ -339,6 +359,7 @@ def _reconcile_move_states(campaign: Path, staging: Path, ledger: Dict[str, Any]
         receipt = read_quantum_acceptance_receipt(
             campaign,
             root,
+            expected_campaign_uid=str(ledger["campaign_uid"]),
             expected_iteration=int(ledger["iteration"]),
             expected_candidate_id=str(record["candidate_id"]),
             expected_source_pointdir=str(record["source_pointdir"]),
@@ -653,6 +674,7 @@ def _prepare_reference_data_delta(
     version: int,
     context: str,
     iteration: int,
+    expected_campaign_uid: Optional[str] = None,
 ) -> Tuple[
     ReferenceDataVersioning,
     Path,
@@ -668,6 +690,7 @@ def _prepare_reference_data_delta(
         campaign,
         context=str(context),
         iteration=int(iteration),
+        expected_campaign_uid=expected_campaign_uid,
     )
     parent_view = None
     if version > 0:
@@ -732,6 +755,7 @@ def prepare_reference_data_delta(
     reference_data_version: int,
     context: str,
     iteration: int,
+    expected_campaign_uid: Optional[str] = None,
 ) -> Path:
     """Prepare the standard commit ledger without moving scientific payloads."""
     campaign = Path(campaign_dir).resolve()
@@ -748,6 +772,7 @@ def prepare_reference_data_delta(
             version=version,
             context=str(context),
             iteration=int(iteration),
+            expected_campaign_uid=expected_campaign_uid,
         )
     )
     return ledger_path
@@ -760,6 +785,7 @@ def commit_reference_data_delta(
     context: str,
     iteration: int,
     progress_callback: ProgressCallback = None,
+    expected_campaign_uid: Optional[str] = None,
 ) -> Tuple[ReferenceDataView, List[str], bool]:
     """Move one accepted allocation into a durable delta and publish its row cache."""
     started = time.monotonic()
@@ -788,6 +814,7 @@ def commit_reference_data_delta(
         version=version,
         context=str(context),
         iteration=int(iteration),
+        expected_campaign_uid=expected_campaign_uid,
     )
     _emit(
         progress_callback,

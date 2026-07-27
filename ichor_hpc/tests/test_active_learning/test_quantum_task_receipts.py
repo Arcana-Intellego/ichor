@@ -15,6 +15,7 @@ from ichor.hpc.active_learning.daemon.submission_intent import (
     load_intent,
     mark_completed,
     mark_submitted,
+    resolve_quantum_task_receipt_producer,
     write_pre_submit_intent,
 )
 
@@ -67,6 +68,84 @@ def test_gaussian_task_receipt_binds_input_output_and_attempt(tmp_path):
         "input.gau",
         "input.wfn",
     }
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("expected_campaign_uid", "foreign-campaign", "campaign_uid"),
+        ("expected_attempt_id", "foreign-attempt", "attempt_id"),
+        (
+            "expected_submission_identity",
+            "r0000-a9999-foreign",
+            "submission_identity",
+        ),
+        ("expected_job_id", "99999", "job_id"),
+    ],
+)
+def test_quantum_task_receipt_binds_scheduler_producer(
+    tmp_path,
+    field,
+    value,
+    message,
+):
+    campaign, pointdir = _submitted_gaussian(tmp_path)
+    write_quantum_task_receipt(
+        campaign,
+        pointdir,
+        phase_name="GAUSSIAN",
+        iteration=1,
+        logical_task_id=0,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        read_quantum_task_receipt(
+            pointdir,
+            phase_name="GAUSSIAN",
+            iteration=1,
+            logical_task_id=0,
+            **{field: value},
+        )
+
+
+def test_quantum_task_receipt_resolves_authoritative_scheduler_identity(tmp_path):
+    campaign, pointdir = _submitted_gaussian(tmp_path)
+    write_quantum_task_receipt(
+        campaign,
+        pointdir,
+        phase_name="GAUSSIAN",
+        iteration=1,
+        logical_task_id=0,
+    )
+    receipt = read_quantum_task_receipt(
+        pointdir,
+        phase_name="GAUSSIAN",
+        iteration=1,
+        logical_task_id=0,
+    )
+
+    producer = resolve_quantum_task_receipt_producer(
+        campaign,
+        receipt,
+        expected_campaign_uid="receipt-test",
+        phase_name="GAUSSIAN",
+        iteration=1,
+        logical_task_id=0,
+        replacement_round=0,
+    )
+
+    assert producer["scheduler_identity_kind"] == "slurm"
+
+    with pytest.raises(ValueError, match="campaign UID mismatch"):
+        resolve_quantum_task_receipt_producer(
+            campaign,
+            receipt,
+            expected_campaign_uid="foreign-campaign",
+            phase_name="GAUSSIAN",
+            iteration=1,
+            logical_task_id=0,
+            replacement_round=0,
+        )
 
 
 def test_quantum_task_receipt_rejects_input_drift(tmp_path):

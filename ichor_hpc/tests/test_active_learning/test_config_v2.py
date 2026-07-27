@@ -280,7 +280,10 @@ def test_exact_point_allocation_consumed_by_split_executor(tmp_path):
         ],
         reserve_candidates=[],
     )
-    ex.submit_or_run(SimpleNamespace(iteration=1), CampaignPhase.SPLIT)
+    ex.submit_or_run(
+        SimpleNamespace(iteration=1, campaign_uid="config-test"),
+        CampaignPhase.SPLIT,
+    )
     split_json = (
         tmp_path
         / "ACTIVE_LEARNING"

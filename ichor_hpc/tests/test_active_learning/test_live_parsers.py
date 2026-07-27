@@ -56,6 +56,7 @@ from ichor.hpc.active_learning.point_allocation import (
     create_point_allocation,
     pending_attempts,
     point_allocation_path,
+    read_point_allocation,
     record_quantum_results,
 )
 from ichor.hpc.active_learning.versioning.provenance import (
@@ -836,6 +837,45 @@ def test_aimall_parser_only_consumes_gaussian_accepted_pointdirs(tmp_path):
     assert result.failure_reason is None
     manifest = json.loads((staging / stg.QUANTUM_ACCEPTANCE_MANIFEST).read_text(encoding="utf-8"))
     assert manifest["accepted_pointdirs"] == ["POINT_0000.pointdir", "POINT_0001.pointdir"]
+
+
+def test_aimall_allocation_join_accepts_absent_gaussian_rejections(tmp_path):
+    ex = _make_executor(tmp_path)
+    staging = _bind_staging(ex, FIXTURES / "initial_quantum")
+    allocation_path, _allocation = _seed_point_allocation(
+        ex.campaign_dir,
+        staging,
+        context="bootstrap",
+        iteration=0,
+    )
+    accepted = [staging / "POINT_0000.pointdir", staging / "POINT_0001.pointdir"]
+    rejected_names = ["POINT_0002.pointdir", "POINT_0003.pointdir"]
+    stg.write_quantum_acceptance_manifest(
+        staging,
+        phase_name="INITIAL_GAUSSIAN",
+        iteration=0,
+        accepted=accepted,
+        rejected=[
+            (name, "submitted_pointdir_missing")
+            for name in rejected_names
+        ],
+    )
+    stg.write_points_file(staging, accepted)
+    for name in rejected_names:
+        shutil.rmtree(staging / name)
+    state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
+
+    result = _parse_quantum_fixture(ex, state, CampaignPhase("INITIAL_AIMALL"))
+
+    assert result.failure_reason is None
+    allocation = read_point_allocation(
+        allocation_path,
+        expected_campaign_uid="m16-test",
+        expected_context="bootstrap",
+        expected_iteration=0,
+    )
+    assert allocation["summary"]["accepted_total"] == 2
+    assert allocation["summary"]["vacant_slots"] == 2
 
 
 def test_partial_rejection_below_threshold_still_succeeds(tmp_path):

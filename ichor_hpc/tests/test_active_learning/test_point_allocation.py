@@ -82,6 +82,25 @@ def _results(attempts, accepted_ids):
     ]
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"expected_campaign_uid": "other-campaign"}, "campaign UID"),
+        ({"expected_context": "bootstrap"}, "context"),
+        ({"expected_iteration": 2}, "iteration"),
+    ],
+)
+def test_allocation_reader_binds_campaign_context_and_iteration(
+    tmp_path,
+    kwargs,
+    message,
+):
+    path, _payload = _create(tmp_path)
+
+    with pytest.raises(ValueError, match=message):
+        read_point_allocation(path, **kwargs)
+
+
 def test_config_targets_are_exact_integer_counts():
     config = CampaignConfig()
 

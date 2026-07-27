@@ -32,6 +32,11 @@ def test_prepare_retry_submission_writes_only_incomplete_task_ids(tmp_path, monk
         return (int(task_id) in {0, 2}, "" if int(task_id) in {0, 2} else "missing", "out")
 
     monkeypatch.setattr(array_recovery, "_validate_task", fake_validate)
+    monkeypatch.setattr(
+        array_recovery,
+        "logical_task_ids",
+        lambda *_args, **_kwargs: [0, 1, 2, 3],
+    )
 
     payload = array_recovery.prepare_retry_submission(campaign, phase, 0)
 
@@ -52,6 +57,11 @@ def test_force_resubmit_array_ignores_reusable_outputs(tmp_path, monkeypatch):
         "_validate_task",
         lambda _campaign, _phase, _iteration, task_id: (True, "", "out"),
     )
+    monkeypatch.setattr(
+        array_recovery,
+        "logical_task_ids",
+        lambda *_args, **_kwargs: [0, 1, 2],
+    )
 
     payload = array_recovery.prepare_retry_submission(
         campaign,
@@ -63,6 +73,154 @@ def test_force_resubmit_array_ignores_reusable_outputs(tmp_path, monkeypatch):
     assert payload["force_resubmit"] is True
     assert payload["n_reuse"] == 0
     assert payload["retry_task_ids"] == [0, 1, 2]
+
+
+def test_missing_middle_quantum_task_is_independently_retryable(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import quantum_task_contracts
+    from ichor.hpc.active_learning.daemon.quantum_task_contracts import (
+        QuantumLogicalTask,
+        QuantumTaskContract,
+    )
+
+    campaign = tmp_path / "campaign"
+    staging = campaign / ".DATA" / "STAGING" / "iter_4"
+    staging.mkdir(parents=True)
+    tasks = []
+    for task_id in range(3):
+        pointdir = staging / ("POINT_" + str(task_id).zfill(4) + ".pointdir")
+        if task_id != 1:
+            pointdir.mkdir()
+        tasks.append(
+            QuantumLogicalTask(
+                logical_task_id=task_id,
+                pointdir_name=pointdir.name,
+                pointdir=pointdir,
+                producer_logical_task_id=task_id,
+                candidate_id="candidate-" + str(task_id),
+            )
+        )
+    contract = QuantumTaskContract(
+        campaign_uid="campaign-uid",
+        phase="GAUSSIAN",
+        iteration=4,
+        replacement_round=0,
+        staging_dir=staging,
+        tasks=tuple(tasks),
+    )
+    monkeypatch.setattr(
+        quantum_task_contracts,
+        "quantum_task_contract",
+        lambda *_args, **_kwargs: contract,
+    )
+
+    assert array_recovery.logical_task_ids(campaign, "GAUSSIAN", 4) == [0, 1, 2]
+    missing = array_recovery._pointdir_for_task(
+        campaign,
+        "GAUSSIAN",
+        4,
+        1,
+    )
+    assert missing == tasks[1].pointdir
+    assert array_recovery._validate_quantum_task_path(
+        campaign,
+        "GAUSSIAN",
+        4,
+        1,
+        missing,
+    )[:2] == (False, "pointdir_missing")
+
+
+def test_missing_aimall_task_rewinds_only_its_gaussian_producer(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import (
+        input_staging,
+        quantum_task_contracts,
+    )
+    from ichor.hpc.active_learning.daemon.quantum_task_contracts import (
+        QuantumLogicalTask,
+        QuantumTaskContract,
+    )
+
+    campaign = tmp_path / "campaign"
+    staging = campaign / ".DATA" / "STAGING" / "iter_4"
+    staging.mkdir(parents=True)
+    names = [
+        "POINT_0000.pointdir",
+        "POINT_0001.pointdir",
+        "POINT_0002.pointdir",
+    ]
+    (staging / names[1]).mkdir()
+    input_staging.write_points_file(
+        staging,
+        [staging / names[0], staging / names[1]],
+    )
+    input_staging.write_quantum_acceptance_manifest(
+        staging,
+        phase_name="GAUSSIAN",
+        iteration=4,
+        accepted=[staging / names[0], staging / names[1]],
+        rejected=[(names[2], "submitted_pointdir_missing")],
+    )
+
+    gaussian_tasks = tuple(
+        QuantumLogicalTask(
+            logical_task_id=index,
+            pointdir_name=name,
+            pointdir=staging / name,
+            producer_logical_task_id=index,
+            candidate_id="candidate-" + str(index),
+        )
+        for index, name in enumerate(names)
+    )
+    aimall_tasks = tuple(
+        QuantumLogicalTask(
+            logical_task_id=index,
+            pointdir_name=name,
+            pointdir=staging / name,
+            producer_logical_task_id=index,
+            candidate_id="candidate-" + str(index),
+        )
+        for index, name in enumerate(names[:2])
+    )
+
+    def contract(_campaign, phase_name, _iteration, **_kwargs):
+        tasks = gaussian_tasks if phase_name == "GAUSSIAN" else aimall_tasks
+        return QuantumTaskContract(
+            campaign_uid="campaign-uid",
+            phase=phase_name,
+            iteration=4,
+            replacement_round=0,
+            staging_dir=staging,
+            tasks=tasks,
+        )
+
+    monkeypatch.setattr(
+        quantum_task_contracts,
+        "quantum_task_contract",
+        contract,
+    )
+    monkeypatch.setattr(
+        array_recovery,
+        "_validate_quantum_task_path",
+        lambda *_args, **_kwargs: (True, "", str(staging / names[1])),
+    )
+
+    recovery = array_recovery.scan_aimall_upstream_gaussian_recovery(
+        campaign,
+        "AIMALL",
+        4,
+    )
+
+    assert recovery is not None
+    assert recovery["phase"] == "GAUSSIAN"
+    assert recovery["retry_task_ids"] == [0]
+    assert recovery["n_complete"] == 2
+    assert recovery["tasks"][2]["reason"] == "prior_gaussian_rejection_preserved"
 
 
 def test_sbatch_retry_map_uses_logical_task_id_for_ariadne(tmp_path, monkeypatch):
@@ -257,6 +415,11 @@ def test_replacement_phases_support_round_specific_partial_recovery(
             "" if int(task_id) == 1 else "missing",
             "output",
         ),
+    )
+    monkeypatch.setattr(
+        array_recovery,
+        "logical_task_ids",
+        lambda *_args, **_kwargs: [0, 1, 2],
     )
 
     payload = array_recovery.prepare_retry_submission(

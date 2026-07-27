@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+import ichor.hpc.active_learning.daemon.submission_intent as intent_module
 from ichor.hpc.active_learning.daemon.submission_intent import (
     aimall_postprocess_task_contract,
     classify_completed_unsubmitted_intents,
@@ -14,6 +15,7 @@ from ichor.hpc.active_learning.daemon.submission_intent import (
     mark_completed,
     mark_failed,
     mark_superseded,
+    resolve_gaussian_postprocess_source,
     write_pre_submit_intent,
 )
 from ichor.hpc.active_learning.daemon import input_staging
@@ -111,6 +113,88 @@ def test_aimall_postprocess_task_contract_covers_all_aimall_phases(
     assert contract["gaussian_phase"] == gaussian_phase
     assert contract["logical_total"] == 2
     assert contract["gaussian_n_total"] == 3
+
+
+def test_gaussian_postprocess_source_requires_complete_scheduler_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    task_digest = "1" * 64
+    decision_contract = {
+        "failure_threshold_fraction": 0.5,
+        "config_sha256": "2" * 64,
+    }
+    contract = {
+        "campaign_uid": "intent-test",
+        "phase": "GAUSSIAN",
+        "iteration": 3,
+        "replacement_round": 0,
+        "logical_total": 2,
+        "logical_task_set_sha256": task_digest,
+        "staging": str(tmp_path / "staging"),
+    }
+    monkeypatch.setattr(
+        intent_module,
+        "gaussian_postprocess_task_contract",
+        lambda *_args, **_kwargs: dict(contract),
+    )
+    monkeypatch.setattr(
+        intent_module,
+        "_validate_postprocess_source_environment",
+        lambda *_args, **_kwargs: None,
+    )
+    intent = {
+        "status": "FAILED",
+        "reason": "postprocess_exception",
+        "campaign_uid": "intent-test",
+        "phase": "GAUSSIAN",
+        "iteration": 3,
+        "replacement_round": 0,
+        "submission_kind": "array",
+        "scheduler_identity_kind": "slurm",
+        "expected_tasks": 2,
+        "job_id": "12345",
+        "attempt_id": "a" * 32,
+        "submission_identity": "r0000-a0001-test",
+        "environment_generation": 4,
+        "environment_generation_digest_sha256": "3" * 64,
+        "decision_contract": decision_contract,
+        "submission_metadata": {
+            "logical_task_set_sha256": task_digest,
+        },
+        "queue_lifecycle": {
+            "terminal_status": "COMPLETED",
+            "n_expected": 2,
+            "n_observed": 2,
+            "n_missing": 0,
+        },
+    }
+
+    source = resolve_gaussian_postprocess_source(
+        tmp_path,
+        campaign_uid="intent-test",
+        phase_name="GAUSSIAN",
+        iteration=3,
+        intent=intent,
+    )
+
+    assert source["job_id"] == "12345"
+    assert source["attempt_id"] == "a" * 32
+    assert source["logical_total"] == 2
+
+    incomplete = dict(intent)
+    incomplete["queue_lifecycle"] = {
+        **intent["queue_lifecycle"],
+        "n_missing": 1,
+    }
+    with pytest.raises(ValueError, match="does not prove complete task ownership"):
+        resolve_gaussian_postprocess_source(
+            tmp_path,
+            campaign_uid="intent-test",
+            phase_name="GAUSSIAN",
+            iteration=3,
+            intent=incomplete,
+        )
 
 
 def test_submission_intent_rejects_unknown_status_on_read(tmp_path):

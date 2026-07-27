@@ -56,6 +56,7 @@ from .array_recovery import (
     compact_array_recovery_summary,
     discover_partial_array_recovery,
     refresh_array_ledger,
+    scan_aimall_upstream_gaussian_recovery,
     supports_partial_array_recovery,
 )
 from .ariadne_publication import classify_ariadne_publication
@@ -303,6 +304,7 @@ class ReconciliationReport:
     recommended_actions: List[str] = field(default_factory=list)
     recovery_candidates: List[Dict[str, Any]] = field(default_factory=list)
     partial_array_recovery: Optional[Dict[str, Any]] = None
+    aimall_upstream_gaussian_recovery: Optional[Dict[str, Any]] = None
     aimall_postprocess_recovery: Optional[Dict[str, Any]] = None
     ariadne_results_recovery: Optional[Dict[str, Any]] = None
     ariadne_publication_recovery: Optional[Dict[str, Any]] = None
@@ -411,6 +413,86 @@ def _inspect_aimall_postprocess_recovery(
         )
         return None
     source = resolve_aimall_postprocess_source(
+        campaign,
+        campaign_uid=str(campaign_uid),
+        phase_name=phase,
+        iteration=int(iteration),
+        replacement_round=int(replacement_round),
+        intent=matching[0],
+    )
+    logical_total = int(source["logical_total"])
+    return {
+        "phase": phase,
+        "iteration": int(iteration),
+        "replacement_round": int(replacement_round),
+        "logical_total": logical_total,
+        "n_complete": logical_total,
+        "n_reuse": logical_total,
+        "n_retry": 0,
+        "retry_task_ids": [],
+        "retry_task_file": None,
+        "force_resubmit": False,
+        "path": str(contract["staging"]),
+        "producer_job_id": str(source["job_id"]),
+        "producer_submission_identity": str(source["submission_identity"]),
+        "source_sha256": str(source["source_sha256"]),
+        "scheduler_jobs_submitted": 0,
+        "validation": "local_postprocess_required",
+    }
+
+
+def _inspect_gaussian_postprocess_recovery(
+    campaign: Path,
+    *,
+    campaign_uid: str,
+    phase_name: str,
+    iteration: int,
+    replacement_round: int,
+    intent_records: Sequence[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Classify a scheduler-complete Gaussian attempt from control evidence."""
+    gaussian_phases = {
+        CampaignPhase.INITIAL_GAUSSIAN.value,
+        CampaignPhase.GAUSSIAN.value,
+        CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN.value,
+        CampaignPhase.REPLACEMENT_GAUSSIAN.value,
+    }
+    phase = str(phase_name)
+    if phase not in gaussian_phases:
+        return None
+    matching = [
+        dict(record)
+        for record in intent_records
+        if str(record.get("phase") or "") == phase
+        and int(record.get("iteration", -1)) == int(iteration)
+        and int(record.get("replacement_round", -1)) == int(replacement_round)
+    ]
+    if len(matching) != 1:
+        return None
+    from .submission_intent import (
+        gaussian_intent_claims_completed_array,
+        gaussian_postprocess_task_contract,
+        resolve_gaussian_postprocess_source,
+    )
+
+    if not gaussian_intent_claims_completed_array(matching[0]):
+        return None
+    contract = gaussian_postprocess_task_contract(
+        campaign,
+        phase_name=phase,
+        iteration=int(iteration),
+        replacement_round=int(replacement_round),
+        require_unpublished=False,
+    )
+    from . import input_staging as _stg
+
+    publication = _stg.quantum_acceptance_manifest_path(
+        Path(str(contract["staging"])),
+        phase_name=phase,
+    )
+    if publication.exists() or publication.is_symlink():
+        return None
+    source = resolve_gaussian_postprocess_source(
         campaign,
         campaign_uid=str(campaign_uid),
         phase_name=phase,
@@ -2331,6 +2413,7 @@ def propose_recovery(
 
     partial_array_recovery: Optional[Dict[str, Any]] = None
     aimall_postprocess_recovery: Optional[Dict[str, Any]] = None
+    gaussian_postprocess_recovery: Optional[Dict[str, Any]] = None
     ariadne_publication_recovery: Optional[Dict[str, Any]] = None
     partial_array_decision: Optional[RecoveryDecision] = None
     preferred_phase = last_phase
@@ -2338,9 +2421,35 @@ def propose_recovery(
     if existing is not None and supports_partial_array_recovery(existing.phase):
         preferred_phase = existing.phase.value
         preferred_iteration = int(existing.iteration)
+    aimall_upstream_recovery: Optional[Dict[str, Any]] = None
+    if (
+        preferred_phase in {
+            CampaignPhase.INITIAL_AIMALL.value,
+            CampaignPhase.AIMALL.value,
+            CampaignPhase.INITIAL_REPLACEMENT_AIMALL.value,
+            CampaignPhase.REPLACEMENT_AIMALL.value,
+        }
+        and preferred_iteration is not None
+    ):
+        try:
+            aimall_upstream_recovery = (
+                scan_aimall_upstream_gaussian_recovery(
+                    campaign,
+                    str(preferred_phase),
+                    int(preferred_iteration),
+                )
+            )
+        except Exception as exc:
+            unsafe_reasons.append(
+                "AIMAll task recovery evidence is invalid: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:180]
+            )
+            blocking_artifacts.append("AIMAll-to-Gaussian task recovery")
     if preferred_phase is not None and preferred_iteration is not None:
         try:
-            aimall_postprocess_recovery = _inspect_aimall_postprocess_recovery(
+            gaussian_postprocess_recovery = _inspect_gaussian_postprocess_recovery(
                 campaign,
                 campaign_uid=str(recovered.campaign_uid),
                 phase_name=str(preferred_phase),
@@ -2352,15 +2461,43 @@ def propose_recovery(
             )
         except Exception as exc:
             unsafe_reasons.append(
-                "scheduler-complete AIMAll recovery evidence is invalid: "
+                "scheduler-complete Gaussian recovery evidence is invalid: "
                 + type(exc).__name__
                 + ": "
                 + str(exc)[:180]
             )
-            blocking_artifacts.append("AIMAll postprocess producer evidence")
-            aimall_postprocess_recovery = None
-    if isinstance(aimall_postprocess_recovery, dict):
-        partial_array_recovery = dict(aimall_postprocess_recovery)
+            blocking_artifacts.append("Gaussian postprocess producer evidence")
+            gaussian_postprocess_recovery = None
+        if not isinstance(aimall_upstream_recovery, dict):
+            try:
+                aimall_postprocess_recovery = _inspect_aimall_postprocess_recovery(
+                    campaign,
+                    campaign_uid=str(recovered.campaign_uid),
+                    phase_name=str(preferred_phase),
+                    iteration=int(preferred_iteration),
+                    replacement_round=int(
+                        getattr(recovered, "replacement_round", 0)
+                    ),
+                    intent_records=tuple(intent_records),
+                )
+            except Exception as exc:
+                unsafe_reasons.append(
+                    "scheduler-complete AIMAll recovery evidence is invalid: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)[:180]
+                )
+                blocking_artifacts.append("AIMAll postprocess producer evidence")
+                aimall_postprocess_recovery = None
+    postprocess_only_recovery = (
+        gaussian_postprocess_recovery
+        if isinstance(gaussian_postprocess_recovery, dict)
+        else aimall_postprocess_recovery
+    )
+    if isinstance(aimall_upstream_recovery, dict):
+        partial_array_recovery = dict(aimall_upstream_recovery)
+    elif isinstance(postprocess_only_recovery, dict):
+        partial_array_recovery = dict(postprocess_only_recovery)
     elif preferred_phase is not None and supports_partial_array_recovery(preferred_phase):
         try:
             partial_array_recovery = discover_partial_array_recovery(
@@ -2389,10 +2526,28 @@ def propose_recovery(
                 iteration=partial_iteration,
                 reason=(
                     (
-                        "scheduler-complete AIMAll outputs require local "
+                        "scheduler-complete "
+                        + (
+                            "Gaussian"
+                            if isinstance(
+                                gaussian_postprocess_recovery,
+                                dict,
+                            )
+                            else "AIMAll"
+                        )
+                        + " outputs require local "
                         "postprocessing; no array tasks will be resubmitted"
                     )
-                    if isinstance(aimall_postprocess_recovery, dict)
+                    if isinstance(postprocess_only_recovery, dict)
+                    else (
+                        "missing AIMAll task output requires its Gaussian "
+                        "producer to be rerun; completed Gaussian siblings "
+                        "will be reused"
+                    )
+                    if str(
+                        partial_array_recovery.get("upstream_rewind") or ""
+                    )
+                    == "missing_aimall_pointdir"
                     else (
                         "partial array recovery available: "
                         + str(
@@ -2419,8 +2574,8 @@ def propose_recovery(
             _append_recovery_candidate(recovery_candidates, partial_array_decision)
             trusted_artifacts.append(
                 (
-                    "scheduler-complete AIMAll producer for "
-                    if isinstance(aimall_postprocess_recovery, dict)
+                    "scheduler-complete quantum producer for "
+                    if isinstance(postprocess_only_recovery, dict)
                     else "partial array recovery ledger for "
                 )
                 + partial_phase.value
@@ -2948,6 +3103,11 @@ def propose_recovery(
         partial_array_recovery=(
             compact_array_recovery_summary(partial_array_recovery)
             if isinstance(partial_array_recovery, dict)
+            else None
+        ),
+        aimall_upstream_gaussian_recovery=(
+            dict(aimall_upstream_recovery)
+            if isinstance(aimall_upstream_recovery, dict)
             else None
         ),
         aimall_postprocess_recovery=(

@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 from .strict_json import StrictJSONDecodeError, strict_json as json
+import hashlib
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ichor.core.atoms import Atom, Atoms
 
@@ -71,7 +72,7 @@ def replacement_sample_manifest_path(round_dir: str | Path) -> Path:
     return Path(round_dir) / REPLACEMENT_SAMPLE_FILENAME
 
 
-def _write_xyz(frames: Sequence[Atoms], path: Path) -> None:
+def _render_xyz(frames: Sequence[Atoms]) -> str:
     lines: List[str] = []
     for index, frame in enumerate(frames):
         lines.append(str(len(frame)))
@@ -88,8 +89,12 @@ def _write_xyz(frames: Sequence[Atoms], path: Path) -> None:
                     z=coordinates[2],
                 )
             )
+    return "\n".join(lines) + "\n"
+
+
+def _write_xyz(frames: Sequence[Atoms], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(path, "\n".join(lines) + "\n")
+    atomic_write_text(path, _render_xyz(frames))
 
 
 def _active_frame(
@@ -263,20 +268,27 @@ def _bootstrap_frames(campaign_dir: Path, attempts: Sequence[Mapping[str, Any]])
     return selected
 
 
-def prepare_replacement_round(
+def _replacement_material(
     campaign_dir: str | Path,
     *,
     context: str,
     iteration: int,
     replacement_round: int,
-) -> Dict[str, Any]:
+    allow_allocate: bool,
+    expected_campaign_uid: Optional[str] = None,
+) -> Tuple[Path, Dict[str, Any], List[Dict[str, Any]], List[Atoms]]:
     campaign = Path(campaign_dir)
     allocation_path = point_allocation_path(
         campaign,
         context=context,
         iteration=int(iteration),
     )
-    current = read_point_allocation(allocation_path)
+    current = read_point_allocation(
+        allocation_path,
+        expected_campaign_uid=expected_campaign_uid,
+        expected_context=str(context),
+        expected_iteration=int(iteration),
+    )
     if (current.get("summary") or {}).get("complete") is True:
         raise ValueError("point allocation is already complete")
     existing_pending = pending_attempts(current)
@@ -296,6 +308,10 @@ def prepare_replacement_round(
             )
         updated = current
     else:
+        if not bool(allow_allocate):
+            raise ValueError(
+                "replacement sample recovery requires an existing pending round"
+            )
         updated = allocate_replacements(
             allocation_path,
             replacement_round=int(replacement_round),
@@ -324,6 +340,74 @@ def prepare_replacement_round(
         )
     else:
         raise ValueError("replacement context must be bootstrap or active")
+    return allocation_path, updated, [dict(attempt) for attempt in attempts], frames
+
+
+def _replacement_payload(
+    *,
+    allocation_path: Path,
+    allocation: Mapping[str, Any],
+    attempts: Sequence[Mapping[str, Any]],
+    sample_text: str,
+    context: str,
+    iteration: int,
+    replacement_round: int,
+) -> Dict[str, Any]:
+    records = []
+    target_total = _required_integer(
+        allocation["targets"]["total"], "point-allocation target total"
+    )
+    for sample_index, attempt in enumerate(attempts):
+        reserve_rank = _required_integer(
+            attempt.get("reserve_rank"),
+            "replacement reserve_rank",
+        )
+        pointdir_index = target_total + reserve_rank
+        records.append(
+            {
+                **dict(attempt),
+                "sample_index": int(sample_index),
+                "pointdir_index": int(pointdir_index),
+            }
+        )
+    sample_bytes = sample_text.encode("utf-8")
+    return {
+        "schema_version": REPLACEMENT_SAMPLE_SCHEMA_VERSION,
+        "context": str(context),
+        "iteration": int(iteration),
+        "replacement_round": int(replacement_round),
+        "sample_xyz": {
+            "path": "replacement-SAMPLE.xyz",
+            "size": int(len(sample_bytes)),
+            "sha256": hashlib.sha256(sample_bytes).hexdigest(),
+        },
+        "n_candidates": int(len(records)),
+        "records": records,
+        "point_allocation_manifest": str(allocation_path.resolve()),
+        "point_allocation_generation": _required_integer(
+            allocation["generation"], "point-allocation generation"
+        ),
+        "point_allocation_sha256": allocation_manifest_sha256(allocation_path),
+    }
+
+
+def prepare_replacement_round(
+    campaign_dir: str | Path,
+    *,
+    context: str,
+    iteration: int,
+    replacement_round: int,
+    expected_campaign_uid: Optional[str] = None,
+) -> Dict[str, Any]:
+    campaign = Path(campaign_dir)
+    allocation_path, updated, attempts, frames = _replacement_material(
+        campaign,
+        context=str(context),
+        iteration=int(iteration),
+        replacement_round=int(replacement_round),
+        allow_allocate=True,
+        expected_campaign_uid=expected_campaign_uid,
+    )
 
     round_dir = replacement_round_dir(
         campaign,
@@ -333,40 +417,17 @@ def prepare_replacement_round(
     )
     round_dir.mkdir(parents=True, exist_ok=True)
     sample_path = round_dir / "replacement-SAMPLE.xyz"
-    _write_xyz(frames, sample_path)
-    records = []
-    target_total = _required_integer(
-        updated["targets"]["total"], "point-allocation target total"
+    sample_text = _render_xyz(frames)
+    atomic_write_text(sample_path, sample_text)
+    payload = _replacement_payload(
+        allocation_path=allocation_path,
+        allocation=updated,
+        attempts=attempts,
+        sample_text=sample_text,
+        context=str(context),
+        iteration=int(iteration),
+        replacement_round=int(replacement_round),
     )
-    for sample_index, attempt in enumerate(attempts):
-        reserve_rank = _required_integer(
-            attempt.get("reserve_rank"),
-            "replacement reserve_rank",
-        )
-        pointdir_index = target_total + reserve_rank
-        records.append({
-            **attempt,
-            "sample_index": int(sample_index),
-            "pointdir_index": int(pointdir_index),
-        })
-    payload = {
-        "schema_version": REPLACEMENT_SAMPLE_SCHEMA_VERSION,
-        "context": str(context),
-        "iteration": int(iteration),
-        "replacement_round": int(replacement_round),
-        "sample_xyz": {
-            "path": sample_path.name,
-            "size": int(sample_path.stat().st_size),
-            "sha256": sha256_file(sample_path),
-        },
-        "n_candidates": int(len(records)),
-        "records": records,
-        "point_allocation_manifest": str(allocation_path.resolve()),
-        "point_allocation_generation": _required_integer(
-            updated["generation"], "point-allocation generation"
-        ),
-        "point_allocation_sha256": allocation_manifest_sha256(allocation_path),
-    }
     atomic_write_json(replacement_sample_manifest_path(round_dir), payload)
     return payload
 
@@ -390,6 +451,9 @@ def read_replacement_sample(
     round_dir: str | Path,
     *,
     verify_allocation: bool = False,
+    expected_campaign_uid: Optional[str] = None,
+    expected_context: Optional[str] = None,
+    expected_iteration: Optional[int] = None,
 ) -> Dict[str, Any]:
     path = replacement_sample_manifest_path(round_dir)
     if not path.is_file():
@@ -491,7 +555,12 @@ def read_replacement_sample(
         "replacement point-allocation SHA-256",
     )
     if verify_allocation:
-        current = read_point_allocation(allocation_path)
+        current = read_point_allocation(
+            allocation_path,
+            expected_campaign_uid=expected_campaign_uid,
+            expected_context=expected_context,
+            expected_iteration=expected_iteration,
+        )
         if int(current["generation"]) != allocation_generation:
             raise ValueError("replacement point-allocation generation has changed")
         if allocation_manifest_sha256(allocation_path) != allocation_sha:
@@ -509,6 +578,7 @@ def read_replacement_sample_strict(
     context: str,
     iteration: int,
     replacement_round: int,
+    expected_campaign_uid: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Read a replacement sample and join it exactly to current allocation."""
     campaign = Path(campaign_dir)
@@ -521,6 +591,9 @@ def read_replacement_sample_strict(
     data = read_replacement_sample(
         canonical_round_dir,
         verify_allocation=True,
+        expected_campaign_uid=expected_campaign_uid,
+        expected_context=str(context),
+        expected_iteration=int(iteration),
     )
     if str(data.get("context")) != str(context):
         raise ValueError("replacement sample context does not match its campaign phase")
@@ -535,7 +608,12 @@ def read_replacement_sample_strict(
     ).resolve(strict=False)
     if Path(str(data["point_allocation_manifest"])).resolve(strict=False) != allocation_path:
         raise ValueError("replacement sample references a non-canonical allocation manifest")
-    allocation = read_point_allocation(allocation_path)
+    allocation = read_point_allocation(
+        allocation_path,
+        expected_campaign_uid=expected_campaign_uid,
+        expected_context=str(context),
+        expected_iteration=int(iteration),
+    )
     expected_attempts = [
         attempt
         for attempt in pending_attempts(allocation)
@@ -573,9 +651,96 @@ def read_replacement_sample_strict(
     return data
 
 
+def ensure_replacement_sample_strict(
+    campaign_dir: str | Path,
+    *,
+    context: str,
+    iteration: int,
+    replacement_round: int,
+    expected_campaign_uid: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Recreate only missing derived sample evidence from pending allocation."""
+    campaign = Path(campaign_dir)
+    round_dir = replacement_round_dir(
+        campaign,
+        context=str(context),
+        iteration=int(iteration),
+        replacement_round=int(replacement_round),
+    )
+    sample_path = round_dir / "replacement-SAMPLE.xyz"
+    manifest_path = replacement_sample_manifest_path(round_dir)
+    try:
+        return read_replacement_sample_strict(
+            campaign,
+            context=str(context),
+            iteration=int(iteration),
+            replacement_round=int(replacement_round),
+            expected_campaign_uid=expected_campaign_uid,
+        )
+    except (FileNotFoundError, ValueError):
+        sample_present = sample_path.exists() or sample_path.is_symlink()
+        manifest_present = manifest_path.exists() or manifest_path.is_symlink()
+        if sample_present and manifest_present:
+            raise
+        if sample_path.is_symlink() or manifest_path.is_symlink():
+            raise ValueError("replacement sample evidence must not be symlinked")
+
+    allocation_path, allocation, attempts, frames = _replacement_material(
+        campaign,
+        context=str(context),
+        iteration=int(iteration),
+        replacement_round=int(replacement_round),
+        allow_allocate=False,
+        expected_campaign_uid=expected_campaign_uid,
+    )
+    sample_text = _render_xyz(frames)
+    expected_manifest = _replacement_payload(
+        allocation_path=allocation_path,
+        allocation=allocation,
+        attempts=attempts,
+        sample_text=sample_text,
+        context=str(context),
+        iteration=int(iteration),
+        replacement_round=int(replacement_round),
+    )
+    if sample_path.exists():
+        if not sample_path.is_file() or sample_path.read_text(
+            encoding="utf-8"
+        ) != sample_text:
+            raise ValueError(
+                "existing replacement sample conflicts with pending allocation"
+            )
+    if manifest_path.exists():
+        try:
+            existing_manifest = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                "existing replacement sample manifest is unreadable"
+            ) from exc
+        if existing_manifest != expected_manifest:
+            raise ValueError(
+                "existing replacement sample manifest conflicts with pending allocation"
+            )
+    round_dir.mkdir(parents=True, exist_ok=True)
+    if not sample_path.exists():
+        atomic_write_text(sample_path, sample_text)
+    if not manifest_path.exists():
+        atomic_write_json(manifest_path, expected_manifest)
+    return read_replacement_sample_strict(
+        campaign,
+        context=str(context),
+        iteration=int(iteration),
+        replacement_round=int(replacement_round),
+        expected_campaign_uid=expected_campaign_uid,
+    )
+
+
 __all__ = [
     "REPLACEMENT_SAMPLE_FILENAME",
     "replacement_round_dir",
+    "ensure_replacement_sample_strict",
     "prepare_replacement_round",
     "read_replacement_sample",
     "read_replacement_sample_strict",

@@ -1370,18 +1370,21 @@ def locate_gaussian_sample_xyz(
         "INITIAL_REPLACEMENT_GAUSSIAN",
         "REPLACEMENT_GAUSSIAN",
     }:
-        from ..replacement_sampling import read_replacement_sample_strict
+        from ..replacement_sampling import ensure_replacement_sample_strict
 
         context = (
             "bootstrap"
             if phase_name == "INITIAL_REPLACEMENT_GAUSSIAN"
             else "active"
         )
-        manifest = read_replacement_sample_strict(
+        manifest = ensure_replacement_sample_strict(
             camp,
             context=context,
             iteration=0 if context == "bootstrap" else int(iteration),
             replacement_round=int(replacement_round),
+            expected_campaign_uid=(
+                str(campaign_uid).strip() if campaign_uid is not None else None
+            ),
         )
         return Path(str(manifest["sample_xyz"]))
     if phase_name == "INITIAL_GAUSSIAN":
@@ -1461,11 +1464,16 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
     # --- SBATCH submission ---------------------------------------------
 
     def _locate_sample_xyz(self, phase_name, iteration, replacement_round=0):
+        from .filesystem import operational_path
+        from .state import read_state
+
+        state = read_state(operational_path(self.campaign_dir, "state.json"))
         return locate_gaussian_sample_xyz(
             self.campaign_dir,
             str(phase_name),
             int(iteration),
             replacement_round=int(replacement_round),
+            campaign_uid=str(state.campaign_uid),
         )
 
     def _count_seeds(self, iteration):
@@ -2305,6 +2313,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             staging_dir=staging,
             gaussian_phase=gaussian_phase,
             aimall_phase=phase_name,
+            expected_campaign_uid=str(state.campaign_uid),
+            replacement_round=int(getattr(state, "replacement_round", 0)),
         )
         self._journal_event(
             "aimall_skipped_no_gaussian_acceptances",
@@ -2611,7 +2621,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             raise RuntimeError(
                 "phase " + phase_name + " classified as neither INLINE nor SBATCH"
             )
-        if "AIMALL" in phase_name:
+        if "AIMALL" in phase_name or "GAUSSIAN" in phase_name:
             from . import submission_intent as _submission_intent
 
             postprocess_intent = _submission_intent.load_active_intent(
@@ -2627,16 +2637,21 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     Mapping,
                 )
             ):
-                source = _submission_intent.resolve_aimall_postprocess_source(
-                    self.campaign_dir,
-                    campaign_uid=str(state.campaign_uid),
-                    phase_name=phase_name,
-                    iteration=int(getattr(state, "iteration", 0)),
-                    replacement_round=int(
-                        getattr(state, "replacement_round", 0)
-                    ),
-                    intent=postprocess_intent,
+                resolver = (
+                    _submission_intent.resolve_aimall_postprocess_source
+                    if "AIMALL" in phase_name
+                    else _submission_intent.resolve_gaussian_postprocess_source
                 )
+                source = resolver(
+                        self.campaign_dir,
+                        campaign_uid=str(state.campaign_uid),
+                        phase_name=phase_name,
+                        iteration=int(getattr(state, "iteration", 0)),
+                        replacement_round=int(
+                            getattr(state, "replacement_round", 0)
+                        ),
+                        intent=postprocess_intent,
+                    )
                 self._journal_event(
                     "partial_array_recovery_postprocess_only",
                     phase=phase_name,
@@ -3323,6 +3338,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         unit="task receipts",
                     )
 
+        gaussian_previous_manifest = None
+        gaussian_membership_archive = None
+        gaussian_aimall_phase = None
         if "AIMALL" in phase_name:
             from ichor.core.files.point_directory import PointDirectory
             from .quantum_quality import (
@@ -3546,6 +3564,73 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 n_rejected=int(sum(1 for r in quality_records if not bool(r.get("accepted")))),
             )
         else:
+            from .quantum_task_contracts import aimall_phase_for_gaussian
+
+            gaussian_aimall_phase = aimall_phase_for_gaussian(phase_name)
+            try:
+                _stg.resume_aimall_membership_changes(
+                    self.campaign_dir,
+                    staging_dir=staging_root,
+                    gaussian_phase=phase_name,
+                    aimall_phase=gaussian_aimall_phase,
+                    iteration=int(state.iteration),
+                )
+                previous_path = _stg.quantum_acceptance_manifest_path(
+                    staging_root,
+                    phase_name=phase_name,
+                )
+                if previous_path.exists() or previous_path.is_symlink():
+                    if previous_path.is_symlink():
+                        raise ValueError(
+                            "previous Gaussian acceptance must not be a symlink"
+                        )
+                    _unused, gaussian_previous_manifest = (
+                        _stg.read_quantum_acceptance_manifest(
+                            staging_root,
+                            expected_phase=phase_name,
+                            expected_iteration=int(state.iteration),
+                            require_nonempty=False,
+                            points_membership=_stg.POINTS_MEMBERSHIP_NONE,
+                            require_accepted_payloads=False,
+                        )
+                    )
+                    dispositions = list(
+                        gaussian_previous_manifest["accepted_pointdirs"]
+                    ) + [
+                        str(record["pointdir"])
+                        for record in list(
+                            gaussian_previous_manifest["rejected"]
+                        )
+                    ]
+                    if (
+                        int(gaussian_previous_manifest["n_total"])
+                        != len(point_names)
+                        or set(dispositions) != set(point_names)
+                        or len(dispositions) != len(set(dispositions))
+                    ):
+                        raise ValueError(
+                            "previous Gaussian acceptance does not exactly "
+                            "cover POINTS.txt"
+                        )
+                    _stg.publish_completed_aimall_sibling_receipts(
+                        self.campaign_dir,
+                        gaussian_phase=phase_name,
+                        aimall_phase=gaussian_aimall_phase,
+                        iteration=int(state.iteration),
+                        replacement_round=int(
+                            getattr(state, "replacement_round", 0)
+                        ),
+                    )
+            except Exception as exc:
+                return PhaseResult(
+                    is_complete=True,
+                    failure_reason=(
+                        "gaussian_membership_recovery_invalid: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc)[:180]
+                    ),
+                )
             try:
                 allowed_names = _stg._points_file_names(staging_root)
                 kept, rejected = self._parse_staged_pointdirs(
@@ -3575,13 +3660,52 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         + str(exc)[:180]
                     ),
                 )
-        _stg.write_quantum_acceptance_manifest(
-            staging_root,
-            phase_name=phase_name,
-            iteration=int(state.iteration),
-            accepted=kept,
-            rejected=rejected,
-        )
+        try:
+            if gaussian_previous_manifest is not None:
+                gaussian_membership_archive = (
+                    _stg.archive_aimall_membership_change(
+                        self.campaign_dir,
+                        staging_dir=staging_root,
+                        gaussian_phase=phase_name,
+                        aimall_phase=str(gaussian_aimall_phase),
+                        iteration=int(state.iteration),
+                        replacement_round=int(
+                            getattr(state, "replacement_round", 0)
+                        ),
+                        previous_manifest=gaussian_previous_manifest,
+                        replacement_accepted=[
+                            Path(getattr(item, "path", item)).name
+                            for item in kept
+                        ],
+                        replacement_rejected=rejected,
+                    )
+                )
+            _stg.write_quantum_acceptance_manifest(
+                staging_root,
+                phase_name=phase_name,
+                iteration=int(state.iteration),
+                accepted=kept,
+                rejected=rejected,
+            )
+            if gaussian_membership_archive is not None:
+                _stg.finalise_aimall_membership_change(
+                    self.campaign_dir,
+                    staging_dir=staging_root,
+                    archive_root=gaussian_membership_archive,
+                    gaussian_phase=phase_name,
+                    aimall_phase=str(gaussian_aimall_phase),
+                    iteration=int(state.iteration),
+                )
+        except Exception as exc:
+            return PhaseResult(
+                is_complete=True,
+                failure_reason=(
+                    "quantum_acceptance_publication_failed: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)[:180]
+                ),
+            )
         self._report_runtime_progress(
             "acceptance_publication",
             completed=int(len(kept) + len(rejected)),
@@ -3611,6 +3735,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     gaussian_phase=gaussian_phase,
                     aimall_phase=phase_name,
                     expected_method=str(self.config.gaussian.method),
+                    expected_campaign_uid=str(state.campaign_uid),
+                    replacement_round=int(getattr(state, "replacement_round", 0)),
                 )
             except Exception as exc:
                 return PhaseResult(

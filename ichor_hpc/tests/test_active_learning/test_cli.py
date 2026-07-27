@@ -4600,3 +4600,55 @@ def test_restore_checkpoint_preview_prints_the_exact_apply_command(
     assert "verified; no files were written" in out
     assert "restore-checkpoint --checkpoint" in out
     assert "--apply" in out
+
+
+def test_aimall_upstream_recovery_requires_explicit_selected_evidence():
+    state = fresh_campaign_state(max_iterations=20)
+    state.phase = CampaignPhase.GAUSSIAN
+    state.iteration = 14
+
+    report = SimpleNamespace(
+        proposed_state=state,
+        source_state_phase=CampaignPhase.HALTED.value,
+        last_phase_in_journal=CampaignPhase.AIMALL.value,
+        partial_array_recovery={
+            "phase": CampaignPhase.GAUSSIAN.value,
+            "iteration": 14,
+            "logical_total": 149,
+            "n_complete": 148,
+            "n_retry": 1,
+        },
+        aimall_upstream_gaussian_recovery=None,
+    )
+
+    assert cli_mod._aimall_upstream_gaussian_recovery_evidence(report) is None
+
+
+def test_aimall_upstream_recovery_validates_selected_evidence():
+    state = fresh_campaign_state(max_iterations=20)
+    state.phase = CampaignPhase.GAUSSIAN
+    state.iteration = 14
+    evidence = {
+        "phase": CampaignPhase.GAUSSIAN.value,
+        "source_phase": CampaignPhase.AIMALL.value,
+        "iteration": 14,
+        "replacement_round": 0,
+        "upstream_rewind": "missing_aimall_pointdir",
+        "logical_total": 149,
+        "n_complete": 148,
+        "n_retry": 1,
+        "retry_task_ids": [8],
+    }
+    report = SimpleNamespace(
+        proposed_state=state,
+        partial_array_recovery={
+            "phase": CampaignPhase.GAUSSIAN.value,
+            "iteration": 14,
+            "logical_total": 149,
+            "n_complete": 148,
+            "n_retry": 1,
+        },
+        aimall_upstream_gaussian_recovery=evidence,
+    )
+
+    assert cli_mod._aimall_upstream_gaussian_recovery_evidence(report) == evidence

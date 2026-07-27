@@ -326,9 +326,21 @@ def _validate_allocation_snapshot(
     if _digest(snapshot, payload=False, digest_file=digest_file) != expected_sha:
         raise ReferenceDataError("reference-data allocation snapshot SHA mismatch")
     try:
+        expected_header = (
+            str(payload.get("campaign_uid") or ""),
+            str(payload.get("source_context") or ""),
+            _safe_int(
+                payload.get("source_iteration"),
+                "source_iteration",
+                minimum=0,
+            ),
+        )
         allocation = read_point_allocation(
             snapshot,
             history_dir=iteration_dir / ".point_allocation_history",
+            expected_campaign_uid=expected_header[0],
+            expected_context=expected_header[1],
+            expected_iteration=expected_header[2],
         )
     except Exception as exc:
         raise ReferenceDataError(
@@ -336,11 +348,6 @@ def _validate_allocation_snapshot(
         ) from exc
     if not bool((allocation.get("summary") or {}).get("complete", False)):
         raise ReferenceDataError("reference-data allocation snapshot is incomplete")
-    expected_header = (
-        str(payload.get("campaign_uid") or ""),
-        str(payload.get("source_context") or ""),
-        _safe_int(payload.get("source_iteration"), "source_iteration", minimum=0),
-    )
     observed_header = (
         str(allocation.get("campaign_uid") or ""),
         str(allocation.get("context") or ""),
@@ -674,6 +681,7 @@ def resolve_reference_data_chain(
                     receipt = read_quantum_acceptance_receipt(
                         campaign,
                         entry.pointdir_path,
+                        expected_campaign_uid=uid,
                         expected_iteration=_safe_int(
                             payload.get("source_iteration"),
                             "source_iteration",

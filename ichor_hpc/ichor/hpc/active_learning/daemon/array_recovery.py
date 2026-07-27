@@ -126,15 +126,21 @@ def _replacement_identity(
         read_replacement_sample_strict,
         replacement_round_dir,
     )
+    from .filesystem import operational_path
+    from .state import read_state
 
     context = "bootstrap" if str(phase_name).startswith("INITIAL_") else "active"
     allocation_iteration = 0 if context == "bootstrap" else int(iteration)
+    state = read_state(operational_path(campaign_dir, "state.json"))
     allocation = read_point_allocation(
         point_allocation_path(
             campaign_dir,
             context=context,
             iteration=allocation_iteration,
-        )
+        ),
+        expected_campaign_uid=str(state.campaign_uid),
+        expected_context=context,
+        expected_iteration=allocation_iteration,
     )
     rounds = {
         int(attempt.get("round", -1)) for attempt in pending_attempts(allocation)
@@ -147,6 +153,7 @@ def _replacement_identity(
         context=context,
         iteration=allocation_iteration,
         replacement_round=replacement_round,
+        expected_campaign_uid=str(state.campaign_uid),
     )
     return replacement_round, replacement_round_dir(
         campaign_dir,
@@ -186,8 +193,6 @@ def _read_point_paths(points_file: Path) -> List[Path]:
             expected = bucket / candidate.name
             if candidate.resolve(strict=False) != expected.resolve(strict=False):
                 raise ValueError("POINTS.txt path escapes its bucket at line " + str(line_number))
-            if expected.is_symlink() or not expected.is_dir():
-                raise ValueError("POINTS.txt pointdir is missing or symlinked")
             if expected.name in seen:
                 raise ValueError("POINTS.txt contains a duplicate pointdir")
             seen.add(expected.name)
@@ -212,8 +217,21 @@ def logical_task_ids(
             expected_iteration=int(iteration),
         )
         return [int(task["array_task_id"]) for task in task_map["tasks"]]
-    points = _read_point_paths(_points_file(campaign_dir, phase, int(iteration)))
-    return list(range(len(points)))
+    from .quantum_task_contracts import quantum_task_contract
+
+    replacement_round = (
+        _replacement_identity(campaign_dir, phase, int(iteration))[0]
+        if "REPLACEMENT" in phase
+        else 0
+    )
+    contract = quantum_task_contract(
+        campaign_dir,
+        phase,
+        int(iteration),
+        replacement_round=int(replacement_round),
+        validate_points_file=True,
+    )
+    return [task.logical_task_id for task in contract.tasks]
 
 
 def _pointdir_for_task(
@@ -222,11 +240,24 @@ def _pointdir_for_task(
     iteration: int,
     task_id: int,
 ) -> Optional[Path]:
-    points = _read_point_paths(_points_file(campaign_dir, phase_name, int(iteration)))
+    from .quantum_task_contracts import quantum_task_contract
+
+    replacement_round = (
+        _replacement_identity(campaign_dir, phase_name, int(iteration))[0]
+        if "REPLACEMENT" in phase_name
+        else 0
+    )
+    contract = quantum_task_contract(
+        campaign_dir,
+        phase_name,
+        int(iteration),
+        replacement_round=int(replacement_round),
+        validate_points_file=True,
+    )
     index = int(task_id)
-    if index < 0 or index >= len(points):
+    if index < 0 or index >= len(contract.tasks):
         return None
-    return points[index]
+    return contract.tasks[index].pointdir
 
 
 def _validate_quantum_task(
@@ -235,9 +266,104 @@ def _validate_quantum_task(
     iteration: int,
     task_id: int,
 ) -> Tuple[bool, str, str]:
-    pointdir = _pointdir_for_task(campaign_dir, phase_name, iteration, task_id)
-    if pointdir is None:
+    from .quantum_task_contracts import quantum_task_contract
+
+    replacement_round = (
+        _replacement_identity(campaign_dir, phase_name, int(iteration))[0]
+        if "REPLACEMENT" in phase_name
+        else 0
+    )
+    contract = quantum_task_contract(
+        campaign_dir,
+        phase_name,
+        int(iteration),
+        replacement_round=int(replacement_round),
+        validate_points_file=True,
+    )
+    index = int(task_id)
+    if index < 0 or index >= len(contract.tasks):
         return False, "task_not_in_points_file", ""
+    pointdir = contract.tasks[index].pointdir
+    if "GAUSSIAN" in str(phase_name):
+        from .input_staging import (
+            POINTS_MEMBERSHIP_NONE,
+            quantum_acceptance_manifest_path,
+            read_quantum_acceptance_manifest,
+        )
+        manifest_path = quantum_acceptance_manifest_path(
+            contract.staging_dir,
+            phase_name=str(phase_name),
+        )
+        if manifest_path.exists() or manifest_path.is_symlink():
+            try:
+                if manifest_path.is_symlink():
+                    raise ValueError(
+                        "Gaussian acceptance manifest must not be a symlink"
+                    )
+                _accepted, manifest = read_quantum_acceptance_manifest(
+                    contract.staging_dir,
+                    expected_phase=str(phase_name),
+                    expected_iteration=int(iteration),
+                    require_nonempty=False,
+                    points_membership=POINTS_MEMBERSHIP_NONE,
+                    require_accepted_payloads=False,
+                )
+                dispositions = list(manifest["accepted_pointdirs"]) + [
+                    str(record["pointdir"])
+                    for record in list(manifest["rejected"])
+                ]
+                if (
+                    int(manifest["n_total"]) != contract.logical_total
+                    or set(dispositions) != set(contract.pointdir_names)
+                    or len(dispositions) != len(set(dispositions))
+                ):
+                    raise ValueError(
+                        "Gaussian acceptance does not cover its producer task set"
+                    )
+                rejected_names = {
+                    str(record["pointdir"])
+                    for record in list(manifest["rejected"])
+                }
+                if pointdir.name in rejected_names:
+                    return (
+                        True,
+                        "terminal_gaussian_rejection",
+                        str(pointdir.resolve(strict=False)),
+                    )
+            except Exception as exc:
+                return (
+                    False,
+                    "gaussian_acceptance_invalid: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)[:140],
+                    str(pointdir.resolve(strict=False)),
+                )
+    return _validate_quantum_task_path(
+        campaign_dir,
+        phase_name,
+        int(iteration),
+        int(task_id),
+        pointdir,
+        expected_campaign_uid=str(contract.campaign_uid),
+    )
+
+
+def _validate_quantum_task_path(
+    campaign_dir: Union[str, Path],
+    phase_name: str,
+    iteration: int,
+    task_id: int,
+    pointdir: Path,
+    *,
+    expected_campaign_uid: Optional[str] = None,
+) -> Tuple[bool, str, str]:
+    if pointdir.is_symlink():
+        return False, "pointdir_symlinked", str(pointdir.resolve(strict=False))
+    if not pointdir.exists():
+        return False, "pointdir_missing", str(pointdir.resolve(strict=False))
+    if not pointdir.is_dir():
+        return False, "pointdir_wrong_type", str(pointdir.resolve(strict=False))
     try:
         from ichor.core.files.point_directory import PointDirectory
         from .live_executor import validate_aimall_completed, validate_gaussian_completed
@@ -246,16 +372,301 @@ def _validate_quantum_task(
         ok, reason = validator(PointDirectory(pointdir))
         if ok:
             from .quantum_task_receipts import read_quantum_task_receipt
+            from .submission_intent import (
+                resolve_quantum_task_receipt_producer,
+            )
 
-            read_quantum_task_receipt(
-                pointdir,
+            try:
+                receipt = read_quantum_task_receipt(
+                    pointdir,
+                    phase_name=phase_name,
+                    iteration=int(iteration),
+                    logical_task_id=int(task_id),
+                )
+            except ValueError:
+                if "GAUSSIAN" not in phase_name:
+                    raise
+                from .input_staging import (
+                    read_gaussian_task_receipt_after_aimall,
+                )
+                from .quantum_task_contracts import (
+                    aimall_phase_for_gaussian,
+                )
+
+                receipt = read_gaussian_task_receipt_after_aimall(
+                    pointdir,
+                    gaussian_phase=phase_name,
+                    aimall_phase=aimall_phase_for_gaussian(phase_name),
+                    iteration=int(iteration),
+                    logical_task_id=int(task_id),
+                )
+            replacement_round = (
+                _replacement_identity(
+                    campaign_dir,
+                    phase_name,
+                    int(iteration),
+                )[0]
+                if "REPLACEMENT" in phase_name
+                else 0
+            )
+            producer = resolve_quantum_task_receipt_producer(
+                campaign_dir,
+                receipt,
+                expected_campaign_uid=(
+                    str(expected_campaign_uid)
+                    if expected_campaign_uid is not None
+                    else str(receipt["campaign_uid"])
+                ),
                 phase_name=phase_name,
                 iteration=int(iteration),
                 logical_task_id=int(task_id),
+                replacement_round=int(replacement_round),
             )
+            observed_identity = (
+                str(receipt["campaign_uid"]),
+                str(receipt["attempt_id"]),
+                str(receipt["submission_identity"]),
+                str(receipt["job_id"]),
+            )
+            expected_identity = (
+                str(producer["campaign_uid"]),
+                str(producer["attempt_id"]),
+                str(producer["submission_identity"]),
+                str(producer["job_id"]),
+            )
+            if observed_identity != expected_identity:
+                raise ValueError("quantum task receipt producer identity mismatch")
         return bool(ok), str(reason or ""), str(Path(pointdir).resolve(strict=False))
     except Exception as exc:
         return False, type(exc).__name__ + ": " + str(exc)[:160], str(Path(pointdir).resolve(strict=False))
+
+
+def scan_aimall_upstream_gaussian_recovery(
+    campaign_dir: Union[str, Path],
+    phase_name: Any,
+    iteration: int,
+) -> Optional[Dict[str, Any]]:
+    """Rewind absent AIMAll pointdirs through their Gaussian producer tasks."""
+    phase = str(getattr(phase_name, "value", phase_name))
+    from .quantum_task_contracts import (
+        AIMALL_PHASES,
+        gaussian_phase_for_aimall,
+        quantum_task_contract,
+    )
+
+    if phase not in AIMALL_PHASES:
+        return None
+    if "REPLACEMENT" in phase:
+        replacement_round, staging = _replacement_identity(
+            campaign_dir,
+            phase,
+            int(iteration),
+        )
+    else:
+        replacement_round = 0
+        staging = staging_phase_dir(campaign_dir, phase, int(iteration))
+    from .input_staging import quantum_acceptance_manifest_path
+
+    publication = quantum_acceptance_manifest_path(
+        staging,
+        phase_name=phase,
+    )
+    if publication.exists() or publication.is_symlink():
+        return None
+    gaussian_phase = gaussian_phase_for_aimall(phase)
+    from .input_staging import (
+        POINTS_MEMBERSHIP_NONE,
+        _points_file_names,
+        read_quantum_acceptance_manifest,
+    )
+
+    accepted_paths, gaussian_manifest = read_quantum_acceptance_manifest(
+        staging,
+        expected_phase=gaussian_phase,
+        expected_iteration=int(iteration),
+        require_nonempty=False,
+        points_membership=POINTS_MEMBERSHIP_NONE,
+        require_accepted_payloads=False,
+    )
+    missing_names = {
+        Path(path).name
+        for path in accepted_paths
+        if not Path(path).exists() and not Path(path).is_symlink()
+    }
+    if not missing_names:
+        return None
+    aimall = quantum_task_contract(
+        campaign_dir,
+        phase,
+        int(iteration),
+        replacement_round=int(replacement_round),
+        validate_points_file=False,
+    )
+    missing = [
+        task for task in aimall.tasks if task.pointdir_name in missing_names
+    ]
+    if len(missing) != len(missing_names):
+        raise ValueError(
+            "missing AIMAll pointdirs do not match the accepted Gaussian task set"
+        )
+    gaussian = quantum_task_contract(
+        campaign_dir,
+        gaussian_phase,
+        int(iteration),
+        replacement_round=int(replacement_round),
+        validate_points_file=False,
+    )
+    listed_names = tuple(_points_file_names(aimall.staging_dir))
+    if listed_names not in {
+        aimall.pointdir_names,
+        gaussian.pointdir_names,
+    }:
+        raise ValueError(
+            "AIMAll POINTS.txt matches neither its accepted task set nor the "
+            "complete Gaussian producer task set"
+        )
+    prior_rejected = {
+        str(record["pointdir"])
+        for record in list(gaussian_manifest.get("rejected") or [])
+    }
+    missing_producer_ids = {
+        int(task.producer_logical_task_id) for task in missing
+    }
+    tasks = []
+    retry_ids = []
+    n_complete = 0
+    for task in gaussian.tasks:
+        if int(task.logical_task_id) in missing_producer_ids:
+            ok = False
+            reason = "aimall_pointdir_missing_requires_gaussian"
+            output_path = str(task.pointdir.resolve(strict=False))
+        elif task.pointdir_name in prior_rejected:
+            ok = True
+            reason = "prior_gaussian_rejection_preserved"
+            output_path = str(task.pointdir.resolve(strict=False))
+        else:
+            ok, reason, output_path = _validate_quantum_task_path(
+                campaign_dir,
+                gaussian_phase,
+                int(iteration),
+                int(task.logical_task_id),
+                task.pointdir,
+            )
+        status = "complete" if ok else "pending"
+        if ok:
+            n_complete += 1
+        else:
+            retry_ids.append(int(task.logical_task_id))
+        tasks.append(
+            {
+                "task_id": int(task.logical_task_id),
+                "status": status,
+                "complete": bool(ok),
+                "reason": str(reason or ""),
+                "output_path": str(output_path),
+                "contract_hash": _sha_payload(
+                    {
+                        "phase": gaussian_phase,
+                        "iteration": int(iteration),
+                        "task_id": int(task.logical_task_id),
+                        "output_path": str(output_path),
+                    }
+                ),
+            }
+        )
+    return {
+        "schema_version": ARRAY_RECOVERY_SCHEMA_VERSION,
+        "phase": gaussian_phase,
+        "iteration": int(iteration),
+        "replacement_round": int(replacement_round),
+        "updated_at_iso": _now_iso(),
+        "force_resubmit": False,
+        "logical_total": int(len(tasks)),
+        "n_complete": int(n_complete),
+        "n_reuse": int(n_complete),
+        "n_retry": int(len(retry_ids)),
+        "retry_task_ids": retry_ids,
+        "all_complete": False,
+        "tasks": tasks,
+        "source_phase": phase,
+        "upstream_rewind": "missing_aimall_pointdir",
+        "missing_aimall_task_ids": [
+            int(task.logical_task_id) for task in missing
+        ],
+    }
+
+
+def prepare_aimall_upstream_gaussian_recovery(
+    campaign_dir: Union[str, Path],
+    phase_name: Any,
+    iteration: int,
+) -> Dict[str, Any]:
+    """Restore the complete Gaussian task list for an AIMAll rewind."""
+    phase = str(getattr(phase_name, "value", phase_name))
+    from .input_staging import _points_file_names, write_points_file
+    from .quantum_task_contracts import (
+        AIMALL_PHASES,
+        gaussian_phase_for_aimall,
+        quantum_task_contract,
+    )
+
+    if phase not in AIMALL_PHASES:
+        raise ValueError("phase is not an AIMAll recovery phase: " + phase)
+    replacement_round = (
+        _replacement_identity(campaign_dir, phase, int(iteration))[0]
+        if "REPLACEMENT" in phase
+        else 0
+    )
+    aimall = quantum_task_contract(
+        campaign_dir,
+        phase,
+        int(iteration),
+        replacement_round=int(replacement_round),
+        validate_points_file=False,
+    )
+    missing = [
+        task
+        for task in aimall.tasks
+        if not task.pointdir.exists() and not task.pointdir.is_symlink()
+    ]
+    if not missing:
+        raise ValueError(
+            "AIMAll recovery has no absent accepted point directory"
+        )
+    gaussian_phase = gaussian_phase_for_aimall(phase)
+    gaussian = quantum_task_contract(
+        campaign_dir,
+        gaussian_phase,
+        int(iteration),
+        replacement_round=int(replacement_round),
+        validate_points_file=False,
+    )
+    listed = tuple(_points_file_names(aimall.staging_dir))
+    permitted = {aimall.pointdir_names, gaussian.pointdir_names}
+    if listed not in permitted:
+        raise ValueError(
+            "AIMAll POINTS.txt is inconsistent with its Gaussian producer"
+        )
+    changed = listed != gaussian.pointdir_names
+    if changed:
+        write_points_file(
+            gaussian.staging_dir,
+            [task.pointdir for task in gaussian.tasks],
+        )
+    return {
+        "phase": gaussian_phase,
+        "source_phase": phase,
+        "iteration": int(iteration),
+        "replacement_round": int(replacement_round),
+        "changed": bool(changed),
+        "points_file": str(
+            (gaussian.staging_dir / "POINTS.txt").resolve(strict=False)
+        ),
+        "logical_total": int(gaussian.logical_total),
+        "retry_task_ids": [
+            int(task.producer_logical_task_id) for task in missing
+        ],
+    }
 
 
 def _validate_ariadne_task(

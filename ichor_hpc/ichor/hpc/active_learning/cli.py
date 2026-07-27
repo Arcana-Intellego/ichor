@@ -138,6 +138,7 @@ from .daemon.array_recovery import (
     array_ledger_path,
     archive_existing_array_task_outputs,
     compact_array_recovery_summary,
+    prepare_aimall_upstream_gaussian_recovery,
     read_array_ledger,
     refresh_array_ledger,
     supports_partial_array_recovery,
@@ -6978,6 +6979,12 @@ def cmd_status(args: argparse.Namespace) -> int:
             allocation = read_point_allocation(
                 allocation_path,
                 expected_campaign_uid=str(state.campaign_uid),
+                expected_context=allocation_context,
+                expected_iteration=(
+                    0
+                    if allocation_context == "bootstrap"
+                    else int(state.iteration)
+                ),
             )
             payload["point_allocation_summary"] = dict(allocation.get("summary") or {})
     except Exception as exc:
@@ -8125,6 +8132,63 @@ def _resolve_terminal_submission_intents_for_apply(
     return resolved, blocking
 
 
+def _aimall_upstream_gaussian_recovery_evidence(
+    report: Any,
+) -> Optional[Dict[str, Any]]:
+    """Return the exact AIMAll rewind selected by recovery planning."""
+    evidence = getattr(
+        report,
+        "aimall_upstream_gaussian_recovery",
+        None,
+    )
+    if not isinstance(evidence, Mapping):
+        return None
+    if str(evidence.get("upstream_rewind") or "") != "missing_aimall_pointdir":
+        raise ValueError("invalid AIMAll-to-Gaussian recovery marker")
+    source_by_target = {
+        CampaignPhase.INITIAL_GAUSSIAN.value:
+            CampaignPhase.INITIAL_AIMALL.value,
+        CampaignPhase.GAUSSIAN.value: CampaignPhase.AIMALL.value,
+        CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN.value:
+            CampaignPhase.INITIAL_REPLACEMENT_AIMALL.value,
+        CampaignPhase.REPLACEMENT_GAUSSIAN.value:
+            CampaignPhase.REPLACEMENT_AIMALL.value,
+    }
+    target_phase = str(report.proposed_state.phase.value)
+    expected_source = source_by_target.get(target_phase)
+    if (
+        expected_source is None
+        or str(evidence.get("phase") or "") != target_phase
+        or str(evidence.get("source_phase") or "") != expected_source
+        or int(evidence.get("iteration", -1))
+        != int(report.proposed_state.iteration)
+        or int(evidence.get("replacement_round", -1))
+        != int(getattr(report.proposed_state, "replacement_round", 0))
+    ):
+        raise ValueError(
+            "AIMAll-to-Gaussian recovery evidence does not match the "
+            "selected recovery state"
+        )
+    retry_ids = [int(value) for value in list(evidence.get("retry_task_ids") or [])]
+    if (
+        not retry_ids
+        or len(retry_ids) != len(set(retry_ids))
+        or any(value < 0 for value in retry_ids)
+        or int(evidence.get("n_retry") or 0) != len(retry_ids)
+    ):
+        raise ValueError("AIMAll-to-Gaussian recovery task set is invalid")
+    partial = getattr(report, "partial_array_recovery", None)
+    if not isinstance(partial, Mapping):
+        raise ValueError("AIMAll-to-Gaussian partial recovery summary is missing")
+    for key in ("phase", "iteration", "logical_total", "n_complete", "n_retry"):
+        if str(partial.get(key)) != str(evidence.get(key)):
+            raise ValueError(
+                "AIMAll-to-Gaussian recovery summary does not match its "
+                "authoritative evidence"
+            )
+    return dict(evidence)
+
+
 def _perform_reconcile_apply_mutations(
     campaign: Path,
     report: Any,
@@ -8158,6 +8222,7 @@ def _perform_reconcile_apply_mutations(
         "archived_reference_data_staging": [],
         "archived_reentry_staging": [],
         "archived_ariadne_publication": [],
+        "aimall_upstream_gaussian_recovery": None,
         "retired_completed_staging": {
             "retired": [],
             "deleted": [],
@@ -8168,6 +8233,19 @@ def _perform_reconcile_apply_mutations(
             "n_preserved": 0,
         },
     }
+    upstream_evidence = _aimall_upstream_gaussian_recovery_evidence(report)
+    if upstream_evidence is not None:
+        upstream_recovery = prepare_aimall_upstream_gaussian_recovery(
+            campaign,
+            str(upstream_evidence["source_phase"]),
+            int(report.proposed_state.iteration),
+        )
+        result["aimall_upstream_gaussian_recovery"] = upstream_recovery
+        if bool(upstream_recovery.get("changed", False)):
+            transaction.record_paths(
+                "restore_gaussian_task_membership",
+                [str(upstream_recovery["points_file"])],
+            )
     publication = getattr(report, "ariadne_publication_recovery", None)
     archive_for_replay = bool(
         isinstance(publication, dict)
@@ -12103,6 +12181,8 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         "update_config_lock",
         "publish_intent_transitions",
     ]
+    if _aimall_upstream_gaussian_recovery_evidence(report) is not None:
+        planned_operations.insert(0, "restore_gaussian_task_membership")
     completed_staging_records = list(
         (getattr(report, "completed_staging_retirement", {}) or {}).get(
             "eligible", []

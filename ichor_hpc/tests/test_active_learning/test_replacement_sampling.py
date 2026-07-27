@@ -2,10 +2,23 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from ichor.core.atoms import Atom, Atoms
+from ichor.hpc.active_learning.config import CampaignConfig
+from ichor.hpc.active_learning.daemon.input_staging import stage_gaussian_inputs
+from ichor.hpc.active_learning.daemon.scheduler_contracts import (
+    infer_expected_tasks_from_artifacts,
+)
+from ichor.hpc.active_learning.daemon.recovery_contracts import (
+    phase_recovery_contract_error,
+)
+from ichor.hpc.active_learning.daemon.state import (
+    CampaignPhase,
+    fresh_campaign_state,
+)
 from ichor.hpc.active_learning.point_allocation import (
     allocate_replacements,
     allocation_manifest_sha256,
@@ -284,6 +297,67 @@ def test_strict_replacement_reader_joins_current_pending_attempts(tmp_path):
     assert loaded["records"][0]["pointdir_index"] == 1
 
 
+@pytest.mark.parametrize("verification", ["metadata", "authority", "deep"])
+def test_replacement_gaussian_recovery_contract_accepts_strict_sample(
+    tmp_path,
+    verification,
+):
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    _canonical_bootstrap_replacement(campaign)
+    state = fresh_campaign_state(campaign_uid="replacement-test")
+    state.phase = CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN
+    state.iteration = 0
+    state.replacement_round = 1
+
+    assert phase_recovery_contract_error(
+        campaign,
+        state,
+        verification=verification,
+    ) is None
+
+
+def test_replacement_gaussian_staging_preserves_strict_sample(tmp_path):
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    _allocation_path, _payload = _canonical_bootstrap_replacement(campaign)
+    round_dir = replacement_round_dir(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        replacement_round=1,
+    )
+    sample = round_dir / "replacement-SAMPLE.xyz"
+    manifest = round_dir / "REPLACEMENT_SAMPLE.json"
+    before = {
+        sample: sample.read_bytes(),
+        manifest: manifest.read_bytes(),
+    }
+
+    staging, count = stage_gaussian_inputs(
+        campaign,
+        CampaignConfig(),
+        "INITIAL_REPLACEMENT_GAUSSIAN",
+        0,
+        sample,
+        campaign_uid="replacement-test",
+    )
+    repeated_staging, repeated_count = stage_gaussian_inputs(
+        campaign,
+        CampaignConfig(),
+        "INITIAL_REPLACEMENT_GAUSSIAN",
+        0,
+        sample,
+        campaign_uid="replacement-test",
+    )
+
+    assert staging == round_dir
+    assert repeated_staging == round_dir
+    assert count == repeated_count == 1
+    assert (round_dir / "POINT_0001.pointdir" / "input.gjf").is_file()
+    assert {path: path.read_bytes() for path in before} == before
+
+
 def test_strict_replacement_reader_rejects_plausible_record_drift(tmp_path):
     campaign = tmp_path / "campaign"
     campaign.mkdir()
@@ -363,12 +437,60 @@ def test_daemon_infers_replacement_expected_tasks_from_exact_round(
         encoding="utf-8",
         newline="\n",
     )
+    if phase_name == "INITIAL_REPLACEMENT_AIMALL":
+        from ichor.hpc.active_learning.daemon.input_staging import (
+            write_quantum_acceptance_manifest,
+        )
+
+        write_quantum_acceptance_manifest(
+            round_dir,
+            phase_name="INITIAL_REPLACEMENT_GAUSSIAN",
+            iteration=0,
+            accepted=[pointdir],
+            rejected=[],
+        )
     state = fresh_campaign_state()
     state.replacement_round = 1
     state.phase = CampaignPhase(phase_name)
     daemon = Daemon(campaign_dir=campaign, config=CampaignConfig())
 
     assert daemon._infer_expected_tasks_from_artifacts(state, state.phase) == 1
+
+
+def test_replacement_aimall_task_count_uses_filtered_gaussian_handoff(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import quantum_task_contracts
+
+    staging = tmp_path / "replacement_round_0001"
+    staging.mkdir()
+
+    def contract(_campaign, phase_name, _iteration, **_kwargs):
+        if phase_name == "REPLACEMENT_GAUSSIAN":
+            names = ("POINT_0004.pointdir", "POINT_0005.pointdir")
+        elif phase_name == "REPLACEMENT_AIMALL":
+            names = ("POINT_0004.pointdir",)
+        else:
+            raise AssertionError("unexpected phase " + str(phase_name))
+        return SimpleNamespace(
+            staging_dir=staging,
+            pointdir_names=names,
+            logical_total=len(names),
+        )
+
+    monkeypatch.setattr(
+        quantum_task_contracts,
+        "quantum_task_contract",
+        contract,
+    )
+
+    assert infer_expected_tasks_from_artifacts(
+        tmp_path,
+        phase="REPLACEMENT_AIMALL",
+        iteration=3,
+        replacement_round=1,
+    ) == 1
 
 
 def test_replacement_xyz_writer_uses_atomic_text_helper(tmp_path, monkeypatch):

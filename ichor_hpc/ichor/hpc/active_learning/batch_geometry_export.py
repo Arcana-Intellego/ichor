@@ -644,6 +644,7 @@ def _geometry_from_atoms(atoms: Sequence[Any], label: str) -> Geometry:
 def _read_committed_geometry(
     campaign: Path,
     *,
+    campaign_uid: str,
     entry: ReferenceDataEntry,
     iteration: int,
     attempt: Mapping[str, Any],
@@ -660,6 +661,7 @@ def _read_committed_geometry(
     receipt = read_quantum_acceptance_receipt(
         campaign,
         pointdir,
+        expected_campaign_uid=str(campaign_uid),
         expected_iteration=iteration,
         expected_candidate_id=str(attempt["candidate_id"]),
         expected_assignment_sha256=assignment_sha256,
@@ -938,6 +940,8 @@ def _records_for_iteration(
         immutable_allocation_path,
         history_dir=reference_root / ".point_allocation_history",
         expected_campaign_uid=campaign_uid,
+        expected_context="active",
+        expected_iteration=int(iteration),
     )
     if (
         str(allocation.get("context") or "") != "active"
@@ -1165,6 +1169,7 @@ def _records_for_iteration(
             raise BatchGeometryExportError("committed provenance lacks Phase B selection identity")
         final_geometry = _read_committed_geometry(
             campaign,
+            campaign_uid=campaign_uid,
             entry=entry,
             iteration=iteration,
             attempt=attempt,

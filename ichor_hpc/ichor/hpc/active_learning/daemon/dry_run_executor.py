@@ -1327,7 +1327,12 @@ class DryRunPhaseExecutor:
             iteration=int(iteration),
         )
         self._report_runtime_progress("allocation_loading")
-        allocation = read_point_allocation(path)
+        allocation = read_point_allocation(
+            path,
+            expected_campaign_uid=str(state.campaign_uid),
+            expected_context=str(context),
+            expected_iteration=int(iteration),
+        )
         summary = dict(allocation.get("summary") or {})
         self._report_runtime_progress(
             "completeness_check",
@@ -1383,6 +1388,7 @@ class DryRunPhaseExecutor:
                 context=str(context),
                 iteration=int(iteration),
                 replacement_round=int(replacement_round),
+                expected_campaign_uid=str(state.campaign_uid),
             )
         except Exception as exc:
             raise BackendSubmissionError(
@@ -1436,7 +1442,12 @@ class DryRunPhaseExecutor:
             iteration=int(state.iteration),
         )
         self._report_runtime_progress("allocation_loading")
-        allocation = read_point_allocation(allocation_path)
+        allocation = read_point_allocation(
+            allocation_path,
+            expected_campaign_uid=str(state.campaign_uid),
+            expected_context="active",
+            expected_iteration=int(state.iteration),
+        )
         self._report_runtime_progress(
             "split_ledger",
             completed=0,
@@ -1518,6 +1529,7 @@ class DryRunPhaseExecutor:
                 context=context,
                 iteration=int(state.iteration),
                 progress_callback=_progress,
+                expected_campaign_uid=str(state.campaign_uid),
             )
         except Exception as exc:
             raise BackendSubmissionError(
@@ -2981,7 +2993,12 @@ class DryRunPhaseExecutor:
             context=context,
             iteration=allocation_iteration,
         )
-        allocation = read_point_allocation(allocation_path)
+        allocation = read_point_allocation(
+            allocation_path,
+            expected_campaign_uid=str(state.campaign_uid),
+            expected_context=str(context),
+            expected_iteration=int(allocation_iteration),
+        )
         pending = pending_attempts(allocation)
         expected_round = int(getattr(state, "replacement_round", 0)) if replacement else 0
         attempts = [
@@ -3267,6 +3284,8 @@ class DryRunPhaseExecutor:
                 gaussian_phase=gaussian_phase,
                 aimall_phase=phase_name,
                 expected_method=str(self.config.gaussian.method),
+                expected_campaign_uid=str(state.campaign_uid),
+                replacement_round=int(getattr(state, "replacement_round", 0)),
             )
             if not initial and bool(getattr(self.config.error_calibration, "enabled", True)):
                 from .error_calibration import (
