@@ -25,6 +25,7 @@ from ichor.hpc.active_learning.daemon.journal import (
 )
 from ichor.hpc.active_learning.daemon.state import (
     CampaignPhase,
+    CampaignState,
     DEFAULT_STATE_FILENAME,
     fresh_campaign_state,
     make_lifecycle_context,
@@ -2201,6 +2202,19 @@ def test_cli_stop_cancel_jobs_records_mixed_terminal_task_evidence(
     assert receipt is not None
     assert receipt["completed_logical_task_ids"] == [0]
     assert receipt["retry_logical_task_ids"] == [1, 2, 3]
+    resolved, blockers = (
+        cli_mod._resolve_terminal_submission_intents_for_apply(
+            campaign,
+            [intent],
+            persist_terminal_receipts=False,
+        )
+    )
+    assert blockers == []
+    assert len(resolved) == 1
+    assert resolved[0]["submission_identity"] == intent[
+        "submission_identity"
+    ]
+    assert resolved[0]["job_id"] == "17923151"
     request = read_stop_request(
         campaign,
         expected_campaign_uid=state.campaign_uid,
@@ -5186,3 +5200,186 @@ def test_aimall_upstream_recovery_validates_selected_evidence():
     )
 
     assert cli_mod._aimall_upstream_gaussian_recovery_evidence(report) == evidence
+
+
+def test_cli_reconcile_reselects_after_terminal_intent_before_proposal(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from ichor.hpc.active_learning.daemon.reconcile import (
+        ReconciliationReport,
+    )
+
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(
+        max_iterations=2,
+        campaign_uid="cli-test",
+    )
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.validation_set_version = 0
+    state.models_version = 0
+    state.pending_jobs[CampaignPhase.ARIADNE_ARRAY.value] = "17923151"
+    state_path = (
+        campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+    )
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    write_state(state_path, state)
+    intent = {
+        "phase": CampaignPhase.ARIADNE_ARRAY.value,
+        "iteration": 1,
+        "replacement_round": 0,
+        "job_id": "17923151",
+        "submission_identity": "r0000-a0001-fixture",
+        "attempt_id": "fixture-attempt",
+        "scheduler_identity_kind": "slurm",
+    }
+    partial = {
+        "phase": CampaignPhase.ARIADNE_ARRAY.value,
+        "iteration": 1,
+        "logical_total": 200,
+        "n_complete": 4,
+        "n_reuse": 4,
+        "n_retry": 196,
+        "path": str(
+            campaign
+            / DEFAULT_DATA_SUBDIR
+            / "array_task_ledgers"
+            / "ARIADNE_ARRAY-000001.json"
+        ),
+    }
+    blocked_state = CampaignState.from_dict(state.to_dict())
+    recovered_state = CampaignState.from_dict(state.to_dict())
+    recovered_state.phase = CampaignPhase.ARIADNE_ARRAY
+    recovered_state.pending_jobs = {}
+    blocked = ReconciliationReport(
+        proposed_state=blocked_state,
+        valid_reference_data_versions=[0],
+        valid_model_versions=[0],
+        source_state_phase=CampaignPhase.HALTED.value,
+        existing_state_loaded=True,
+        unsafe_reasons=[
+            "active submission intent(s) present: "
+            "ARIADNE_ARRAY@1 job_id=17923151",
+            "scheduler-inconclusive prepared scratch task(s) preserve "
+            "job ownership: 17923151@ARIADNE_ARRAY",
+        ],
+        active_submission_intents=[dict(intent)],
+        blocking_artifacts=[
+            "active submission intent(s)",
+            "prepared scratch ownership",
+        ],
+        scratch_inventory=[
+            {
+                "status": "prepared",
+                "phase": CampaignPhase.ARIADNE_ARRAY.value,
+                "iteration": 1,
+                "job_id": "17923151",
+            }
+        ],
+        decision="HALTED: unsafe artefacts need user review",
+        recovery_candidates=[
+            {
+                "phase": CampaignPhase.ARIADNE_ARRAY.value,
+                "iteration": 1,
+                "path": str(partial["path"]),
+                "reason": "partial array recovery available",
+            }
+        ],
+        partial_array_recovery=dict(partial),
+    )
+    recovered = ReconciliationReport(
+        proposed_state=recovered_state,
+        valid_reference_data_versions=[0],
+        valid_model_versions=[0],
+        source_state_phase=CampaignPhase.HALTED.value,
+        existing_state_loaded=True,
+        decision="partial array recovery available",
+        recovery_candidates=list(blocked.recovery_candidates),
+        partial_array_recovery=dict(partial),
+    )
+    calls = []
+
+    def propose(*_args, **kwargs):
+        calls.append(dict(kwargs))
+        return blocked if len(calls) == 1 else recovered
+
+    terminal = {
+        **intent,
+        "scheduler_recovery": True,
+        "n_completed": 4,
+        "n_retry": 196,
+        "target_status": "FAILED",
+        "reason": "user_cancelled_via_stop",
+    }
+    monkeypatch.setattr(cli_mod, "_reconcile_runtime_status", lambda *_a: {})
+    monkeypatch.setattr(
+        cli_mod,
+        "build_committed_artifact_snapshot",
+        lambda *_a, **_k: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "inspect_reconcile_transaction_recovery",
+        lambda *_a, **_k: {"state": "none", "recoverable": False},
+    )
+    monkeypatch.setattr(cli_mod, "propose_recovery", propose)
+    monkeypatch.setattr(
+        cli_mod,
+        "_resolve_terminal_submission_intents_for_apply",
+        lambda *_a, **_k: ([dict(terminal)], []),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "review_config_changes",
+        lambda *_a, **_k: SimpleNamespace(
+            allowed_changes=[
+                SimpleNamespace(
+                    path="resources." + name + ".partition",
+                    old="multicore_small",
+                    new="multicore",
+                )
+                for name in (
+                    "ariadne",
+                    "gaussian",
+                    "aimall",
+                    "ferebus",
+                    "diversity",
+                    "defaults",
+                )
+            ],
+            blocked_changes=[],
+        ),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "inspect_aimall_quality_revalidation",
+        lambda *_a, **_k: {"state": "ineligible"},
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "recovery_contract_status",
+        lambda *_a, **_k: {
+            "contract_ok": True,
+            "selected_phase": CampaignPhase.ARIADNE_ARRAY.value,
+            "missing_or_invalid_inputs": [],
+            "trusted_handoffs": [],
+            "protected_artifacts": [],
+            "trusted_inputs": [],
+        },
+    )
+
+    rc = main(["reconcile", "--campaign-dir", str(campaign)])
+
+    assert rc == 0
+    assert len(calls) == 2
+    assert calls[1]["_terminal_submission_intents"] == [terminal]
+    proposed = read_state(
+        state_path.with_name(DEFAULT_STATE_FILENAME + ".proposed")
+    )
+    assert proposed.phase is CampaignPhase.ARIADNE_ARRAY
+    output = capsys.readouterr().out
+    assert output.count("partition multicore_small -> multicore") == 1
+    assert "(6 affected settings)" in output

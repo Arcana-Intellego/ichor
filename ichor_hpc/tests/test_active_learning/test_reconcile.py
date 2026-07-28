@@ -1466,6 +1466,132 @@ def test_propose_recovery_active_submission_intent_is_adoption_ready(tmp_path):
     assert "expected_job_name=uid-FEREBUS-3" in reason
 
 
+def test_propose_recovery_reselects_array_after_exact_terminal_intent(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon.submission_intent import (
+        load_intent,
+        mark_submitted,
+        write_pre_submit_intent,
+    )
+
+    _trust_marker_models(monkeypatch)
+    monkeypatch.setattr(
+        reconcile_mod,
+        "_validate_recovered_state_contract",
+        lambda *_args, **_kwargs: None,
+    )
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0])
+    state = fresh_campaign_state(
+        max_iterations=3,
+        campaign_uid=_FIXTURE_CAMPAIGN_UID,
+    )
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.validation_set_version = 0
+    state.models_version = 0
+    state.pending_jobs[CampaignPhase.ARIADNE_ARRAY.value] = "17923151"
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    append_event(
+        data / "journal.ndjson",
+        "halt",
+        from_phase=CampaignPhase.ARIADNE_ARRAY.value,
+        iteration=1,
+        reason="user_cancelled",
+    )
+    write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=CampaignPhase.ARIADNE_ARRAY.value,
+        iteration=1,
+        expected_tasks=200,
+    )
+    mark_submitted(
+        campaign,
+        CampaignPhase.ARIADNE_ARRAY.value,
+        1,
+        "17923151",
+        expected_tasks=200,
+    )
+    intent = load_intent(
+        campaign,
+        CampaignPhase.ARIADNE_ARRAY.value,
+        1,
+    )
+    monkeypatch.setattr(
+        reconcile_mod,
+        "discover_partial_array_recovery",
+        lambda *_args, **_kwargs: {
+            "phase": CampaignPhase.ARIADNE_ARRAY.value,
+            "iteration": 1,
+            "replacement_round": 0,
+            "logical_total": 200,
+            "n_complete": 4,
+            "n_reuse": 4,
+            "n_retry": 196,
+            "path": str(
+                data
+                / "array_task_ledgers"
+                / "ARIADNE_ARRAY-000001.json"
+            ),
+        },
+    )
+
+    blocked = propose_recovery(campaign)
+    assert blocked.proposed_state.phase is CampaignPhase.HALTED
+    assert len(blocked.active_submission_intents) == 1
+
+    recovered = propose_recovery(
+        campaign,
+        _terminal_submission_intents=[
+            {
+                "phase": CampaignPhase.ARIADNE_ARRAY.value,
+                "iteration": 1,
+                "job_id": "17923151",
+                "submission_identity": str(intent["submission_identity"]),
+            }
+        ],
+    )
+
+    assert recovered.proposed_state.phase is CampaignPhase.ARIADNE_ARRAY
+    assert recovered.proposed_state.iteration == 1
+    assert recovered.active_submission_intents == []
+    assert recovered.partial_array_recovery["n_reuse"] == 4
+    assert recovered.partial_array_recovery["n_retry"] == 196
+    assert not any(
+        "active submission intent" in reason
+        or "prepared scratch" in reason
+        or "pending job" in reason
+        for reason in recovered.unsafe_reasons
+    )
+
+
+def test_propose_recovery_rejects_inexact_terminal_intent_identity(
+    tmp_path,
+):
+    campaign, _data, _training, _models = _campaign_dirs(tmp_path)
+
+    with pytest.raises(
+        ValueError,
+        match="changed during recovery selection",
+    ):
+        propose_recovery(
+            campaign,
+            _terminal_submission_intents=[
+                {
+                    "phase": CampaignPhase.ARIADNE_ARRAY.value,
+                    "iteration": 1,
+                    "job_id": "wrong-job",
+                    "submission_identity": "wrong-intent",
+                }
+            ],
+        )
+
+
 def test_propose_recovery_excludes_receipt_backed_jobless_ferebus_intent(
     tmp_path,
     monkeypatch,

@@ -1229,6 +1229,9 @@ def propose_recovery(
     iteration_prefix: str = "iteration",
     allow_fresh_init_on_nonempty: bool = False,
     _active_reconcile_transaction_id: Optional[str] = None,
+    _terminal_submission_intents: Optional[
+        Sequence[Mapping[str, Any]]
+    ] = None,
     artifact_snapshot: Optional[CommittedArtifactSnapshot] = None,
     verification_level: str = "authority",
     progress_stream: Optional[Any] = None,
@@ -1261,6 +1264,35 @@ def propose_recovery(
     blocking_artifacts: List[str] = []
     recommended_actions: List[str] = []
     recovery_candidates: List[Dict[str, Any]] = []
+    terminal_intent_keys = set()
+    for record in _terminal_submission_intents or ():
+        phase = str(record.get("phase") or "")
+        submission_identity = str(
+            record.get("submission_identity") or ""
+        )
+        try:
+            iteration = int(record.get("iteration"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "terminal submission-intent recovery has an invalid iteration"
+            ) from exc
+        if not phase or iteration < 0 or not submission_identity:
+            raise ValueError(
+                "terminal submission-intent recovery lacks an exact identity"
+            )
+        terminal_intent_keys.add(
+            (
+                phase,
+                iteration,
+                str(
+                    record.get("intent_job_id")
+                    if "intent_job_id" in record
+                    else record.get("job_id")
+                    or ""
+                ),
+                submission_identity,
+            )
+        )
 
     existing: Optional[CampaignState] = None
     existing_loaded = False
@@ -1465,6 +1497,7 @@ def propose_recovery(
         initial_handoff_indicated = True
 
     active_intents: List[Dict[str, Any]] = []
+    terminal_intent_records: List[Dict[str, Any]] = []
     receipt_backed_intent_repairs: List[Dict[str, Any]] = []
     if artifact_snapshot is not None:
         intent_records = getattr(artifact_snapshot, "submission_intents", ())
@@ -1551,7 +1584,30 @@ def propose_recovery(
             str(payload.get("status")) in _submission_intent.ACTIVE_STATUSES
             and key not in repair_keys
         ):
-            active_intents.append(dict(payload))
+            terminal_key = (
+                str(payload.get("phase") or ""),
+                int(payload.get("iteration", 0)),
+                str(payload.get("job_id") or ""),
+                str(payload.get("submission_identity") or ""),
+            )
+            if terminal_key in terminal_intent_keys:
+                terminal_intent_records.append(dict(payload))
+            else:
+                active_intents.append(dict(payload))
+    matched_terminal_keys = {
+        (
+            str(payload.get("phase") or ""),
+            int(payload.get("iteration", 0)),
+            str(payload.get("job_id") or ""),
+            str(payload.get("submission_identity") or ""),
+        )
+        for payload in terminal_intent_records
+    }
+    if matched_terminal_keys != terminal_intent_keys:
+        raise ValueError(
+            "scheduler-proven terminal submission intent changed during "
+            "recovery selection"
+        )
     if receipt_backed_intent_repairs:
         notes.append(
             str(len(receipt_backed_intent_repairs))
@@ -1918,7 +1974,7 @@ def propose_recovery(
                 str(intent.get("phase") or ""),
                 str(intent.get("job_id") or ""),
             )
-            for intent in active_intents
+            for intent in active_intents + terminal_intent_records
         }
         uncovered_pending = []
         for phase_name, job_id in existing.pending_jobs.items():

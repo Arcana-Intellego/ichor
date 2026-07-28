@@ -9113,6 +9113,16 @@ def _resolve_terminal_submission_intents_for_apply(
         scheduler_kind = str(
             intent.get("scheduler_identity_kind") or "slurm"
         ).strip().lower()
+        intent_identity = {
+            "submission_identity": str(
+                intent.get("submission_identity") or ""
+            ),
+            "attempt_id": str(intent.get("attempt_id") or ""),
+            "replacement_round": int(
+                intent.get("replacement_round") or 0
+            ),
+            "scheduler_identity_kind": scheduler_kind,
+        }
         try:
             scheduler_backend = get_scheduler_backend(scheduler_kind)
         except ValueError as exc:
@@ -9129,6 +9139,7 @@ def _resolve_terminal_submission_intents_for_apply(
             )
             continue
         job_id = str(intent.get("job_id") or "")
+        intent_identity["intent_job_id"] = job_id
         expected_job_name = str(intent.get("expected_job_name") or "")
         status = str(intent.get("status") or "")
         if not phase or iteration < 0:
@@ -9214,6 +9225,7 @@ def _resolve_terminal_submission_intents_for_apply(
                             terminal_state = str(row_state)
                             break
                     terminal_candidates.append({
+                        **intent_identity,
                         "phase": phase,
                         "iteration": iteration,
                         "job_id": str(lookup.job_id),
@@ -9252,6 +9264,7 @@ def _resolve_terminal_submission_intents_for_apply(
                     })
                     continue
                 stale_pre_submit_no_job.append({
+                    **intent_identity,
                     "phase": phase,
                     "iteration": iteration,
                     "job_id": job_id,
@@ -9292,6 +9305,7 @@ def _resolve_terminal_submission_intents_for_apply(
         if existing_terminal_receipt is not None:
             terminal_candidates.append(
                 {
+                    **intent_identity,
                     "phase": phase,
                     "iteration": iteration,
                     "job_id": job_id,
@@ -9401,6 +9415,7 @@ def _resolve_terminal_submission_intents_for_apply(
                 continue
             terminal_candidates.append(
                 {
+                    **intent_identity,
                     "phase": phase,
                     "iteration": iteration,
                     "job_id": job_id,
@@ -9456,6 +9471,7 @@ def _resolve_terminal_submission_intents_for_apply(
             })
             continue
         terminal_candidates.append({
+            **intent_identity,
             "phase": phase,
             "iteration": iteration,
             "job_id": job_id,
@@ -11031,17 +11047,26 @@ def _reconcile_presentation(
             planned.insert(0, ("interrupted reconcile", description))
             reason_parts.insert(0, "an interrupted reconcile was recovered")
     allowed_changes = list(getattr(config_review, "allowed_changes", []) or [])
+    grouped_config_changes: Dict[str, List[str]] = {}
     for change in allowed_changes:
-        planned.append(
-            (
-                "configuration",
-                _reconcile_config_label(change.path)
-                + " "
-                + _reconcile_config_value(change.old)
-                + " -> "
-                + _reconcile_config_value(change.new),
-            )
+        description = (
+            _reconcile_config_label(change.path)
+            + " "
+            + _reconcile_config_value(change.old)
+            + " -> "
+            + _reconcile_config_value(change.new)
         )
+        grouped_config_changes.setdefault(description, []).append(
+            str(change.path)
+        )
+    for description, paths in grouped_config_changes.items():
+        if len(paths) > 1:
+            description += (
+                " ("
+                + str(len(paths))
+                + " affected settings)"
+            )
+        planned.append(("configuration", description))
     if allowed_changes:
         reason_parts.insert(0, "configuration changed")
         planned.append(
@@ -13361,6 +13386,16 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             )
         )
         if terminal_recoveries and not terminal_blockers:
+            report = propose_recovery(
+                campaign,
+                allow_fresh_init_on_nonempty=bool(
+                    getattr(args, "allow_fresh_init", False)
+                ),
+                _active_reconcile_transaction_id=active_recovery_id,
+                _terminal_submission_intents=terminal_recoveries,
+                artifact_snapshot=artifact_snapshot,
+                verification_level=verification_level,
+            )
             _apply_terminal_intent_recovery_to_report(
                 report,
                 terminal_recoveries,
