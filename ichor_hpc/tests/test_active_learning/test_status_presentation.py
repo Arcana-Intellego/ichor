@@ -7,8 +7,14 @@ import pytest
 import ichor.hpc.active_learning.cli as cli
 import ichor.hpc.active_learning.daemon.status_recommendations as recommendations
 from ichor.hpc.active_learning.daemon import phase_progress
+from ichor.hpc.active_learning.daemon.presentation_assessment import (
+    assess_campaign_presentation,
+)
 
-from ichor.hpc.active_learning.daemon.state import CampaignPhase
+from ichor.hpc.active_learning.daemon.state import (
+    CampaignPhase,
+    fresh_campaign_state,
+)
 
 
 def _recommendation(code, primary, command):
@@ -73,6 +79,395 @@ def _active_ariadne_payload():
             )
         ],
     }
+
+
+def _cancelled_ariadne_recovery_payload(*, config_state="allowed"):
+    return {
+        "phase": CampaignPhase.ARIADNE_ARRAY.value,
+        "iteration": 15,
+        "replacement_round": 0,
+        "max_iterations": 40,
+        "reference_data_version": 14,
+        "models_version": 14,
+        "lock_held": False,
+        "background_pid_alive": False,
+        "pending_jobs": {CampaignPhase.ARIADNE_ARRAY.value: "17923151"},
+        "active_submission_intents": [
+            {
+                "phase": CampaignPhase.ARIADNE_ARRAY.value,
+                "iteration": 15,
+                "replacement_round": 0,
+                "status": "FAILED",
+                "job_id": "17923151",
+            }
+        ],
+        "stop_request": {
+            "status": "completed",
+            "mode": "immediate",
+            "observed_phase": CampaignPhase.ARIADNE_ARRAY.value,
+            "observed_iteration": 15,
+        },
+        "shutdown_requested": True,
+        "artifact_manifest_status": {
+            "reference_data": {"ok": True},
+            "models": {"ok": True},
+        },
+        "state_artifact_contract_status": {"ok": True},
+        "_presentation_config_review": {
+            "state": config_state,
+            "n_allowed": 6 if config_state == "allowed" else 0,
+            "n_blocked": 0,
+        },
+        "_presentation_scheduler_recovery": {
+            "state": "awaiting_validation",
+            "phase": CampaignPhase.ARIADNE_ARRAY.value,
+            "iteration": 15,
+            "replacement_round": 0,
+            "original_job_ids": ["17923151"],
+            "n_scheduler_completed": 4,
+            "n_scheduler_retry": 196,
+        },
+    }
+
+
+def test_terminal_scheduler_evidence_retires_stale_job_ownership():
+    assessment = assess_campaign_presentation(
+        _cancelled_ariadne_recovery_payload()
+    )
+
+    assert assessment.scheduler.terminal_job_ids == frozenset({"17923151"})
+    assert assessment.scheduler.pending_job_count == 0
+    assert assessment.scheduler.scheduler_intent_count == 0
+    assert assessment.scheduler.completed_candidates == 4
+    assert assessment.scheduler.retry_tasks == 196
+
+
+def test_invalid_scheduler_recovery_does_not_retire_job_ownership():
+    payload = _cancelled_ariadne_recovery_payload(config_state="unchanged")
+    payload["_presentation_scheduler_recovery"] = {
+        **payload["_presentation_scheduler_recovery"],
+        "state": "invalid",
+        "error": "terminal receipt digest mismatch",
+    }
+    assessment = assess_campaign_presentation(payload)
+    result = recommendations.build_status_recommendations(
+        Path("campaign"),
+        payload,
+    )
+
+    assert assessment.scheduler.pending_job_count == 1
+    assert assessment.scheduler.scheduler_intent_count == 1
+    assert result[0].code == "scheduler_recovery_invalid"
+    assert str(result[0].command).startswith("ichor-al-daemon reconcile")
+
+
+def test_mismatched_scheduler_recovery_is_invalid_and_keeps_job_ownership():
+    payload = _cancelled_ariadne_recovery_payload(config_state="unchanged")
+    payload["_presentation_scheduler_recovery"]["iteration"] = 14
+    assessment = assess_campaign_presentation(payload)
+
+    assert assessment.scheduler.recovery_state == "invalid"
+    assert assessment.scheduler.pending_job_count == 1
+    assert assessment.scheduler.scheduler_intent_count == 1
+
+
+def test_validated_scheduler_recovery_uses_postvalidation_retry_count():
+    payload = _cancelled_ariadne_recovery_payload(config_state="unchanged")
+    payload["_presentation_scheduler_recovery"].update(
+        {
+            "state": "validated",
+            "n_reusable": 3,
+            "n_retry": 197,
+        }
+    )
+    assessment = assess_campaign_presentation(payload)
+    result = recommendations.build_status_recommendations(
+        Path("campaign"),
+        payload,
+    )
+
+    assert assessment.scheduler.reusable_outputs == 3
+    assert assessment.scheduler.retry_tasks == 197
+    assert result[0].code == "scheduler_terminal_recovery_resume"
+    assert "3 validated outputs and 197 retry tasks" in result[0].primary
+
+
+def test_status_prioritises_config_reconcile_over_completed_stop():
+    campaign = Path("campaign")
+    payload = _cancelled_ariadne_recovery_payload()
+    result = recommendations.build_status_recommendations(campaign, payload)
+    payload["recommendations"] = [result[0].to_dict()]
+
+    assert result[0].code == "config_change_reconcile_required"
+    assert str(result[0].command).startswith("ichor-al-daemon reconcile")
+    assert cli._status_active_job_count(payload) == 0
+    assert cli._status_intent_counts(payload) == (0, 0)
+    assert cli._status_overall(payload) == "stopped; reconcile required"
+    assert cli._status_current_activity(payload) == (
+        "4 scheduler-completed outputs await local validation; "
+        "196 unfinished tasks are recorded for retry."
+    )
+    rows = dict(
+        cli._build_status_presentation(
+            payload,
+            campaign=campaign,
+            journal_events=[],
+        ).current_status
+    )
+    assert rows["configuration"] == (
+        "6 pending changes; reconcile is required before resume"
+    )
+    assert rows["stop request"] == (
+        "stopped immediately during ARIADNE_ARRAY in iteration 15"
+    )
+    assert "recorded Slurm" not in rows["current work"]
+
+
+def test_status_recommends_direct_resume_when_reconcile_has_nothing_to_apply():
+    payload = _cancelled_ariadne_recovery_payload(config_state="unchanged")
+    result = recommendations.build_status_recommendations(
+        Path("campaign"),
+        payload,
+    )
+
+    assert result[0].code == "scheduler_terminal_recovery_resume"
+    assert str(result[0].command).startswith("ichor-al-daemon resume")
+    assert "validate 4 scheduler-completed outputs" in result[0].primary
+
+
+def test_running_daemon_reports_on_disk_config_change_as_deferred():
+    payload = _active_ariadne_payload()
+    payload["_presentation_config_review"] = {
+        "state": "allowed",
+        "n_allowed": 1,
+        "n_blocked": 0,
+    }
+    result = recommendations.build_status_recommendations(
+        Path("campaign"),
+        payload,
+    )
+    payload["recommendations"] = [result[0].to_dict()]
+    current = dict(
+        cli._build_status_presentation(
+            payload,
+            campaign=Path("campaign"),
+            journal_events=[],
+        ).current_status
+    )
+
+    assert result[0].code == "config_change_pending_running"
+    assert cli._status_overall(payload) == "running normally"
+    assert current["configuration"] == (
+        "1 pending change; this process still uses the locked configuration"
+    )
+    next_rows = dict(
+        cli._status_next_rows(payload, campaign=Path("campaign"))
+    )
+    assert next_rows["you need to do"] == (
+        "nothing now; after the daemon stops, preview reconcile before "
+        "restarting"
+    )
+
+
+def test_running_daemon_is_not_marked_blocked_by_invalid_on_disk_config():
+    payload = _active_ariadne_payload()
+    payload["campaign_config_status"] = {
+        "ok": False,
+        "error": "campaign.yaml is malformed",
+    }
+    payload["pool_feasibility"] = {
+        "ok": False,
+        "error": "pool cannot be assessed from malformed config",
+    }
+    payload["_presentation_config_review"] = {
+        "state": "invalid",
+        "n_allowed": 0,
+        "n_blocked": 0,
+        "error": "campaign.yaml is malformed",
+    }
+    result = recommendations.build_status_recommendations(
+        Path("campaign"),
+        payload,
+    )
+    payload["recommendations"] = [result[0].to_dict()]
+    current = dict(
+        cli._build_status_presentation(
+            payload,
+            campaign=Path("campaign"),
+            journal_events=[],
+        ).current_status
+    )
+
+    assert result[0].code == "config_change_pending_running"
+    assert cli._status_overall(payload) == "running normally"
+    assert current["configuration"].endswith(
+        "this process still uses the locked configuration"
+    )
+    next_rows = dict(
+        cli._status_next_rows(payload, campaign=Path("campaign"))
+    )
+    assert next_rows["you need to do"] == (
+        "nothing now; repair campaign.yaml before the next start"
+    )
+
+
+def test_preflight_uses_the_same_reconcile_action_for_cancelled_array_config_drift(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = tmp_path / "campaign"
+    state = fresh_campaign_state(max_iterations=40)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 15
+    state.reference_data_version = 14
+    state.models_version = 14
+    state.pending_jobs = {CampaignPhase.ARIADNE_ARRAY.value: "17923151"}
+    payload = {
+        "all_backends_present": True,
+        "campaign_config": {"ok": True},
+        "pool_feasibility": {"ok": True},
+        "campaign_state": {
+            "ok": False,
+            "condition": "reconcile_required",
+            "phase": CampaignPhase.ARIADNE_ARRAY.value,
+            "iteration": 15,
+            "issues": ["campaign configuration differs from its lock"],
+        },
+        "_presentation_state": state,
+        "_presentation_artifact_contract": {"ok": True},
+        "_presentation_config_review": {
+            "state": "allowed",
+            "n_allowed": 6,
+            "n_blocked": 0,
+        },
+        "_presentation_stop": {
+            "stop_request": {
+                "status": "completed",
+                "mode": "immediate",
+            },
+            "shutdown_requested": True,
+        },
+    }
+    intent = _cancelled_ariadne_recovery_payload()[
+        "active_submission_intents"
+    ]
+    recovery = _cancelled_ariadne_recovery_payload()[
+        "_presentation_scheduler_recovery"
+    ]
+    monkeypatch.setattr(
+        cli,
+        "_runtime_liveness_policy",
+        lambda _campaign: (300.0, 5.0),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_probe_daemon_lock",
+        lambda _path: {"lock_held": False},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_probe_daemon_lease",
+        lambda *_args, **_kwargs: {"lease_fresh": False},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_probe_background_daemon",
+        lambda *_args, **_kwargs: {"background_pid_alive": False},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_load_active_submission_intents",
+        lambda *_args, **_kwargs: list(intent),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_load_scheduler_recovery_status",
+        lambda *_args, **_kwargs: dict(recovery),
+    )
+    monkeypatch.setattr(
+        cli,
+        "inspect_reconcile_transaction_recovery",
+        lambda *_args, **_kwargs: {"state": "none"},
+    )
+
+    action, command = cli._preflight_launch_advice(campaign, payload)
+
+    assert action == (
+        "preview and apply the pending configuration change before resuming"
+    )
+    assert command == cli._campaign_command(campaign, "reconcile")
+
+
+def test_preflight_does_not_tell_an_active_daemon_to_restart_for_config_error(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = tmp_path / "campaign"
+    state = fresh_campaign_state(max_iterations=2)
+    payload = {
+        "all_backends_present": False,
+        "campaign_config": {
+            "ok": False,
+            "error": "campaign.yaml is malformed",
+        },
+        "pool_feasibility": {"ok": False},
+        "campaign_state": {
+            "ok": False,
+            "condition": "blocked",
+            "issues": ["campaign.yaml is malformed"],
+        },
+        "_presentation_state": state,
+        "_presentation_artifact_contract": {"ok": True},
+        "_presentation_config_review": {
+            "state": "invalid",
+            "n_allowed": 0,
+            "n_blocked": 0,
+            "error": "campaign.yaml is malformed",
+        },
+    }
+    monkeypatch.setattr(
+        cli,
+        "_runtime_liveness_policy",
+        lambda _campaign: (300.0, 5.0),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_probe_daemon_lock",
+        lambda _path: {"lock_held": True},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_probe_daemon_lease",
+        lambda *_args, **_kwargs: {"lease_fresh": False},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_probe_background_daemon",
+        lambda *_args, **_kwargs: {"background_pid_alive": False},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_load_active_submission_intents",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        cli,
+        "_load_scheduler_recovery_status",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        cli,
+        "inspect_reconcile_transaction_recovery",
+        lambda *_args, **_kwargs: {"state": "none"},
+    )
+
+    action, command = cli._preflight_launch_advice(campaign, payload)
+
+    assert action == (
+        "the daemon is still using its locked configuration; "
+        "repair campaign.yaml before the next start"
+    )
+    assert command is not None and "journal" in command
 
 
 def test_status_running_ariadne_matches_the_agreed_human_contract():
@@ -282,6 +677,12 @@ def test_stop_and_invalid_artifacts_override_daemon_running_recommendation(tmp_p
     invalid_payload = {
         "phase": CampaignPhase.STOP_CHECK.value,
         "lock_held": True,
+        "stop_request": {
+            "status": "requested",
+            "request_id": "request-1",
+            "mode": "after_iteration",
+            "target_iteration": 7,
+        },
         "state_artifact_contract_status": {
             "ok": False,
             "error": "missing model",

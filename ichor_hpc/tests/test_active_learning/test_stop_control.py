@@ -69,6 +69,9 @@ def test_stop_descriptions_cover_all_modes_and_malformed_payloads():
     assert describe_stop_request(immediate) == (
         "immediate stop requested during AIMALL in iteration 3"
     )
+    assert describe_stop_request(immediate, completed=True) == (
+        "stopped immediately during AIMALL in iteration 3"
+    )
     assert describe_stop_request(after_phase) == (
         "stop requested after phase AIMALL in iteration 3, replacement round 2"
     )

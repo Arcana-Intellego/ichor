@@ -69,7 +69,11 @@ def describe_stop_request(
         if not isinstance(phase, str) or not phase or iteration is None:
             return "stop target unavailable"
         return (
-            "immediate stop requested during "
+            (
+                "stopped immediately during "
+                if completed
+                else "immediate stop requested during "
+            )
             + phase
             + " in iteration "
             + str(iteration)

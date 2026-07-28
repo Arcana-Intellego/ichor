@@ -120,6 +120,11 @@ from .daemon.live_executor import (
     make_live_job_liveness_checker,
 )
 from .daemon.preflight import check_backends, missing_backend_message
+from .daemon.presentation_assessment import (
+    assess_campaign_presentation,
+    config_review_evidence,
+    invalid_config_review_evidence,
+)
 from .daemon.submitted_environment_smoke import run_submitted_environment_smoke
 from .daemon.recovery_contracts import (
     recovery_contract_status,
@@ -1937,6 +1942,9 @@ _STATUS_BLOCKED_RECOMMENDATIONS = frozenset(
         "halted_seed_pool_exhausted",
         "reconcile_transaction_manual_review",
         "allocation_check_environment_blocked",
+        "config_change_blocked",
+        "config_lock_review_failed",
+        "scheduler_recovery_invalid",
     }
 )
 
@@ -2000,6 +2008,13 @@ _STATUS_PRESENTATION_RECOMMENDATIONS = frozenset(
         "reconcile_transaction_manual_review",
         "allocation_check_environment_blocked",
         "allocation_check_environment_retry",
+        "config_change_pending_running",
+        "config_change_reconcile_required",
+        "config_change_blocked",
+        "config_lock_review_failed",
+        "scheduler_recovery_invalid",
+        "scheduler_terminal_recovery_resume",
+        "background_startup_failed",
     }
     | {
         "phase_" + phase.value.lower() + "_ready"
@@ -2100,27 +2115,12 @@ def _status_daemon_active(payload: Dict[str, Any]) -> bool:
 
 
 def _status_active_job_count(payload: Dict[str, Any]) -> int:
-    pending = payload.get("pending_jobs")
-    if not isinstance(pending, dict):
-        return 0
-    return sum(1 for job_id in pending.values() if job_id)
+    return assess_campaign_presentation(payload).scheduler.pending_job_count
 
 
 def _status_intent_counts(payload: Dict[str, Any]) -> Tuple[int, int]:
-    intents = payload.get("active_submission_intents")
-    if not isinstance(intents, list):
-        return 0, 0
-    scheduler = sum(
-        1
-        for intent in intents
-        if isinstance(intent, dict) and intent.get("job_id")
-    )
-    local = sum(
-        1
-        for intent in intents
-        if isinstance(intent, dict) and not intent.get("job_id")
-    )
-    return scheduler, local
+    scheduler = assess_campaign_presentation(payload).scheduler
+    return scheduler.scheduler_intent_count, scheduler.local_intent_count
 
 
 def _scheduler_display_name(
@@ -2239,6 +2239,14 @@ def _status_progress_rows(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
     scheduler_recovery = payload.get(
         "_presentation_scheduler_recovery"
     )
+    scheduler_assessment = assess_campaign_presentation(
+        payload
+    ).scheduler
+    if (
+        isinstance(scheduler_recovery, Mapping)
+        and scheduler_assessment.recovery_state == "invalid"
+    ):
+        return []
     seed_record = (
         _seed_selection_progress_record(payload)
         if str(payload.get("phase") or "") == CampaignPhase.SEED_SELECT.value
@@ -2262,25 +2270,24 @@ def _status_progress_rows(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
     scheduler_intents, _local_intents = _status_intent_counts(payload)
     if (
         isinstance(scheduler_recovery, Mapping)
-        and scheduler_recovery.get("state") != "invalid"
+        and scheduler_assessment.has_terminal_recovery
         and not _status_active_job_count(payload)
         and not scheduler_intents
     ):
-        if scheduler_recovery.get("state") == "validated":
+        if scheduler_assessment.recovery_state == "validated":
             return [
                 (
                     "reusable outputs",
-                    str(int(scheduler_recovery.get("n_reusable") or 0))
+                    str(scheduler_assessment.reusable_outputs)
                     + " validated",
                 ),
                 (
                     "retry work",
-                    str(int(scheduler_recovery.get("n_retry") or 0))
+                    str(scheduler_assessment.retry_tasks)
                     + " task"
                     + (
                         ""
-                        if int(scheduler_recovery.get("n_retry") or 0)
-                        == 1
+                        if scheduler_assessment.retry_tasks == 1
                         else "s"
                     ),
                 ),
@@ -2288,47 +2295,21 @@ def _status_progress_rows(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
         return [
             (
                 "awaiting validation",
-                str(
-                    int(
-                        scheduler_recovery.get(
-                            "n_scheduler_completed",
-                            0,
-                        )
-                    )
-                )
+                str(scheduler_assessment.completed_candidates)
                 + " scheduler-completed output"
                 + (
                     ""
-                    if int(
-                        scheduler_recovery.get(
-                            "n_scheduler_completed",
-                            0,
-                        )
-                    )
-                    == 1
+                    if scheduler_assessment.completed_candidates == 1
                     else "s"
                 ),
             ),
             (
                 "recorded retry work",
-                str(
-                    int(
-                        scheduler_recovery.get(
-                            "n_scheduler_retry",
-                            0,
-                        )
-                    )
-                )
+                str(scheduler_assessment.retry_tasks)
                 + " task"
                 + (
                     ""
-                    if int(
-                        scheduler_recovery.get(
-                            "n_scheduler_retry",
-                            0,
-                        )
-                    )
-                    == 1
+                    if scheduler_assessment.retry_tasks == 1
                     else "s"
                 ),
             ),
@@ -2337,13 +2318,14 @@ def _status_progress_rows(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
     if record is None:
         return []
     rows = []
+    historical_scheduler_progress = bool(
+        str(record.get("producer_kind") or "") == "scheduler"
+        and not _status_daemon_active(payload)
+    )
     count = _format_generic_progress_count(record)
     if count:
         progress_label = "progress"
-        if (
-            str(record.get("producer_kind") or "") == "scheduler"
-            and not _status_daemon_active(payload)
-        ):
+        if historical_scheduler_progress:
             progress_label = (
                 "last recorded "
                 + _status_scheduler_display_name(payload)
@@ -2352,12 +2334,23 @@ def _status_progress_rows(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
         rows.append((progress_label, count))
     elapsed = _format_elapsed_seconds(record.get("elapsed_seconds"))
     if elapsed:
-        rows.append(("elapsed", elapsed))
+        rows.append(
+            (
+                "last recorded elapsed"
+                if historical_scheduler_progress
+                else "elapsed",
+                elapsed,
+            )
+        )
     try:
         throughput = float(record.get("throughput"))
     except (TypeError, ValueError):
         throughput = 0.0
-    if np.isfinite(throughput) and throughput > 0.0:
+    if (
+        not historical_scheduler_progress
+        and np.isfinite(throughput)
+        and throughput > 0.0
+    ):
         counters = record.get("counters")
         unit = (
             str(counters.get("unit") or "items")
@@ -2504,6 +2497,9 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
     scheduler_recovery = payload.get(
         "_presentation_scheduler_recovery"
     )
+    scheduler_assessment = assess_campaign_presentation(
+        payload
+    ).scheduler
     if str(payload.get("background_startup_state") or "") in {
         "prepared",
         "spawned",
@@ -2511,18 +2507,32 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
     } and payload.get("background_pid_alive") is True:
         stage = str(payload.get("background_startup_stage") or "initial checks")
         return "The background process is still starting (" + stage + ")."
+    if (
+        str(payload.get("background_startup_state") or "") == "failed"
+        and not daemon_active
+    ):
+        stage = str(payload.get("background_startup_stage") or "startup")
+        return (
+            "The last daemon startup failed during "
+            + stage.replace("_", " ")
+            + "; no campaign work is running."
+        )
     if phase == CampaignPhase.SEED_SELECT.value and progress is not None:
         return _format_seed_selection_progress(progress)
     if (
         isinstance(scheduler_recovery, Mapping)
+        and scheduler_assessment.recovery_state == "invalid"
+    ):
+        return (
+            "Scheduler recovery evidence could not be validated; no retry "
+            "work is being submitted."
+        )
+    if (
+        isinstance(scheduler_recovery, Mapping)
+        and scheduler_assessment.has_terminal_recovery
         and not active_jobs
         and not scheduler_intents
     ):
-        if scheduler_recovery.get("state") == "invalid":
-            return (
-                "Scheduler recovery evidence could not be validated; no "
-                "retry work is being submitted."
-            )
         disposition = str(
             scheduler_recovery.get("publication_disposition") or ""
         )
@@ -2536,9 +2546,9 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
                 "The interrupted diversity publication was incomplete; its "
                 "single scheduler job is ready to be rerun."
             )
-        if scheduler_recovery.get("state") == "validated":
-            reusable = int(scheduler_recovery.get("n_reusable") or 0)
-            retry = int(scheduler_recovery.get("n_retry") or 0)
+        if scheduler_assessment.recovery_state == "validated":
+            reusable = scheduler_assessment.reusable_outputs
+            retry = scheduler_assessment.retry_tasks
             return (
                 str(reusable)
                 + " completed task"
@@ -2549,12 +2559,8 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
                 + ("" if retry == 1 else "s")
                 + " will be retried."
             )
-        completed = int(
-            scheduler_recovery.get("n_scheduler_completed") or 0
-        )
-        retry = int(
-            scheduler_recovery.get("n_scheduler_retry") or 0
-        )
+        completed = scheduler_assessment.completed_candidates
+        retry = scheduler_assessment.retry_tasks
         return (
             str(completed)
             + " scheduler-completed output"
@@ -2701,20 +2707,15 @@ def _status_control_problem(payload: Mapping[str, Any]) -> bool:
     config = payload.get("campaign_config_status")
     feasibility = payload.get("pool_feasibility")
     progress = _runtime_progress_record(dict(payload))
+    assessment = assess_campaign_presentation(payload)
     return bool(
         (isinstance(config, Mapping) and config.get("ok") is False)
+        or assessment.config_blocks_progress
         or payload.get("partial_array_recovery_error")
         or payload.get("journal_error")
         or payload.get("submission_intent_errors")
         or payload.get("stop_control_error")
-        or (
-            isinstance(
-                payload.get("_presentation_scheduler_recovery"),
-                Mapping,
-            )
-            and payload["_presentation_scheduler_recovery"].get("state")
-            == "invalid"
-        )
+        or assessment.scheduler.recovery_state == "invalid"
         or (
             isinstance(feasibility, Mapping)
             and feasibility.get("ok") is False
@@ -2740,6 +2741,18 @@ def _status_overall(payload: Dict[str, Any]) -> str:
         return "needs attention"
     if code == "allocation_check_environment_retry":
         return "stopped and ready to continue"
+    if code == "config_change_pending_running":
+        return "running normally"
+    if code == "config_change_reconcile_required":
+        return "stopped; reconcile required"
+    if code in {
+        "config_change_blocked",
+        "config_lock_review_failed",
+        "scheduler_recovery_invalid",
+    }:
+        return "blocked"
+    if code == "background_startup_failed":
+        return "startup failed"
     if _status_control_problem(payload) or _status_artifact_problem(payload):
         return "blocked" if code in _STATUS_BLOCKED_RECOMMENDATIONS else "needs attention"
     if phase == CampaignPhase.HALTED.value:
@@ -3241,6 +3254,16 @@ def _status_plain_reason(payload: Dict[str, Any], code: str) -> Optional[str]:
 
     if code in {"campaign_config_invalid", "pool_feasibility_failed"}:
         return "the campaign configuration or trajectory-pool plan is not currently valid"
+    if code == "config_change_reconcile_required":
+        return "campaign.yaml differs from the locked configuration used by the stopped daemon"
+    if code in {"config_change_blocked", "config_lock_review_failed"}:
+        return "the requested configuration cannot be approved safely at the current campaign position"
+    if code == "scheduler_recovery_invalid":
+        return "the recorded terminal scheduler evidence does not satisfy the recovery contract"
+    if code == "scheduler_terminal_recovery_resume":
+        return "the previous scheduler job is conclusively terminal and only local validation or retry preparation remains"
+    if code == "background_startup_failed":
+        return "the previous background process stopped before daemon startup completed"
     if code in {
         "runtime_probe_failed",
         "state_missing",
@@ -3307,6 +3330,15 @@ def _status_next_rows(
     )
     if review:
         automatic = "no further daemon work is scheduled"
+    elif overall == "stopped; reconcile required":
+        automatic = (
+            "nothing will run until reconcile applies the reviewed campaign "
+            "changes"
+        )
+    elif overall == "startup failed":
+        automatic = "the daemon did not become ready and no new work will start"
+    elif overall in {"cannot determine safely", "needs attention", "blocked", "halted"}:
+        automatic = "no further work can be relied upon until this condition is reviewed"
     elif isinstance(stop_request, Mapping):
         if daemon_active and str(stop_request.get("status") or "") != "completed":
             from .daemon.stop_control import describe_stop_request
@@ -3316,8 +3348,6 @@ def _status_next_rows(
             )
         else:
             automatic = "nothing further will run until the stopped campaign is resumed"
-    elif overall in {"cannot determine safely", "needs attention", "blocked", "halted"}:
-        automatic = "no further work can be relied upon until this condition is reviewed"
     elif overall == "stopped with unfinished work":
         scheduler_intents, local_intents = _status_intent_counts(payload)
         if _status_active_job_count(payload) or scheduler_intents:
@@ -3346,7 +3376,23 @@ def _status_next_rows(
     else:
         automatic = _status_phase_outcome(payload)
 
-    if no_action:
+    if code == "config_change_pending_running":
+        config_state = assess_campaign_presentation(payload).config_state
+        user_action = (
+            "nothing now; repair campaign.yaml before the next start"
+            if config_state == "invalid"
+            else (
+                "nothing now; after the daemon stops, review or revert the "
+                "blocked change before restarting"
+                if config_state == "blocked"
+                else (
+                    "nothing now; after the daemon stops, preview reconcile "
+                    "before restarting"
+                )
+            )
+        )
+        command_label = "follow progress"
+    elif no_action:
         user_action = "nothing"
         command_label = "review" if review else "follow progress"
     else:
@@ -3393,6 +3439,46 @@ def _build_status_presentation(
         ("daemon", _status_daemon_label(payload)),
         ("current work", _status_current_activity(payload)),
     ]
+    assessment = assess_campaign_presentation(payload)
+    config_count = (
+        assessment.config_allowed_count + assessment.config_blocked_count
+    )
+    if assessment.config_state == "allowed":
+        if _status_daemon_active(payload):
+            config_text = (
+                str(config_count)
+                + " pending change"
+                + ("" if config_count == 1 else "s")
+                + "; this process still uses the locked configuration"
+            )
+        else:
+            config_text = (
+                str(config_count)
+                + " pending change"
+                + ("" if config_count == 1 else "s")
+                + "; reconcile is required before resume"
+            )
+        current_rows.append(("configuration", config_text))
+    elif assessment.config_state == "blocked":
+        config_text = (
+            str(assessment.config_blocked_count)
+            + " blocked change"
+            + ("" if assessment.config_blocked_count == 1 else "s")
+        )
+        if _status_daemon_active(payload):
+            config_text += (
+                "; this process still uses the locked configuration"
+            )
+        current_rows.append(("configuration", config_text))
+    elif assessment.config_state == "invalid":
+        config_text = "could not be compared with the campaign lock"
+        if _status_daemon_active(payload):
+            config_text += (
+                "; this process still uses the locked configuration"
+            )
+        current_rows.append(
+            ("configuration", config_text)
+        )
     stop_request = payload.get("stop_request")
     if isinstance(stop_request, Mapping):
         from .daemon.stop_control import describe_stop_request
@@ -3803,7 +3889,7 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "failure_action": "phase failure decision",
     "halt": "daemon halted",
     "live_postprocess_refused": "live postprocess refused",
-    "effective_config_diff": "config diff recorded",
+    "effective_config_diff": "effective configuration recorded",
     "autotune_applied": "autotune applied",
     "trajectory_pool_imported": "trajectory pool imported",
     "bootstrap_inputs_confirmed": "bootstrap inputs confirmed",
@@ -3859,7 +3945,7 @@ JOURNAL_EVENT_LABELS: Dict[str, str] = {
     "user_stop_boundary_reached": "user stop boundary reached",
     "user_stop_control_invalid": "user stop control invalid",
     "user_stop_request_cancelled": "user stop request cancelled",
-    "user_stop_resumed": "user stop resumed",
+    "user_stop_resumed": "stop cleared for resume",
     "stop_request_completion_deferred": "stop completion deferred",
     "sacct_empty_timeout": "Slurm accounting empty timeout",
     "sacct_missing_timeout": "Slurm accounting timeout",
@@ -3994,6 +4080,7 @@ _JOURNAL_OK_EVENTS = {
     "error_calibration_summary",
     "submission_intent_retired_without_submission",
     "user_stop_boundary_reached",
+    "user_stop_request_cancelled",
     "user_stop_resumed",
 }
 
@@ -4058,7 +4145,6 @@ _JOURNAL_WARN_EVENTS = {
     "daemon_lease_cleanup_failed",
     "daemon_lease_heartbeat_failed",
     "daemon_lease_heartbeat_recovered",
-    "user_stop_request_cancelled",
     "ferebus_quality_measurement_incomplete",
     "initial_training_existing_without_bootstrap_handoff",
     "legacy_sampling_protocol_repreview",
@@ -4161,6 +4247,10 @@ def _journal_event_severity(event: Dict[str, Any]) -> str:
     if raw == "queue_lifecycle_update":
         queue_event = str(event.get("queue_event") or "")
         status = str(event.get("status") or "").upper()
+        user_cancelled = bool(
+            event.get("user_requested_cancellation") is True
+            or str(event.get("terminal_cause") or "") == "user_stop"
+        )
         if queue_event == "postprocess_started":
             return "RUN"
         if queue_event == "postprocess_finished":
@@ -4169,6 +4259,8 @@ def _journal_event_severity(event: Dict[str, Any]) -> str:
                 if status in {"FAILED", "FAILURE", "ERROR"}
                 else "OK"
             )
+        if status == "CANCELLED" and user_cancelled:
+            return "OK"
         if status in {
             "FAILED",
             "FAILURE",
@@ -4408,6 +4500,20 @@ def _journal_operator_summary(
                     description += "s"
             return description
     if raw == "reconcile_applied":
+        config_changes = _event_int(event, "n_allowed_config_changes") or 0
+
+        def _with_config_changes(description: str) -> str:
+            if config_changes <= 0:
+                return description
+            return (
+                description
+                + "; "
+                + str(config_changes)
+                + " configuration change"
+                + ("" if config_changes == 1 else "s")
+                + " applied"
+            )
+
         scheduler_completed = _event_int(
             event,
             "scheduler_completed_task_candidates",
@@ -4427,7 +4533,7 @@ def _journal_operator_summary(
                 if scheduler_submitted == 0
                 else str(scheduler_submitted) + " retry tasks submitted"
             )
-            return (
+            return _with_config_changes(
                 "reconcile applied; preserving "
                 + str(scheduler_completed)
                 + " scheduler-completed task candidate"
@@ -4453,7 +4559,7 @@ def _journal_operator_summary(
                 if resubmitted == 0
                 else str(resubmitted) + " ARIADNE tasks resubmitted"
             )
-            return (
+            return _with_config_changes(
                 "reconcile applied; reusing "
                 + str(accepted)
                 + " accepted ARIADNE results, "
@@ -4469,7 +4575,7 @@ def _journal_operator_summary(
                 if aimall_resubmitted == 0
                 else str(aimall_resubmitted) + " AIMAll tasks resubmitted"
             )
-            return (
+            return _with_config_changes(
                 "reconcile applied; reusing "
                 + str(aimall_completed)
                 + " completed AIMAll output"
@@ -4477,6 +4583,8 @@ def _journal_operator_summary(
                 + " for local validation, "
                 + resubmission
             )
+        if config_changes:
+            return _with_config_changes("reconcile applied")
     if raw in {"user_stop_requested", "user_stop_boundary_reached"}:
         from .daemon.stop_control import describe_stop_request
 
@@ -4530,6 +4638,10 @@ def _journal_operator_summary(
         queue_event = str(event.get("queue_event") or "")
         status = str(event.get("status") or "").upper()
         scheduler_name = _journal_scheduler_name(event)
+        user_cancelled = bool(
+            event.get("user_requested_cancellation") is True
+            or str(event.get("terminal_cause") or "") == "user_stop"
+        )
         if queue_event == "postprocess_started":
             return "local postprocessing started"
         if queue_event == "postprocess_finished":
@@ -4539,6 +4651,8 @@ def _journal_operator_summary(
                 else "local postprocessing completed"
             )
         if queue_event == "terminal":
+            if status == "CANCELLED" and user_cancelled:
+                return scheduler_name + " work cancelled as requested"
             return (
                 scheduler_name + " tasks failed"
                 if status in {
@@ -7890,15 +8004,39 @@ def cmd_status(args: argparse.Namespace) -> int:
             dict(aimall_postprocess_recovery_status)
         )
         payload.pop("partial_array_recovery_error", None)
+    config_review_status: Dict[str, Any]
     try:
         cfg = CampaignConfig.from_yaml(campaign / "campaign.yaml")
         payload["campaign_config_status"] = {"ok": True}
         payload["pool_feasibility"] = _pool_feasibility_summary(campaign, cfg)
+        try:
+            config_review_status = config_review_evidence(
+                review_config_changes(
+                    campaign,
+                    cfg,
+                    state,
+                    initialise_missing=False,
+                ),
+                allow_unbound=(
+                    state.phase is CampaignPhase.INIT
+                    and not any(
+                        job_id for job_id in state.pending_jobs.values()
+                    )
+                    and not payload.get("active_submission_intents")
+                ),
+            )
+        except Exception as exc:
+            config_review_status = invalid_config_review_evidence(
+                type(exc).__name__ + ": " + str(exc)
+            )
     except Exception as exc:
         payload["campaign_config_status"] = {
             "ok": False,
             "error": type(exc).__name__ + ": " + str(exc),
         }
+        config_review_status = invalid_config_review_evidence(
+            type(exc).__name__ + ": " + str(exc)
+        )
     try:
         from .daemon.artifact_contracts import (
             artifact_manifest_status,
@@ -7943,6 +8081,9 @@ def cmd_status(args: argparse.Namespace) -> int:
             "errors": [type(exc).__name__ + ": " + str(exc)],
         }
     presentation_payload = dict(payload)
+    presentation_payload["_presentation_config_review"] = dict(
+        config_review_status
+    )
     scheduler_recovery_status = _load_scheduler_recovery_status(
         campaign,
         state,
@@ -8014,6 +8155,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
     )
     payload["next_action"] = payload["recommendations"][0]["primary"]
+    if not bool(getattr(args, "json", False)):
+        payload["_presentation_config_review"] = dict(config_review_status)
     if (
         not bool(getattr(args, "json", False))
         and isinstance(aimall_postprocess_recovery_status, Mapping)
@@ -8404,6 +8547,74 @@ def cmd_resume(args: argparse.Namespace) -> int:
         if lease_status.get("lease_fresh") is True:
             print(
                 "cannot resume while a fresh daemon lease exists",
+                file=sys.stderr,
+            )
+            return 7
+        lifecycle = state.lifecycle_context or {}
+        scheduler_uncertain_halt = bool(
+            state.phase is CampaignPhase.HALTED
+            and isinstance(lifecycle, Mapping)
+            and lifecycle.get("scheduler_uncertain") is True
+        )
+        if (
+            state.phase is CampaignPhase.HALTED
+            and not scheduler_uncertain_halt
+        ):
+            print(
+                "campaign is HALTED; preview reconcile and apply only after "
+                "it reports a safe recovery",
+                file=sys.stderr,
+            )
+            return 6
+        if (
+            state.phase is CampaignPhase.DONE
+            and not bool(getattr(args, "reopen_converged", False))
+        ):
+            print(
+                "campaign is DONE; rerun resume with --reopen-converged "
+                "only after deliberately increasing campaign.max_iterations",
+                file=sys.stderr,
+            )
+            return 6
+        config_path = (
+            Path(args.config).expanduser().resolve()
+            if getattr(args, "config", None)
+            else campaign / "campaign.yaml"
+        )
+        try:
+            resume_config = CampaignConfig.from_yaml(config_path)
+            resume_config_review = assert_config_unchanged_for_start(
+                campaign,
+                resume_config,
+                state,
+            )
+        except Exception as exc:
+            print(
+                "resume precheck could not validate the campaign "
+                "configuration: "
+                + str(exc),
+                file=sys.stderr,
+            )
+            print(
+                "preview reconcile with `"
+                + _campaign_command(campaign, "reconcile")
+                + "` before resuming.",
+                file=sys.stderr,
+            )
+            return 7
+        if resume_config_review.changed:
+            print(
+                "campaign.yaml differs from the campaign configuration lock; "
+                "the stop request and campaign state were left unchanged.",
+                file=sys.stderr,
+            )
+            formatted = format_config_review(resume_config_review)
+            if formatted:
+                print(formatted, file=sys.stderr)
+            print(
+                "preview reconcile with `"
+                + _campaign_command(campaign, "reconcile")
+                + "` and apply only after it reports the change is safe.",
                 file=sys.stderr,
             )
             return 7
@@ -10239,6 +10450,51 @@ def _reconcile_cleanable_reasons(report: Any) -> List[str]:
     return cleanable
 
 
+def _reconcile_campaign_assessment(
+    state: Optional[CampaignState],
+    report: Any,
+) -> Any:
+    intents = list(
+        getattr(report, "active_submission_intents", []) or []
+    )
+    recoveries = [
+        dict(item)
+        for item in (
+            getattr(report, "scheduler_cancellation_recovery", []) or []
+        )
+        if isinstance(item, Mapping)
+    ]
+    payload: Dict[str, Any] = (
+        state.to_dict() if state is not None else {}
+    )
+    payload["active_submission_intents"] = intents
+    if recoveries:
+        payload["_presentation_scheduler_recovery"] = {
+            "state": "awaiting_validation",
+            "phase": (
+                state.phase.value
+                if state is not None
+                else str(recoveries[0].get("phase") or "")
+            ),
+            "iteration": (
+                int(state.iteration)
+                if state is not None
+                else int(recoveries[0].get("iteration") or 0)
+            ),
+            "replacement_round": (
+                int(state.replacement_round)
+                if state is not None
+                else int(recoveries[0].get("replacement_round") or 0)
+            ),
+            "original_job_ids": [
+                str(item.get("job_id"))
+                for item in recoveries
+                if item.get("job_id")
+            ],
+        }
+    return assess_campaign_presentation(payload)
+
+
 def _reconcile_hard_blockers(
     report: Any,
     contract_status: Optional[Dict[str, Any]] = None,
@@ -10282,7 +10538,11 @@ def _reconcile_hard_blockers(
         if text in cleanable_blocking_artifacts:
             continue
         blockers.append(text)
-    if getattr(report, "active_submission_intents", []):
+    scheduler = _reconcile_campaign_assessment(
+        getattr(report, "proposed_state", None),
+        report,
+    ).scheduler
+    if scheduler.scheduler_intents or scheduler.local_intents:
         blockers.append("active submission intent(s) present")
     if contract_status is not None:
         phase = str(contract_status.get("selected_phase") or "")
@@ -10834,25 +11094,15 @@ def _reconcile_active_work(
     if runtime_blockers:
         return "campaign ownership is active or cannot be confirmed safely"
     intents = list(getattr(report, "active_submission_intents", []) or [])
+    scheduler = _reconcile_campaign_assessment(current, report).scheduler
     scheduler_jobs = {
+        job_id for _phase, job_id in scheduler.pending_jobs
+    }
+    scheduler_jobs.update(
         str(item.get("job_id"))
-        for item in intents
-        if isinstance(item, Mapping) and item.get("job_id")
-    }
-    terminal_recovery_jobs = {
-        str(item.get("job_id") or "")
-        for item in (
-            getattr(report, "scheduler_cancellation_recovery", []) or []
-        )
-        if isinstance(item, Mapping) and item.get("job_id")
-    }
-    if current is not None:
-        scheduler_jobs.update(
-            str(job_id)
-            for job_id in (current.pending_jobs or {}).values()
-            if job_id and str(job_id) not in terminal_recovery_jobs
-        )
-    scheduler_jobs.difference_update(terminal_recovery_jobs)
+        for item in scheduler.scheduler_intents
+        if item.get("job_id")
+    )
     if scheduler_jobs:
         count = len(scheduler_jobs)
         return (
@@ -11165,6 +11415,7 @@ def _reconcile_presentation(
         isinstance(partial, Mapping)
         and partial
         and not isinstance(aimall_postprocess, Mapping)
+        and not scheduler_cancellation
     ):
         reuse = int(partial.get("n_reuse") or partial.get("n_complete") or 0)
         retry = int(partial.get("n_retry") or 0)
@@ -11247,6 +11498,26 @@ def _reconcile_presentation(
         )
         reason_parts.append("campaign state needs recovery")
 
+    scheduler_resume_only = bool(
+        scheduler_cancellation
+        and not blockers
+        and current is not None
+        and current.phase is proposed.phase
+        and int(current.iteration) == int(proposed.iteration)
+        and int(current.replacement_round) == int(proposed.replacement_round)
+        and not cleanup_rows
+        and not allowed_changes
+        and not blocked_changes
+        and not isinstance(transaction_recovery, Mapping)
+        and not (
+            isinstance(revalidation, Mapping)
+            and revalidation.get("eligible") is True
+        )
+        and not isinstance(aimall_postprocess, Mapping)
+        and not isinstance(ariadne, Mapping)
+        and not ordinary_repairs
+        and not isinstance(candidate, Mapping)
+    )
     has_changes = bool(planned)
     if blockers:
         result = "blocked"
@@ -11254,6 +11525,12 @@ def _reconcile_presentation(
     elif proposed.phase is CampaignPhase.DONE:
         result = "no recovery needed"
         reason = "the completed campaign and its committed data are coherent"
+    elif scheduler_resume_only:
+        result = "no reconcile changes needed"
+        reason = (
+            "terminal scheduler evidence is coherent and resume can validate "
+            "completed outputs and prepare retry work directly"
+        )
     elif has_changes:
         result = "ready to apply"
         reason = _reconcile_join_phrases(reason_parts)
@@ -11344,7 +11621,26 @@ def _reconcile_presentation(
     elif result == "no reconcile changes needed":
         next_label = "run"
         next_command = _campaign_command(campaign, "resume")
-        if (
+        if scheduler_resume_only:
+            completed = sum(
+                int(item.get("n_completed") or 0)
+                for item in scheduler_cancellation
+            )
+            retry = sum(
+                int(item.get("n_retry") or 0)
+                for item in scheduler_cancellation
+            )
+            next_effect = (
+                "validate "
+                + str(completed)
+                + " scheduler-completed output"
+                + ("" if completed == 1 else "s")
+                + " locally and retry "
+                + str(retry)
+                + " unfinished task"
+                + ("" if retry == 1 else "s")
+            )
+        elif (
             isinstance(allocation_transition, Mapping)
             and str(allocation_transition.get("replacement_sample_state") or "")
             in {"missing_rebuildable", "partial_rebuildable"}
@@ -15562,7 +15858,10 @@ def _preflight_reports_intentional_pause(payload: Mapping[str, Any]) -> bool:
     state = payload.get("campaign_state")
     if not isinstance(state, Mapping):
         return False
-    return "campaign is intentionally paused" in str(state.get("error") or "")
+    return bool(
+        str(state.get("condition") or "") == "paused"
+        or "campaign is intentionally paused" in str(state.get("error") or "")
+    )
 
 
 def _preflight_failure_details(payload: Dict[str, Any]) -> List[str]:
@@ -15635,13 +15934,27 @@ def _preflight_failure_details(payload: Dict[str, Any]) -> List[str]:
         )
     state = payload.get("campaign_state")
     if isinstance(state, dict) and not bool(state.get("ok", False)):
-        if _preflight_reports_intentional_pause(payload):
+        condition = str(state.get("condition") or "")
+        issues = [
+            str(item)
+            for item in (state.get("issues") or [])
+            if str(item).strip()
+        ]
+        if (
+            not condition
+            and _preflight_reports_intentional_pause(payload)
+        ):
             details.append(
-                "resume the campaign to clear the completed stop"
+                str(
+                    payload.get("next_action")
+                    or "resume the campaign to clear the completed stop"
+                )
             )
+        elif condition in {"paused", "reconcile_required", "complete"}:
+            details.extend(issues)
         else:
             details.append(
-                "fix campaign state readiness: "
+                "campaign launch state: "
                 + str(
                     state.get("error")
                     or state.get("phase")
@@ -15671,12 +15984,44 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
     if not isinstance(state, dict):
         state = {}
 
+    environment_ready = bool(
+        payload.get("all_backends_present", False)
+        and config.get("ok") is True
+        and pool.get("ok") is True
+    )
+    submitted_smoke = payload.get("submitted_environment_smoke")
+    if isinstance(submitted_smoke, Mapping):
+        environment_ready = environment_ready and bool(
+            submitted_smoke.get("ok", False)
+        )
+    condition = str(state.get("condition") or "")
+    launch_labels = {
+        "ready": "ready",
+        "paused": "paused",
+        "reconcile_required": "reconcile required",
+        "halted": "halted",
+        "complete": "campaign complete",
+        "missing": "not initialised",
+        "unreadable": "state unreadable",
+        "blocked": "blocked",
+    }
     lines: List[str] = []
     lines.extend(
         _section(
             "Preflight",
             [
                 ("result", "ready" if payload.get("ready") else "blocked"),
+                (
+                    "environment readiness",
+                    "ready" if environment_ready else "blocked",
+                ),
+                (
+                    "campaign launch",
+                    launch_labels.get(
+                        condition,
+                        "ready" if state.get("ok") else "blocked",
+                    ),
+                ),
                 ("active profile", avail.get("active_profile") or "<unresolved>"),
                 ("campaign", payload.get("campaign_dir")),
             ],
@@ -15824,19 +16169,36 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
     lines.append("")
     lines.append("Campaign State")
     intentionally_paused = _preflight_reports_intentional_pause(payload)
+    state_warn = bool(
+        condition in {
+            "paused",
+            "reconcile_required",
+            "complete",
+        }
+        or intentionally_paused
+    )
+    state_detail = state.get("error")
+    if not state_detail and state.get("phase") is not None:
+        state_detail = (
+            str(state.get("phase"))
+            + " iteration "
+            + str(state.get("iteration"))
+        )
     lines.append(
         _preflight_check_line(
             "campaign pause" if intentionally_paused else "runnable state",
             state.get("ok"),
-            state.get("error")
-            or (
-                str(state.get("phase"))
-                + " iteration "
-                + str(state.get("iteration"))
-            ),
-            warn=intentionally_paused,
+            state_detail or "state is not runnable",
+            warn=state_warn,
         )
     )
+    issues = [
+        str(item)
+        for item in (state.get("issues") or [])
+        if str(item).strip()
+    ]
+    for issue in issues[1:] if state.get("error") else issues:
+        lines.append("  - " + issue)
     if state.get("contract_error"):
         lines.append("  contract error: " + str(state.get("contract_error")))
 
@@ -15910,85 +16272,172 @@ def _preflight_launch_advice(
     campaign: Path,
     payload: Dict[str, Any],
 ) -> Tuple[str, Optional[str]]:
-    if not bool(payload.get("ready", False)):
-        if _preflight_reports_intentional_pause(payload):
-            return (
-                "resume the campaign to clear the completed stop",
-                _campaign_command(campaign, "resume"),
-            )
-        return "fix failed checks before live start", None
+    has_environment_evidence = any(
+        key in payload
+        for key in (
+            "all_backends_present",
+            "campaign_config",
+            "pool_feasibility",
+            "submitted_environment_smoke",
+        )
+    )
+    if (
+        not has_environment_evidence
+        and _preflight_reports_intentional_pause(payload)
+    ):
+        return (
+            "resume the campaign to clear the completed stop",
+            _campaign_command(campaign, "resume"),
+        )
+    environment_ready = bool(
+        payload.get("all_backends_present", False)
+        and isinstance(payload.get("campaign_config"), Mapping)
+        and payload["campaign_config"].get("ok") is True
+        and isinstance(payload.get("pool_feasibility"), Mapping)
+        and payload["pool_feasibility"].get("ok") is True
+    )
+    submitted_smoke = payload.get("submitted_environment_smoke")
+    if isinstance(submitted_smoke, Mapping):
+        environment_ready = environment_ready and bool(
+            submitted_smoke.get("ok", False)
+        )
+
+    state = payload.get("_presentation_state")
+    state_summary = payload.get("campaign_state")
+    if not isinstance(state, CampaignState):
+        if not environment_ready:
+            return "fix failed checks before live start", None
+        condition = (
+            str(state_summary.get("condition") or "")
+            if isinstance(state_summary, Mapping)
+            else ""
+        )
+        if condition == "missing":
+            missing = _missing_state_context(campaign)
+            if bool(missing.get("fresh_init_safe", False)):
+                return (
+                    "initialise the campaign before live start",
+                    _campaign_command(campaign, "init"),
+                )
+        return (
+            "preview recovery before attempting a live start",
+            _campaign_command(campaign, "reconcile"),
+        )
+
     paths = _campaign_paths(campaign)
+    status_payload = state.to_dict()
+    status_payload["campaign_config_status"] = dict(
+        payload.get("campaign_config") or {}
+    )
+    status_payload["pool_feasibility"] = dict(
+        payload.get("pool_feasibility") or {}
+    )
+    status_payload["_presentation_config_review"] = dict(
+        payload.get("_presentation_config_review") or {}
+    )
+    contract = payload.get("_presentation_artifact_contract")
+    if isinstance(contract, Mapping):
+        status_payload["state_artifact_contract_status"] = dict(contract)
+    stop = payload.get("_presentation_stop")
+    if isinstance(stop, Mapping):
+        status_payload.update(dict(stop))
+
     lock = _probe_daemon_lock(paths["lock"])
+    status_payload.update(lock)
     stale_seconds, clock_skew = _runtime_liveness_policy(campaign)
     lease = _probe_daemon_lease(
         paths["lease"],
         stale_seconds=stale_seconds,
         clock_skew_tolerance_seconds=clock_skew,
     )
+    status_payload.update(lease)
     background = _probe_background_daemon(
         paths["background_pid"],
         paths["background_log"],
         paths["background_startup"],
     )
-    daemon_active = bool(
-        lock.get("lock_held") is True
-        or background.get("background_pid_alive") is True
-        or _lease_is_fresh(
-            lease.get("lease_heartbeat"),
-            stale_seconds=stale_seconds,
-            clock_skew_tolerance_seconds=clock_skew,
-        )
-    )
-    status_command = _campaign_command(campaign, "status")
-    if daemon_active:
-        return "monitor the running campaign", status_command
-
-    state = None
+    status_payload.update(background)
     try:
-        state = read_state(paths["state"])
-    except Exception:
-        pass
-    intents: List[Dict[str, Any]] = []
-    if state is not None:
-        try:
-            intents = _load_active_submission_intents(
+        status_payload["active_submission_intents"] = (
+            _load_active_submission_intents(
                 campaign,
                 expected_campaign_uid=str(state.campaign_uid),
                 state=state,
             )
-        except Exception:
-            intents = []
-        if any(job_id for job_id in state.pending_jobs.values()) or any(
-            intent.get("job_id") for intent in intents
-        ):
-            return (
-                "resume the daemon to monitor recorded "
-                + _scheduler_display_name(intents=intents)
-                + " work",
-                _campaign_command(campaign, "resume"),
-            )
-        if intents:
-            return (
-                "resume the daemon to continue prepared local work",
-                _campaign_command(campaign, "resume"),
-            )
-
+        )
+    except Exception as exc:
+        status_payload["submission_intent_errors"] = [
+            {
+                "path": "",
+                "error": type(exc).__name__ + ": " + str(exc),
+            }
+        ]
+    scheduler_recovery = _load_scheduler_recovery_status(campaign, state)
+    if scheduler_recovery is not None:
+        status_payload["_presentation_scheduler_recovery"] = (
+            scheduler_recovery
+        )
     try:
-        from .execution_identity import execution_identity_path
+        transaction = inspect_reconcile_transaction_recovery(
+            campaign,
+            artifact_snapshot=None,
+        )
+        if isinstance(transaction, Mapping) and str(
+            transaction.get("state") or ""
+        ) != "none":
+            status_payload[
+                "_presentation_reconcile_transaction_recovery"
+            ] = dict(transaction)
+    except Exception as exc:
+        status_payload[
+            "_presentation_reconcile_transaction_recovery"
+        ] = {
+            "state": "blocked",
+            "recoverable": False,
+            "reason": type(exc).__name__ + ": " + str(exc),
+        }
+    status_payload["_presentation_execution_identity_checked"] = True
+    try:
+        from .execution_identity import (
+            execution_identity_path,
+            read_execution_identity,
+        )
 
         if execution_identity_path(campaign).is_file():
-            return (
-                "resume the existing campaign",
-                _campaign_command(campaign, "resume"),
+            identity = read_execution_identity(
+                campaign,
+                expected_campaign_uid=str(state.campaign_uid),
             )
-    except OSError:
-        return (
-            "preview campaign recovery before starting",
-            _campaign_command(campaign, "reconcile"),
+            status_payload["_presentation_execution_mode"] = str(
+                identity["mode"]
+            )
+    except Exception as exc:
+        status_payload["_presentation_execution_identity_error"] = (
+            type(exc).__name__ + ": " + str(exc)
         )
+
+    recommendations = build_status_recommendations(
+        campaign,
+        status_payload,
+        paths["journal"],
+    )
+    if recommendations:
+        first = recommendations[0]
+        if _status_daemon_active(status_payload):
+            return first.primary, first.command
+        if first.code in {
+            "runtime_probe_failed",
+            "campaign_done",
+            "campaign_config_invalid",
+            "pool_feasibility_failed",
+        } or "reconcile" in str(first.command or ""):
+            return first.primary, first.command
+        if not environment_ready:
+            return "fix failed checks before live start", None
+        return first.primary, first.command
     return (
-        "start the campaign in live mode",
-        _campaign_command(campaign, "start", " --mode live"),
+        "inspect campaign status before live start",
+        _campaign_command(campaign, "status"),
     )
 
 
@@ -16123,80 +16572,195 @@ def evaluate_campaign_preflight(
                 "error": type(exc).__name__ + ": " + str(exc),
             }
 
+    presentation_state: Optional[CampaignState] = None
+    presentation_contract: Optional[Dict[str, Any]] = None
+    presentation_stop: Dict[str, Any] = {}
+    presentation_config_review: Dict[str, Any] = {
+        "state": "unavailable",
+        "n_allowed": 0,
+        "n_blocked": 0,
+    }
     state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
     if not state_path.is_file():
         state_summary = {
             "ok": False,
+            "condition": "missing",
             "error": "state.json is missing; initialise the campaign before live start",
+            "issues": [
+                "state.json is missing; initialise the campaign before live start"
+            ],
         }
     else:
         try:
             state = read_state(state_path)
-            if state.phase is CampaignPhase.HALTED:
-                raise ValueError("campaign is HALTED and requires reconcile")
-            if state.phase is CampaignPhase.DONE:
-                raise ValueError("campaign is DONE")
-            if state.shutdown_requested:
-                if _is_intentionally_stopped_state(state):
-                    raise ValueError(
-                        "campaign is intentionally paused; resume clears the "
-                        "completed stop"
-                    )
-                raise ValueError("campaign has an invalid shutdown request")
-            from .daemon.artifact_contracts import state_artifact_contract_status
-
-            preflight_snapshot = build_committed_artifact_snapshot(
-                campaign,
-                verification_level="authority",
-            )
-            contract = state_artifact_contract_status(
-                campaign,
-                state,
-                verification="authority",
-                snapshot=preflight_snapshot,
-            )
-            if not bool(contract.get("ok", False)):
-                raise ValueError(str(contract.get("error") or "artefact contract invalid"))
-            if loaded_config is not None:
-                review = review_config_changes(
-                    campaign,
-                    loaded_config,
-                    state,
-                    initialise_missing=False,
-                )
-                if review.changed:
-                    raise ValueError("campaign config differs from its lock")
-                if bool(loaded_config.retention.checkpoint_required):
-                    from .daemon.checkpoints import checkpoint_store
-
-                    store = checkpoint_store(
-                        str(loaded_config.retention.checkpoint_destination),
-                        str(state.campaign_uid),
-                    )
-                    if (store / "current.json").exists():
-                        from .daemon.checkpoints import checkpoint_authority_status
-
-                        checkpoint_authority_status(
-                            campaign,
-                            str(loaded_config.retention.checkpoint_destination),
-                        )
-            state_summary = {
-                "ok": True,
-                "phase": state.phase.value,
-                "iteration": int(state.iteration),
-            }
         except Exception as exc:
             state_summary = {
                 "ok": False,
+                "condition": "unreadable",
                 "error": type(exc).__name__ + ": " + str(exc),
+                "issues": [type(exc).__name__ + ": " + str(exc)],
             }
-    return _preflight_payload(
+        else:
+            presentation_state = state
+            issues: List[str] = []
+            condition = "ready"
+            if state.phase is CampaignPhase.HALTED:
+                condition = "halted"
+                issues.append("campaign is HALTED and requires reconcile")
+            elif state.phase is CampaignPhase.DONE:
+                condition = "complete"
+                issues.append("campaign is DONE; no live launch is required")
+
+            try:
+                presentation_stop = _stop_control_status(campaign)
+            except Exception as exc:
+                presentation_stop = {
+                    "stop_control_error": type(exc).__name__ + ": " + str(exc)
+                }
+            stop_request = presentation_stop.get("stop_request")
+            stop_error = presentation_stop.get("stop_control_error")
+            if stop_error:
+                condition = "blocked"
+                issues.append("user stop control could not be validated")
+            elif isinstance(stop_request, Mapping):
+                if condition == "ready":
+                    condition = "paused"
+                issues.append("campaign has a user stop request")
+            elif state.shutdown_requested:
+                if _is_intentionally_stopped_state(state):
+                    if condition == "ready":
+                        condition = "paused"
+                    issues.append(
+                        "campaign is intentionally paused; resume clears the "
+                        "completed stop"
+                    )
+                else:
+                    condition = "blocked"
+                    issues.append("campaign has an invalid shutdown request")
+
+            try:
+                from .daemon.artifact_contracts import (
+                    state_artifact_contract_status,
+                )
+
+                preflight_snapshot = build_committed_artifact_snapshot(
+                    campaign,
+                    verification_level="authority",
+                )
+                presentation_contract = state_artifact_contract_status(
+                    campaign,
+                    state,
+                    verification="authority",
+                    snapshot=preflight_snapshot,
+                )
+                if not bool(presentation_contract.get("ok", False)):
+                    condition = "blocked"
+                    issues.append(
+                        str(
+                            presentation_contract.get("error")
+                            or "artefact contract invalid"
+                        )
+                    )
+            except Exception as exc:
+                presentation_contract = {
+                    "ok": False,
+                    "error": type(exc).__name__ + ": " + str(exc),
+                }
+                condition = "blocked"
+                issues.append(
+                    "committed artefact authority could not be validated"
+                )
+
+            if loaded_config is not None:
+                try:
+                    review = review_config_changes(
+                        campaign,
+                        loaded_config,
+                        state,
+                        initialise_missing=False,
+                    )
+                    presentation_config_review = config_review_evidence(
+                        review,
+                        allow_unbound=(
+                            state.phase is CampaignPhase.INIT
+                            and not any(
+                                job_id
+                                for job_id in state.pending_jobs.values()
+                            )
+                        ),
+                    )
+                    if review.blocked_changes:
+                        condition = "blocked"
+                        issues.append(
+                            "campaign configuration contains blocked changes"
+                        )
+                    elif review.allowed_changes:
+                        if condition in {"ready", "paused", "complete"}:
+                            condition = "reconcile_required"
+                        issues.append(
+                            "campaign configuration differs from its lock"
+                        )
+                except Exception as exc:
+                    presentation_config_review = (
+                        invalid_config_review_evidence(
+                            type(exc).__name__ + ": " + str(exc)
+                        )
+                    )
+                    condition = "blocked"
+                    issues.append(
+                        "campaign configuration could not be compared with its lock"
+                    )
+
+                if bool(loaded_config.retention.checkpoint_required):
+                    try:
+                        from .daemon.checkpoints import checkpoint_store
+
+                        store = checkpoint_store(
+                            str(
+                                loaded_config.retention.checkpoint_destination
+                            ),
+                            str(state.campaign_uid),
+                        )
+                        if (store / "current.json").exists():
+                            from .daemon.checkpoints import (
+                                checkpoint_authority_status,
+                            )
+
+                            checkpoint_authority_status(
+                                campaign,
+                                str(
+                                    loaded_config.retention.checkpoint_destination
+                                ),
+                            )
+                    except Exception as exc:
+                        condition = "blocked"
+                        issues.append(
+                            "required checkpoint authority is invalid: "
+                            + str(exc)
+                        )
+
+            state_summary = {
+                "ok": not issues,
+                "condition": condition,
+                "phase": state.phase.value,
+                "iteration": int(state.iteration),
+                "issues": issues,
+            }
+            if issues:
+                state_summary["error"] = issues[0]
+
+    payload = _preflight_payload(
         campaign,
         availability,
         config_summary,
         feasibility_summary,
         state_summary,
     )
+    payload["_presentation_state"] = presentation_state
+    payload["_presentation_artifact_contract"] = presentation_contract
+    payload["_presentation_stop"] = presentation_stop
+    payload["_presentation_config_review"] = presentation_config_review
+    return payload
 
 
 def cmd_preflight(args: argparse.Namespace) -> int:
@@ -16237,7 +16801,19 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     next_action, next_command = _preflight_launch_advice(campaign, payload)
     payload["next_action"] = next_action
     if bool(getattr(args, "json", False)):
-        print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
+        machine_payload = {
+            key: value
+            for key, value in payload.items()
+            if not str(key).startswith("_presentation_")
+        }
+        print(
+            json.dumps(
+                machine_payload,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+        )
     else:
         presentation_payload = dict(payload)
         presentation_payload["_presentation_next_command"] = next_command

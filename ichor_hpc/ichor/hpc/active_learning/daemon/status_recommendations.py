@@ -14,6 +14,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from .state import CampaignPhase
 from .lease import evaluate_lease_liveness
+from .presentation_assessment import assess_campaign_presentation
 
 
 @dataclass
@@ -102,21 +103,15 @@ def _lease_is_fresh(payload: Dict[str, Any]) -> bool:
 
 
 def _active_pending_jobs(payload: Dict[str, Any]) -> Dict[str, str]:
-    pending = payload.get("pending_jobs")
-    if not isinstance(pending, dict):
-        return {}
-    return {
-        str(phase): str(job_id)
-        for phase, job_id in pending.items()
-        if job_id not in (None, "", False)
-    }
+    return dict(assess_campaign_presentation(payload).scheduler.pending_jobs)
 
 
 def _active_submission_intents(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    intents = payload.get("active_submission_intents")
-    if not isinstance(intents, list):
-        return []
-    return [item for item in intents if isinstance(item, dict)]
+    scheduler = assess_campaign_presentation(payload).scheduler
+    return [
+        dict(item)
+        for item in scheduler.scheduler_intents + scheduler.local_intents
+    ]
 
 
 def _scheduler_name(payload: Dict[str, Any]) -> str:
@@ -352,6 +347,166 @@ def _reconcile_transaction_recommendation(
             command=_reconcile_cmd(campaign),
         )
     return None
+
+
+def _config_review_recommendation(
+    campaign: Path,
+    payload: Dict[str, Any],
+) -> Optional[StatusRecommendation]:
+    assessment = assess_campaign_presentation(payload)
+    count = assessment.config_allowed_count + assessment.config_blocked_count
+    if (
+        assessment.config_state in {"allowed", "blocked"}
+        and _daemon_is_active(payload)
+    ):
+        return StatusRecommendation(
+            code="config_change_pending_running",
+            severity="watch",
+            primary=(
+                "the daemon is still using its locked configuration; "
+                "review the on-disk change after it stops"
+            ),
+            why=(
+                str(count)
+                + " configuration setting"
+                + ("" if count == 1 else "s")
+                + " differ on disk and do not affect the running process"
+            ),
+            command=_journal_cmd(campaign) + " --last-n 40",
+            details=[
+                "after the daemon stops, run " + _reconcile_cmd(campaign)
+            ],
+        )
+    if assessment.config_state == "allowed":
+        return StatusRecommendation(
+            code="config_change_reconcile_required",
+            severity="required",
+            primary="preview and apply the pending configuration change before resuming",
+            why=(
+                str(count)
+                + " configuration setting"
+                + ("" if count == 1 else "s")
+                + " differ from the campaign lock"
+            ),
+            command=_reconcile_cmd(campaign),
+        )
+    if assessment.config_state == "blocked":
+        return StatusRecommendation(
+            code="config_change_blocked",
+            severity="blocked",
+            primary="review or revert the blocked configuration change before continuing",
+            why=(
+                str(assessment.config_blocked_count)
+                + " configuration setting"
+                + ("" if assessment.config_blocked_count == 1 else "s")
+                + " cannot be changed at the current campaign position"
+            ),
+            command=_reconcile_cmd(campaign),
+        )
+    if assessment.config_state == "invalid":
+        return StatusRecommendation(
+            code="config_lock_review_failed",
+            severity="blocked",
+            primary="inspect the campaign configuration and its lock before continuing",
+            why=(
+                _short_error(assessment.config_error)
+                or "the configuration-lock comparison could not be completed"
+            ),
+            command=_reconcile_cmd(campaign),
+        )
+    return None
+
+
+def _scheduler_recovery_recommendation(
+    campaign: Path,
+    payload: Dict[str, Any],
+) -> Optional[StatusRecommendation]:
+    assessment = assess_campaign_presentation(payload)
+    scheduler = assessment.scheduler
+    if scheduler.recovery_state == "invalid":
+        recovery = payload.get("_presentation_scheduler_recovery")
+        return StatusRecommendation(
+            code="scheduler_recovery_invalid",
+            severity="blocked",
+            primary="preview recovery and inspect the invalid scheduler evidence",
+            why=_short_error(
+                recovery.get("error")
+                if isinstance(recovery, dict)
+                else "scheduler recovery evidence is malformed"
+            ),
+            command=_reconcile_cmd(campaign),
+        )
+    if (
+        not scheduler.has_terminal_recovery
+        or scheduler.has_unresolved_scheduler_work
+        or scheduler.has_local_work
+    ):
+        return None
+    if scheduler.recovery_state == "validated":
+        primary = (
+            "resume the campaign to continue with "
+            + str(scheduler.reusable_outputs)
+            + " validated output"
+            + ("" if scheduler.reusable_outputs == 1 else "s")
+            + " and "
+            + str(scheduler.retry_tasks)
+            + " retry task"
+            + ("" if scheduler.retry_tasks == 1 else "s")
+        )
+    else:
+        primary = (
+            "resume the campaign to validate "
+            + str(scheduler.completed_candidates)
+            + " scheduler-completed output"
+            + ("" if scheduler.completed_candidates == 1 else "s")
+            + " and retry unfinished work"
+        )
+    return StatusRecommendation(
+        code="scheduler_terminal_recovery_resume",
+        severity="required",
+        primary=primary,
+        why=(
+            "authenticated terminal scheduler evidence proves the old job is "
+            "no longer active"
+        ),
+        command=_resume_cmd(campaign),
+    )
+
+
+def _background_startup_failure_recommendation(
+    campaign: Path,
+    payload: Dict[str, Any],
+) -> Optional[StatusRecommendation]:
+    if _daemon_is_active(payload) or str(
+        payload.get("background_startup_state") or ""
+    ) != "failed":
+        return None
+    stage = str(payload.get("background_startup_stage") or "startup")
+    failure = _short_error(payload.get("background_startup_failure"))
+    if stage in {"environment_transition", "config_lock"}:
+        primary = "preview recovery before retrying the failed daemon startup"
+        command = _reconcile_cmd(campaign)
+    elif stage in {
+        "campaign_validation",
+        "backend_preflight",
+        "environment_preflight",
+    }:
+        primary = "run preflight and fix the failed startup check"
+        command = _cmd(campaign, "preflight")
+    else:
+        primary = "review the failed startup details before trying again"
+        command = _journal_cmd(campaign) + " --last-n 40"
+    return StatusRecommendation(
+        code="background_startup_failed",
+        severity="required",
+        primary=primary,
+        why=(
+            "background startup stopped during "
+            + stage.replace("_", " ")
+            + (": " + failure if failure else "")
+        ),
+        command=command,
+    )
 
 
 def _daemon_running_recommendation(
@@ -993,6 +1148,24 @@ def build_status_recommendations(
         ]
     config_status = payload.get("campaign_config_status")
     if isinstance(config_status, dict) and config_status.get("ok") is False:
+        if _daemon_is_active(payload):
+            return [
+                StatusRecommendation(
+                    code="config_change_pending_running",
+                    severity="watch",
+                    primary=(
+                        "the daemon is still using its locked configuration; "
+                        "repair campaign.yaml before the next start"
+                    ),
+                    why=_short_error(config_status.get("error")),
+                    command=_journal_cmd(campaign) + " --last-n 40",
+                    details=[
+                        "after the daemon stops, run "
+                        + _cmd(campaign, "config-check")
+                        + " --human"
+                    ],
+                )
+            ]
         return [
             StatusRecommendation(
                 code="campaign_config_invalid",
@@ -1057,6 +1230,11 @@ def build_status_recommendations(
         isinstance(feasibility, dict)
         and feasibility.get("ok") is False
         and "FileNotFoundError" not in feasibility_error
+        and not (
+            _daemon_is_active(payload)
+            and assess_campaign_presentation(payload).config_state
+            in {"allowed", "blocked", "invalid"}
+        )
     ):
         return [
             StatusRecommendation(
@@ -1136,6 +1314,27 @@ def build_status_recommendations(
     )
     if allocation_transition is not None:
         return [allocation_transition] + stale_pid
+
+    if _state_contract_problem(payload):
+        return [_contract_recommendation(campaign, payload)] + stale_pid
+
+    if _artifact_problem(payload):
+        return [_artifact_recommendation(campaign, payload)] + stale_pid
+
+    config_review = _config_review_recommendation(campaign, payload)
+    if config_review is not None:
+        return [config_review] + stale_pid
+
+    scheduler_recovery = _scheduler_recovery_recommendation(campaign, payload)
+    if scheduler_recovery is not None:
+        return [scheduler_recovery] + stale_pid
+
+    startup_failure = _background_startup_failure_recommendation(
+        campaign,
+        payload,
+    )
+    if startup_failure is not None:
+        return [startup_failure] + stale_pid
 
     stop_request = payload.get("stop_request")
     if isinstance(stop_request, dict) and not payload.get("shutdown_requested"):
@@ -1241,12 +1440,6 @@ def build_status_recommendations(
                 ),
             )
         ] + stale_pid
-
-    if _state_contract_problem(payload):
-        return [_contract_recommendation(campaign, payload)] + stale_pid
-
-    if _artifact_problem(payload):
-        return [_artifact_recommendation(campaign, payload)] + stale_pid
 
     daemon_running = _daemon_running_recommendation(campaign, payload)
     if daemon_running is not None:

@@ -913,8 +913,8 @@ def test_cli_preflight_ready_campaign_with_active_daemon_recommends_monitoring(
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "monitor the running campaign" in out
-    assert "ichor-al-daemon status --campaign-dir" in out
+    assert "the daemon is running; monitor it instead of starting another" in out
+    assert "ichor-al-daemon journal --campaign-dir" in out
     assert "start --campaign-dir" not in out
 
 
@@ -1348,7 +1348,7 @@ def test_cli_status_default_summarises_active_submission_intents(tmp_path, capsy
     data = campaign / DEFAULT_DATA_SUBDIR
     data.mkdir(parents=True, exist_ok=True)
     s = fresh_campaign_state(max_iterations=5)
-    write_state(data / DEFAULT_STATE_FILENAME, s)
+    _write_locked_state(campaign, s)
     submission_intent.write_pre_submit_intent(
         campaign,
         campaign_uid=s.campaign_uid,
@@ -2953,9 +2953,7 @@ def test_cli_status_reports_pending_stop_request(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["stop_request"]["mode"] == "after_iteration"
     assert payload["stop_request"]["target_iteration"] == 1
-    assert payload["next_action"] == (
-        "resume the daemon so it can honour the pending stop boundary"
-    )
+    assert payload["next_action"].startswith("run reconcile;")
 
     assert main(["status", "--campaign-dir", str(campaign)]) == 0
     out = capsys.readouterr().out
@@ -3387,9 +3385,19 @@ def test_cli_stop_when_no_state_returns_4(tmp_path):
         ({"event": "sacct_error_timeout"}, "FAIL"),
         ({"event": "campaign_completed"}, "OK"),
         ({"event": "phase_completion_replayed"}, "WARN"),
+        ({"event": "user_stop_request_cancelled"}, "OK"),
         ({"event": "user_cancelled_jobs", "n_failed": 1}, "FAIL"),
         ({"event": "user_cancelled_jobs", "n_skipped": 1}, "WARN"),
         ({"event": "user_cancelled_jobs", "n_cancelled": 2}, "OK"),
+        (
+            {
+                "event": "queue_lifecycle_update",
+                "queue_event": "terminal",
+                "status": "CANCELLED",
+                "user_requested_cancellation": True,
+            },
+            "OK",
+        ),
     ],
 )
 def test_journal_event_severity_uses_event_semantics(event, expected):
@@ -3423,6 +3431,15 @@ def test_journal_event_severity_uses_event_semantics(event, expected):
             },
             "local postprocessing failed",
         ),
+        (
+            {
+                "event": "queue_lifecycle_update",
+                "queue_event": "terminal",
+                "status": "CANCELLED",
+                "user_requested_cancellation": True,
+            },
+            "Slurm work cancelled as requested",
+        ),
     ],
 )
 def test_journal_queue_lifecycle_names_scheduler_and_local_work_separately(
@@ -3430,6 +3447,28 @@ def test_journal_queue_lifecycle_names_scheduler_and_local_work_separately(
     expected,
 ):
     assert cli_mod._journal_operator_summary(event) == expected
+
+
+def test_journal_uses_plain_config_and_stop_lifecycle_labels():
+    assert (
+        cli_mod.JOURNAL_EVENT_LABELS["effective_config_diff"]
+        == "effective configuration recorded"
+    )
+    assert (
+        cli_mod.JOURNAL_EVENT_LABELS["user_stop_resumed"]
+        == "stop cleared for resume"
+    )
+
+
+def test_journal_reconcile_summary_includes_applied_config_changes():
+    summary = cli_mod._journal_operator_summary(
+        {
+            "event": "reconcile_applied",
+            "n_allowed_config_changes": 6,
+        }
+    )
+
+    assert summary == "reconcile applied; 6 configuration changes applied"
 
 
 def test_journal_reconcile_summary_reports_ariadne_reuse_without_resubmission():
@@ -4714,6 +4753,71 @@ def test_cli_resume_refuses_halted_state(tmp_path, capsys):
     assert "campaign is HALTED" in capsys.readouterr().err
 
 
+def test_cli_resume_config_drift_preserves_stop_and_state(tmp_path, capsys):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=2)
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 1
+    state.shutdown_requested = True
+    state.lifecycle_context = make_lifecycle_context(
+        disposition="stopped",
+        reason_code="user_stop_immediate",
+        message="campaign stopped by user request",
+        from_phase=CampaignPhase.SEED_SELECT,
+        iteration=1,
+        source="stop_control",
+    )
+    _write_locked_state(campaign, state)
+    request, _status = install_stop_request(
+        campaign,
+        build_stop_request(state, mode="immediate"),
+    )
+    config_payload = CampaignConfig.from_yaml(
+        campaign / "campaign.yaml"
+    ).to_dict()
+    config_payload["resources"]["defaults"]["partition"] = (
+        "changed-partition"
+    )
+    CampaignConfig.from_dict(config_payload).to_yaml(
+        campaign / "campaign.yaml"
+    )
+    state_path = (
+        campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+    )
+    request_path = stop_request_path(campaign)
+    before_state = state_path.read_bytes()
+    before_request = request_path.read_bytes()
+
+    rc = main(
+        [
+            "resume",
+            "--campaign-dir",
+            str(campaign),
+            "--mode",
+            "dry_run",
+            "--foreground",
+            "--max-ticks",
+            "0",
+        ]
+    )
+
+    assert rc == 7
+    assert state_path.read_bytes() == before_state
+    assert request_path.read_bytes() == before_request
+    assert read_stop_request(
+        campaign,
+        expected_campaign_uid=str(state.campaign_uid),
+    )["request_id"] == request["request_id"]
+    journal = campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson"
+    assert not journal.exists() or not any(
+        event.get("event") == "user_stop_resumed"
+        for event in iter_events(journal)
+    )
+    error = capsys.readouterr().err
+    assert "stop request and campaign state were left unchanged" in error
+    assert "preview reconcile" in error
+
+
 def test_cli_resume_repolls_matching_scheduler_uncertain_job(
     tmp_path,
     monkeypatch,
@@ -5383,3 +5487,89 @@ def test_cli_reconcile_reselects_after_terminal_intent_before_proposal(
     output = capsys.readouterr().out
     assert output.count("partition multicore_small -> multicore") == 1
     assert "(6 affected settings)" in output
+    assert "array recovery" not in output
+    assert re.search(r"active work\s*: none", output)
+
+
+def test_reconcile_terminal_scheduler_recovery_without_changes_uses_resume(
+    tmp_path,
+):
+    from ichor.hpc.active_learning.daemon.reconcile import (
+        ReconciliationReport,
+    )
+
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(
+        max_iterations=40,
+        campaign_uid="cli-test",
+    )
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 15
+    state.reference_data_version = 14
+    state.models_version = 14
+    state.pending_jobs = {
+        CampaignPhase.ARIADNE_ARRAY.value: "17923151"
+    }
+    state.shutdown_requested = True
+    state.lifecycle_context = make_lifecycle_context(
+        disposition="stopped",
+        reason_code="user_stop_immediate",
+        message="campaign stopped after scheduler cancellation",
+        from_phase=CampaignPhase.ARIADNE_ARRAY,
+        iteration=15,
+        source="stop_control",
+    )
+    state_path = (
+        campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+    )
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    write_state(state_path, state)
+    intent = {
+        "phase": CampaignPhase.ARIADNE_ARRAY.value,
+        "iteration": 15,
+        "replacement_round": 0,
+        "job_id": "17923151",
+    }
+    report = ReconciliationReport(
+        proposed_state=CampaignState.from_dict(state.to_dict()),
+        active_submission_intents=[intent],
+        partial_array_recovery={
+            "phase": CampaignPhase.ARIADNE_ARRAY.value,
+            "iteration": 15,
+            "logical_total": 200,
+            "n_complete": 4,
+            "n_reuse": 4,
+            "n_retry": 196,
+        },
+    )
+    report.scheduler_cancellation_recovery = [
+        {
+            **intent,
+            "n_completed": 4,
+            "n_retry": 196,
+        }
+    ]
+    presentation = cli_mod._reconcile_presentation(
+        campaign,
+        report,
+        {
+            "contract_ok": True,
+            "missing_or_invalid_inputs": [],
+            "protected_artifacts": [],
+        },
+        config_review=SimpleNamespace(
+            allowed_changes=[],
+            blocked_changes=[],
+        ),
+        runtime_status={},
+    )
+
+    assert presentation.result == "no reconcile changes needed"
+    assert dict(presentation.campaign_state)["active work"] == "none"
+    labels = [label for label, _value in presentation.planned_changes]
+    assert labels == ["scheduler recovery"]
+    assert presentation.next_command.startswith("ichor-al-daemon resume")
+    assert "validate 4 scheduler-completed outputs" in (
+        presentation.next_effect
+    )
+    assert "retry 196 unfinished tasks" in presentation.next_effect
