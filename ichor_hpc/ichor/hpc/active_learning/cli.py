@@ -105,6 +105,13 @@ from .daemon.config_lock import (
 from .daemon.dry_run_executor import DryRunPhaseExecutor
 from .daemon.dry_run_sacct import DryRunSacctPoller
 from .daemon.job_names import live_job_name
+from .daemon.scheduler_recovery import (
+    classify_terminal_scheduler_evidence,
+    classify_unaccepted_scheduler_intent,
+    load_scheduler_terminal_receipt,
+    scheduler_terminal_receipt_path,
+    write_scheduler_terminal_receipt,
+)
 from .daemon.live_executor import (
     LiveBackendNotAvailableError,
     LiveBackendsPhaseExecutor,
@@ -2229,6 +2236,9 @@ def _format_generic_progress_count(record: Mapping[str, Any]) -> Optional[str]:
 
 def _status_progress_rows(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
     runtime = payload.get("runtime_progress")
+    scheduler_recovery = payload.get(
+        "_presentation_scheduler_recovery"
+    )
     seed_record = (
         _seed_selection_progress_record(payload)
         if str(payload.get("phase") or "") == CampaignPhase.SEED_SELECT.value
@@ -2249,6 +2259,80 @@ def _status_progress_rows(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
             if age:
                 rows.append(("last update", age + " ago"))
         return rows
+    scheduler_intents, _local_intents = _status_intent_counts(payload)
+    if (
+        isinstance(scheduler_recovery, Mapping)
+        and scheduler_recovery.get("state") != "invalid"
+        and not _status_active_job_count(payload)
+        and not scheduler_intents
+    ):
+        if scheduler_recovery.get("state") == "validated":
+            return [
+                (
+                    "reusable outputs",
+                    str(int(scheduler_recovery.get("n_reusable") or 0))
+                    + " validated",
+                ),
+                (
+                    "retry work",
+                    str(int(scheduler_recovery.get("n_retry") or 0))
+                    + " task"
+                    + (
+                        ""
+                        if int(scheduler_recovery.get("n_retry") or 0)
+                        == 1
+                        else "s"
+                    ),
+                ),
+            ]
+        return [
+            (
+                "awaiting validation",
+                str(
+                    int(
+                        scheduler_recovery.get(
+                            "n_scheduler_completed",
+                            0,
+                        )
+                    )
+                )
+                + " scheduler-completed output"
+                + (
+                    ""
+                    if int(
+                        scheduler_recovery.get(
+                            "n_scheduler_completed",
+                            0,
+                        )
+                    )
+                    == 1
+                    else "s"
+                ),
+            ),
+            (
+                "recorded retry work",
+                str(
+                    int(
+                        scheduler_recovery.get(
+                            "n_scheduler_retry",
+                            0,
+                        )
+                    )
+                )
+                + " task"
+                + (
+                    ""
+                    if int(
+                        scheduler_recovery.get(
+                            "n_scheduler_retry",
+                            0,
+                        )
+                    )
+                    == 1
+                    else "s"
+                ),
+            ),
+        ]
     record = _runtime_progress_record(payload)
     if record is None:
         return []
@@ -2417,6 +2501,9 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
     aimall_recovery = payload.get(
         "_presentation_aimall_postprocess_recovery"
     )
+    scheduler_recovery = payload.get(
+        "_presentation_scheduler_recovery"
+    )
     if str(payload.get("background_startup_state") or "") in {
         "prepared",
         "spawned",
@@ -2426,6 +2513,59 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
         return "The background process is still starting (" + stage + ")."
     if phase == CampaignPhase.SEED_SELECT.value and progress is not None:
         return _format_seed_selection_progress(progress)
+    if (
+        isinstance(scheduler_recovery, Mapping)
+        and not active_jobs
+        and not scheduler_intents
+    ):
+        if scheduler_recovery.get("state") == "invalid":
+            return (
+                "Scheduler recovery evidence could not be validated; no "
+                "retry work is being submitted."
+            )
+        disposition = str(
+            scheduler_recovery.get("publication_disposition") or ""
+        )
+        if disposition == "adopted":
+            return (
+                "A complete diversity publication is ready to be adopted "
+                "without rerunning its scheduler job."
+            )
+        if disposition == "rerun":
+            return (
+                "The interrupted diversity publication was incomplete; its "
+                "single scheduler job is ready to be rerun."
+            )
+        if scheduler_recovery.get("state") == "validated":
+            reusable = int(scheduler_recovery.get("n_reusable") or 0)
+            retry = int(scheduler_recovery.get("n_retry") or 0)
+            return (
+                str(reusable)
+                + " completed task"
+                + ("" if reusable == 1 else "s")
+                + " passed output validation; "
+                + str(retry)
+                + " task"
+                + ("" if retry == 1 else "s")
+                + " will be retried."
+            )
+        completed = int(
+            scheduler_recovery.get("n_scheduler_completed") or 0
+        )
+        retry = int(
+            scheduler_recovery.get("n_scheduler_retry") or 0
+        )
+        return (
+            str(completed)
+            + " scheduler-completed output"
+            + ("" if completed == 1 else "s")
+            + " await local validation; "
+            + str(retry)
+            + " unfinished task"
+            + ("" if retry == 1 else "s")
+            + (" is" if retry == 1 else " are")
+            + " recorded for retry."
+        )
     if isinstance(aimall_recovery, Mapping):
         total = int(aimall_recovery.get("logical_total") or 0)
         if daemon_active:
@@ -2567,6 +2707,14 @@ def _status_control_problem(payload: Mapping[str, Any]) -> bool:
         or payload.get("journal_error")
         or payload.get("submission_intent_errors")
         or payload.get("stop_control_error")
+        or (
+            isinstance(
+                payload.get("_presentation_scheduler_recovery"),
+                Mapping,
+            )
+            and payload["_presentation_scheduler_recovery"].get("state")
+            == "invalid"
+        )
         or (
             isinstance(feasibility, Mapping)
             and feasibility.get("ok") is False
@@ -3001,6 +3149,46 @@ def _status_progress_so_far_rows(payload: Dict[str, Any]) -> List[Tuple[str, str
 def _status_phase_outcome(payload: Dict[str, Any]) -> str:
     phase = str(payload.get("phase") or "")
     iteration = int(payload.get("iteration") or 0)
+    scheduler_recovery = payload.get(
+        "_presentation_scheduler_recovery"
+    )
+    if isinstance(scheduler_recovery, Mapping):
+        disposition = str(
+            scheduler_recovery.get("publication_disposition") or ""
+        )
+        if disposition == "adopted":
+            return (
+                "the daemon will adopt the completed diversity publication "
+                "and continue to the next phase"
+            )
+        if disposition == "rerun":
+            return (
+                "the daemon will rerun the interrupted diversity job, then "
+                "continue normally"
+            )
+        retry = int(scheduler_recovery.get("n_retry") or 0)
+        reusable = int(scheduler_recovery.get("n_reusable") or 0)
+        if scheduler_recovery.get("state") == "validated":
+            return (
+                "the daemon will retain "
+                + str(reusable)
+                + " validated task"
+                + ("" if reusable == 1 else "s")
+                + " and submit only "
+                + str(retry)
+                + " retry task"
+                + ("" if retry == 1 else "s")
+            )
+        completed = int(
+            scheduler_recovery.get("n_scheduler_completed") or 0
+        )
+        return (
+            "the daemon will validate "
+            + str(completed)
+            + " scheduler-completed output"
+            + ("" if completed == 1 else "s")
+            + " locally and retry only unfinished or invalid tasks"
+        )
     if isinstance(
         payload.get("_presentation_aimall_postprocess_recovery"),
         Mapping,
@@ -4193,7 +4381,64 @@ def _journal_operator_summary(
             + " cache "
             + str(event.get("cache_status") or "updated").replace("_", " ")
         )
+    if raw == "user_cancelled_jobs":
+        completed = _event_int(event, "n_scheduler_completed_tasks")
+        retry = _event_int(event, "n_retry_tasks")
+        failed = _event_int(event, "n_failed") or 0
+        skipped = _event_int(event, "n_skipped") or 0
+        if completed is not None and retry is not None:
+            description = (
+                "scheduler cancellation recorded: "
+                + str(completed)
+                + " completed task"
+                + ("" if completed == 1 else "s")
+                + " preserved for validation, "
+                + str(retry)
+                + " task"
+                + ("" if retry == 1 else "s")
+                + " to retry"
+            )
+            if failed:
+                description += ", " + str(failed) + " job cancellation failure"
+                if failed != 1:
+                    description += "s"
+            if skipped:
+                description += ", " + str(skipped) + " inconclusive job"
+                if skipped != 1:
+                    description += "s"
+            return description
     if raw == "reconcile_applied":
+        scheduler_completed = _event_int(
+            event,
+            "scheduler_completed_task_candidates",
+        )
+        scheduler_retry = _event_int(event, "scheduler_retry_tasks")
+        scheduler_submitted = _event_int(
+            event,
+            "scheduler_tasks_resubmitted",
+        )
+        if (
+            scheduler_completed is not None
+            and scheduler_retry is not None
+            and scheduler_submitted is not None
+        ):
+            submission_text = (
+                "no jobs submitted"
+                if scheduler_submitted == 0
+                else str(scheduler_submitted) + " retry tasks submitted"
+            )
+            return (
+                "reconcile applied; preserving "
+                + str(scheduler_completed)
+                + " scheduler-completed task candidate"
+                + ("" if scheduler_completed == 1 else "s")
+                + " for local validation, "
+                + str(scheduler_retry)
+                + " task"
+                + ("" if scheduler_retry == 1 else "s")
+                + " prepared for retry, "
+                + submission_text
+            )
         accepted = _event_int(event, "ariadne_accepted_tasks")
         rejected = _event_int(event, "ariadne_rejected_tasks")
         resubmitted = _event_int(event, "ariadne_tasks_resubmitted")
@@ -5009,7 +5254,7 @@ def _lookup_active_slurm_job_for_cancel(
         "-j",
         str(job_id),
         "--noheader",
-        "--format=%i|%T|%j",
+        "--format=%i|%T|%j|%u",
     ]
     try:
         requested_job_id = validate_parent_job_id(job_id)
@@ -5053,8 +5298,8 @@ def _lookup_active_slurm_job_for_cancel(
     for line in stdout.splitlines():
         if not line.strip():
             continue
-        parts = line.split("|", 2)
-        if len(parts) != 3:
+        parts = line.split("|", 3)
+        if len(parts) != 4:
             return {
                 "active": False,
                 "inconclusive": True,
@@ -5077,6 +5322,7 @@ def _lookup_active_slurm_job_for_cancel(
             "job_id": row_job_id,
             "state": parts[1].strip() if len(parts) > 1 else "",
             "job_name": parts[2].strip() if len(parts) > 2 else "",
+            "owner": parts[3].strip() if len(parts) > 3 else "",
         })
     return {
         "active": bool(rows),
@@ -5114,12 +5360,17 @@ def _confirm_cancelled_slurm_job(
     submission_kind: str,
     confirmation_timeout_seconds: int,
     command_timeout_seconds: int,
+    campaign_dir: Optional[Path] = None,
+    intent: Optional[Mapping[str, Any]] = None,
+    classification_sink: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, str]:
-    from .submit.sacct_poll import JobStatus, aggregate_states, poll_job
+    from .submit.sacct_poll import aggregate_states, poll_job
 
     deadline = time.monotonic() + float(confirmation_timeout_seconds)
     last_reason = "scheduler has not confirmed cancellation"
     while True:
+        observations: Sequence[Any] = ()
+        summary = None
         try:
             observations = poll_job(
                 job_id,
@@ -5131,22 +5382,6 @@ def _confirm_cancelled_slurm_job(
                 expected_task_count=expected_tasks,
                 submission_kind=submission_kind,
             )
-            if summary.is_terminal:
-                if summary.observations and all(
-                    observation.status is JobStatus.CANCELLED
-                    for observation in summary.observations
-                ):
-                    return True, ""
-                states = sorted(
-                    {
-                        str(observation.status.value)
-                        for observation in summary.observations
-                    }
-                )
-                return False, (
-                    "job became terminal without cancellation-derived states: "
-                    + ", ".join(states)
-                )
             if summary.n_unknown:
                 last_reason = "accounting returned unknown cancellation state"
             elif summary.n_missing:
@@ -5164,6 +5399,26 @@ def _confirm_cancelled_slurm_job(
             )
         elif lookup.get("active"):
             last_reason = "job remains active or completing in squeue"
+        elif summary is not None and summary.is_terminal and not summary.n_missing:
+            if campaign_dir is not None and intent is not None:
+                try:
+                    classification = classify_terminal_scheduler_evidence(
+                        campaign_dir,
+                        intent,
+                        observations,
+                        queue_active=False,
+                    )
+                except Exception as exc:
+                    return False, (
+                        "terminal scheduler evidence is invalid: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc)
+                    )
+                if classification_sink is not None:
+                    classification_sink.clear()
+                    classification_sink.update(classification)
+            return True, ""
         if time.monotonic() >= deadline:
             return False, (
                 "cancellation confirmation timed out after "
@@ -5200,6 +5455,7 @@ def _collect_stop_cancel_jobs(campaign: Path, state: Any) -> Dict[str, Dict[str,
                 "submission_kind": None,
                 "scheduler_identity_kinds": set(),
                 "scheduler_identity_from_intent": False,
+                "intents": [],
             },
         )
 
@@ -5242,6 +5498,7 @@ def _collect_stop_cancel_jobs(campaign: Path, state: Any) -> Dict[str, Dict[str,
             item["expected_job_names"].add(expected)
         item["expected_tasks"] = intent.get("expected_tasks")
         item["submission_kind"] = str(intent.get("submission_kind"))
+        item["intents"].append(dict(intent))
         recorded_scheduler = str(
             intent.get("scheduler_identity_kind") or "slurm"
         )
@@ -5259,6 +5516,12 @@ def _lookup_active_scheduler_job_for_cancel(
     scheduler_kind: str,
     timeout_seconds: int = 60,
 ) -> Dict[str, Any]:
+    if str(scheduler_kind).strip().lower() == "slurm":
+        return _call_timeout_aware(
+            _lookup_active_slurm_job_for_cancel,
+            job_id,
+            timeout_seconds=int(timeout_seconds),
+        )
     backend = get_scheduler_backend(scheduler_kind)
     return backend.cancellation_lookup(
         job_id,
@@ -5272,6 +5535,12 @@ def _run_scheduler_cancel(
     scheduler_kind: str,
     timeout_seconds: int = 60,
 ) -> Tuple[bool, str]:
+    if str(scheduler_kind).strip().lower() == "slurm":
+        return _call_timeout_aware(
+            _run_scancel,
+            job_id,
+            timeout_seconds=int(timeout_seconds),
+        )
     return get_scheduler_backend(scheduler_kind).cancel(
         job_id,
         timeout_seconds=int(timeout_seconds),
@@ -5295,6 +5564,99 @@ def _sge_rows_were_never_started(rows: Sequence[Mapping[str, Any]]) -> bool:
     )
 
 
+def _record_inactive_scheduler_terminal_evidence(
+    campaign: Path,
+    *,
+    job_id: str,
+    item: Mapping[str, Any],
+    scheduler_kind: str,
+    timeout_seconds: int,
+) -> Dict[str, Any]:
+    """Authenticate a job that became terminal before qdel/scancel ran."""
+    expected_tasks = item.get("expected_tasks")
+    if (
+        isinstance(expected_tasks, bool)
+        or not isinstance(expected_tasks, int)
+        or expected_tasks <= 0
+    ):
+        raise ValueError("submission intent has no exact expected task count")
+    submission_kind = str(item.get("submission_kind") or "")
+    if submission_kind not in {"scalar", "array"}:
+        raise ValueError("submission kind is unavailable")
+    intent_records = [
+        dict(record)
+        for record in item.get("intents", [])
+        if str(record.get("job_id") or "") == str(job_id)
+    ]
+    if len(intent_records) != 1:
+        raise ValueError(
+            "terminal scheduler job is not owned by exactly one submission intent"
+        )
+    intent = intent_records[0]
+    backend = get_scheduler_backend(scheduler_kind)
+    expected_name = str(intent.get("expected_job_name") or "")
+    accounted = backend.find_accounted_job_by_name(
+        expected_name,
+        expected_task_count=int(expected_tasks),
+        submission_kind=submission_kind,
+        timeout_seconds=int(timeout_seconds),
+    )
+    if accounted.inconclusive:
+        raise ValueError(
+            "terminal scheduler job-name lookup is inconclusive: "
+            + str(accounted.error or "unknown error")
+        )
+    if (
+        str(accounted.job_id or "") != str(job_id)
+        or not bool(accounted.terminal)
+    ):
+        raise ValueError(
+            "terminal scheduler accounting does not match the expected "
+            "campaign job name"
+        )
+    observations = backend.poll_job(
+        job_id,
+        timeout_seconds=int(timeout_seconds),
+        cancellation_requested=True,
+    )
+    classification = classify_terminal_scheduler_evidence(
+        campaign,
+        intent,
+        observations,
+        queue_active=False,
+    )
+    receipt = write_scheduler_terminal_receipt(
+        campaign,
+        intent,
+        classification,
+    )
+    receipt_path = scheduler_terminal_receipt_path(
+        campaign,
+        phase=receipt["phase"],
+        iteration=int(receipt["iteration"]),
+        replacement_round=int(receipt["replacement_round"]),
+        submission_identity=str(receipt["submission_identity"]),
+    )
+    return {
+        "job_id": str(job_id),
+        "scheduler_identity_kind": str(scheduler_kind),
+        "phases": sorted(
+            str(phase) for phase in item.get("phases", set())
+        ),
+        "intent_keys": [
+            {"phase": str(phase_name), "iteration": int(iteration)}
+            for phase_name, iteration in sorted(
+                item.get("intent_keys", set())
+            )
+        ],
+        "terminal_receipt": str(receipt_path),
+        "terminal_receipt_sha256": str(receipt["receipt_sha256"]),
+        "n_completed": int(receipt["n_completed"]),
+        "n_retry": int(receipt["n_retry"]),
+        "reason": "job was already terminal when cancellation was checked",
+    }
+
+
 def _confirm_cancelled_scheduler_job(
     job_id: str,
     *,
@@ -5304,14 +5666,31 @@ def _confirm_cancelled_scheduler_job(
     pre_cancel_rows: Sequence[Mapping[str, Any]],
     confirmation_timeout_seconds: int,
     command_timeout_seconds: int,
+    campaign_dir: Optional[Path] = None,
+    intent: Optional[Mapping[str, Any]] = None,
+    classification_sink: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, str]:
-    from .submit.sacct_poll import JobStatus, aggregate_states
+    from .submit.sacct_poll import aggregate_states
 
+    if str(scheduler_kind).strip().lower() == "slurm":
+        return _confirm_cancelled_slurm_job(
+            job_id,
+            expected_tasks=expected_tasks,
+            submission_kind=submission_kind,
+            confirmation_timeout_seconds=int(
+                confirmation_timeout_seconds
+            ),
+            command_timeout_seconds=int(command_timeout_seconds),
+            campaign_dir=campaign_dir,
+            intent=intent,
+            classification_sink=classification_sink,
+        )
     backend = get_scheduler_backend(scheduler_kind)
     deadline = time.monotonic() + float(confirmation_timeout_seconds)
     last_reason = backend.display_name + " has not confirmed cancellation"
     while True:
         observations: Sequence[Any] = ()
+        summary = None
         try:
             observations = backend.poll_job(
                 job_id,
@@ -5325,30 +5704,6 @@ def _confirm_cancelled_scheduler_job(
                 submission_kind=submission_kind,
                 strict_parent_job_id=(scheduler_kind == "slurm"),
             )
-            if summary.is_terminal and int(summary.n_missing) == 0:
-                terminal_statuses = {
-                    observation.status for observation in summary.observations
-                }
-                if (
-                    scheduler_kind == "sge"
-                    and terminal_statuses
-                    and terminal_statuses.issubset(
-                        {JobStatus.COMPLETED, JobStatus.CANCELLED}
-                    )
-                ):
-                    return True, ""
-                if terminal_statuses == {JobStatus.CANCELLED}:
-                    return True, ""
-                states = sorted(
-                    {
-                        str(observation.status.value)
-                        for observation in summary.observations
-                    }
-                )
-                return False, (
-                    "job became terminal without cancellation-derived states: "
-                    + ", ".join(states)
-                )
             if summary.n_unknown:
                 last_reason = "accounting returned an unknown cancellation state"
             elif summary.n_missing:
@@ -5369,13 +5724,33 @@ def _confirm_cancelled_scheduler_job(
         elif lookup.get("active"):
             last_reason = "job remains active or is still leaving the scheduler"
         elif (
+            summary is not None
+            and summary.is_terminal
+            and int(summary.n_missing) == 0
+        ) or (
             scheduler_kind == "sge"
             and not observations
             and _sge_rows_were_never_started(pre_cancel_rows)
         ):
-            # SGE may never create qacct records for a queued or held array
-            # deleted before any task starts. The pre-cancel qstat ownership
-            # evidence plus confirmed disappearance is conclusive.
+            if campaign_dir is not None and intent is not None:
+                try:
+                    classification = classify_terminal_scheduler_evidence(
+                        campaign_dir,
+                        intent,
+                        observations,
+                        queue_active=False,
+                        pre_cancel_rows=pre_cancel_rows,
+                    )
+                except Exception as exc:
+                    return False, (
+                        "terminal scheduler evidence is invalid: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc)
+                    )
+                if classification_sink is not None:
+                    classification_sink.clear()
+                    classification_sink.update(classification)
             return True, ""
         if time.monotonic() >= deadline:
             return False, (
@@ -5387,129 +5762,6 @@ def _confirm_cancelled_scheduler_job(
         time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
 
-def _cancel_recorded_slurm_jobs(
-    campaign: Path,
-    state: Any,
-    *,
-    command_timeout_seconds: int = 60,
-    confirmation_timeout_seconds: int = 120,
-) -> Dict[str, Any]:
-    jobs = _collect_stop_cancel_jobs(campaign, state)
-    cancelled: List[Dict[str, Any]] = []
-    skipped: List[Dict[str, Any]] = []
-    failed: List[Dict[str, Any]] = []
-    campaign_uid = str(getattr(state, "campaign_uid", "") or "")
-    for intent in _load_active_submission_intents(
-        campaign,
-        fail_on_error=True,
-        expected_campaign_uid=(campaign_uid or None),
-    ):
-        if str(intent.get("job_id") or ""):
-            continue
-        phase_name, iteration = _intent_phase_iteration(intent)
-        skipped.append({
-            "job_id": "",
-            "reason": "active submission intent has no job_id: "
-            + str(phase_name)
-            + "@"
-            + str(iteration),
-        })
-    for job_id, item in sorted(jobs.items()):
-        lookup = _call_timeout_aware(
-            _lookup_active_slurm_job_for_cancel,
-            job_id,
-            timeout_seconds=int(command_timeout_seconds),
-        )
-        if bool(lookup.get("inconclusive")):
-            failed.append({
-                "job_id": job_id,
-                "reason": "squeue lookup inconclusive: " + str(lookup.get("error") or "unknown error"),
-            })
-            continue
-        if not bool(lookup.get("active")):
-            skipped.append({
-                "job_id": job_id,
-                "reason": "not active in squeue",
-            })
-            continue
-        expected_names = sorted(str(name) for name in item.get("expected_job_names", set()) if str(name))
-        rows = list(lookup.get("rows") or [])
-        if not _job_name_matches_expected(rows, expected_names):
-            actual_names = sorted({str(row.get("job_name") or "") for row in rows})
-            failed.append({
-                "job_id": job_id,
-                "reason": "scheduler job name mismatch",
-                "expected_job_names": expected_names,
-                "actual_job_names": actual_names,
-            })
-            continue
-        expected_tasks = item.get("expected_tasks")
-        if expected_tasks is not None and (
-            isinstance(expected_tasks, bool)
-            or not isinstance(expected_tasks, int)
-            or expected_tasks <= 0
-        ):
-            failed.append({
-                "job_id": job_id,
-                "reason": "submission intent has an invalid expected task count",
-            })
-            continue
-        submission_kind = str(item.get("submission_kind") or "")
-        if submission_kind not in {"scalar", "array"}:
-            failed.append({
-                "job_id": job_id,
-                "reason": "submission kind is unavailable for cancellation confirmation",
-            })
-            continue
-        if submission_kind == "array" and expected_tasks is None:
-            failed.append({
-                "job_id": job_id,
-                "reason": (
-                    "array task cardinality is unavailable; cancellation was not "
-                    "issued because complete terminal confirmation would be impossible"
-                ),
-            })
-            continue
-        ok, message = _call_timeout_aware(
-            _run_scancel,
-            job_id,
-            timeout_seconds=int(command_timeout_seconds),
-        )
-        if not ok:
-            failed.append({
-                "job_id": job_id,
-                "reason": "scancel failed: " + message,
-            })
-            continue
-        confirmed, confirmation_reason = _confirm_cancelled_slurm_job(
-            job_id,
-            expected_tasks=expected_tasks,
-            submission_kind=submission_kind,
-            confirmation_timeout_seconds=int(confirmation_timeout_seconds),
-            command_timeout_seconds=int(command_timeout_seconds),
-        )
-        if not confirmed:
-            failed.append({
-                "job_id": job_id,
-                "reason": confirmation_reason,
-            })
-            continue
-        phases = sorted(str(phase) for phase in item.get("phases", set()))
-        cancelled.append({
-            "job_id": job_id,
-            "phases": phases,
-            "intent_keys": [
-                {"phase": str(phase_name), "iteration": int(iteration)}
-                for phase_name, iteration in sorted(item.get("intent_keys", set()))
-            ],
-        })
-    return {
-        "cancelled": cancelled,
-        "skipped": skipped,
-        "failed": failed,
-    }
-
-
 def _cancel_recorded_scheduler_jobs(
     campaign: Path,
     state: Any,
@@ -5518,27 +5770,337 @@ def _cancel_recorded_scheduler_jobs(
     confirmation_timeout_seconds: int = 120,
 ) -> Dict[str, Any]:
     """Cancel campaign-owned work through its recorded scheduler contract."""
-    jobs = _collect_stop_cancel_jobs(campaign, state)
-    all_kinds = {
-        kind
-        for item in jobs.values()
-        for kind in item.get("scheduler_identity_kinds", set())
-        if kind
-    }
-    if not all_kinds or all_kinds == {"slurm"}:
-        # Preserve the established Slurm implementation and its injected test
-        # seams byte-for-byte.
-        return _cancel_recorded_slurm_jobs(
-            campaign,
-            state,
-            command_timeout_seconds=int(command_timeout_seconds),
-            confirmation_timeout_seconds=int(confirmation_timeout_seconds),
-        )
-
     cancelled: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
     failed: List[Dict[str, Any]] = []
     campaign_uid = str(getattr(state, "campaign_uid", "") or "")
+    pre_submit_intents = [
+        intent
+        for intent in _load_active_submission_intents(
+            campaign,
+            fail_on_error=True,
+            expected_campaign_uid=(campaign_uid or None),
+        )
+        if not str(intent.get("job_id") or "")
+        and str(intent.get("status") or "") == "PRE_SUBMIT"
+    ]
+    for original_intent in pre_submit_intents:
+        phase_name, iteration = _intent_phase_iteration(original_intent)
+        scheduler_kind = str(
+            original_intent.get("scheduler_identity_kind") or "slurm"
+        ).strip().lower()
+        try:
+            backend = get_scheduler_backend(scheduler_kind)
+        except ValueError as exc:
+            failed.append(
+                {
+                    "job_id": "",
+                    "scheduler_identity_kind": scheduler_kind,
+                    "reason": str(exc),
+                }
+            )
+            continue
+        expected_name = str(original_intent.get("expected_job_name") or "")
+        expected_tasks = original_intent.get("expected_tasks")
+        if not expected_name:
+            failed.append(
+                {
+                    "job_id": "",
+                    "scheduler_identity_kind": scheduler_kind,
+                    "reason": "PRE_SUBMIT cancellation lacks an exact job name",
+                }
+            )
+            continue
+        if expected_tasks is not None and (
+            isinstance(expected_tasks, bool)
+            or not isinstance(expected_tasks, int)
+            or expected_tasks <= 0
+        ):
+            failed.append(
+                {
+                    "job_id": "",
+                    "scheduler_identity_kind": scheduler_kind,
+                    "reason": "PRE_SUBMIT task count is invalid",
+                }
+            )
+            continue
+        submission_kind = str(
+            original_intent.get("submission_kind") or ""
+        )
+        if submission_kind not in {"scalar", "array"}:
+            failed.append(
+                {
+                    "job_id": "",
+                    "scheduler_identity_kind": scheduler_kind,
+                    "reason": "PRE_SUBMIT submission kind is unavailable",
+                }
+            )
+            continue
+        deadline = time.monotonic() + float(confirmation_timeout_seconds)
+        adopted_job_id = ""
+        while True:
+            try:
+                current_intent = _submission_intent.load_intent(
+                    campaign,
+                    phase_name,
+                    int(iteration),
+                    expected_campaign_uid=(campaign_uid or None),
+                )
+            except Exception as exc:
+                failed.append(
+                    {
+                        "job_id": "",
+                        "scheduler_identity_kind": scheduler_kind,
+                        "reason": (
+                            "PRE_SUBMIT intent became unreadable during "
+                            "cancellation: "
+                            + type(exc).__name__
+                            + ": "
+                            + str(exc)
+                        ),
+                    }
+                )
+                break
+            if not isinstance(current_intent, Mapping):
+                failed.append(
+                    {
+                        "job_id": "",
+                        "scheduler_identity_kind": scheduler_kind,
+                        "reason": "PRE_SUBMIT intent disappeared during cancellation",
+                    }
+                )
+                break
+            current_expected_tasks = current_intent.get("expected_tasks")
+            if current_expected_tasks is not None:
+                if (
+                    isinstance(current_expected_tasks, bool)
+                    or not isinstance(current_expected_tasks, int)
+                    or current_expected_tasks <= 0
+                ):
+                    failed.append(
+                        {
+                            "job_id": "",
+                            "scheduler_identity_kind": scheduler_kind,
+                            "reason": (
+                                "PRE_SUBMIT intent acquired an invalid task "
+                                "count during cancellation"
+                            ),
+                        }
+                    )
+                    break
+                expected_tasks = int(current_expected_tasks)
+            recorded_job_id = str(current_intent.get("job_id") or "")
+            if recorded_job_id:
+                adopted_job_id = recorded_job_id
+                break
+            if str(current_intent.get("status") or "") in {
+                "FAILED",
+                "SUPERSEDED",
+            }:
+                if str(current_intent.get("reason") or "") not in {
+                    "user_cancelled_before_scheduler_acceptance",
+                    "user_cancelled_via_stop",
+                }:
+                    failed.append(
+                        {
+                            "job_id": "",
+                            "scheduler_identity_kind": scheduler_kind,
+                            "reason": (
+                                "PRE_SUBMIT intent became terminal for a "
+                                "reason unrelated to the stop request"
+                            ),
+                        }
+                    )
+                    break
+                lookup = backend.find_accounted_job_by_name(
+                    expected_name,
+                    expected_task_count=(
+                        None
+                        if expected_tasks is None
+                        else int(expected_tasks)
+                    ),
+                    submission_kind=submission_kind,
+                    timeout_seconds=int(command_timeout_seconds),
+                )
+                if lookup.inconclusive:
+                    failed.append(
+                        {
+                            "job_id": "",
+                            "scheduler_identity_kind": scheduler_kind,
+                            "reason": (
+                                "PRE_SUBMIT no-acceptance proof is "
+                                "inconclusive: "
+                                + str(lookup.error or "unknown error")
+                            ),
+                        }
+                    )
+                    break
+                if lookup.job_id:
+                    failed.append(
+                        {
+                            "job_id": str(lookup.job_id),
+                            "scheduler_identity_kind": scheduler_kind,
+                            "reason": (
+                                "scheduler accepted a job after the intent "
+                                "was marked as not submitted"
+                            ),
+                        }
+                    )
+                    break
+                if expected_tasks is None:
+                    cancelled.append(
+                        {
+                            "job_id": "",
+                            "scheduler_identity_kind": scheduler_kind,
+                            "phases": [phase_name],
+                            "intent_keys": [
+                                {
+                                    "phase": phase_name,
+                                    "iteration": int(iteration),
+                                }
+                            ],
+                            "n_completed": 0,
+                            "task_count_unknown": True,
+                            "reason": (
+                                "scheduler submission stopped before task "
+                                "staging completed"
+                            ),
+                        }
+                    )
+                    break
+                try:
+                    classification = classify_unaccepted_scheduler_intent(
+                        campaign,
+                        current_intent,
+                    )
+                    receipt = write_scheduler_terminal_receipt(
+                        campaign,
+                        current_intent,
+                        classification,
+                    )
+                    receipt_path = scheduler_terminal_receipt_path(
+                        campaign,
+                        phase=receipt["phase"],
+                        iteration=int(receipt["iteration"]),
+                        replacement_round=int(
+                            receipt["replacement_round"]
+                        ),
+                        submission_identity=str(
+                            receipt["submission_identity"]
+                        ),
+                    )
+                except Exception as exc:
+                    failed.append(
+                        {
+                            "job_id": "",
+                            "scheduler_identity_kind": scheduler_kind,
+                            "reason": (
+                                "PRE_SUBMIT cancellation evidence could not "
+                                "be recorded: "
+                                + type(exc).__name__
+                                + ": "
+                                + str(exc)
+                            ),
+                        }
+                    )
+                    break
+                cancelled.append(
+                    {
+                        "job_id": "",
+                        "scheduler_identity_kind": scheduler_kind,
+                        "phases": [phase_name],
+                        "intent_keys": [
+                            {
+                                "phase": phase_name,
+                                "iteration": int(iteration),
+                            }
+                        ],
+                        "n_completed": 0,
+                        "n_retry": int(expected_tasks),
+                        "terminal_receipt": str(receipt_path),
+                        "terminal_receipt_sha256": str(
+                            receipt["receipt_sha256"]
+                        ),
+                        "reason": "scheduler submission stopped before acceptance",
+                    }
+                )
+                break
+            lookup = backend.find_accounted_job_by_name(
+                expected_name,
+                expected_task_count=(
+                    None
+                    if expected_tasks is None
+                    else int(expected_tasks)
+                ),
+                submission_kind=submission_kind,
+                timeout_seconds=int(command_timeout_seconds),
+            )
+            if lookup.inconclusive:
+                failed.append(
+                    {
+                        "job_id": "",
+                        "scheduler_identity_kind": scheduler_kind,
+                        "reason": "PRE_SUBMIT job-name lookup is inconclusive: "
+                        + str(lookup.error or "unknown error"),
+                    }
+                )
+                break
+            if lookup.job_id:
+                if expected_tasks is None:
+                    failed.append(
+                        {
+                            "job_id": str(lookup.job_id),
+                            "scheduler_identity_kind": scheduler_kind,
+                            "reason": (
+                                "scheduler accepted a PRE_SUBMIT job before "
+                                "its immutable task count was recorded"
+                            ),
+                        }
+                    )
+                    break
+                adopted_job_id = str(lookup.job_id)
+                try:
+                    _submission_intent.mark_submitted(
+                        campaign,
+                        phase_name,
+                        int(iteration),
+                        adopted_job_id,
+                        expected_tasks=int(expected_tasks),
+                    )
+                except Exception as exc:
+                    failed.append(
+                        {
+                            "job_id": adopted_job_id,
+                            "scheduler_identity_kind": scheduler_kind,
+                            "reason": (
+                                "accepted scheduler job could not be bound to "
+                                "its PRE_SUBMIT intent: "
+                                + type(exc).__name__
+                                + ": "
+                                + str(exc)
+                            ),
+                        }
+                    )
+                    adopted_job_id = ""
+                break
+            if time.monotonic() >= deadline:
+                failed.append(
+                    {
+                        "job_id": "",
+                        "scheduler_identity_kind": scheduler_kind,
+                        "reason": (
+                            "PRE_SUBMIT cancellation timed out before the "
+                            "daemon acknowledged the stop gate or a scheduler "
+                            "job became visible"
+                        ),
+                    }
+                )
+                break
+            time.sleep(
+                min(0.25, max(0.0, deadline - time.monotonic()))
+            )
+
+    jobs = _collect_stop_cancel_jobs(campaign, state)
     for intent in _load_active_submission_intents(
         campaign,
         fail_on_error=True,
@@ -5547,13 +6109,13 @@ def _cancel_recorded_scheduler_jobs(
         if str(intent.get("job_id") or ""):
             continue
         phase_name, iteration = _intent_phase_iteration(intent)
-        skipped.append(
+        failed.append(
             {
                 "job_id": "",
                 "scheduler_identity_kind": str(
                     intent.get("scheduler_identity_kind") or "slurm"
                 ),
-                "reason": "active submission intent has no job_id: "
+                "reason": "active submission intent still has no job_id: "
                 + str(phase_name)
                 + "@"
                 + str(iteration),
@@ -5597,29 +6159,81 @@ def _cancel_recorded_scheduler_jobs(
                 {
                     "job_id": job_id,
                     "scheduler_identity_kind": scheduler_kind,
-                    "reason": backend.display_name
-                    + " lookup inconclusive: "
+                    "reason": (
+                        "squeue lookup inconclusive: "
+                        if scheduler_kind == "slurm"
+                        else backend.display_name + " lookup inconclusive: "
+                    )
                     + str(lookup.get("error") or "unknown error"),
                 }
             )
             continue
         if not bool(lookup.get("active")):
-            skipped.append(
-                {
-                    "job_id": job_id,
-                    "scheduler_identity_kind": scheduler_kind,
-                    "reason": "not active in " + backend.display_name,
-                }
-            )
+            matching_intents = [
+                record
+                for record in item.get("intents", [])
+                if str(record.get("job_id") or "") == str(job_id)
+            ]
+            if not matching_intents:
+                # Legacy state-only ownership has no immutable task map from
+                # which an exact terminal receipt can be built.  Preserve the
+                # established inactive-job behaviour without claiming partial
+                # recovery evidence.
+                skipped.append(
+                    {
+                        "job_id": job_id,
+                        "scheduler_identity_kind": scheduler_kind,
+                        "reason": "not active in " + backend.queue_command,
+                    }
+                )
+                continue
+            try:
+                terminal_record = _record_inactive_scheduler_terminal_evidence(
+                    campaign,
+                    job_id=job_id,
+                    item=item,
+                    scheduler_kind=scheduler_kind,
+                    timeout_seconds=int(command_timeout_seconds),
+                )
+            except Exception as exc:
+                failed.append(
+                    {
+                        "job_id": job_id,
+                        "scheduler_identity_kind": scheduler_kind,
+                        "reason": (
+                            "job left "
+                            + backend.display_name
+                            + " but exact terminal accounting is unavailable: "
+                            + type(exc).__name__
+                            + ": "
+                            + str(exc)
+                        ),
+                    }
+                )
+            else:
+                cancelled.append(terminal_record)
             continue
         rows = list(lookup.get("rows") or [])
         foreign_owners = sorted(
             {
                 str(row.get("owner") or "")
                 for row in rows
-                if str(row.get("owner") or "") != expected_owner
+                if str(row.get("owner") or "")
+                and str(row.get("owner") or "") != expected_owner
             }
         )
+        missing_owner = any(
+            not str(row.get("owner") or "") for row in rows
+        )
+        if missing_owner and scheduler_kind != "slurm":
+            failed.append(
+                {
+                    "job_id": job_id,
+                    "scheduler_identity_kind": scheduler_kind,
+                    "reason": "scheduler ownership is unavailable",
+                }
+            )
+            continue
         if foreign_owners:
             failed.append(
                 {
@@ -5685,6 +6299,21 @@ def _cancel_recorded_scheduler_jobs(
                 }
             )
             continue
+        intent_records = [
+            dict(record)
+            for record in item.get("intents", [])
+            if str(record.get("job_id") or "") == str(job_id)
+        ]
+        if len(intent_records) > 1:
+            failed.append(
+                {
+                    "job_id": job_id,
+                    "scheduler_identity_kind": scheduler_kind,
+                    "reason": "multiple submission intents claim the same scheduler job",
+                }
+            )
+            continue
+        producer_intent = intent_records[0] if intent_records else None
         ok, message = _run_scheduler_cancel(
             job_id,
             scheduler_kind=scheduler_kind,
@@ -5699,7 +6328,8 @@ def _cancel_recorded_scheduler_jobs(
                 }
             )
             continue
-        confirmed, confirmation_reason = _confirm_cancelled_scheduler_job(
+        classification: Dict[str, Any] = {}
+        confirmation_result = _confirm_cancelled_scheduler_job(
             job_id,
             scheduler_kind=scheduler_kind,
             expected_tasks=expected_tasks,
@@ -5707,7 +6337,11 @@ def _cancel_recorded_scheduler_jobs(
             pre_cancel_rows=rows,
             confirmation_timeout_seconds=int(confirmation_timeout_seconds),
             command_timeout_seconds=int(command_timeout_seconds),
+            campaign_dir=(campaign if producer_intent is not None else None),
+            intent=producer_intent,
+            classification_sink=classification,
         )
+        confirmed, confirmation_reason = confirmation_result
         if not confirmed:
             failed.append(
                 {
@@ -5717,6 +6351,42 @@ def _cancel_recorded_scheduler_jobs(
                 }
             )
             continue
+        terminal_evidence: Dict[str, Any] = {}
+        if producer_intent is not None and classification:
+            try:
+                receipt = write_scheduler_terminal_receipt(
+                    campaign,
+                    producer_intent,
+                    classification,
+                )
+                receipt_path = scheduler_terminal_receipt_path(
+                    campaign,
+                    phase=receipt["phase"],
+                    iteration=int(receipt["iteration"]),
+                    replacement_round=int(receipt["replacement_round"]),
+                    submission_identity=str(receipt["submission_identity"]),
+                )
+            except Exception as exc:
+                failed.append(
+                    {
+                        "job_id": job_id,
+                        "scheduler_identity_kind": scheduler_kind,
+                        "reason": (
+                            "scheduler cancellation completed but terminal evidence "
+                            "could not be recorded: "
+                            + type(exc).__name__
+                            + ": "
+                            + str(exc)
+                        ),
+                    }
+                )
+                continue
+            terminal_evidence = {
+                "terminal_receipt": str(receipt_path),
+                "terminal_receipt_sha256": str(receipt["receipt_sha256"]),
+                "n_completed": int(receipt["n_completed"]),
+                "n_retry": int(receipt["n_retry"]),
+            }
         cancelled.append(
             {
                 "job_id": job_id,
@@ -5730,6 +6400,7 @@ def _cancel_recorded_scheduler_jobs(
                         item.get("intent_keys", set())
                     )
                 ],
+                **terminal_evidence,
             }
         )
     return {"cancelled": cancelled, "skipped": skipped, "failed": failed}
@@ -5779,6 +6450,13 @@ def _journal_cancel_jobs_summary(
         }
         if len(recorded_kinds) == 1:
             context["scheduler_identity_kind"] = next(iter(recorded_kinds))
+        classified = [
+            item
+            for item in (summary.get("cancelled") or [])
+            if isinstance(item, Mapping)
+            and isinstance(item.get("n_completed"), int)
+            and isinstance(item.get("n_retry"), int)
+        ]
         append_event(
             journal_path,
             "user_cancelled_jobs",
@@ -5798,6 +6476,10 @@ def _journal_cancel_jobs_summary(
                 str(item.get("job_id"))
                 for item in (summary.get("failed") or [])
             ],
+            n_scheduler_completed_tasks=sum(
+                int(item["n_completed"]) for item in classified
+            ),
+            n_retry_tasks=sum(int(item["n_retry"]) for item in classified),
         )
     except Exception:
         pass
@@ -5836,6 +6518,24 @@ def _print_cancel_jobs_summary(
                 "Cancellation needs attention: "
                 + str(failed[0].get("reason") or "scheduler confirmation failed"),
                 file=sys.stderr,
+            )
+        completed_tasks = sum(
+            int(item.get("n_completed", 0))
+            for item in cancelled
+            if isinstance(item, Mapping)
+        )
+        retry_tasks = sum(
+            int(item.get("n_retry", 0))
+            for item in cancelled
+            if isinstance(item, Mapping)
+        )
+        if completed_tasks or retry_tasks:
+            print(
+                "Recorded task outcomes: "
+                + str(completed_tasks)
+                + " scheduler-completed, "
+                + str(retry_tasks)
+                + " to validate or retry."
             )
         return
     if cancelled:
@@ -6083,12 +6783,15 @@ def cmd_stop(args: argparse.Namespace) -> int:
     except Exception:
         pass
     background_signal = None
-    if mode == "immediate":
+    cancel_summary = None
+    if mode == "immediate" and cancel_jobs:
+        # The durable cancelling request is already installed.  Signalling now
+        # lets a daemon in PRE_SUBMIT reach its final pre-acceptance gate while
+        # this command proves whether a scheduler job exists.
         background_signal = _signal_recorded_background_daemon(
             campaign,
             paths,
         )
-    cancel_summary = None
     if cancel_jobs:
         try:
             cancel_summary = _cancel_recorded_scheduler_jobs(
@@ -6115,6 +6818,11 @@ def cmd_stop(args: argparse.Namespace) -> int:
     if cancel_summary is not None:
         _journal_cancel_jobs_summary(
             paths["journal"], cancel_summary, state=state
+        )
+    if mode == "immediate" and background_signal is None:
+        background_signal = _signal_recorded_background_daemon(
+            campaign,
+            paths,
         )
     print(describe_stop_request(request))
     stop_verbose = bool(getattr(args, "verbose", False))
@@ -6794,6 +7502,112 @@ def _reference_commit_runtime_progress(
     }
 
 
+def _load_scheduler_recovery_status(
+    campaign: Path,
+    state: CampaignState,
+) -> Optional[Dict[str, Any]]:
+    """Read bounded cancellation recovery evidence for human status output."""
+    from .daemon.phase_executor import SBATCH_PHASES
+    from .daemon.scheduler_recovery import (
+        phase_recovery_ledger_path,
+        read_phase_recovery_ledger,
+        scheduler_terminal_recoveries,
+    )
+
+    if state.phase.value not in SBATCH_PHASES:
+        return None
+    try:
+        recoveries = scheduler_terminal_recoveries(
+            campaign,
+            campaign_uid=str(state.campaign_uid),
+            phase=state.phase.value,
+            iteration=int(state.iteration),
+            replacement_round=int(state.replacement_round),
+        )
+        if not recoveries:
+            return None
+        latest_by_task: Dict[int, Mapping[str, Any]] = {}
+        for recovery in recoveries:
+            for outcome in recovery["receipt"].get("outcomes", []):
+                latest_by_task[int(outcome["logical_task_id"])] = outcome
+        scheduler_completed = sum(
+            1
+            for outcome in latest_by_task.values()
+            if str(outcome.get("status") or "") == "COMPLETED"
+            and outcome.get("exit_code") == [0, 0]
+        )
+        scheduler_retry = len(latest_by_task) - scheduler_completed
+        receipt_digests = {
+            str(recovery["receipt"]["receipt_sha256"])
+            for recovery in recoveries
+        }
+        status: Dict[str, Any] = {
+            "state": "awaiting_validation",
+            "phase": state.phase.value,
+            "iteration": int(state.iteration),
+            "replacement_round": int(state.replacement_round),
+            "n_terminal_receipts": len(recoveries),
+            "n_scheduler_completed": int(scheduler_completed),
+            "n_scheduler_retry": int(scheduler_retry),
+            "original_job_ids": [
+                str(recovery["receipt"]["job_id"])
+                for recovery in recoveries
+                if recovery["receipt"].get("job_id")
+            ],
+        }
+        ledger_path = phase_recovery_ledger_path(
+            campaign,
+            phase=state.phase.value,
+            iteration=int(state.iteration),
+            replacement_round=int(state.replacement_round),
+        )
+        if not ledger_path.exists() and not ledger_path.is_symlink():
+            return status
+        ledger = read_phase_recovery_ledger(ledger_path)
+        identity = (
+            str(ledger.get("campaign_uid") or ""),
+            str(ledger.get("phase") or ""),
+            int(ledger.get("iteration", -1)),
+            int(ledger.get("replacement_round", -1)),
+        )
+        expected = (
+            str(state.campaign_uid),
+            state.phase.value,
+            int(state.iteration),
+            int(state.replacement_round),
+        )
+        if identity != expected:
+            raise ValueError("phase recovery ledger identity mismatch")
+        ledger_receipts = {
+            str(record.get("receipt_sha256") or "")
+            for record in ledger.get("source_terminal_receipts", [])
+            if isinstance(record, Mapping)
+        }
+        if ledger_receipts != receipt_digests:
+            return status
+        status.update(
+            {
+                "state": "validated",
+                "n_reusable": int(ledger.get("n_reusable") or 0),
+                "n_retry": int(ledger.get("n_retry") or 0),
+                "publication_disposition": ledger.get(
+                    "publication_disposition"
+                ),
+                "ledger": str(ledger_path),
+                "ledger_sha256": str(ledger.get("ledger_sha256") or ""),
+            }
+        )
+        return status
+    except Exception as exc:
+        return {
+            "state": "invalid",
+            "phase": state.phase.value,
+            "iteration": int(state.iteration),
+            "replacement_round": int(state.replacement_round),
+            "error": type(exc).__name__ + ": " + str(exc),
+        }
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     campaign = resolve_campaign_dir(
         args.campaign_dir,
@@ -7129,6 +7943,14 @@ def cmd_status(args: argparse.Namespace) -> int:
             "errors": [type(exc).__name__ + ": " + str(exc)],
         }
     presentation_payload = dict(payload)
+    scheduler_recovery_status = _load_scheduler_recovery_status(
+        campaign,
+        state,
+    )
+    if scheduler_recovery_status is not None:
+        presentation_payload[
+            "_presentation_scheduler_recovery"
+        ] = scheduler_recovery_status
     if state.phase in {
         CampaignPhase.INITIAL_ALLOCATION_CHECK,
         CampaignPhase.ALLOCATION_CHECK,
@@ -7198,6 +8020,13 @@ def cmd_status(args: argparse.Namespace) -> int:
     ):
         payload["_presentation_aimall_postprocess_recovery"] = dict(
             aimall_postprocess_recovery_status
+        )
+    if (
+        not bool(getattr(args, "json", False))
+        and scheduler_recovery_status is not None
+    ):
+        payload["_presentation_scheduler_recovery"] = dict(
+            scheduler_recovery_status
         )
     if (
         not bool(getattr(args, "json", False))
@@ -7426,6 +8255,129 @@ def _scheduler_uncertain_resume_target(
     return target, intent
 
 
+def _verify_unaccepted_pre_submit_cancellation(
+    campaign: Path,
+    intent: Mapping[str, Any],
+    stop_request: Mapping[str, Any],
+    *,
+    command_timeout_seconds: int,
+) -> bool:
+    """Re-prove that a cancelled PRE_SUBMIT attempt never reached a scheduler."""
+    if (
+        str(intent.get("status") or "") != "FAILED"
+        or str(intent.get("reason") or "")
+        != "user_cancelled_before_scheduler_acceptance"
+        or intent.get("job_id") not in (None, "")
+        or intent.get("expected_tasks") is not None
+    ):
+        return False
+    phase = str(intent.get("phase") or "")
+    iteration = int(intent.get("iteration", -1))
+    replacement_round = int(intent.get("replacement_round", 0))
+    if (
+        str(stop_request.get("mode") or "") != "immediate"
+        or stop_request.get("cancel_jobs_requested") is not True
+        or str(stop_request.get("observed_phase") or "") != phase
+        or int(stop_request.get("observed_iteration", -1)) != iteration
+        or int(stop_request.get("observed_replacement_round", -1))
+        != replacement_round
+    ):
+        raise ValueError(
+            "unaccepted PRE_SUBMIT evidence does not match the stop request"
+        )
+    summary = stop_request.get("cancellation_summary")
+    if not isinstance(summary, Mapping):
+        raise ValueError(
+            "unaccepted PRE_SUBMIT cancellation summary is missing"
+        )
+    matching = []
+    for item in summary.get("cancelled", []):
+        if not isinstance(item, Mapping):
+            continue
+        keys = item.get("intent_keys")
+        if not isinstance(keys, list):
+            continue
+        if any(
+            isinstance(key, Mapping)
+            and str(key.get("phase") or "") == phase
+            and int(key.get("iteration", -1)) == iteration
+            for key in keys
+        ):
+            matching.append(item)
+    if len(matching) != 1:
+        raise ValueError(
+            "stop request does not contain one exact unaccepted PRE_SUBMIT "
+            "cancellation record"
+        )
+    record = matching[0]
+    scheduler_kind = str(
+        intent.get("scheduler_identity_kind") or "slurm"
+    ).strip().lower()
+    if (
+        record.get("job_id") != ""
+        or record.get("task_count_unknown") is not True
+        or record.get("n_completed") != 0
+        or record.get("terminal_receipt") not in (None, "")
+        or str(record.get("scheduler_identity_kind") or "").strip().lower()
+        != scheduler_kind
+        or record.get("phases") != [phase]
+        or record.get("intent_keys")
+        != [{"phase": phase, "iteration": iteration}]
+    ):
+        raise ValueError(
+            "unaccepted PRE_SUBMIT cancellation record is contradictory"
+        )
+    expected_job_name = str(intent.get("expected_job_name") or "")
+    submission_kind = str(intent.get("submission_kind") or "")
+    if not expected_job_name or submission_kind not in {"scalar", "array"}:
+        raise ValueError(
+            "unaccepted PRE_SUBMIT intent lacks its scheduler identity"
+        )
+    backend = get_scheduler_backend(scheduler_kind)
+    lookup = backend.find_accounted_job_by_name(
+        expected_job_name,
+        expected_task_count=None,
+        submission_kind=submission_kind,
+        timeout_seconds=int(command_timeout_seconds),
+    )
+    if bool(getattr(lookup, "inconclusive", False)):
+        raise ValueError(
+            "scheduler no-acceptance proof is inconclusive: "
+            + str(getattr(lookup, "error", None) or "unknown error")
+        )
+    if str(getattr(lookup, "job_id", None) or ""):
+        raise ValueError(
+            "the scheduler contains a job matching the cancelled PRE_SUBMIT "
+            "attempt"
+        )
+    return True
+
+
+def _cancelled_scheduler_resume_target(
+    state: CampaignState,
+    *,
+    phase: str,
+    intent: Mapping[str, Any],
+) -> CampaignState:
+    """Clear only scheduler ownership retired by an exact stop receipt."""
+    target = CampaignState.from_dict(state.to_dict())
+    target.shutdown_requested = False
+    context = target.lifecycle_context
+    if isinstance(context, Mapping) and str(
+        context.get("disposition") or ""
+    ) == "stopped":
+        target.lifecycle_context = None
+    target.pending_jobs[str(phase)] = None
+    job_id = str(intent.get("job_id") or "")
+    if job_id:
+        target.sacct_empty_streak = {
+            key: value
+            for key, value in target.sacct_empty_streak.items()
+            if key != job_id and not str(key).startswith(job_id + ":")
+        }
+    return target
+
+
 def cmd_resume(args: argparse.Namespace) -> int:
     campaign = resolve_campaign_dir(args.campaign_dir)
     paths = _campaign_paths(campaign)
@@ -7485,6 +8437,140 @@ def cmd_resume(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 7
+        cancelled_resume_phase: Optional[str] = None
+        cancelled_resume_intent: Optional[Mapping[str, Any]] = None
+        if (
+            isinstance(stop_request, Mapping)
+            and str(stop_request.get("mode") or "") == "immediate"
+            and stop_request.get("cancel_jobs_requested") is True
+        ):
+            stop_phase = str(stop_request.get("observed_phase") or "")
+            stop_iteration = int(
+                stop_request.get("observed_iteration", state.iteration)
+            )
+            try:
+                stopped_intent = _submission_intent.load_intent(
+                    campaign,
+                    stop_phase,
+                    stop_iteration,
+                    expected_campaign_uid=str(state.campaign_uid),
+                )
+            except Exception as exc:
+                print(
+                    "cancelled scheduler ownership could not be read; preview "
+                    "reconcile before resuming: "
+                    + str(exc),
+                    file=sys.stderr,
+                )
+                return 7
+            if isinstance(stopped_intent, Mapping):
+                try:
+                    terminal_receipt = load_scheduler_terminal_receipt(
+                        campaign,
+                        stopped_intent,
+                    )
+                except Exception as exc:
+                    print(
+                        "cancelled scheduler evidence is invalid; preview "
+                        "reconcile before resuming: "
+                        + str(exc),
+                        file=sys.stderr,
+                    )
+                    return 7
+                if (
+                    terminal_receipt is None
+                    and str(stopped_intent.get("job_id") or "")
+                    and str(stopped_intent.get("status") or "")
+                    in _submission_intent.ACTIVE_STATUSES
+                ):
+                    resolved, blockers = (
+                        _resolve_terminal_submission_intents_for_apply(
+                            campaign,
+                            [dict(stopped_intent)],
+                            persist_terminal_receipts=True,
+                        )
+                    )
+                    if blockers or not resolved:
+                        detail = (
+                            str(blockers[0].get("reason"))
+                            if blockers
+                            else "terminal evidence is unavailable"
+                        )
+                        print(
+                            "cancelled scheduler work cannot yet be recovered "
+                            "safely; run reconcile to review it: "
+                            + detail,
+                            file=sys.stderr,
+                        )
+                        return 7
+                    terminal_receipt = load_scheduler_terminal_receipt(
+                        campaign,
+                        stopped_intent,
+                    )
+                if terminal_receipt is not None:
+                    if str(stopped_intent.get("status") or "") in (
+                        _submission_intent.ACTIVE_STATUSES
+                    ):
+                        _submission_intent.mark_failed(
+                            campaign,
+                            stop_phase,
+                            stop_iteration,
+                            "user_cancelled_via_stop",
+                        )
+                    cancelled_resume_phase = stop_phase
+                    cancelled_resume_intent = stopped_intent
+                    if str(stop_request.get("status") or "") != "completed":
+                        from .daemon.stop_control import complete_stop_request
+
+                        completed_stop = complete_stop_request(
+                            campaign,
+                            str(stop_request["request_id"]),
+                            reason="scheduler_cancellation_recovered",
+                        )
+                        if completed_stop is not None:
+                            stop_request = completed_stop
+                elif terminal_receipt is None:
+                    try:
+                        command_timeout, _confirmation_timeout = (
+                            _runtime_scheduler_policy(campaign)
+                        )
+                        unaccepted_pre_submit = (
+                            _verify_unaccepted_pre_submit_cancellation(
+                                campaign,
+                                stopped_intent,
+                                stop_request,
+                                command_timeout_seconds=command_timeout,
+                            )
+                        )
+                    except Exception as exc:
+                        print(
+                            "cancelled PRE_SUBMIT work cannot be recovered "
+                            "safely; run reconcile to review it: "
+                            + str(exc),
+                            file=sys.stderr,
+                        )
+                        return 7
+                    if unaccepted_pre_submit:
+                        cancelled_resume_phase = stop_phase
+                        cancelled_resume_intent = stopped_intent
+                        if str(stop_request.get("status") or "") != "completed":
+                            from .daemon.stop_control import complete_stop_request
+
+                            completed_stop = complete_stop_request(
+                                campaign,
+                                str(stop_request["request_id"]),
+                                reason=(
+                                    "scheduler_submission_stopped_before_staging"
+                                ),
+                            )
+                            if completed_stop is None:
+                                print(
+                                    "cancelled PRE_SUBMIT stop request changed "
+                                    "before it could be completed",
+                                    file=sys.stderr,
+                                )
+                                return 7
+                            stop_request = completed_stop
         if state.phase is CampaignPhase.HALTED:
             try:
                 target_state, preserved_intent = _scheduler_uncertain_resume_target(
@@ -7708,9 +8794,19 @@ def cmd_resume(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 6
-            target_state = CampaignState.from_dict(state.to_dict())
-            target_state.shutdown_requested = False
-            target_state.lifecycle_context = None
+            if (
+                cancelled_resume_phase is not None
+                and cancelled_resume_intent is not None
+            ):
+                target_state = _cancelled_scheduler_resume_target(
+                    state,
+                    phase=cancelled_resume_phase,
+                    intent=cancelled_resume_intent,
+                )
+            else:
+                target_state = CampaignState.from_dict(state.to_dict())
+                target_state.shutdown_requested = False
+                target_state.lifecycle_context = None
             cancelling_stop = bool(getattr(args, "cancel_stop_request", False))
             try:
                 state, resume_history = _finish_resume_transaction(
@@ -7750,6 +8846,64 @@ def cmd_resume(args: argparse.Namespace) -> int:
                     ),
                     phase=state.phase.value,
                     iteration=int(state.iteration),
+                    resume_transaction_history=str(resume_history),
+                )
+            except Exception:
+                pass
+        elif (
+            cancelled_resume_phase is not None
+            and cancelled_resume_intent is not None
+        ):
+            target_state = _cancelled_scheduler_resume_target(
+                state,
+                phase=cancelled_resume_phase,
+                intent=cancelled_resume_intent,
+            )
+            cancelling_stop = bool(
+                getattr(args, "cancel_stop_request", False)
+            )
+            try:
+                state, resume_history = _finish_resume_transaction(
+                    campaign,
+                    state_path,
+                    before_state=state,
+                    after_state=target_state,
+                    request_id=(
+                        None
+                        if stop_request is None
+                        else str(stop_request.get("request_id"))
+                    ),
+                    operation=(
+                        "resume_scheduler_cancellation_cancel_stop"
+                        if cancelling_stop
+                        else "resume_scheduler_cancellation"
+                    ),
+                    archive_status=(
+                        "cancelled" if cancelling_stop else "resumed"
+                    ),
+                )
+                stop_request = None
+            except Exception as exc:
+                print(
+                    "could not complete the scheduler-cancellation resume "
+                    "transaction: "
+                    + str(exc),
+                    file=sys.stderr,
+                )
+                return 7
+            try:
+                from .daemon.journal import append_event
+
+                append_event(
+                    paths["journal"],
+                    (
+                        "user_stop_request_cancelled"
+                        if cancelling_stop
+                        else "user_stop_resumed"
+                    ),
+                    phase=state.phase.value,
+                    iteration=int(state.iteration),
+                    resumed_scheduler_phase=cancelled_resume_phase,
                     resume_transaction_history=str(resume_history),
                 )
             except Exception:
@@ -7894,11 +9048,51 @@ def _intent_age_seconds(intent: Dict[str, Any]) -> Optional[float]:
     return max(0.0, (datetime.now(timezone.utc) - created).total_seconds())
 
 
+def _intent_matches_cancel_stop_request(
+    campaign: Path,
+    intent: Mapping[str, Any],
+) -> bool:
+    """Return whether an immediate stop owns this exact scheduler attempt."""
+    from .daemon.stop_control import read_stop_request
+
+    try:
+        request = read_stop_request(
+            campaign,
+            expected_campaign_uid=str(intent.get("campaign_uid") or ""),
+        )
+    except Exception:
+        return False
+    if (
+        not isinstance(request, Mapping)
+        or str(request.get("mode") or "") != "immediate"
+        or request.get("cancel_jobs_requested") is not True
+        or str(request.get("observed_phase") or "")
+        != str(intent.get("phase") or "")
+        or int(request.get("observed_iteration", -1))
+        != int(intent.get("iteration", -2))
+        or int(request.get("observed_replacement_round", -1))
+        != int(intent.get("replacement_round", 0))
+    ):
+        return False
+    job_id = str(intent.get("job_id") or "")
+    summary = request.get("cancellation_summary")
+    if not isinstance(summary, Mapping):
+        return str(request.get("status") or "") == "cancelling"
+    recorded_ids = {
+        str(item.get("job_id") or "")
+        for category in ("cancelled", "failed", "skipped")
+        for item in (summary.get(category) or [])
+        if isinstance(item, Mapping)
+    }
+    return job_id in recorded_ids or str(request.get("status") or "") == "cancelling"
+
+
 def _resolve_terminal_submission_intents_for_apply(
     campaign: Path,
     active_intents: Sequence[Dict[str, Any]],
     *,
     pre_submit_stale_seconds: int = 900,
+    persist_terminal_receipts: bool = True,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Classify conclusively terminal active intents before safe apply.
 
@@ -8074,6 +9268,67 @@ def _resolve_terminal_submission_intents_for_apply(
                 "reason": "submission intent has no job_id",
             })
             continue
+        try:
+            existing_terminal_receipt = load_scheduler_terminal_receipt(
+                campaign,
+                intent,
+            )
+        except Exception as exc:
+            blocking.append(
+                {
+                    "phase": phase,
+                    "iteration": iteration,
+                    "job_id": job_id,
+                    "expected_job_name": expected_job_name,
+                    "reason": (
+                        "stored scheduler terminal evidence is invalid: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc)
+                    ),
+                }
+            )
+            continue
+        if existing_terminal_receipt is not None:
+            terminal_candidates.append(
+                {
+                    "phase": phase,
+                    "iteration": iteration,
+                    "job_id": job_id,
+                    "terminal_state": "USER_CANCELLED_TERMINAL",
+                    "n_sacct_rows": len(
+                        existing_terminal_receipt.get("outcomes", [])
+                    ),
+                    "scheduler_recovery": True,
+                    "n_completed": int(
+                        existing_terminal_receipt["n_completed"]
+                    ),
+                    "n_retry": int(existing_terminal_receipt["n_retry"]),
+                    "terminal_receipt": str(
+                        scheduler_terminal_receipt_path(
+                            campaign,
+                            phase=existing_terminal_receipt["phase"],
+                            iteration=int(
+                                existing_terminal_receipt["iteration"]
+                            ),
+                            replacement_round=int(
+                                existing_terminal_receipt[
+                                    "replacement_round"
+                                ]
+                            ),
+                            submission_identity=str(
+                                existing_terminal_receipt[
+                                    "submission_identity"
+                                ]
+                            ),
+                        )
+                    ),
+                    "terminal_receipt_sha256": str(
+                        existing_terminal_receipt["receipt_sha256"]
+                    ),
+                }
+            )
+            continue
         queue_lookup = scheduler_backend.find_active_job_by_id(job_id)
         if queue_lookup.inconclusive:
             blocking.append({
@@ -8110,6 +9365,74 @@ def _resolve_terminal_submission_intents_for_apply(
                 + ": "
                 + str(exc),
             })
+            continue
+        if _intent_matches_cancel_stop_request(campaign, intent):
+            try:
+                classification = classify_terminal_scheduler_evidence(
+                    campaign,
+                    intent,
+                    observations,
+                    queue_active=False,
+                )
+                receipt = (
+                    write_scheduler_terminal_receipt(
+                        campaign,
+                        intent,
+                        classification,
+                    )
+                    if persist_terminal_receipts
+                    else None
+                )
+            except Exception as exc:
+                blocking.append(
+                    {
+                        "phase": phase,
+                        "iteration": iteration,
+                        "job_id": job_id,
+                        "expected_job_name": expected_job_name,
+                        "reason": (
+                            "cancelled scheduler work is not yet recoverable: "
+                            + type(exc).__name__
+                            + ": "
+                            + str(exc)
+                        ),
+                    }
+                )
+                continue
+            terminal_candidates.append(
+                {
+                    "phase": phase,
+                    "iteration": iteration,
+                    "job_id": job_id,
+                    "terminal_state": "USER_CANCELLED_TERMINAL",
+                    "n_sacct_rows": len(observations),
+                    "scheduler_recovery": True,
+                    "n_completed": int(classification["n_completed"]),
+                    "n_retry": int(classification["n_retry"]),
+                    "terminal_receipt": (
+                        None
+                        if receipt is None
+                        else str(
+                            scheduler_terminal_receipt_path(
+                                campaign,
+                                phase=receipt["phase"],
+                                iteration=int(receipt["iteration"]),
+                                replacement_round=int(
+                                    receipt["replacement_round"]
+                                ),
+                                submission_identity=str(
+                                    receipt["submission_identity"]
+                                ),
+                            )
+                        )
+                    ),
+                    "terminal_receipt_sha256": (
+                        None
+                        if receipt is None
+                        else str(receipt["receipt_sha256"])
+                    ),
+                }
+            )
             continue
         terminal_state, reason, n_rows = _terminal_sacct_state_for_intent(
             job_id,
@@ -8150,12 +9473,115 @@ def _resolve_terminal_submission_intents_for_apply(
         resolved.append(payload)
     for candidate in terminal_candidates:
         terminal_state = str(candidate["terminal_state"])
-        failure_reason = "reconcile_apply_terminal_job:" + terminal_state
+        failure_reason = (
+            "user_cancelled_via_stop"
+            if bool(candidate.get("scheduler_recovery", False))
+            else "reconcile_apply_terminal_job:" + terminal_state
+        )
         payload = dict(candidate)
         payload["reason"] = failure_reason
         payload["target_status"] = "FAILED"
         resolved.append(payload)
     return resolved, blocking
+
+
+def _apply_terminal_intent_recovery_to_report(
+    report: Any,
+    resolved: Sequence[Mapping[str, Any]],
+    *,
+    persist_for_apply: bool,
+) -> None:
+    """Remove only proven terminal cancellation ownership from a report."""
+    if not resolved:
+        return
+    keys = {
+        (
+            str(item.get("phase") or ""),
+            int(item.get("iteration") or 0),
+            str(item.get("job_id") or ""),
+        )
+        for item in resolved
+    }
+    intent_keys = {
+        (phase, iteration)
+        for phase, iteration, _job_id in keys
+    }
+    report.active_submission_intents = [
+        intent
+        for intent in list(
+            getattr(report, "active_submission_intents", []) or []
+        )
+        if (
+            str(intent.get("phase") or ""),
+            int(intent.get("iteration") or 0),
+        )
+        not in intent_keys
+    ]
+    report.unsafe_reasons = [
+        reason
+        for reason in list(getattr(report, "unsafe_reasons", []) or [])
+        if not str(reason).startswith("active submission intent(s) present:")
+        and not str(reason).startswith(
+            "scheduler-inconclusive prepared scratch task(s)"
+        )
+    ]
+    report.blocking_artifacts = [
+        value
+        for value in list(getattr(report, "blocking_artifacts", []) or [])
+        if str(value)
+        not in {
+            "prepared scratch ownership",
+            "active submission intent(s)",
+        }
+    ]
+    for scratch_record in list(
+        getattr(report, "scratch_inventory", []) or []
+    ):
+        key = (
+            str(scratch_record.get("phase") or ""),
+            int(scratch_record.get("iteration") or 0),
+            str(scratch_record.get("job_id") or ""),
+        )
+        if key in keys:
+            scratch_record["status"] = "terminal_intent"
+    for item in resolved:
+        phase = str(item.get("phase") or "")
+        job_id = str(item.get("job_id") or "")
+        if (
+            phase
+            and getattr(report, "proposed_state", None) is not None
+            and str(report.proposed_state.pending_jobs.get(phase) or "")
+            == job_id
+        ):
+            report.proposed_state.pending_jobs[phase] = None
+    report.scheduler_cancellation_recovery = [
+        dict(item)
+        for item in resolved
+        if bool(item.get("scheduler_recovery", False))
+    ]
+    if persist_for_apply:
+        existing = list(
+            getattr(report, "receipt_backed_intent_repairs", []) or []
+        )
+        existing_keys = {
+            (
+                str(item.get("phase") or ""),
+                int(item.get("iteration") or 0),
+                str(item.get("job_id") or ""),
+            )
+            for item in existing
+        }
+        existing.extend(
+            dict(item)
+            for item in resolved
+            if (
+                str(item.get("phase") or ""),
+                int(item.get("iteration") or 0),
+                str(item.get("job_id") or ""),
+            )
+            not in existing_keys
+        )
+        report.receipt_backed_intent_repairs = existing
 
 
 def _aimall_upstream_gaussian_recovery_evidence(
@@ -8555,6 +9981,79 @@ def _publish_reconcile_intent_transitions(
                 iteration,
                 "reconcile_apply_retry",
             )
+
+
+def _complete_reconcile_scheduler_cancellation_stop(
+    campaign: Path,
+    recovered_state: Any,
+    recoveries: Sequence[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Complete only the immediate stop that owns the recovered attempts."""
+    if not recoveries:
+        return None
+    from .daemon.stop_control import (
+        complete_stop_request,
+        read_stop_request,
+    )
+
+    request = read_stop_request(
+        campaign,
+        expected_campaign_uid=str(recovered_state.campaign_uid),
+    )
+    if not isinstance(request, Mapping):
+        raise ValueError(
+            "scheduler cancellation recovery has no matching stop request"
+        )
+    expected_identity = (
+        str(recovered_state.phase.value),
+        int(recovered_state.iteration),
+        int(getattr(recovered_state, "replacement_round", 0)),
+    )
+    observed_identity = (
+        str(request.get("observed_phase") or ""),
+        int(request.get("observed_iteration", -1)),
+        int(request.get("observed_replacement_round", -1)),
+    )
+    if (
+        str(request.get("mode") or "") != "immediate"
+        or request.get("cancel_jobs_requested") is not True
+        or observed_identity != expected_identity
+    ):
+        raise ValueError(
+            "scheduler cancellation recovery does not match the active "
+            "immediate stop request"
+        )
+    recovery_job_ids = {
+        str(item.get("job_id") or "")
+        for item in recoveries
+        if str(item.get("job_id") or "")
+    }
+    summary = request.get("cancellation_summary")
+    recorded_job_ids = {
+        str(item.get("job_id") or "")
+        for category in ("cancelled", "failed", "skipped")
+        for item in (
+            summary.get(category, [])
+            if isinstance(summary, Mapping)
+            else []
+        )
+        if isinstance(item, Mapping) and str(item.get("job_id") or "")
+    }
+    if recovery_job_ids and not recovery_job_ids.issubset(recorded_job_ids):
+        raise ValueError(
+            "scheduler cancellation recovery JobIDs do not match the stop "
+            "request"
+        )
+    if str(request.get("status") or "") == "completed":
+        return dict(request)
+    completed = complete_stop_request(
+        campaign,
+        str(request["request_id"]),
+        reason="scheduler_cancellation_recovered",
+    )
+    if not isinstance(completed, Mapping):
+        raise ValueError("scheduler cancellation stop request was not completed")
+    return dict(completed)
 
 
 def _retry_phase_from_cleaned_report(report) -> Optional[CampaignPhase]:
@@ -9324,12 +10823,20 @@ def _reconcile_active_work(
         for item in intents
         if isinstance(item, Mapping) and item.get("job_id")
     }
+    terminal_recovery_jobs = {
+        str(item.get("job_id") or "")
+        for item in (
+            getattr(report, "scheduler_cancellation_recovery", []) or []
+        )
+        if isinstance(item, Mapping) and item.get("job_id")
+    }
     if current is not None:
         scheduler_jobs.update(
             str(job_id)
             for job_id in (current.pending_jobs or {}).values()
-            if job_id
+            if job_id and str(job_id) not in terminal_recovery_jobs
         )
+    scheduler_jobs.difference_update(terminal_recovery_jobs)
     if scheduler_jobs:
         count = len(scheduler_jobs)
         return (
@@ -9547,6 +11054,54 @@ def _reconcile_presentation(
                 ),
             )
         )
+        if any(
+            str(change.path).startswith("resources.")
+            for change in allowed_changes
+        ):
+            planned.append(
+                (
+                    "retry resources",
+                    "approved resource changes apply only to the retry "
+                    "attempt; reused outputs keep their original producer "
+                    "record",
+                )
+            )
+
+    scheduler_cancellation = [
+        dict(item)
+        for item in (
+            getattr(report, "scheduler_cancellation_recovery", []) or []
+        )
+        if isinstance(item, Mapping)
+    ]
+    if scheduler_cancellation:
+        completed = sum(
+            int(item.get("n_completed") or 0)
+            for item in scheduler_cancellation
+        )
+        retry = sum(
+            int(item.get("n_retry") or 0)
+            for item in scheduler_cancellation
+        )
+        planned.append(
+            (
+                "scheduler recovery",
+                "preserve "
+                + str(completed)
+                + " scheduler-completed task"
+                + ("" if completed == 1 else "s")
+                + " as candidate"
+                + ("" if completed == 1 else "s")
+                + " for local output validation after resume; "
+                + str(retry)
+                + " unfinished task"
+                + ("" if retry == 1 else "s")
+                + " will be retried",
+            )
+        )
+        reason_parts.append(
+            "cancelled scheduler work has exact recoverable task outcomes"
+        )
 
     revalidation = getattr(report, "aimall_quality_revalidation", None)
     if isinstance(revalidation, Mapping) and revalidation.get("state") in {
@@ -9610,11 +11165,32 @@ def _reconcile_presentation(
         )
 
     repairs = list(getattr(report, "receipt_backed_intent_repairs", []) or [])
-    if repairs:
+    scheduler_recovery_keys = {
+        (
+            str(item.get("phase") or ""),
+            int(item.get("iteration") or 0),
+            str(item.get("job_id") or ""),
+        )
+        for item in scheduler_cancellation
+    }
+    ordinary_repairs = [
+        item
+        for item in repairs
+        if (
+            str(item.get("phase") or ""),
+            int(item.get("iteration") or 0),
+            str(item.get("job_id") or ""),
+        )
+        not in scheduler_recovery_keys
+    ]
+    if ordinary_repairs:
         planned.append(
             (
                 "submission records",
-                "retire " + str(len(repairs)) + " completed local record" + ("" if len(repairs) == 1 else "s"),
+                "retire "
+                + str(len(ordinary_repairs))
+                + " completed local record"
+                + ("" if len(ordinary_repairs) == 1 else "s"),
             )
         )
         reason_parts.append("completed submission bookkeeping needs to be retired")
@@ -11774,6 +13350,22 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 9
+    if report.active_submission_intents:
+        terminal_recoveries, terminal_blockers = (
+            _resolve_terminal_submission_intents_for_apply(
+                campaign,
+                report.active_submission_intents,
+                persist_terminal_receipts=bool(
+                    getattr(args, "apply", False)
+                ),
+            )
+        )
+        if terminal_recoveries and not terminal_blockers:
+            _apply_terminal_intent_recovery_to_report(
+                report,
+                terminal_recoveries,
+                persist_for_apply=bool(getattr(args, "apply", False)),
+            )
     if transaction_recovery_results:
         report.reconcile_transaction_recovery = {
             "state": "recovered",
@@ -12720,6 +14312,46 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         )
         return 9
     try:
+        _complete_reconcile_scheduler_cancellation_stop(
+            campaign,
+            report.proposed_state,
+            [
+                dict(item)
+                for item in (
+                    getattr(
+                        report,
+                        "scheduler_cancellation_recovery",
+                        [],
+                    )
+                    or []
+                )
+                if isinstance(item, Mapping)
+            ],
+        )
+    except Exception as exc:
+        reason = (
+            "recovered scheduler work was committed, but the matching stop "
+            "request could not be completed: "
+            + type(exc).__name__
+            + ": "
+            + str(exc)
+        )
+        _fail_reconcile_transaction(transaction, reason)
+        _print_reconcile_follow_up_required(
+            campaign,
+            report.proposed_state,
+            problem=(
+                "scheduler recovery was applied, but stop-control "
+                "bookkeeping remains incomplete"
+            ),
+            next_command=_campaign_command(campaign, "reconcile"),
+            next_effect="finish the recorded stop-control repair before resuming",
+            verbose_detail=(
+                reason if bool(getattr(args, "verbose", False)) else None
+            ),
+        )
+        return 9
+    try:
         applied_proposal_path = _rename_existing_timestamped(target, ".applied-")
     except Exception as exc:
         applied_proposal_path = None
@@ -12839,6 +14471,35 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             if isinstance(aimall_recovery, Mapping)
             else {}
         )
+        scheduler_recoveries = [
+            dict(item)
+            for item in (
+                getattr(report, "scheduler_cancellation_recovery", []) or []
+            )
+            if isinstance(item, Mapping)
+        ]
+        scheduler_event_fields = (
+            {
+                "scheduler_completed_task_candidates": sum(
+                    int(item.get("n_completed") or 0)
+                    for item in scheduler_recoveries
+                ),
+                "scheduler_retry_tasks": sum(
+                    int(item.get("n_retry") or 0)
+                    for item in scheduler_recoveries
+                ),
+                "scheduler_original_job_ids": sorted(
+                    {
+                        str(item.get("job_id") or "")
+                        for item in scheduler_recoveries
+                        if item.get("job_id")
+                    }
+                ),
+                "scheduler_tasks_resubmitted": 0,
+            }
+            if scheduler_recoveries
+            else {}
+        )
         append_event(
             campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
             "reconcile_applied",
@@ -12881,6 +14542,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             recovery_reason=str(report.decision or ""),
             **ariadne_event_fields,
             **aimall_event_fields,
+            **scheduler_event_fields,
         )
     except Exception:
         pass

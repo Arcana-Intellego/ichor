@@ -3200,6 +3200,35 @@ def test_polus_phase_b_happy_path(tmp_path):
     assert succeeded[-1]["phase"] == "PHASE_B_DIVERSITY"
 
 
+def test_polus_phase_b_recovery_defers_success_reporting_until_adoption(
+    tmp_path,
+):
+    ex = _make_executor(tmp_path)
+    iter_dir = _seed_phase_b_sample(tmp_path / "campaign", iteration=5)
+    _write_phase_b_manifest(iter_dir, n_final=2)
+    state = SimpleNamespace(iteration=5, campaign_uid="m16-test")
+
+    result = ex._parse_diversity_postprocess(
+        state,
+        CampaignPhase("PHASE_B_DIVERSITY"),
+        observations=[],
+        emit_success_events=False,
+    )
+
+    assert result.is_complete is True
+    assert result.failure_reason is None
+    events = _read_journal_events(tmp_path / "campaign")
+    assert not [
+        event
+        for event in events
+        if event.get("event") == "phase_succeeded_live"
+        and event.get("phase") == "PHASE_B_DIVERSITY"
+    ]
+    deferred = result.journal_events
+    assert deferred[-1]["event"] == "phase_succeeded_live"
+    assert deferred[-1]["phase"] == "PHASE_B_DIVERSITY"
+
+
 def test_polus_phase_b_missing_sample(tmp_path):
     ex = _make_executor(tmp_path)
     iter_dir = active_iteration_dir(tmp_path / "campaign", 5)

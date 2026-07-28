@@ -59,6 +59,7 @@ from .phase_executor import (
     PostprocessFilesystemNotSettled,
     PostprocessRetryDisposition,
     SBATCH_PHASES,
+    SubmissionCancelledBeforeSchedulerAcceptance,
 )
 from .phase_progress import PhaseProgressReporter
 from .reconcile import stateful_campaign_artifacts
@@ -1939,6 +1940,12 @@ class Daemon:
                         state,
                         phase,
                     )
+                    recovery_decision_contract = (
+                        self._scheduler_recovery_decision_contract(
+                            state,
+                            phase,
+                        )
+                    )
                     _submission_intent.write_pre_submit_intent(
                         self.campaign_dir,
                         campaign_uid=str(getattr(state, "campaign_uid", "")),
@@ -1951,7 +1958,11 @@ class Daemon:
                         decision_contract=(
                             dict(postprocess_source["decision_contract"])
                             if postprocess_source is not None
-                            else self._submission_decision_contract()
+                            else (
+                                recovery_decision_contract
+                                if recovery_decision_contract is not None
+                                else self._submission_decision_contract()
+                            )
                         ),
                         postprocess_source=(
                             dict(postprocess_source)
@@ -1995,6 +2006,34 @@ class Daemon:
                 result.validate(stage="submit", phase_name=phase_name)
             finally:
                 self._bind_executor_progress(None)
+        except SubmissionCancelledBeforeSchedulerAcceptance as exc:
+            if phase_reporter is not None:
+                phase_reporter.fail(
+                    str(exc),
+                    stage=(
+                        "sge_submission"
+                        if self.scheduler_identity_kind == "sge"
+                        else "slurm_submission"
+                    ),
+                )
+            if intent_written:
+                try:
+                    _submission_intent.mark_failed(
+                        self.campaign_dir,
+                        phase_name,
+                        int(state.iteration),
+                        "user_cancelled_before_scheduler_acceptance",
+                    )
+                except Exception:
+                    pass
+            self._journal(
+                "phase_activity_failed",
+                phase=phase_name,
+                iteration=int(state.iteration),
+                stage="scheduler_submission",
+                reason="user_cancelled_before_scheduler_acceptance",
+            )
+            return TickStatus.POLLING
         except BackendSubmissionError as exc:
             if phase_reporter is not None:
                 phase_reporter.fail(
@@ -2688,6 +2727,34 @@ class Daemon:
         if not summary.is_terminal:
             return TickStatus.POLLING
 
+        # Re-read stop control at the terminal boundary.  An immediate
+        # cancellation can be installed while this tick is blocked in the
+        # scheduler query; entering scientific postprocessing in that window
+        # would race the CLI's terminal-evidence transaction.
+        try:
+            terminal_stop = self._read_stop_control(state)
+        except Exception as exc:
+            return self._halt_scheduler_uncertain(
+                state,
+                phase,
+                "stop_control_invalid_at_scheduler_terminal: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:180],
+            )
+        if (
+            isinstance(terminal_stop, Mapping)
+            and str(terminal_stop.get("mode")) == "immediate"
+            and bool(terminal_stop.get("cancel_jobs_requested", False))
+        ):
+            if str(terminal_stop.get("status")) == "cancelling":
+                return TickStatus.POLLING
+            return self._latch_stop_request(
+                state,
+                terminal_stop,
+                reason="scheduler_cancellation_completed",
+            )
+
         self._finish_scheduler_progress(
             phase,
             str(job_id),
@@ -2751,6 +2818,43 @@ class Daemon:
             ),
             "config_sha256": config_fingerprint(canonical_config(self.config)),
         }
+
+    def _scheduler_recovery_decision_contract(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+    ) -> Optional[Dict[str, Any]]:
+        """Retain the first attempt's decision controls across retry arrays."""
+        from .scheduler_recovery import scheduler_terminal_recoveries
+
+        recoveries = scheduler_terminal_recoveries(
+            self.campaign_dir,
+            campaign_uid=str(state.campaign_uid),
+            phase=phase.value,
+            iteration=int(state.iteration),
+            replacement_round=int(getattr(state, "replacement_round", 0)),
+        )
+        if not recoveries:
+            return None
+        contracts: List[Dict[str, Any]] = []
+        for recovery in recoveries:
+            intent = recovery.get("intent")
+            contract = (
+                intent.get("decision_contract")
+                if isinstance(intent, Mapping)
+                else None
+            )
+            if not isinstance(contract, Mapping):
+                raise ValueError(
+                    "scheduler recovery producer has no decision contract"
+                )
+            contracts.append(dict(contract))
+        original = contracts[0]
+        if any(contract != original for contract in contracts[1:]):
+            raise ValueError(
+                "scheduler recovery attempts have contradictory decision contracts"
+            )
+        return original
 
     def _ariadne_postprocess_source_if_complete(
         self,

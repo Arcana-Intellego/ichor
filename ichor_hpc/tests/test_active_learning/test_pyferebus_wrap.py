@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
+import ichor.hpc.active_learning.daemon.ferebus_task_runner as task_runner
 from ichor.hpc.active_learning.daemon.ferebus_task_runner import (
     FerebusTaskRunnerError,
     _canonical_sha256,
@@ -453,6 +454,119 @@ def test_submit_ferebus_happy_path(tmp_path):
     assert runner.kwargs[0]["check"] is False
     assert runner.kwargs[0]["capture_output"] is True
     assert runner.kwargs[0]["text"] is True
+
+
+def test_submit_ferebus_reuses_authenticated_prepared_inputs_without_regeneration(
+    tmp_path,
+):
+    captured: List[_StubModel] = []
+    jd = tmp_path / "job.json"
+    jd.write_text("{}")
+    submit_ferebus(
+        jd,
+        tmp_path,
+        model_class=_make_model_class(captured),
+        submit_runner=_StubRunner(),
+    )
+    assert len(captured) == 1
+
+    def fail_if_constructed(**_kwargs):
+        raise AssertionError("pyferebus input generation must not be repeated")
+
+    retry_runner = _StubRunner(
+        result=_StubCompletedProcess(stdout="12345679\n")
+    )
+    result = submit_ferebus(
+        jd,
+        tmp_path,
+        expected_tasks=1,
+        submitted_tasks=1,
+        reuse_prepared_inputs=True,
+        model_class=fail_if_constructed,
+        submit_runner=retry_runner,
+    )
+
+    assert result.job_id == "12345679"
+    assert len(captured) == 1
+    assert len(retry_runner.calls) == 1
+
+
+def test_submit_ferebus_all_task_retry_rebinds_changed_executable(
+    tmp_path,
+):
+    captured: List[_StubModel] = []
+    jd = tmp_path / "job.json"
+    jd.write_text("{}")
+    submit_ferebus(
+        jd,
+        tmp_path,
+        path_to_executable="/old/ferebus",
+        model_class=_make_model_class(captured),
+        submit_runner=_StubRunner(),
+    )
+
+    result = submit_ferebus(
+        jd,
+        tmp_path,
+        path_to_executable="/new/ferebus",
+        expected_tasks=1,
+        submitted_tasks=1,
+        reuse_prepared_inputs=True,
+        require_existing_task_map_match=False,
+        submit_runner=_StubRunner(
+            result=_StubCompletedProcess(stdout="12345680\n")
+        ),
+    )
+
+    assert result.job_id == "12345680"
+    task_map = json.loads(
+        (tmp_path / "FEREBUS_TASK_MAP.json").read_text(encoding="utf-8")
+    )
+    rebound_executable = Path(task_map["executable"]["path"])
+    assert rebound_executable.name == "ferebus"
+    assert rebound_executable.parent.name == "new"
+    assert task_map["tasks"][0]["argv"][0] == str(rebound_executable)
+
+
+def test_ferebus_runner_maps_dense_retry_index_to_original_task(
+    tmp_path,
+    monkeypatch,
+):
+    task_map = tmp_path / "FEREBUS_TASK_MAP.json"
+    task_map.write_text("{}")
+    scheduler_map = tmp_path / "array_task_map.json"
+    scheduler_map.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "dense_to_logical": [1, 4],
+            }
+        )
+    )
+    called = {}
+
+    def fake_execute(path, logical_task_id):
+        called["path"] = path
+        called["logical_task_id"] = logical_task_id
+        return 0
+
+    monkeypatch.setattr(task_runner, "execute_task", fake_execute)
+    result = task_runner.main(
+        [
+            "--task-map",
+            str(task_map),
+            "--scheduler-task-map",
+            str(scheduler_map),
+            "--task-index",
+            "1",
+        ]
+    )
+
+    assert result == 0
+    assert called == {
+        "path": task_map,
+        "logical_task_id": 4,
+    }
 
 
 def test_submit_ferebus_keeps_sbatch_directives_before_shell_commands(tmp_path):

@@ -3616,15 +3616,64 @@ def stage_ferebus_inputs(
     )
 
     staging = trained_models_dir(campaign) / "iteration-staging"
-    # iteration-staging is ONE shared scratch dir reused every iteration, so wipe it first.
-    # otherwise last iteration's *_train.csv / *.model lying around get globbed back in and we
-    # either split stale data or re-commit an old model as a fresh version (both silent + nasty).
-    if staging.exists():
-        _checked_rmtree(
-            staging,
-            campaign_dir=campaign,
-            allowed_roots=[campaign / TRAINED_MODELS_DIRNAME],
+    # A cancelled FEREBUS array may leave independently authenticated task
+    # receipts in this shared tree.  Retain it only when the complete immutable
+    # preparation contract still describes the current reference-data view and
+    # scientific configuration.  Resource-only changes (for example a new
+    # partition) deliberately do not invalidate that preparation.
+    if staging.exists() or staging.is_symlink():
+        preserve_existing = False
+        try:
+            if staging.is_symlink() or not staging.is_dir():
+                raise ValueError("FEREBUS iteration-staging is not a directory")
+            existing = read_ferebus_manifest(
+                staging,
+                verify_dataset_files=True,
+            )
+            from ..ferebus_prior import resolve_ferebus_prior_contract
+
+            existing_atoms = [str(value) for value in existing.get("atoms", [])]
+            expected_prior = resolve_ferebus_prior_contract(
+                config,
+                atom_labels=existing_atoms,
+            ).to_dict()
+            configured_properties = [
+                str(value)
+                for value in getattr(config.ferebus, "properties", ["iqa"])
+            ]
+            preserve_existing = bool(
+                str(existing.get("campaign_uid") or "") == str(view.campaign_uid)
+                and int(existing.get("reference_data_version", -1)) == version
+                and str(existing.get("reference_data_head_manifest_sha256") or "")
+                == str(view.head_manifest_sha256)
+                and str(existing.get("reference_data_view_sha256") or "")
+                == str(view.cumulative_view_sha256)
+                and list(existing.get("properties") or [])
+                == configured_properties
+                and (existing.get("kernel_contract") or {}).get("family")
+                == str(config.ferebus.kernel)
+                and existing.get("prior_mean_contract") == expected_prior
+            )
+        except Exception:
+            preserve_existing = False
+        if preserve_existing:
+            report(
+                "task_staging",
+                completed=int(existing["n_tasks"]),
+                total=int(existing["n_tasks"]),
+                unit="tasks",
+                recovery="preserved_matching_iteration_staging",
+            )
+            return staging, int(existing["n_tasks"])
+        if staging.is_symlink() or not staging.is_dir():
+            raise ValueError("refusing invalid FEREBUS iteration-staging")
+        archive = staging.with_name(
+            "iteration-staging.archived-" + uuid.uuid4().hex
         )
+        if archive.exists() or archive.is_symlink():
+            raise ValueError("FEREBUS staging archive destination already exists")
+        staging.rename(archive)
+        _fsync_parent_dir(staging)
     staging.mkdir(parents=True, exist_ok=True)
 
     pointdir_names = [entry.pointdir_name for entry in view.entries]

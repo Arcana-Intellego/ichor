@@ -17,6 +17,7 @@ from ichor.hpc.active_learning.daemon.stop_control import (
     STOP_REQUEST_SCHEMA_VERSION,
     StopControlError,
     build_stop_request,
+    complete_stop_request,
     describe_stop_request,
     install_stop_request,
     read_stop_request,
@@ -350,6 +351,31 @@ def test_cancelling_status_waits_for_cli_cancellation_summary(tmp_path):
             daemon.campaign_dir,
             build_stop_request(state, mode="immediate", cancel_jobs=False),
         )
+
+
+def test_conclusively_recovered_cancellation_can_complete_stop(tmp_path):
+    state = fresh_campaign_state()
+    request, _ = install_stop_request(
+        tmp_path,
+        build_stop_request(
+            state,
+            mode="immediate",
+            cancel_jobs=True,
+        ),
+    )
+
+    completed = complete_stop_request(
+        tmp_path,
+        request["request_id"],
+        reason="scheduler_cancellation_recovered",
+    )
+
+    assert completed is not None
+    assert completed["status"] == "completed"
+    assert (
+        completed["completion_reason"]
+        == "scheduler_cancellation_recovered"
+    )
 
 
 def test_cancelling_request_does_not_race_phase_transition(tmp_path):

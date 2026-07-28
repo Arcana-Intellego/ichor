@@ -760,6 +760,93 @@ def _bind_generated_configs_to_task_manifest(
     atomic_write_json(manifest_path, payload)
 
 
+def _read_bound_generated_configs(
+    working_dir: Path,
+) -> Tuple[Mapping[str, Any], ...]:
+    """Authenticate already generated configs without rewriting their manifest."""
+    from ..strict_json import strict_json as json
+    from ..versioning.manifest import sha256_file
+
+    root = Path(working_dir).resolve()
+    manifest_path = root / "FEREBUS_TASKS.json"
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise FerebusSubmissionError(
+            "cannot read prepared FEREBUS task manifest"
+        ) from exc
+    tasks = payload.get("tasks") if isinstance(payload, Mapping) else None
+    if not isinstance(tasks, list) or not tasks:
+        raise FerebusSubmissionError(
+            "prepared FEREBUS task manifest has no tasks"
+        )
+    records: List[Mapping[str, Any]] = []
+    seen = set()
+    for task in tasks:
+        binding = (
+            task.get("generated_config")
+            if isinstance(task, Mapping)
+            else None
+        )
+        if not isinstance(binding, Mapping):
+            raise FerebusSubmissionError(
+                "prepared FEREBUS task has no generated-config binding"
+            )
+        relative = str(binding.get("path") or "")
+        if (
+            not relative
+            or Path(relative).is_absolute()
+            or "\\" in relative
+            or relative in seen
+        ):
+            raise FerebusSubmissionError(
+                "prepared FEREBUS generated-config path is invalid"
+            )
+        seen.add(relative)
+        parts = tuple(relative.split("/"))
+        if any(part in {"", ".", ".."} for part in parts):
+            raise FerebusSubmissionError(
+                "prepared FEREBUS generated-config path is not canonical"
+            )
+        candidate = root.joinpath(*parts)
+        try:
+            candidate.resolve(strict=False).relative_to(root)
+        except ValueError as exc:
+            raise FerebusSubmissionError(
+                "prepared FEREBUS generated config escapes staging"
+            ) from exc
+        current = root
+        for part in parts:
+            current = current / part
+            if current.is_symlink():
+                raise FerebusSubmissionError(
+                    "prepared FEREBUS generated config contains a symlink"
+                )
+        if candidate.is_symlink() or not candidate.is_file():
+            raise FerebusSubmissionError(
+                "prepared FEREBUS generated config is missing"
+            )
+        size = binding.get("size")
+        digest = str(binding.get("sha256") or "")
+        if (
+            isinstance(size, bool)
+            or not isinstance(size, int)
+            or int(candidate.stat().st_size) != int(size)
+            or sha256_file(candidate) != digest
+        ):
+            raise FerebusSubmissionError(
+                "prepared FEREBUS generated config binding is invalid"
+            )
+        records.append(
+            {
+                "path": str(candidate),
+                "size": int(size),
+                "sha256": digest,
+            }
+        )
+    return tuple(records)
+
+
 def _canonical_sha256(payload: Mapping[str, Any]) -> str:
     import hashlib
     from ..strict_json import strict_json as json
@@ -780,6 +867,7 @@ def _write_structured_task_map(
     executable: Union[str, Path],
     execution_kind: str = "native_ferebus",
     performance_required: bool = True,
+    require_existing_match: bool = False,
 ) -> Path:
     """Bind pyferebus-generated configs to shell-free daemon task records."""
     from ..daemon.ferebus_task_runner import (
@@ -787,6 +875,7 @@ def _write_structured_task_map(
         FEREBUS_TASK_MAP_SCHEMA_VERSION,
         FEREBUS_TASK_RECEIPT_FILENAME,
     )
+    from ..strict_json import strict_json as json
     from ..daemon.state import atomic_write_json
     from ..versioning.manifest import sha256_file
 
@@ -906,6 +995,22 @@ def _write_structured_task_map(
     }
     payload["task_map_sha256"] = _canonical_sha256(payload)
     path = working_dir / FEREBUS_TASK_MAP_FILENAME
+    if require_existing_match:
+        if path.is_symlink() or not path.is_file():
+            raise FerebusSubmissionError(
+                "prepared FEREBUS task map is missing"
+            )
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise FerebusSubmissionError(
+                "prepared FEREBUS task map is unreadable"
+            ) from exc
+        if existing != payload:
+            raise FerebusSubmissionError(
+                "prepared FEREBUS task map does not match current immutable inputs"
+            )
+        return path
     atomic_write_json(path, payload)
     return path
 
@@ -915,6 +1020,7 @@ def _replace_with_structured_task_script(
     *,
     task_map: Path,
     scheduler_kind: str,
+    scheduler_task_map: Optional[Path] = None,
 ) -> None:
     """Discard backend-owned shell commands and invoke the structured runner."""
     from ..daemon.state import atomic_write_text
@@ -943,8 +1049,21 @@ def _replace_with_structured_task_script(
         + " -m ichor.hpc.active_learning.daemon.ferebus_task_runner"
         + " --task-map "
         + shlex.quote(str(task_map.resolve()))
-        + ' --task-index "${ICHOR_SCHEDULER_ARRAY_TASK_ID}"'
     )
+    if scheduler_task_map is not None:
+        from ..daemon.script_bundles import read_array_task_map
+
+        retry_map = Path(scheduler_task_map)
+        logical_ids = list(read_array_task_map(retry_map))
+        if not logical_ids:
+            raise FerebusSubmissionError(
+                "FEREBUS scheduler task map contains no retry tasks"
+            )
+        command += (
+            " --scheduler-task-map "
+            + shlex.quote(str(retry_map.resolve()))
+        )
+    command += ' --task-index "${ICHOR_SCHEDULER_ARRAY_TASK_ID}"'
     body = [shebang, *scheduler_directives, command]
     atomic_write_text(script, "\n".join(body) + "\n")
 
@@ -976,6 +1095,10 @@ def submit_ferebus(
     move_dataset_files: bool = True,
     path_to_executable: Optional[Union[str, Path]] = None,
     expected_tasks: Optional[int] = None,
+    submitted_tasks: Optional[int] = None,
+    scheduler_task_map: Optional[Union[str, Path]] = None,
+    reuse_prepared_inputs: bool = False,
+    require_existing_task_map_match: Optional[bool] = None,
     expected_job_name: Optional[str] = None,
     extra: Optional[Mapping[str, Any]] = None,
     model_class: Optional[Any] = None,
@@ -1036,7 +1159,21 @@ def submit_ferebus(
         maxiter=maxiter,
     )
 
-    if model_class is None:
+    if not isinstance(reuse_prepared_inputs, bool):
+        raise FerebusSubmissionError(
+            "reuse_prepared_inputs must be a boolean"
+        )
+    if require_existing_task_map_match is None:
+        require_existing_task_map_match = bool(reuse_prepared_inputs)
+    if not isinstance(require_existing_task_map_match, bool):
+        raise FerebusSubmissionError(
+            "require_existing_task_map_match must be a boolean or null"
+        )
+    if require_existing_task_map_match and not reuse_prepared_inputs:
+        raise FerebusSubmissionError(
+            "existing FEREBUS task-map matching requires prepared-input reuse"
+        )
+    if model_class is None and not reuse_prepared_inputs:
         from pyferebus.executors.trainer import MODEL as _MODEL
         model_class = _MODEL
     if submit_runner is None:
@@ -1105,20 +1242,21 @@ def submit_ferebus(
     # Force pyferebus to write inputs without submitting its generated script.
     model_kwargs["submitToComputeNode"] = False
 
-    cwd = os.getcwd()
-    try:
-        # pyferebus' SLURM writer enumerates property directories relative to cwd even when
-        # workingDirectory is absolute, so run its generation step from the staged workdir.
-        os.chdir(str(working_dir))
-        model = model_class(
-            jdFile=str(jd_file_path),
-            workingDirectory=str(working_dir),
-            platform=platform,
-            **model_kwargs,
-        )
-        model.run()
-    finally:
-        os.chdir(cwd)
+    if not reuse_prepared_inputs:
+        cwd = os.getcwd()
+        try:
+            # pyferebus' writer enumerates property directories relative to
+            # cwd even when workingDirectory is absolute.
+            os.chdir(str(working_dir))
+            model = model_class(
+                jdFile=str(jd_file_path),
+                workingDirectory=str(working_dir),
+                platform=platform,
+                **model_kwargs,
+            )
+            model.run()
+        finally:
+            os.chdir(cwd)
 
     script, generated_task_count = _validate_generated_pyferebus_artifacts(
         working_dir,
@@ -1126,8 +1264,36 @@ def submit_ferebus(
     )
     if expected_tasks is None:
         expected_tasks = generated_task_count
-    generated_configs = _patch_generated_configs(working_dir, prior_contract)
-    _bind_generated_configs_to_task_manifest(working_dir, generated_configs)
+    submitted_task_count = (
+        int(expected_tasks)
+        if submitted_tasks is None
+        else int(submitted_tasks)
+    )
+    if submitted_task_count <= 0 or submitted_task_count > int(expected_tasks):
+        raise FerebusSubmissionError(
+            "FEREBUS submitted task count must be between one and the "
+            "generated task count"
+        )
+    scheduler_task_map_path = (
+        None if scheduler_task_map is None else Path(scheduler_task_map)
+    )
+    if scheduler_task_map_path is None and submitted_task_count != int(
+        expected_tasks
+    ):
+        raise FerebusSubmissionError(
+            "a partial FEREBUS submission requires a scheduler task map"
+        )
+    if reuse_prepared_inputs:
+        generated_configs = _read_bound_generated_configs(working_dir)
+    else:
+        generated_configs = _patch_generated_configs(
+            working_dir,
+            prior_contract,
+        )
+        _bind_generated_configs_to_task_manifest(
+            working_dir,
+            generated_configs,
+        )
     if prepared_callback is not None:
         overrides = prepared_callback(working_dir, script, generated_configs)
         if not isinstance(overrides, Mapping):
@@ -1178,11 +1344,13 @@ def submit_ferebus(
     task_map = _write_structured_task_map(
         working_dir,
         executable=path_to_executable or "ferebus",
+        require_existing_match=bool(require_existing_task_map_match),
     )
     _replace_with_structured_task_script(
         script,
         task_map=task_map,
         scheduler_kind=scheduler_kind,
+        scheduler_task_map=scheduler_task_map_path,
     )
     _harden_generated_script(
         script,
@@ -1195,7 +1363,7 @@ def submit_ferebus(
         output_path=output_path,
         error_path=error_path,
         runtime_preamble=runtime_preamble,
-        expected_tasks=expected_tasks,
+        expected_tasks=submitted_task_count,
         array_concurrency_limit=array_concurrency_limit,
         scheduler_kind=scheduler_kind,
         scheduler_queue=scheduler_queue,

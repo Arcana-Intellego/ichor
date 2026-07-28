@@ -41,6 +41,92 @@ _REBINDABLE_REFERENCE_COMMIT_STATES = frozenset(
 )
 
 
+def _scheduler_cancellation_transition_boundary(
+    campaign: Path,
+    state: Any,
+) -> Optional[Dict[str, Any]]:
+    """Recognise exact terminal cancellation evidence without parsing outputs."""
+    from .daemon.phase_executor import SBATCH_PHASES
+    from .daemon.scheduler_recovery import scheduler_terminal_recoveries
+    from .daemon.submission_intent import intent_attempt_records
+
+    phase = CampaignPhase(state.phase)
+    if phase.value not in SBATCH_PHASES:
+        return None
+    recoveries = scheduler_terminal_recoveries(
+        campaign,
+        campaign_uid=str(state.campaign_uid),
+        phase=phase.value,
+        iteration=int(state.iteration),
+        replacement_round=int(getattr(state, "replacement_round", 0)),
+    )
+    if not recoveries:
+        return None
+    attempts = [
+        record
+        for record in intent_attempt_records(
+            campaign,
+            phase.value,
+            int(state.iteration),
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        if int(record.get("replacement_round", 0))
+        == int(getattr(state, "replacement_round", 0))
+    ]
+    if not attempts:
+        return None
+    latest_attempt = max(
+        attempts,
+        key=lambda record: int(record.get("attempt_sequence", 0)),
+    )
+    recovery_identities = {
+        str(recovery["intent"].get("submission_identity") or "")
+        for recovery in recoveries
+    }
+    if (
+        str(latest_attempt.get("submission_identity") or "")
+        not in recovery_identities
+    ):
+        return None
+    from .daemon.cluster_profile import profile_value
+
+    current_scheduler = str(
+        profile_value("hpc", "scheduler", default="slurm") or "slurm"
+    ).strip().lower()
+    recorded_schedulers = {
+        str(
+            recovery["intent"].get("scheduler_identity_kind") or "slurm"
+        ).strip().lower()
+        for recovery in recoveries
+    }
+    if recorded_schedulers != {current_scheduler}:
+        raise ExecutionIdentityError(
+            "scheduler kind cannot change during "
+            + phase.value
+            + " recovery: recorded "
+            + ", ".join(sorted(recorded_schedulers))
+            + ", active "
+            + current_scheduler
+        )
+    latest_by_task: Dict[int, Mapping[str, Any]] = {}
+    for recovery in recoveries:
+        for outcome in recovery["receipt"].get("outcomes", []):
+            latest_by_task[int(outcome["logical_task_id"])] = outcome
+    completed = {
+        task_id
+        for task_id, outcome in latest_by_task.items()
+        if str(outcome.get("status") or "") == "COMPLETED"
+        and outcome.get("exit_code") == [0, 0]
+    }
+    retry = set(latest_by_task).difference(completed)
+    return {
+        "transition_kind": "scheduler_cancellation_recovery",
+        "scheduler_terminal_receipts": len(recoveries),
+        "scheduler_completed_candidates": len(completed),
+        "scheduler_retry_candidates": len(retry),
+    }
+
+
 def _validate_ferebus_transition_boundary(campaign: Path, state: Any) -> None:
     """Require a clean, committed-data-only FEREBUS submission boundary."""
     from .daemon.recovery_contracts import phase_recovery_contract_error
@@ -1726,7 +1812,13 @@ def advance_environment_generation(
     aimall_transition_pending = False
     gaussian_transition_pending = False
     allocation_check_transition_pending = False
-    if state.phase is CampaignPhase.REFERENCE_COMMIT:
+    scheduler_cancel_transition = _scheduler_cancellation_transition_boundary(
+        campaign,
+        state,
+    )
+    if scheduler_cancel_transition is not None:
+        transition_context = scheduler_cancel_transition
+    elif state.phase is CampaignPhase.REFERENCE_COMMIT:
         from .daemon.reference_commit import classify_reference_commit
 
         context = "bootstrap" if int(state.iteration) == 0 else "active"
@@ -1945,6 +2037,16 @@ def advance_environment_generation(
     generation_number = int(candidate["generation"])
     generations_root = environment_generations_dir(campaign)
     generations_root.mkdir(parents=True, exist_ok=True)
+    if scheduler_cancel_transition is not None:
+        refreshed_transition = _scheduler_cancellation_transition_boundary(
+            campaign,
+            state,
+        )
+        if refreshed_transition != scheduler_cancel_transition:
+            raise ExecutionIdentityError(
+                "scheduler-cancellation recovery evidence changed during "
+                "environment transition"
+            )
     if phase_b_transition_pending:
         refreshed_intents = inventory_intents(
             campaign,

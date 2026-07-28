@@ -728,11 +728,21 @@ def scan_array_tasks(
     iteration: int,
     *,
     force_resubmit: bool = False,
+    forced_retry_task_ids: Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
     phase = str(getattr(phase_name, "value", phase_name))
     if not supports_partial_array_recovery(phase):
         raise ValueError("phase does not support partial array recovery: " + phase)
     task_ids = logical_task_ids(campaign_dir, phase, int(iteration))
+    forced_retry = {
+        int(value) for value in (forced_retry_task_ids or ())
+    }
+    unknown_forced = forced_retry.difference(int(value) for value in task_ids)
+    if unknown_forced:
+        raise ValueError(
+            "forced retry task IDs are outside the canonical task set: "
+            + ", ".join(str(value) for value in sorted(unknown_forced))
+        )
     tasks: List[Dict[str, Any]] = []
     n_complete = 0
     for task_id in task_ids:
@@ -745,6 +755,9 @@ def scan_array_tasks(
         if bool(force_resubmit):
             status = "pending"
             reason = "force_resubmit"
+        elif int(task_id) in forced_retry:
+            status = "pending"
+            reason = "environment_equivalence_unproven"
         elif ok:
             status = "complete"
             n_complete += 1
@@ -915,12 +928,14 @@ def refresh_array_ledger(
     iteration: int,
     *,
     force_resubmit: bool = False,
+    forced_retry_task_ids: Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
     payload = scan_array_tasks(
         campaign_dir,
         phase_name,
         int(iteration),
         force_resubmit=bool(force_resubmit),
+        forced_retry_task_ids=forced_retry_task_ids,
     )
     path = write_array_ledger(campaign_dir, payload)
     payload["path"] = str(path)
@@ -963,22 +978,30 @@ def _ensure_inside_campaign(campaign_dir: Path, target: Path) -> None:
 def _move_if_exists(source: Path, target_dir: Path, campaign_dir: Path) -> Optional[str]:
     from .filesystem import campaign_owned_path
 
-    if not source.exists() and not source.is_symlink():
-        return None
-    if source.is_symlink():
-        raise ValueError("refusing to archive symlinked array output: " + str(source))
-    source = campaign_owned_path(campaign_dir, source)
     target_dir = campaign_owned_path(campaign_dir, target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
     target_dir = campaign_owned_path(campaign_dir, target_dir)
+    source_present = source.exists() or source.is_symlink()
+    if source_present and source.is_symlink():
+        raise ValueError("refusing to archive symlinked array output: " + str(source))
+    source = campaign_owned_path(campaign_dir, source)
     target = target_dir / source.name
-    suffix = 1
-    while target.exists():
-        target = campaign_owned_path(
-            campaign_dir, target_dir / (source.name + "." + str(suffix))
-        )
-        suffix += 1
     target = campaign_owned_path(campaign_dir, target)
+    target_present = target.exists() or target.is_symlink()
+    if source_present and target_present:
+        raise ValueError(
+            "array output and its recovery archive destination both exist: "
+            + str(source)
+        )
+    if not source_present:
+        if not target_present:
+            return None
+        if target.is_symlink():
+            raise ValueError(
+                "array recovery archive destination is a symlink: "
+                + str(target)
+            )
+        return str(target)
     shutil.move(str(source), str(target))
     return str(target)
 
@@ -1014,10 +1037,68 @@ def archive_existing_array_task_outputs(
             str(int(iteration)).zfill(6) + "-" + stamp,
         ),
     )
-    archive_root.mkdir(parents=True, exist_ok=False)
     archive_receipt = archive_root / "ARCHIVE.json"
     ids = [int(x) for x in (task_ids if task_ids is not None else logical_task_ids(campaign, phase, int(iteration)))]
     archived: List[str] = []
+    if archive_root.exists() or archive_root.is_symlink():
+        if archive_root.is_symlink() or not archive_root.is_dir():
+            raise ValueError("array output archive is not a regular directory")
+        if archive_receipt.is_symlink() or not archive_receipt.is_file():
+            try:
+                unexpected = list(archive_root.iterdir())
+            except OSError as exc:
+                raise ValueError(
+                    "array output archive cannot be inspected"
+                ) from exc
+            if unexpected:
+                raise ValueError(
+                    "non-empty array output archive lacks its recovery receipt"
+                )
+            # A crash may occur after mkdir and before the first durable
+            # transaction record.  An empty deterministic destination proves
+            # that no output move has happened, so replay may initialise it.
+            existing_receipt = None
+        else:
+            try:
+                existing_receipt = json.loads(
+                    archive_receipt.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError) as exc:
+                raise ValueError("array output archive receipt is unreadable") from exc
+        if existing_receipt is None:
+            pass
+        elif (
+            not isinstance(existing_receipt, dict)
+            or existing_receipt.get("schema_version") != 1
+            or existing_receipt.get("phase") != phase
+            or existing_receipt.get("iteration") != int(iteration)
+            or existing_receipt.get("status") not in {"moving", "complete"}
+            or not isinstance(existing_receipt.get("moved"), list)
+            or any(
+                not isinstance(value, str)
+                for value in existing_receipt.get("moved", [])
+            )
+        ):
+            raise ValueError("array output archive receipt is invalid")
+        else:
+            archived = list(existing_receipt["moved"])
+            for value in archived:
+                archived_path = Path(value)
+                if archived_path.is_symlink() or not archived_path.exists():
+                    raise ValueError(
+                        "array output archive receipt references a missing or "
+                        "symlinked payload: " + str(archived_path)
+                    )
+                archived_path = campaign_owned_path(campaign, archived_path)
+                try:
+                    archived_path.relative_to(archive_root)
+                except ValueError as exc:
+                    raise ValueError(
+                        "array output archive receipt references a payload "
+                        "outside its archive"
+                    ) from exc
+    else:
+        archive_root.mkdir(parents=True, exist_ok=False)
 
     def record_archive(status: str) -> None:
         payload = {
@@ -1047,13 +1128,13 @@ def archive_existing_array_task_outputs(
             task = task_for_array_task_id(task_map, int(task_id))
             seed_dir = ariadne_seed_dir(iter_dir, int(task["seed_id"]))
             moved = _move_if_exists(seed_dir, task_archive, campaign)
-            if moved:
+            if moved and moved not in archived:
                 archived.append(moved)
                 record_archive("moving")
             partial_pattern = "." + seed_dir.name + ".partial-*"
             for candidate in sorted(seed_dir.parent.glob(partial_pattern)):
                 moved = _move_if_exists(candidate, task_archive, campaign)
-                if moved:
+                if moved and moved not in archived:
                     archived.append(moved)
                     record_archive("moving")
             continue
@@ -1069,7 +1150,7 @@ def archive_existing_array_task_outputs(
                 pdir / "GAUSSIAN_TASK_RECEIPT.json",
             ]:
                 moved = _move_if_exists(candidate, task_archive, campaign)
-                if moved:
+                if moved and moved not in archived:
                     archived.append(moved)
                     record_archive("moving")
         elif "AIMALL" in phase:
@@ -1084,7 +1165,7 @@ def archive_existing_array_task_outputs(
             for pattern in patterns:
                 for candidate in sorted(pdir.glob(pattern)):
                     moved = _move_if_exists(candidate, task_archive, campaign)
-                    if moved:
+                    if moved and moved not in archived:
                         archived.append(moved)
                         record_archive("moving")
     record_archive("complete")
@@ -1097,6 +1178,7 @@ def prepare_retry_submission(
     iteration: int,
     *,
     force_resubmit: bool = False,
+    forced_retry_task_ids: Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
     if not bool(force_resubmit):
         try:
@@ -1110,6 +1192,7 @@ def prepare_retry_submission(
         phase_name,
         int(iteration),
         force_resubmit=bool(force_resubmit),
+        forced_retry_task_ids=forced_retry_task_ids,
     )
     retry_ids = [int(x) for x in payload.get("retry_task_ids") or []]
     if retry_ids:

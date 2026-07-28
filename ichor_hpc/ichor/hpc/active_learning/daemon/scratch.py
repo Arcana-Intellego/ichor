@@ -75,6 +75,7 @@ def _validate_resolution_ownership(
         source,
         str(resource_resolution_sha256),
         campaign_dir=campaign,
+        verify_bound_inputs=False,
     )
     expected = {
         "campaign_uid": str(campaign_uid),

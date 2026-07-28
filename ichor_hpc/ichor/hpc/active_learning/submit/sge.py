@@ -458,13 +458,17 @@ def poll_job(
         )
         if str(record.get("jobnumber") or "") == parent
     ]
-    merged: Dict[str, JobObservation] = {
-        observation.job_id: observation
-        for observation in qacct_observations(
-            accounting,
-            cancellation_requested=bool(cancellation_requested),
-        )
-    }
+    merged: Dict[str, JobObservation] = {}
+    for observation in qacct_observations(
+        accounting,
+        cancellation_requested=bool(cancellation_requested),
+    ):
+        if observation.job_id in merged:
+            raise ValueError(
+                "qacct returned duplicate task records for "
+                + str(observation.job_id)
+            )
+        merged[observation.job_id] = observation
     # Live ownership wins over accounting during the brief SGE reporting race.
     for observation in qstat_observations(queue_rows):
         merged[observation.job_id] = observation

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from ichor.hpc.active_learning.daemon import array_recovery
 from ichor.hpc.active_learning.daemon.live_executor import build_sbatch_script
 from ichor.hpc.active_learning.config import CampaignConfig
@@ -377,6 +379,56 @@ def test_ariadne_retry_archives_complete_seed_directory_and_partial_output(
     assert not partial.exists()
     assert len(archived) == 2
     assert all(Path(path).exists() for path in archived)
+
+    replayed = array_recovery.archive_existing_array_task_outputs(
+        campaign,
+        "ARIADNE_ARRAY",
+        1,
+        task_ids=[0],
+        archive_identity=Path(archived[0]).parents[1].name.split(
+            "000001-", 1
+        )[1],
+    )
+    assert replayed == archived
+
+
+def test_ariadne_retry_archive_replay_rejects_recreated_source(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.layout import (
+        active_iteration_dir,
+        ariadne_seed_dir,
+    )
+
+    campaign = tmp_path / "campaign"
+    _patch_ariadne_recovery_identity(monkeypatch)
+    seed_dir = ariadne_seed_dir(active_iteration_dir(campaign, 1), 1)
+    seed_dir.mkdir(parents=True)
+    (seed_dir / "result.json").write_text("{}\n", encoding="utf-8")
+    identity = "replay-conflict"
+
+    array_recovery.archive_existing_array_task_outputs(
+        campaign,
+        "ARIADNE_ARRAY",
+        1,
+        task_ids=[0],
+        archive_identity=identity,
+    )
+    seed_dir.mkdir(parents=True)
+    (seed_dir / "result.json").write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match="archive destination both exist",
+    ):
+        array_recovery.archive_existing_array_task_outputs(
+            campaign,
+            "ARIADNE_ARRAY",
+            1,
+            task_ids=[0],
+            archive_identity=identity,
+        )
 
 
 def test_replacement_phases_support_round_specific_partial_recovery(

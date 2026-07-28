@@ -40,6 +40,7 @@ __all__ = [
     "PhaseExecutor",
     "MockPhaseExecutor",
     "BackendSubmissionError",
+    "SubmissionCancelledBeforeSchedulerAcceptance",
     "INLINE_PHASES",
     "SBATCH_PHASES",
 ]
@@ -49,6 +50,10 @@ class BackendSubmissionError(RuntimeError):
     """raised when a backend submission (sbatch) fails outright. the daemon
     treats this as a halt-worthy backend problem and stops the campaign
     cleanly so it can be resumed, rather than letting the error crash it."""
+
+
+class SubmissionCancelledBeforeSchedulerAcceptance(BackendSubmissionError):
+    """The immediate-stop gate closed before a scheduler accepted the job."""
 
 
 #phases the production daemon runs inline (no SLURM job). The mock executor

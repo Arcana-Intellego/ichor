@@ -68,6 +68,7 @@ from .phase_executor import (
     PhaseResult,
     PostprocessRetryDisposition,
     SBATCH_PHASES,
+    SubmissionCancelledBeforeSchedulerAcceptance,
 )
 from .resource_solver import (
     ResolvedPhaseResources,
@@ -99,7 +100,13 @@ from .cluster_profile import (
 )
 from .state import CampaignPhase, atomic_write_json
 from .job_names import live_job_name
+from .scheduler_recovery import (
+    scheduler_terminal_recoveries,
+    write_phase_recovery_ledger,
+)
+from .environment_equivalence import assess_recovery_environment
 from .array_recovery import (
+    archive_existing_array_task_outputs,
     compact_array_recovery_summary,
     prepare_retry_submission,
     supports_partial_array_recovery,
@@ -532,6 +539,110 @@ def _read_json_object(path: Path, label: str) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(label + " must contain a JSON object")
     return payload
+
+
+def _diversity_publication_is_incomplete(
+    *,
+    phase_name: str,
+    output_dir: Path,
+    manifest_path: Path,
+) -> bool:
+    """Return whether a scalar diversity publication stopped before completion.
+
+    A missing manifest or a valid manifest whose fixed derived files were not
+    all published is recoverably incomplete.  Malformed, non-canonical or
+    contradictory evidence remains a hard failure for the strict reader.
+    """
+    if not manifest_path.exists() and not manifest_path.is_symlink():
+        return True
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise BackendSubmissionError(
+            "diversity publication manifest is not a regular file: "
+            + str(manifest_path)
+        )
+    try:
+        payload = _read_json_object(
+            manifest_path,
+            "diversity publication manifest",
+        )
+    except ValueError as exc:
+        raise BackendSubmissionError(str(exc)) from exc
+
+    if phase_name == "PHASE_A_DIVERSITY":
+        from ..handoff_manifests import PHASE_A_SAMPLE_SCHEMA_VERSION
+
+        if (
+            int(payload.get("schema_version", -1))
+            != int(PHASE_A_SAMPLE_SCHEMA_VERSION)
+            or str(payload.get("phase") or "") != phase_name
+        ):
+            raise BackendSubmissionError(
+                "Phase A diversity publication manifest is contradictory"
+            )
+        bindings = (
+            ("sample_xyz", output_dir / "selected.xyz"),
+            ("index_path", output_dir / "selected_indices.dat"),
+        )
+    elif phase_name == "PHASE_B_DIVERSITY":
+        from ..handoff_manifests import PHASE_B_SELECTION_SCHEMA_VERSION
+
+        if (
+            int(payload.get("schema_version", -1))
+            != int(PHASE_B_SELECTION_SCHEMA_VERSION)
+            or int(payload.get("iteration", -1)) < 1
+        ):
+            raise BackendSubmissionError(
+                "Phase B diversity publication manifest is contradictory"
+            )
+        if str(payload.get("status") or "") != "complete":
+            raise BackendSubmissionError(
+                "Phase B diversity published a terminal non-success result: "
+                + str(payload.get("failure_reason") or "unknown failure")
+            )
+        bindings = (
+            (
+                "considered_candidates_xyz",
+                output_dir / "considered_candidates.xyz",
+            ),
+            ("selected_xyz", output_dir / "selected.xyz"),
+        )
+    else:  # pragma: no cover - guarded by the caller
+        raise BackendSubmissionError(
+            "unsupported scalar diversity phase " + str(phase_name)
+        )
+
+    for field_name, expected_path in bindings:
+        raw_binding = payload.get(field_name)
+        if phase_name == "PHASE_B_DIVERSITY":
+            if not isinstance(raw_binding, Mapping):
+                raise BackendSubmissionError(
+                    "Phase B diversity " + field_name + " binding is malformed"
+                )
+            raw_path = raw_binding.get("path")
+        else:
+            raw_path = raw_binding
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise BackendSubmissionError(
+                "diversity publication " + field_name + " path is missing"
+            )
+        declared = Path(raw_path)
+        if not declared.is_absolute():
+            declared = output_dir.parent / declared
+        if declared.resolve(strict=False) != expected_path.resolve(strict=False):
+            raise BackendSubmissionError(
+                "diversity publication "
+                + field_name
+                + " path is non-canonical"
+            )
+        if not expected_path.exists() and not expected_path.is_symlink():
+            return True
+        if expected_path.is_symlink() or not expected_path.is_file():
+            raise BackendSubmissionError(
+                "diversity publication "
+                + field_name
+                + " is not a regular file"
+            )
+    return False
 
 
 def _sampling_protocol_for_ariadne_result(
@@ -1817,6 +1928,728 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             return n
         return None
 
+    def _scheduler_cancel_recovery_sources(
+        self,
+        state,
+        phase_name: str,
+    ) -> Sequence[Dict[str, Any]]:
+        try:
+            return scheduler_terminal_recoveries(
+                self.campaign_dir,
+                campaign_uid=str(state.campaign_uid),
+                phase=phase_name,
+                iteration=int(state.iteration),
+                replacement_round=int(getattr(state, "replacement_round", 0)),
+            )
+        except Exception as exc:
+            raise BackendSubmissionError(
+                "scheduler cancellation evidence is invalid for "
+                + str(phase_name)
+                + ": "
+                + type(exc).__name__
+                + ": "
+                + str(exc)
+            ) from exc
+
+    def _raise_if_immediate_cancel_before_submission(self, state) -> None:
+        """Close the PRE_SUBMIT race immediately before scheduler acceptance."""
+        from .stop_control import read_stop_request
+
+        request = read_stop_request(
+            self.campaign_dir,
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        if (
+            isinstance(request, Mapping)
+            and str(request.get("mode")) == "immediate"
+            and bool(request.get("cancel_jobs_requested", False))
+            and str(request.get("status")) in {"cancelling", "requested"}
+        ):
+            raise SubmissionCancelledBeforeSchedulerAcceptance(
+                "immediate stop prevented scheduler submission"
+            )
+
+    def _scheduler_recovery_environment_assessments(
+        self,
+        recoveries: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Assess each producer attempt without turning uncertainty into reuse."""
+        assessments: Dict[str, Dict[str, Any]] = {}
+        for recovery in recoveries:
+            intent = recovery["intent"]
+            identity = str(intent.get("submission_identity") or "")
+            recorded_scheduler = str(
+                intent.get("scheduler_identity_kind") or "slurm"
+            ).strip().lower()
+            if recorded_scheduler != str(self.scheduler_identity_kind):
+                raise BackendSubmissionError(
+                    "scheduler kind cannot change during "
+                    + str(intent.get("phase") or "scheduler-backed phase")
+                    + " recovery: recorded "
+                    + recorded_scheduler
+                    + ", active "
+                    + str(self.scheduler_identity_kind)
+                )
+            try:
+                assessments[identity] = assess_recovery_environment(
+                    self.campaign_dir,
+                    intent=intent,
+                    current_scheduler_kind=self.scheduler_identity_kind,
+                )
+            except Exception as exc:
+                assessments[identity] = {
+                    "equivalent": False,
+                    "reasons": [
+                        "environment_equivalence_unproven:"
+                        + type(exc).__name__
+                        + ":"
+                        + str(exc)[:180]
+                    ],
+                    "proof": None,
+                    "path": None,
+                    "sha256": None,
+                }
+        return assessments
+
+    @staticmethod
+    def _latest_scheduler_recovery_by_task(
+        recoveries: Sequence[Mapping[str, Any]],
+    ) -> Dict[int, Mapping[str, Any]]:
+        latest: Dict[int, Mapping[str, Any]] = {}
+        for recovery in recoveries:
+            for record in recovery["receipt"].get("outcomes", []):
+                latest[int(record["logical_task_id"])] = recovery
+        return latest
+
+    @staticmethod
+    def _environment_proof_records(
+        assessments: Mapping[str, Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        return [
+            {
+                "submission_identity": str(identity),
+                "equivalent": bool(assessment.get("equivalent", False)),
+                "reasons": list(assessment.get("reasons") or []),
+                "path": assessment.get("path"),
+                "sha256": assessment.get("sha256"),
+            }
+            for identity, assessment in sorted(assessments.items())
+        ]
+
+    @staticmethod
+    def _task_recovery_lineage(
+        task_ids: Sequence[int],
+        latest: Mapping[int, Mapping[str, Any]],
+        assessments: Mapping[str, Mapping[str, Any]],
+        *,
+        reuse_basis: str,
+    ) -> List[Dict[str, Any]]:
+        records = []
+        for task_id in sorted(int(value) for value in task_ids):
+            recovery = latest.get(task_id)
+            if not isinstance(recovery, Mapping):
+                continue
+            intent = recovery["intent"]
+            identity = str(intent.get("submission_identity") or "")
+            assessment = assessments.get(identity, {})
+            records.append(
+                {
+                    "logical_task_id": int(task_id),
+                    "reuse_basis": str(reuse_basis),
+                    "attempt_id": str(intent.get("attempt_id") or ""),
+                    "submission_identity": identity,
+                    "job_id": str(intent.get("job_id") or ""),
+                    "environment_generation": intent.get(
+                        "environment_generation"
+                    ),
+                    "environment_generation_digest_sha256": intent.get(
+                        "environment_generation_digest_sha256"
+                    ),
+                    "environment_equivalence_path": assessment.get("path"),
+                    "environment_equivalence_sha256": assessment.get("sha256"),
+                }
+            )
+        return records
+
+    def _reconstruct_cancelled_quantum_receipts(
+        self,
+        state,
+        phase_name: str,
+        recoveries: Sequence[Mapping[str, Any]],
+        assessments: Mapping[str, Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        """Validate scheduler-completed quantum outputs and bind receipts."""
+        from ichor.core.files.point_directory import PointDirectory
+
+        from .quantum_task_contracts import quantum_task_contract
+        from .quantum_task_receipts import (
+            read_quantum_task_receipt,
+            write_quantum_task_receipt_from_scheduler_terminal_receipt,
+        )
+
+        replacement_round = int(getattr(state, "replacement_round", 0))
+        contract = quantum_task_contract(
+            self.campaign_dir,
+            phase_name,
+            int(state.iteration),
+            replacement_round=replacement_round,
+            validate_points_file=True,
+        )
+        latest = self._latest_scheduler_recovery_by_task(recoveries)
+
+        validators = self._validators_for(phase_name)
+        reusable = []
+        invalid = []
+        for logical_id in sorted(latest):
+            recovery = latest[logical_id]
+            receipt = recovery["receipt"]
+            identity = str(
+                recovery["intent"].get("submission_identity") or ""
+            )
+            if not bool(
+                assessments.get(identity, {}).get("equivalent", False)
+            ):
+                invalid.append(
+                    {
+                        "task_id": logical_id,
+                        "reason": "environment_equivalence_unproven",
+                    }
+                )
+                continue
+            if logical_id not in {
+                int(value)
+                for value in receipt.get("completed_logical_task_ids", [])
+            }:
+                continue
+            if logical_id >= len(contract.tasks):
+                raise BackendSubmissionError(
+                    "scheduler terminal evidence references a quantum task "
+                    "outside the canonical task contract"
+                )
+            pointdir = Path(contract.tasks[logical_id].pointdir)
+            valid = bool(pointdir.is_dir() and not pointdir.is_symlink())
+            reason = "pointdir_missing_or_invalid"
+            if valid:
+                try:
+                    candidate = PointDirectory(pointdir)
+                    for validator in validators:
+                        ok, observed_reason = validator(candidate)
+                        if not ok:
+                            valid = False
+                            reason = str(
+                                observed_reason or "structural_validation_failed"
+                            )
+                            break
+                except Exception as exc:
+                    valid = False
+                    reason = type(exc).__name__ + ": " + str(exc)[:160]
+            if not valid:
+                invalid.append({"task_id": logical_id, "reason": reason})
+                continue
+            try:
+                read_quantum_task_receipt(
+                    pointdir,
+                    phase_name=phase_name,
+                    iteration=int(state.iteration),
+                    logical_task_id=logical_id,
+                    expected_campaign_uid=str(
+                        recovery["intent"]["campaign_uid"]
+                    ),
+                    expected_attempt_id=str(
+                        recovery["intent"]["attempt_id"]
+                    ),
+                    expected_submission_identity=str(
+                        recovery["intent"]["submission_identity"]
+                    ),
+                    expected_job_id=str(
+                        recovery["intent"]["job_id"]
+                    ),
+                )
+            except (OSError, ValueError):
+                write_quantum_task_receipt_from_scheduler_terminal_receipt(
+                    self.campaign_dir,
+                    pointdir,
+                    phase_name=phase_name,
+                    iteration=int(state.iteration),
+                    logical_task_id=logical_id,
+                    intent=recovery["intent"],
+                    terminal_receipt=receipt,
+                )
+            reusable.append(logical_id)
+        return {
+            "scheduler_completed_candidates": len(
+                {
+                    int(record["logical_task_id"])
+                    for recovery in recoveries
+                    for record in recovery["receipt"].get("outcomes", [])
+                    if record.get("status") == "COMPLETED"
+                    and record.get("exit_code") == [0, 0]
+                }
+            ),
+            "validated_reusable_task_ids": reusable,
+            "invalid_completed_tasks": invalid,
+        }
+
+    def _prepare_scheduler_cancelled_array_recovery(
+        self,
+        state,
+        phase_name: str,
+    ) -> Optional[Dict[str, Any]]:
+        recoveries = self._scheduler_cancel_recovery_sources(state, phase_name)
+        if not recoveries:
+            return None
+        assessments = self._scheduler_recovery_environment_assessments(
+            recoveries
+        )
+        latest = self._latest_scheduler_recovery_by_task(recoveries)
+        forced_retry_ids = [
+            int(task_id)
+            for task_id, recovery in latest.items()
+            if not bool(
+                assessments.get(
+                    str(
+                        recovery["intent"].get("submission_identity") or ""
+                    ),
+                    {},
+                ).get("equivalent", False)
+            )
+        ]
+        validation: Dict[str, Any] = {
+            "scheduler_completed_candidates": sum(
+                int(item["receipt"].get("n_completed", 0))
+                for item in recoveries
+            ),
+            "validated_reusable_task_ids": [],
+            "invalid_completed_tasks": [],
+        }
+        if "GAUSSIAN" in phase_name or "AIMALL" in phase_name:
+            validation = self._reconstruct_cancelled_quantum_receipts(
+                state,
+                phase_name,
+                recoveries,
+                assessments,
+            )
+        source_digest = hashlib.sha256(
+            ",".join(
+                str(item["receipt"]["receipt_sha256"]) for item in recoveries
+            ).encode("ascii")
+        ).hexdigest()
+        result = prepare_retry_submission(
+            self.campaign_dir,
+            phase_name,
+            int(state.iteration),
+            forced_retry_task_ids=forced_retry_ids,
+        )
+        reusable_ids = [
+            int(task["task_id"])
+            for task in result.get("tasks", [])
+            if bool(task.get("complete", False))
+        ]
+        retry_ids = [int(value) for value in result.get("retry_task_ids", [])]
+        ledger = write_phase_recovery_ledger(
+            self.campaign_dir,
+            {
+                "campaign_uid": str(state.campaign_uid),
+                "phase": phase_name,
+                "iteration": int(state.iteration),
+                "replacement_round": int(
+                    getattr(state, "replacement_round", 0)
+                ),
+                "source_receipt_sha256": source_digest,
+                "source_terminal_receipts": [
+                    {
+                        "path": str(item["path"]),
+                        "receipt_sha256": str(
+                            item["receipt"]["receipt_sha256"]
+                        ),
+                        "job_id": str(item["receipt"].get("job_id") or ""),
+                        "submission_identity": str(
+                            item["receipt"]["submission_identity"]
+                        ),
+                    }
+                    for item in recoveries
+                ],
+                "environment_equivalences": (
+                    self._environment_proof_records(assessments)
+                ),
+                "scheduler_completed_candidates": int(
+                    validation["scheduler_completed_candidates"]
+                ),
+                "reusable_logical_task_ids": reusable_ids,
+                "retry_logical_task_ids": retry_ids,
+                "invalid_completed_tasks": list(
+                    validation["invalid_completed_tasks"]
+                ),
+                "recovery_lineage": self._task_recovery_lineage(
+                    reusable_ids,
+                    latest,
+                    assessments,
+                    reuse_basis=(
+                        "self_authenticating_output"
+                        if phase_name == "ARIADNE_ARRAY"
+                        else "scheduler_completed_validated_output"
+                    ),
+                ),
+            },
+        )
+        result["_scheduler_cancel_recovery"] = ledger
+        return result
+
+    def _prepare_scheduler_cancelled_ferebus_recovery(
+        self,
+        state,
+        phase_name: str,
+        staging: Path,
+        *,
+        n_tasks: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Classify reusable FEREBUS tasks after an explicit cancellation."""
+        from .ferebus_task_runner import (
+            FerebusTaskRunnerError,
+            validate_task_receipt,
+        )
+
+        recoveries = self._scheduler_cancel_recovery_sources(state, phase_name)
+        if not recoveries:
+            return None
+        assessments = self._scheduler_recovery_environment_assessments(
+            recoveries
+        )
+        latest = self._latest_scheduler_recovery_by_task(recoveries)
+        scheduler_completed_candidates = {
+            int(task_id)
+            for task_id, recovery in latest.items()
+            if int(task_id)
+            in {
+                int(value)
+                for value in recovery["receipt"].get(
+                    "completed_logical_task_ids",
+                    [],
+                )
+            }
+        }
+        completed_candidates = {
+            int(task_id)
+            for task_id in scheduler_completed_candidates
+            if bool(
+                assessments.get(
+                    str(
+                        latest[int(task_id)]["intent"].get(
+                            "submission_identity"
+                        )
+                        or ""
+                    ),
+                    {},
+                ).get("equivalent", False)
+            )
+        }
+        if any(
+            not 0 <= task_id < int(n_tasks)
+            for task_id in scheduler_completed_candidates
+        ):
+            raise BackendSubmissionError(
+                "scheduler terminal evidence references a FEREBUS task outside "
+                "the canonical task map"
+            )
+        reusable = []
+        invalid = [
+            {
+                "task_id": int(task_id),
+                "reason": "environment_equivalence_unproven",
+            }
+            for task_id in sorted(
+                scheduler_completed_candidates.difference(
+                    completed_candidates
+                )
+            )
+        ]
+        for logical_task_id in sorted(completed_candidates):
+            try:
+                validate_task_receipt(staging, logical_task_id)
+            except (FerebusTaskRunnerError, OSError, ValueError) as exc:
+                invalid.append(
+                    {
+                        "task_id": int(logical_task_id),
+                        "reason": type(exc).__name__ + ": " + str(exc)[:160],
+                    }
+                )
+                continue
+            reusable.append(int(logical_task_id))
+        reusable_set = set(reusable)
+        retry = [
+            logical_task_id
+            for logical_task_id in range(int(n_tasks))
+            if logical_task_id not in reusable_set
+        ]
+        source_digest = hashlib.sha256(
+            ",".join(
+                str(item["receipt"]["receipt_sha256"]) for item in recoveries
+            ).encode("ascii")
+        ).hexdigest()
+        ledger = write_phase_recovery_ledger(
+            self.campaign_dir,
+            {
+                "campaign_uid": str(state.campaign_uid),
+                "phase": phase_name,
+                "iteration": int(state.iteration),
+                "replacement_round": int(
+                    getattr(state, "replacement_round", 0)
+                ),
+                "source_receipt_sha256": source_digest,
+                "source_terminal_receipts": [
+                    {
+                        "path": str(item["path"]),
+                        "receipt_sha256": str(
+                            item["receipt"]["receipt_sha256"]
+                        ),
+                        "job_id": str(item["receipt"].get("job_id") or ""),
+                        "submission_identity": str(
+                            item["receipt"]["submission_identity"]
+                        ),
+                    }
+                    for item in recoveries
+                ],
+                "environment_equivalences": (
+                    self._environment_proof_records(assessments)
+                ),
+                "scheduler_completed_candidates": len(
+                    scheduler_completed_candidates
+                ),
+                "reusable_logical_task_ids": reusable,
+                "retry_logical_task_ids": retry,
+                "invalid_completed_tasks": invalid,
+                "recovery_lineage": self._task_recovery_lineage(
+                    reusable,
+                    latest,
+                    assessments,
+                    reuse_basis="scheduler_completed_task_receipt",
+                ),
+            },
+        )
+        return {
+            "reusable_logical_task_ids": reusable,
+            "retry_logical_task_ids": retry,
+            "ledger": ledger,
+        }
+
+    def _recover_cancelled_diversity_phase(
+        self,
+        state,
+        phase,
+        phase_name: str,
+    ) -> Optional[PhaseResult]:
+        """Adopt a complete scalar publication or retire incomplete output."""
+        recoveries = self._scheduler_cancel_recovery_sources(state, phase_name)
+        if not recoveries:
+            return None
+        assessments = self._scheduler_recovery_environment_assessments(
+            recoveries
+        )
+        latest = self._latest_scheduler_recovery_by_task(recoveries)
+        latest_recovery = latest.get(0)
+        latest_identity = (
+            ""
+            if not isinstance(latest_recovery, Mapping)
+            else str(
+                latest_recovery["intent"].get("submission_identity") or ""
+            )
+        )
+        publication_environment_equivalent = bool(
+            assessments.get(latest_identity, {}).get("equivalent", False)
+        )
+        source_digest = hashlib.sha256(
+            ",".join(
+                str(item["receipt"]["receipt_sha256"]) for item in recoveries
+            ).encode("ascii")
+        ).hexdigest()
+        parsed = self._parse_diversity_postprocess(
+            state,
+            phase,
+            [],
+            emit_success_events=False,
+        )
+        if (
+            parsed.failure_reason is None
+            and publication_environment_equivalent
+        ):
+            write_phase_recovery_ledger(
+                self.campaign_dir,
+                {
+                    "campaign_uid": str(state.campaign_uid),
+                    "phase": phase_name,
+                    "iteration": int(state.iteration),
+                    "replacement_round": int(
+                        getattr(state, "replacement_round", 0)
+                    ),
+                    "source_receipt_sha256": source_digest,
+                    "source_terminal_receipts": [
+                        {
+                            "path": str(item["path"]),
+                            "receipt_sha256": str(
+                                item["receipt"]["receipt_sha256"]
+                            ),
+                            "job_id": str(
+                                item["receipt"].get("job_id") or ""
+                            ),
+                            "submission_identity": str(
+                                item["receipt"]["submission_identity"]
+                            ),
+                        }
+                        for item in recoveries
+                    ],
+                    "environment_equivalences": (
+                        self._environment_proof_records(assessments)
+                    ),
+                    "publication_disposition": "adopted",
+                    "reusable_logical_task_ids": [0],
+                    "retry_logical_task_ids": [],
+                    "invalid_completed_tasks": [],
+                    "recovery_lineage": self._task_recovery_lineage(
+                        [0],
+                        latest,
+                        assessments,
+                        reuse_basis="authority_valid_publication",
+                    ),
+                },
+            )
+            for event_payload in list(
+                parsed.journal_events
+            ):
+                payload = dict(event_payload)
+                event_name = str(payload.pop("event"))
+                self._journal_event(event_name, **payload)
+            parsed.journal_events = []
+            self._journal_event(
+                "partial_array_recovery_postprocess_only",
+                phase=phase_name,
+                iteration=int(state.iteration),
+                logical_total=1,
+                n_complete=1,
+                n_retry=0,
+                recovery_source="scheduler_cancellation",
+                scalar_publication="adopted",
+            )
+            return parsed
+
+        from ..handoff_manifests import (
+            phase_a_sample_manifest_path,
+            phase_b_selection_path,
+        )
+        from ..layout import (
+            active_iteration_dir,
+            active_phase_b_dir,
+            bootstrap_selection_dir,
+        )
+
+        if phase_name == "PHASE_A_DIVERSITY":
+            output_dir = bootstrap_selection_dir(self.campaign_dir)
+            manifest_path = phase_a_sample_manifest_path(output_dir)
+        else:
+            iteration_dir = active_iteration_dir(
+                self.campaign_dir,
+                int(state.iteration),
+            )
+            output_dir = active_phase_b_dir(iteration_dir)
+            manifest_path = phase_b_selection_path(iteration_dir)
+        publication_incomplete = _diversity_publication_is_incomplete(
+            phase_name=phase_name,
+            output_dir=output_dir,
+            manifest_path=manifest_path,
+        )
+        if parsed.failure_reason is not None and not publication_incomplete:
+            raise BackendSubmissionError(
+                "completed diversity publication is invalid after scheduler "
+                "cancellation: "
+                + str(parsed.failure_reason)
+            )
+
+        archive = (
+            Path(self.campaign_dir)
+            / ".DATA"
+            / "ACTIVE_LEARNING"
+            / "diversity_retry_quarantine"
+            / (
+                phase_name
+                + "-"
+                + f"{int(state.iteration):06d}"
+                + "-"
+                + source_digest
+            )
+        )
+        if output_dir.exists() or output_dir.is_symlink():
+            if output_dir.is_symlink() or not output_dir.is_dir():
+                raise BackendSubmissionError(
+                    "partial diversity output is not a regular directory: "
+                    + str(output_dir)
+                )
+            if archive.exists() or archive.is_symlink():
+                raise BackendSubmissionError(
+                    "partial diversity output and its recovery archive both exist"
+                )
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            output_dir.replace(archive)
+        elif archive.exists():
+            if archive.is_symlink() or not archive.is_dir():
+                raise BackendSubmissionError(
+                    "diversity recovery archive is invalid"
+                )
+        ledger = write_phase_recovery_ledger(
+            self.campaign_dir,
+            {
+                "campaign_uid": str(state.campaign_uid),
+                "phase": phase_name,
+                "iteration": int(state.iteration),
+                "replacement_round": int(
+                    getattr(state, "replacement_round", 0)
+                ),
+                "source_receipt_sha256": source_digest,
+                "source_terminal_receipts": [
+                    {
+                        "path": str(item["path"]),
+                        "receipt_sha256": str(
+                            item["receipt"]["receipt_sha256"]
+                        ),
+                        "job_id": str(item["receipt"].get("job_id") or ""),
+                        "submission_identity": str(
+                            item["receipt"]["submission_identity"]
+                        ),
+                    }
+                    for item in recoveries
+                ],
+                "environment_equivalences": (
+                    self._environment_proof_records(assessments)
+                ),
+                "publication_disposition": "rerun",
+                "publication_archive": (
+                    str(archive) if archive.exists() else None
+                ),
+                "reusable_logical_task_ids": [],
+                "retry_logical_task_ids": [0],
+                "invalid_completed_tasks": [
+                    {
+                        "task_id": 0,
+                        "reason": (
+                            str(parsed.failure_reason)
+                            if parsed.failure_reason is not None
+                            else "environment_equivalence_unproven"
+                        ),
+                    }
+                ],
+            },
+        )
+        self._journal_event(
+            "partial_array_recovery_prepared",
+            phase=phase_name,
+            iteration=int(state.iteration),
+            logical_tasks=1,
+            reusable_tasks=0,
+            retry_tasks=1,
+            recovery_source="scheduler_cancellation",
+            scalar_publication="rerun",
+            recovery_ledger_sha256=str(ledger["ledger_sha256"]),
+        )
+        return None
+
     def _submit_ferebus_phase(self, state, phase_name: str) -> PhaseResult:
         from . import input_staging as _stg
         from .ferebus_candidate_recovery import (
@@ -1924,16 +2757,27 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 if "progress_callback" in stage_parameters
                 else {}
             )
-            staging, n_tasks = _stg.stage_ferebus_inputs(
+            staging, staged_task_count = _stg.stage_ferebus_inputs(
                 self.campaign_dir,
                 self.config,
                 tv,
                 **stage_kwargs,
             )
-            if int(n_tasks) <= 0:
-                raise BackendSubmissionError("nothing to submit for " + phase_name + ": staged 0 tasks")
             f = self.config.ferebus
             ferebus_manifest = _stg.read_ferebus_manifest(staging)
+            expected_ferebus_tasks = int(ferebus_manifest.get("n_tasks", 0))
+            if expected_ferebus_tasks <= 0:
+                raise BackendSubmissionError(
+                    "FEREBUS task manifest contains no scheduler tasks"
+                )
+            if int(staged_task_count) != expected_ferebus_tasks:
+                raise BackendSubmissionError(
+                    "FEREBUS staging task count does not match its immutable "
+                    "task manifest: staged "
+                    + str(int(staged_task_count))
+                    + ", manifest "
+                    + str(expected_ferebus_tasks)
+                )
             from ..ferebus_prior import contract_from_payload
 
             prior_contract = contract_from_payload(
@@ -1970,6 +2814,70 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         scheduler_jobs_submitted=0,
                     )
                 return result
+            ferebus_recovery = (
+                self._prepare_scheduler_cancelled_ferebus_recovery(
+                    state,
+                    phase_name,
+                    staging,
+                    n_tasks=expected_ferebus_tasks,
+                )
+            )
+            ferebus_retry_ids = (
+                list(range(expected_ferebus_tasks))
+                if ferebus_recovery is None
+                else [
+                    int(value)
+                    for value in ferebus_recovery["retry_logical_task_ids"]
+                ]
+            )
+            if ferebus_recovery is not None:
+                self._journal_event(
+                    "partial_array_recovery_prepared",
+                    phase=phase_name,
+                    iteration=int(getattr(state, "iteration", 0)),
+                    logical_tasks=expected_ferebus_tasks,
+                    reusable_tasks=len(
+                        ferebus_recovery["reusable_logical_task_ids"]
+                    ),
+                    retry_tasks=len(ferebus_retry_ids),
+                    scheduler_completed_candidates=int(
+                        ferebus_recovery["ledger"].get(
+                            "scheduler_completed_candidates",
+                            0,
+                        )
+                    ),
+                    recovery_source="scheduler_cancellation",
+                )
+            if not ferebus_retry_ids:
+                return self._parse_ferebus_postprocess(
+                    state,
+                    phase_name,
+                    [],
+                )
+            if ferebus_recovery is not None:
+                from .ferebus_task_runner import quarantine_task_outputs
+
+                quarantine_root = (
+                    Path(self.campaign_dir)
+                    / ".DATA"
+                    / "ACTIVE_LEARNING"
+                    / "ferebus_retry_quarantine"
+                    / (
+                        phase_name
+                        + "-"
+                        + f"{int(state.iteration):06d}"
+                        + "-r"
+                        + f"{int(getattr(state, 'replacement_round', 0)):04d}"
+                    )
+                    / str(
+                        ferebus_recovery["ledger"]["source_receipt_sha256"]
+                    )
+                )
+                quarantine_task_outputs(
+                    staging,
+                    ferebus_retry_ids,
+                    quarantine_root,
+                )
             resources = getattr(self.config, "resources", None)
             effective_partition = (
                 str(self.partition)
@@ -1989,23 +2897,18 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             ) != "PRE_SUBMIT":
                 raise BackendSubmissionError(
                     "live FEREBUS submission requires an active PRE_SUBMIT intent"
-                )
+            )
             identity = str(active_intent["submission_identity"])
-            expected_ferebus_tasks = int(ferebus_manifest.get("n_tasks", 0))
-            if expected_ferebus_tasks <= 0:
-                raise BackendSubmissionError(
-                    "FEREBUS task manifest contains no scheduler tasks"
-                )
             bundle = prepare_attempt_bundle(
                 self.campaign_dir,
                 phase_name,
                 int(getattr(state, "iteration", 0)),
                 identity,
-                array_size=expected_ferebus_tasks,
+                array_size=len(ferebus_retry_ids),
                 max_log_files_per_directory=(
                     _configured_max_job_log_files_per_directory()
                 ),
-                logical_task_ids=list(range(expected_ferebus_tasks)),
+                logical_task_ids=ferebus_retry_ids,
             )
             scratch_template = scratch_path_template(
                 self.campaign_dir,
@@ -2051,7 +2954,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     partition=effective_partition,
                     campaign_dir=self.campaign_dir,
                     iteration=int(getattr(state, "iteration", 0)),
-                    array_size=expected_ferebus_tasks,
+                    array_size=len(ferebus_retry_ids),
                     expected_reference_data_version=int(
                         0 if phase_name == "INITIAL_FEREBUS" else tv
                     ),
@@ -2096,7 +2999,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     sha256=str(resolution_binding["sha256"]),
                     formula_version=str(resolution_binding["formula_version"]),
                     scratch_path_template=scratch_template,
-                    expected_tasks=expected_ferebus_tasks,
+                    expected_tasks=len(ferebus_retry_ids),
                 )
                 self._journal_event(
                     "resolved_phase_resources",
@@ -2197,6 +3100,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
             from ..ferebus_prior import backend_kernel_token
 
+            self._raise_if_immediate_cancel_before_submission(state)
             submission = submit_ferebus(
                 staging / _stg.FEREBUS_JOB_DETAILS,
                 staging,
@@ -2223,6 +3127,15 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 move_dataset_files=True,
                 path_to_executable=path_to_executable,
                 expected_tasks=expected_ferebus_tasks,
+                submitted_tasks=len(ferebus_retry_ids),
+                scheduler_task_map=bundle.array_task_map,
+                reuse_prepared_inputs=(ferebus_recovery is not None),
+                require_existing_task_map_match=bool(
+                    ferebus_recovery is not None
+                    and ferebus_recovery[
+                        "reusable_logical_task_ids"
+                    ]
+                ),
                 expected_job_name=expected_job_name,
                 submit_runner=self.sbatch_runner,
                 prepared_callback=_prepared_ferebus_runtime,
@@ -2264,7 +3177,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         return PhaseResult(
             is_complete=False,
             submitted_job_id=str(submission.job_id),
-            expected_tasks=expected_ferebus_tasks,
+            expected_tasks=len(ferebus_retry_ids),
             state_updates=state_updates,
             submission_metadata={
                 "resource_resolution_path": str(resolution_binding["path"]),
@@ -2281,6 +3194,14 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 "script_binding_sha256": submission.script_binding.get(
                     "sha256"
                 ),
+                "scheduler_recovery_reusable_tasks": (
+                    0
+                    if ferebus_recovery is None
+                    else len(
+                        ferebus_recovery["reusable_logical_task_ids"]
+                    )
+                ),
+                "scheduler_recovery_retry_tasks": len(ferebus_retry_ids),
             },
         )
 
@@ -2621,6 +3542,14 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             raise RuntimeError(
                 "phase " + phase_name + " classified as neither INLINE nor SBATCH"
             )
+        if phase_name in {"PHASE_A_DIVERSITY", "PHASE_B_DIVERSITY"}:
+            diversity_recovery = self._recover_cancelled_diversity_phase(
+                state,
+                phase,
+                phase_name,
+            )
+            if diversity_recovery is not None:
+                return diversity_recovery
         if "AIMALL" in phase_name or "GAUSSIAN" in phase_name:
             from . import submission_intent as _submission_intent
 
@@ -2687,10 +3616,16 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             submission_metadata: Dict[str, Any] = {}
             array_task_map: Optional[Path] = None
             if supports_partial_array_recovery(phase_name):
-                recovery = prepare_retry_submission(
-                    self.campaign_dir,
-                    phase_name,
-                    int(getattr(state, "iteration", 0)),
+                recovery = (
+                    self._prepare_scheduler_cancelled_array_recovery(
+                        state,
+                        phase_name,
+                    )
+                    or prepare_retry_submission(
+                        self.campaign_dir,
+                        phase_name,
+                        int(getattr(state, "iteration", 0)),
+                    )
                 )
                 recovery_summary = compact_array_recovery_summary(recovery)
                 submission_metadata["array_recovery"] = recovery_summary
@@ -2699,6 +3634,32 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     "phase",
                     "iteration",
                 )
+                scheduler_recovery = recovery.get(
+                    "_scheduler_cancel_recovery"
+                )
+                if isinstance(scheduler_recovery, Mapping):
+                    recovery_journal_payload.update(
+                        {
+                            "scheduler_completed_candidates": int(
+                                scheduler_recovery.get(
+                                    "scheduler_completed_candidates",
+                                    0,
+                                )
+                            ),
+                            "scheduler_terminal_receipts": len(
+                                scheduler_recovery.get(
+                                    "source_terminal_receipts",
+                                    [],
+                                )
+                            ),
+                            "recovery_ledger_sha256": str(
+                                scheduler_recovery.get(
+                                    "ledger_sha256",
+                                    "",
+                                )
+                            ),
+                        }
+                    )
                 self._journal_event(
                     "partial_array_recovery_prepared",
                     phase=phase_name,
@@ -2748,6 +3709,34 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     )
                     return self.postprocess(state, phase, [])
                 if retry_ids:
+                    if (
+                        isinstance(scheduler_recovery, Mapping)
+                        and (
+                            "GAUSSIAN" in phase_name
+                            or "AIMALL" in phase_name
+                        )
+                    ):
+                        source_digest = str(
+                            scheduler_recovery.get(
+                                "source_receipt_sha256",
+                                "",
+                            )
+                        )
+                        archived_retry_outputs = (
+                            archive_existing_array_task_outputs(
+                                self.campaign_dir,
+                                phase_name,
+                                int(getattr(state, "iteration", 0)),
+                                task_ids=retry_ids,
+                                archive_identity=(
+                                    "scheduler-cancel-"
+                                    + source_digest[:16]
+                                ),
+                            )
+                        )
+                        submission_metadata[
+                            "scheduler_recovery_archived_outputs"
+                        ] = len(archived_retry_outputs)
                     array_size = len(retry_ids)
                     retry_file = recovery.get("retry_task_file")
                     if retry_file:
@@ -2840,6 +3829,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             unit="tasks",
         )
         try:
+            self._raise_if_immediate_cancel_before_submission(state)
             submission = self._scheduler_backend.submit(
                 script,
                 binding_sha256=binding_sha,
@@ -4887,6 +5877,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 ariadne_producer_environment_binding,
                 load_intent,
             )
+            from .scheduler_recovery import (
+                phase_recovery_ledger_path,
+                read_phase_recovery_ledger,
+            )
+            from ..execution_identity import read_environment_generation
 
             postprocess_intent = load_intent(
                 self.campaign_dir,
@@ -4898,19 +5893,98 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 raise ValueError(
                     "submission intent is unavailable for ARIADNE provenance"
                 )
-            calibration_environment = ariadne_producer_environment_binding(
+            default_calibration_environment = (
+                ariadne_producer_environment_binding(
                 self.campaign_dir,
                 postprocess_intent,
                 expected_campaign_uid=str(state.campaign_uid),
                 expected_iteration=int(state.iteration),
             )
-            calibration_context = calibration_context_sha256(
-                self.config,
-                prior_mean_contract_sha256=prior_contract_hash,
-                environment_generation_digest_sha256=calibration_environment[
-                    "generation_digest_sha256"
-                ],
             )
+            calibration_environments_by_task: Dict[int, Dict[str, Any]] = {}
+            recovery_ledger_path = phase_recovery_ledger_path(
+                self.campaign_dir,
+                phase="ARIADNE_ARRAY",
+                iteration=int(state.iteration),
+                replacement_round=int(
+                    getattr(state, "replacement_round", 0)
+                ),
+            )
+            if recovery_ledger_path.exists() or recovery_ledger_path.is_symlink():
+                recovery_ledger = read_phase_recovery_ledger(
+                    recovery_ledger_path
+                )
+                recovery_identity = (
+                    str(recovery_ledger.get("campaign_uid") or ""),
+                    str(recovery_ledger.get("phase") or ""),
+                    int(recovery_ledger.get("iteration", -1)),
+                    int(recovery_ledger.get("replacement_round", -1)),
+                )
+                expected_recovery_identity = (
+                    str(state.campaign_uid),
+                    "ARIADNE_ARRAY",
+                    int(state.iteration),
+                    int(getattr(state, "replacement_round", 0)),
+                )
+                if recovery_identity != expected_recovery_identity:
+                    raise ValueError(
+                        "ARIADNE recovery lineage identity mismatch"
+                    )
+                for lineage in recovery_ledger.get(
+                    "recovery_lineage",
+                    [],
+                ):
+                    if not isinstance(lineage, Mapping):
+                        raise ValueError(
+                            "ARIADNE recovery lineage record is invalid"
+                        )
+                    task_id = int(lineage["logical_task_id"])
+                    generation = int(lineage["environment_generation"])
+                    generation_digest = str(
+                        lineage[
+                            "environment_generation_digest_sha256"
+                        ]
+                    )
+                    historical = read_environment_generation(
+                        self.campaign_dir,
+                        generation=generation,
+                        expected_campaign_uid=str(state.campaign_uid),
+                    )
+                    if str(historical["digest_sha256"]) != generation_digest:
+                        raise ValueError(
+                            "ARIADNE recovery lineage environment digest mismatch"
+                        )
+                    calibration_environments_by_task[task_id] = {
+                        "generation": generation,
+                        "generation_digest_sha256": generation_digest,
+                    }
+            calibration_contexts: Dict[str, str] = {}
+
+            def calibration_environment_for_task(
+                logical_task_id: int,
+            ) -> Dict[str, Any]:
+                return dict(
+                    calibration_environments_by_task.get(
+                        int(logical_task_id),
+                        default_calibration_environment,
+                    )
+                )
+
+            def calibration_context_for_environment(
+                environment: Mapping[str, Any],
+            ) -> str:
+                digest = str(
+                    environment["generation_digest_sha256"]
+                )
+                if digest not in calibration_contexts:
+                    calibration_contexts[digest] = (
+                        calibration_context_sha256(
+                            self.config,
+                            prior_mean_contract_sha256=prior_contract_hash,
+                            environment_generation_digest_sha256=digest,
+                        )
+                    )
+                return calibration_contexts[digest]
         except Exception as exc:
             return PhaseResult(
                 is_complete=True,
@@ -5551,6 +6625,14 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             )
             selection_diagnostics = result_dict.get("selection_diagnostics")
             if isinstance(selection_diagnostics, dict):
+                calibration_environment = (
+                    calibration_environment_for_task(array_task_id)
+                )
+                calibration_context = (
+                    calibration_context_for_environment(
+                        calibration_environment
+                    )
+                )
                 diag_payload = dict(selection_diagnostics)
                 diag_payload["model_version"] = int(getattr(state, "models_version", -1))
                 diag_payload["model_set_sha256"] = str(picked["model_set_sha256"])
@@ -5855,7 +6937,14 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
     #-- Diversity parser body ----------------------------------
 
-    def _parse_diversity_postprocess(self, state, phase, observations):
+    def _parse_diversity_postprocess(
+        self,
+        state,
+        phase,
+        observations,
+        *,
+        emit_success_events: bool = True,
+    ):
         """Parse the Phase A or Phase B diversity sample output.
 
         Phase A reads .DATA/BOOTSTRAP/selection/SELECTION.json. Phase B validates
@@ -5966,6 +7055,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
         # if the Phase-B dedup ran, surface its counts in the journal.
         dedup_payload = {}
+        deferred_journal_events = []
         if phase_name == "PHASE_B_DIVERSITY":
             d = phase_b_manifest.get("dedup", {}) if isinstance(phase_b_manifest, dict) else {}
             if isinstance(d, dict):
@@ -5981,25 +7071,42 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         d.get("effective_min_separation_angstrom")
                     )
                 if bool(relaxation.get("applied", False)):
-                    self._journal_event(
-                        "phase_b_novelty_threshold_relaxed",
-                        phase=phase_name,
-                        iteration=int(state.iteration),
-                        reason=str(relaxation.get("reason", "unknown")),
-                        n_admitted=int(relaxation.get("n_admitted", 0)),
-                        effective_min_separation_angstrom=relaxation.get(
+                    relaxation_event = {
+                        "event": "phase_b_novelty_threshold_relaxed",
+                        "phase": phase_name,
+                        "iteration": int(state.iteration),
+                        "reason": str(relaxation.get("reason", "unknown")),
+                        "n_admitted": int(relaxation.get("n_admitted", 0)),
+                        "effective_min_separation_angstrom": relaxation.get(
                             "effective_min_separation_angstrom"
                         ),
-                    )
-        self._journal_event(
-            "phase_succeeded_live",
-            phase=phase_name,
-            iteration=int(state.iteration),
-            sample_path=str(sample),
-            n_frames=int(n_frames),
+                    }
+                    if emit_success_events:
+                        relaxation_name = str(relaxation_event.pop("event"))
+                        self._journal_event(
+                            relaxation_name,
+                            **relaxation_event,
+                        )
+                    else:
+                        deferred_journal_events.append(relaxation_event)
+        success_event = {
+            "event": "phase_succeeded_live",
+            "phase": phase_name,
+            "iteration": int(state.iteration),
+            "sample_path": str(sample),
+            "n_frames": int(n_frames),
             **dedup_payload,
+        }
+        if emit_success_events:
+            success_name = str(success_event.pop("event"))
+            self._journal_event(success_name, **success_event)
+        else:
+            deferred_journal_events.append(success_event)
+        return PhaseResult(
+            is_complete=True,
+            state_updates={},
+            journal_events=deferred_journal_events,
         )
-        return PhaseResult(is_complete=True, state_updates={})
 
     def _count_xyz_frames(self, sample_path):
         """Count complete positive-cardinality frames using the strict parser."""

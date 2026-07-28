@@ -286,6 +286,65 @@ def write_quantum_task_receipt_from_terminal_intent(
     )
 
 
+def write_quantum_task_receipt_from_scheduler_terminal_receipt(
+    campaign_dir: Path,
+    pointdir: Path,
+    *,
+    phase_name: str,
+    iteration: int,
+    logical_task_id: int,
+    intent: Mapping[str, Any],
+    terminal_receipt: Mapping[str, Any],
+) -> Path:
+    """Reconstruct one receipt from exact successful scheduler-task evidence."""
+    from .scheduler_recovery import validate_scheduler_terminal_receipt
+
+    producer = validate_scheduler_terminal_receipt(
+        terminal_receipt,
+        expected_intent=intent,
+        campaign_dir=campaign_dir,
+    )
+    logical_id = _exact_int(
+        logical_task_id,
+        "quantum task receipt logical_task_id",
+    )
+    if (
+        str(producer.get("phase") or "") != str(phase_name)
+        or int(producer.get("iteration", -1)) != int(iteration)
+        or logical_id
+        not in {
+            int(value)
+            for value in producer.get("completed_logical_task_ids", [])
+        }
+    ):
+        raise ValueError(
+            "scheduler terminal receipt does not prove this quantum task completed"
+        )
+    root = Path(pointdir)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("quantum task pointdir is missing or symlinked")
+    target = root / _receipt_name(str(phase_name))
+    if target.exists() or target.is_symlink():
+        read_quantum_task_receipt(
+            root,
+            phase_name=str(phase_name),
+            iteration=int(iteration),
+            logical_task_id=logical_id,
+            expected_campaign_uid=str(producer["campaign_uid"]),
+            expected_attempt_id=str(producer["attempt_id"]),
+            expected_submission_identity=str(producer["submission_identity"]),
+            expected_job_id=str(producer["job_id"]),
+        )
+        return target
+    return _write_quantum_task_receipt(
+        root,
+        phase_name=str(phase_name),
+        iteration=int(iteration),
+        logical_task_id=logical_id,
+        intent=intent,
+    )
+
+
 def write_quantum_task_receipt_from_postprocess_source(
     pointdir: Path,
     *,
@@ -427,5 +486,6 @@ __all__ = [
     "read_quantum_task_receipt",
     "write_quantum_task_receipt",
     "write_quantum_task_receipt_from_postprocess_source",
+    "write_quantum_task_receipt_from_scheduler_terminal_receipt",
     "write_quantum_task_receipt_from_terminal_intent",
 ]

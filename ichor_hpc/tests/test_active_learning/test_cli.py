@@ -43,6 +43,7 @@ from ichor.hpc.active_learning.daemon.stop_control import (
     read_stop_request,
     stop_request_history_dir,
     stop_request_path,
+    update_stop_request,
 )
 from ichor.hpc.active_learning.handoff_manifests import (
     ARIADNE_RESULTS_SCHEMA_VERSION,
@@ -2100,6 +2101,486 @@ def test_cli_stop_cancel_jobs_records_cancellation_without_rewriting_state(
     assert request["status"] == "requested"
     assert request["cancellation_summary"]["cancelled"][0]["job_id"] == "123"
     assert "Slurm cancellation: 1 cancelled" in out
+
+
+def test_cli_stop_cancel_jobs_records_mixed_terminal_task_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon.scheduler_recovery import (
+        classify_terminal_scheduler_evidence,
+        load_scheduler_terminal_receipt,
+    )
+    from ichor.hpc.active_learning.submit.sacct_poll import (
+        JobObservation,
+        JobStatus,
+    )
+
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state()
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 15
+    phase = state.phase.value
+    state.pending_jobs[phase] = "17923151"
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=phase,
+        iteration=15,
+        expected_tasks=4,
+    )
+    submission_intent.mark_submitted(
+        campaign,
+        phase,
+        15,
+        "17923151",
+        expected_tasks=4,
+    )
+    intent = submission_intent.load_intent(campaign, phase, 15)
+    expected_name = str(intent["expected_job_name"])
+    monkeypatch.setattr(
+        cli_mod,
+        "_lookup_active_slurm_job_for_cancel",
+        lambda job_id: {
+            "active": True,
+            "inconclusive": False,
+            "rows": [
+                {
+                    "job_id": str(job_id),
+                    "state": "RUNNING",
+                    "job_name": expected_name,
+                }
+            ],
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_run_scancel",
+        lambda _job_id: (True, ""),
+    )
+
+    observations = [
+        JobObservation(
+            job_id="17923151_" + str(task_id),
+            status=(
+                JobStatus.COMPLETED
+                if task_id == 0
+                else JobStatus.CANCELLED
+            ),
+            exit_code=((0, 0) if task_id == 0 else (0, 15)),
+            elapsed_seconds=30,
+        )
+        for task_id in range(4)
+    ]
+
+    def confirm(*_args, **kwargs):
+        classification = classify_terminal_scheduler_evidence(
+            kwargs["campaign_dir"],
+            kwargs["intent"],
+            observations,
+            queue_active=False,
+        )
+        kwargs["classification_sink"].update(classification)
+        return True, ""
+
+    monkeypatch.setattr(
+        cli_mod,
+        "_confirm_cancelled_slurm_job",
+        confirm,
+    )
+
+    assert (
+        main(["stop", "--campaign-dir", str(campaign), "--cancel-jobs"])
+        == 0
+    )
+    receipt = load_scheduler_terminal_receipt(campaign, intent)
+    assert receipt is not None
+    assert receipt["completed_logical_task_ids"] == [0]
+    assert receipt["retry_logical_task_ids"] == [1, 2, 3]
+    request = read_stop_request(
+        campaign,
+        expected_campaign_uid=state.campaign_uid,
+    )
+    item = request["cancellation_summary"]["cancelled"][0]
+    assert item["n_completed"] == 1
+    assert item["n_retry"] == 3
+
+
+def test_pre_submit_stop_records_no_scheduler_acceptance_receipt(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon.scheduler_recovery import (
+        load_scheduler_terminal_receipt,
+    )
+
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state()
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 3
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=state.phase.value,
+        iteration=state.iteration,
+        expected_tasks=3,
+    )
+    original_load = submission_intent.load_intent
+    active_intent = original_load(
+        campaign,
+        state.phase.value,
+        state.iteration,
+    )
+    submission_intent.mark_failed(
+        campaign,
+        state.phase.value,
+        state.iteration,
+        "user_cancelled_before_scheduler_acceptance",
+    )
+    inventory_calls = 0
+
+    def active_then_terminal(*_args, **_kwargs):
+        nonlocal inventory_calls
+        inventory_calls += 1
+        return [active_intent] if inventory_calls == 1 else []
+
+    monkeypatch.setattr(
+        cli_mod,
+        "_load_active_submission_intents",
+        active_then_terminal,
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "get_scheduler_backend",
+        lambda _kind: SimpleNamespace(
+            find_accounted_job_by_name=lambda *_args, **_kwargs: SimpleNamespace(
+                job_id=None,
+                inconclusive=False,
+                error=None,
+            )
+        ),
+    )
+
+    summary = cli_mod._cancel_recorded_scheduler_jobs(
+        campaign,
+        state,
+        confirmation_timeout_seconds=1,
+    )
+
+    assert summary["failed"] == []
+    assert len(summary["cancelled"]) == 1
+    assert summary["cancelled"][0]["job_id"] == ""
+    assert summary["cancelled"][0]["n_completed"] == 0
+    assert summary["cancelled"][0]["n_retry"] == 3
+    intent = original_load(
+        campaign,
+        state.phase.value,
+        state.iteration,
+    )
+    receipt = load_scheduler_terminal_receipt(campaign, intent)
+    assert receipt is not None
+    assert receipt["scheduler_acceptance"] == "not_accepted"
+    assert receipt["job_id"] is None
+
+
+def test_pre_submit_stop_before_task_staging_needs_no_fabricated_receipt(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state()
+    state.phase = CampaignPhase.INITIAL_FEREBUS
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=state.phase.value,
+        iteration=state.iteration,
+    )
+    original_load = submission_intent.load_intent
+    active_intent = original_load(
+        campaign,
+        state.phase.value,
+        state.iteration,
+    )
+    submission_intent.mark_failed(
+        campaign,
+        state.phase.value,
+        state.iteration,
+        "user_cancelled_before_scheduler_acceptance",
+    )
+    inventory_calls = 0
+
+    def active_then_terminal(*_args, **_kwargs):
+        nonlocal inventory_calls
+        inventory_calls += 1
+        return [active_intent] if inventory_calls == 1 else []
+
+    class NoAcceptedJobBackend:
+        def find_accounted_job_by_name(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                job_id=None,
+                inconclusive=False,
+                error=None,
+            )
+
+    monkeypatch.setattr(
+        cli_mod,
+        "_load_active_submission_intents",
+        active_then_terminal,
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "get_scheduler_backend",
+        lambda _kind: NoAcceptedJobBackend(),
+    )
+
+    summary = cli_mod._cancel_recorded_scheduler_jobs(
+        campaign,
+        state,
+        confirmation_timeout_seconds=1,
+    )
+
+    assert summary["failed"] == []
+    assert summary["cancelled"] == [
+        {
+            "job_id": "",
+            "scheduler_identity_kind": "slurm",
+            "phases": ["INITIAL_FEREBUS"],
+            "intent_keys": [
+                {
+                    "phase": "INITIAL_FEREBUS",
+                    "iteration": 0,
+                }
+            ],
+            "n_completed": 0,
+            "task_count_unknown": True,
+            "reason": (
+                "scheduler submission stopped before task staging completed"
+            ),
+        }
+    ]
+    terminal_intent = original_load(
+        campaign,
+        state.phase.value,
+        state.iteration,
+    )
+    assert terminal_intent["status"] == "FAILED"
+    assert terminal_intent.get("expected_tasks") is None
+
+
+def test_resume_reproves_unstaged_pre_submit_was_not_accepted(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state()
+    state.phase = CampaignPhase.INITIAL_FEREBUS
+    _write_locked_state(campaign, state)
+    intent = submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=state.phase.value,
+        iteration=state.iteration,
+    )
+    submission_intent.mark_failed(
+        campaign,
+        state.phase.value,
+        state.iteration,
+        "user_cancelled_before_scheduler_acceptance",
+    )
+    request, _ = install_stop_request(
+        campaign,
+        build_stop_request(
+            state,
+            mode="immediate",
+            cancel_jobs=True,
+        ),
+    )
+    request = update_stop_request(
+        campaign,
+        request["request_id"],
+        status="requested",
+        cancellation_summary={
+            "cancelled": [
+                {
+                    "job_id": "",
+                    "scheduler_identity_kind": "slurm",
+                    "phases": [state.phase.value],
+                    "intent_keys": [
+                        {
+                            "phase": state.phase.value,
+                            "iteration": int(state.iteration),
+                        }
+                    ],
+                    "n_completed": 0,
+                    "task_count_unknown": True,
+                    "reason": (
+                        "scheduler submission stopped before task staging "
+                        "completed"
+                    ),
+                }
+            ],
+            "skipped": [],
+            "failed": [],
+        },
+    )
+    assert request is not None
+    lookup_calls = []
+
+    class NoAcceptedJobBackend:
+        def find_accounted_job_by_name(self, name, **kwargs):
+            lookup_calls.append((name, kwargs))
+            return SimpleNamespace(
+                job_id=None,
+                inconclusive=False,
+                error=None,
+            )
+
+    started = []
+    monkeypatch.setattr(
+        cli_mod,
+        "get_scheduler_backend",
+        lambda _kind: NoAcceptedJobBackend(),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "cmd_start",
+        lambda args: (started.append(args) or 0),
+    )
+
+    assert (
+        main(
+            [
+                "resume",
+                "--campaign-dir",
+                str(campaign),
+                "--mode",
+                "dry_run",
+                "--foreground",
+            ]
+        )
+        == 0
+    )
+
+    assert len(lookup_calls) == 1
+    assert lookup_calls[0][0] == intent["expected_job_name"]
+    assert lookup_calls[0][1]["expected_task_count"] is None
+    assert started
+    resumed = read_state(
+        campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+    )
+    assert resumed.phase is CampaignPhase.INITIAL_FEREBUS
+    assert resumed.shutdown_requested is False
+    assert resumed.pending_jobs[state.phase.value] is None
+    assert not stop_request_path(campaign).exists()
+    assert (
+        stop_request_history_dir(campaign)
+        / (str(request["request_id"]) + ".json")
+    ).is_file()
+
+
+def test_resume_refuses_unstaged_pre_submit_when_scheduler_finds_job(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state()
+    state.phase = CampaignPhase.INITIAL_FEREBUS
+    _write_locked_state(campaign, state)
+    submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=state.phase.value,
+        iteration=state.iteration,
+    )
+    submission_intent.mark_failed(
+        campaign,
+        state.phase.value,
+        state.iteration,
+        "user_cancelled_before_scheduler_acceptance",
+    )
+    request, _ = install_stop_request(
+        campaign,
+        build_stop_request(
+            state,
+            mode="immediate",
+            cancel_jobs=True,
+        ),
+    )
+    request = update_stop_request(
+        campaign,
+        request["request_id"],
+        status="requested",
+        cancellation_summary={
+            "cancelled": [
+                {
+                    "job_id": "",
+                    "scheduler_identity_kind": "slurm",
+                    "phases": [state.phase.value],
+                    "intent_keys": [
+                        {
+                            "phase": state.phase.value,
+                            "iteration": int(state.iteration),
+                        }
+                    ],
+                    "n_completed": 0,
+                    "task_count_unknown": True,
+                    "reason": (
+                        "scheduler submission stopped before task staging "
+                        "completed"
+                    ),
+                }
+            ],
+            "skipped": [],
+            "failed": [],
+        },
+    )
+    assert request is not None
+    monkeypatch.setattr(
+        cli_mod,
+        "get_scheduler_backend",
+        lambda _kind: SimpleNamespace(
+            find_accounted_job_by_name=lambda *_args, **_kwargs: (
+                SimpleNamespace(
+                    job_id="12345",
+                    inconclusive=False,
+                    error=None,
+                )
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "cmd_start",
+        lambda _args: pytest.fail("unsafe resume must not start the daemon"),
+    )
+
+    assert (
+        main(
+            [
+                "resume",
+                "--campaign-dir",
+                str(campaign),
+                "--mode",
+                "dry_run",
+                "--foreground",
+            ]
+        )
+        == 7
+    )
+    assert "scheduler contains a job" in capsys.readouterr().err
+    assert stop_request_path(campaign).is_file()
 
 
 def test_cli_stop_cancel_jobs_records_ferebus_intent_for_daemon_cleanup(

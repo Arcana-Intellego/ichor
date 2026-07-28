@@ -35,7 +35,7 @@ STOP_MODES = frozenset({"immediate", "after_phase", "after_iteration"})
 STOP_REQUEST_STATUSES = frozenset({"requested", "cancelling", "completed"})
 _STATUS_TRANSITIONS = {
     "requested": frozenset({"requested", "completed"}),
-    "cancelling": frozenset({"cancelling", "requested"}),
+    "cancelling": frozenset({"cancelling", "requested", "completed"}),
     "completed": frozenset({"completed"}),
 }
 
@@ -372,8 +372,21 @@ def _validate_cancellation_summary(value: Any) -> None:
                     "stop request cancellation summary entries must be objects"
                 )
             job_id = item.get("job_id")
+            unaccepted_pre_submit = (
+                category == "cancelled"
+                and job_id == ""
+                and (
+                    item.get("task_count_unknown") is True
+                    or (
+                        isinstance(item.get("terminal_receipt"), str)
+                        and bool(item.get("terminal_receipt"))
+                    )
+                )
+            )
             if not isinstance(job_id, str) or (
-                category != "skipped" and not job_id
+                category != "skipped"
+                and not job_id
+                and not unaccepted_pre_submit
             ):
                 raise StopControlError(
                     "stop request cancellation job_id must be a string"
@@ -404,6 +417,17 @@ def _validate_cancellation_summary(value: Any) -> None:
                     )
                 _required_nonempty_string(key, "phase")
                 _required_nonnegative_int(key, "iteration")
+            if unaccepted_pre_submit:
+                if item.get("n_completed") != 0:
+                    raise StopControlError(
+                        "unaccepted PRE_SUBMIT cancellation cannot contain "
+                        "completed tasks"
+                    )
+                if len(phases) != 1 or len(keys) != 1:
+                    raise StopControlError(
+                        "unaccepted PRE_SUBMIT cancellation must identify "
+                        "exactly one phase attempt"
+                    )
 
 
 def validate_stop_request(

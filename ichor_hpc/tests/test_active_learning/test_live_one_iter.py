@@ -569,7 +569,10 @@ def _patch_ferebus_submit_for_live_smoke(monkeypatch, campaign_dir, call_log):
             campaign_dir_arg,
             reference_data_version=0 if is_initial else int(reference_data_version),
         )
-        return staging, 1
+        manifest = json.loads(
+            (staging / stg.FEREBUS_TASK_MANIFEST).read_text(encoding="utf-8")
+        )
+        return staging, int(manifest["n_tasks"])
 
     def fake_submit(jd_file, working_directory, **kwargs):
         working = Path(working_directory)

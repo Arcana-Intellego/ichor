@@ -1091,6 +1091,77 @@ def test_ariadne_postprocess_intent_copies_original_decision_contract(
     assert captured[0]["environment_generation"] == 7
 
 
+def test_scheduler_retry_intent_retains_original_decision_contract(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import scheduler_recovery
+
+    d = _make_daemon(tmp_path)
+    state = fresh_campaign_state(max_iterations=2)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 1
+    original = {
+        "failure_threshold_fraction": 0.125,
+        "config_sha256": "6" * 64,
+    }
+    monkeypatch.setattr(
+        scheduler_recovery,
+        "scheduler_terminal_recoveries",
+        lambda *_args, **_kwargs: (
+            {"intent": {"decision_contract": dict(original)}},
+            {"intent": {"decision_contract": dict(original)}},
+        ),
+    )
+
+    observed = d._scheduler_recovery_decision_contract(
+        state,
+        CampaignPhase.ARIADNE_ARRAY,
+    )
+
+    assert observed == original
+
+
+def test_scheduler_retry_rejects_contradictory_decision_contracts(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import scheduler_recovery
+
+    d = _make_daemon(tmp_path)
+    state = fresh_campaign_state(max_iterations=2)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 1
+    monkeypatch.setattr(
+        scheduler_recovery,
+        "scheduler_terminal_recoveries",
+        lambda *_args, **_kwargs: (
+            {
+                "intent": {
+                    "decision_contract": {
+                        "failure_threshold_fraction": 0.125,
+                        "config_sha256": "6" * 64,
+                    }
+                }
+            },
+            {
+                "intent": {
+                    "decision_contract": {
+                        "failure_threshold_fraction": 0.25,
+                        "config_sha256": "7" * 64,
+                    }
+                }
+            },
+        ),
+    )
+
+    with pytest.raises(ValueError, match="contradictory decision contracts"):
+        d._scheduler_recovery_decision_contract(
+            state,
+            CampaignPhase.ARIADNE_ARRAY,
+        )
+
+
 def test_failed_aimall_array_without_complete_scheduler_evidence_retries_normally(
     tmp_path,
     monkeypatch,

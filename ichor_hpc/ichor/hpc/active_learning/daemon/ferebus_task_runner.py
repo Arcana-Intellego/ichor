@@ -327,6 +327,200 @@ def write_imported_model_receipts(staging_dir: Path) -> None:
     )
 
 
+def validate_task_receipt(
+    staging_dir: Path,
+    logical_task_id: int,
+) -> Dict[str, Any]:
+    """Authenticate one zero-based logical FEREBUS task and its outputs."""
+    root = Path(staging_dir).resolve()
+    task_map_path = root / FEREBUS_TASK_MAP_FILENAME
+    payload = _read_task_map(task_map_path)
+    execution_kind = payload.get("execution_kind")
+    if execution_kind not in {
+        "native_ferebus",
+        "imported_model_bootstrap",
+        "synthetic_dry_run",
+    }:
+        raise FerebusTaskRunnerError("FEREBUS task-map execution kind is invalid")
+    performance_required = payload.get("performance_required")
+    if not isinstance(performance_required, bool):
+        raise FerebusTaskRunnerError(
+            "FEREBUS task-map performance requirement is invalid"
+        )
+    tasks = payload.get("tasks")
+    if (
+        not isinstance(tasks, list)
+        or _exact_int(payload.get("n_tasks"), "task-map n_tasks", minimum=1)
+        != len(tasks)
+    ):
+        raise FerebusTaskRunnerError("FEREBUS task-map cardinality mismatch")
+    task_id = _exact_int(logical_task_id, "logical task ID")
+    if task_id >= len(tasks):
+        raise FerebusTaskRunnerError("FEREBUS logical task ID is out of range")
+    task = tasks[task_id]
+    if (
+        not isinstance(task, Mapping)
+        or _exact_int(
+            task.get("task_index"),
+            "logical task index",
+            minimum=1,
+        )
+        != task_id + 1
+    ):
+        raise FerebusTaskRunnerError("FEREBUS task-map task identity is invalid")
+    receipt_path = _contained_file(root, task.get("receipt_path"), "receipt_path")
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise FerebusTaskRunnerError(
+            "FEREBUS task receipt is missing for task " + str(task.get("task_index"))
+        )
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise FerebusTaskRunnerError("FEREBUS task receipt is unreadable") from exc
+    if not isinstance(receipt, dict):
+        raise FerebusTaskRunnerError("FEREBUS task receipt must be an object")
+    if (
+        _exact_int(receipt.get("schema_version"), "task receipt schema")
+        != FEREBUS_TASK_RECEIPT_SCHEMA_VERSION
+    ):
+        raise FerebusTaskRunnerError("unsupported FEREBUS task receipt schema")
+    if (
+        receipt.get("task_map_sha256") != payload["task_map_sha256"]
+        or receipt.get("task_manifest_sha256") != payload["task_manifest_sha256"]
+        or receipt.get("task_index") != task.get("task_index")
+        or receipt.get("property") != task.get("property")
+        or receipt.get("atom") != task.get("atom")
+        or receipt.get("execution_kind") != execution_kind
+        or receipt.get("argv") != task.get("argv")
+        or receipt.get("executable") != payload.get("executable")
+        or receipt.get("success") is not True
+        or receipt.get("exit_code") != 0
+    ):
+        raise FerebusTaskRunnerError("FEREBUS task receipt identity/status mismatch")
+    model = receipt.get("model")
+    if (
+        not isinstance(model, dict)
+        or model.get("path") != task.get("expected_model_path")
+    ):
+        raise FerebusTaskRunnerError("FEREBUS task receipt model binding is invalid")
+    model_path = _validate_input(root, model, "FEREBUS model")
+    performance = receipt.get("performance")
+    performance_path = None
+    if performance_required:
+        if (
+            not isinstance(performance, dict)
+            or performance.get("path") != task.get("expected_performance_path")
+        ):
+            raise FerebusTaskRunnerError(
+                "FEREBUS task receipt performance binding is invalid"
+            )
+        performance_path = _validate_input(
+            root,
+            performance,
+            "FEREBUS performance receipt",
+        )
+    elif performance is not None:
+        raise FerebusTaskRunnerError(
+            "non-executed FEREBUS task must not claim native performance evidence"
+        )
+    return {
+        "task_index": task["task_index"],
+        "receipt_path": receipt_path.relative_to(root).as_posix(),
+        "receipt_sha256": sha256_file(receipt_path),
+        "model_path": model_path.relative_to(root).as_posix(),
+        "model_sha256": model["sha256"],
+        "performance_path": (
+            None
+            if performance_path is None
+            else performance_path.relative_to(root).as_posix()
+        ),
+        "performance_sha256": (
+            None if performance is None else performance["sha256"]
+        ),
+    }
+
+
+def quarantine_task_outputs(
+    staging_dir: Path,
+    logical_task_ids: Sequence[int],
+    quarantine_dir: Path,
+) -> Sequence[Dict[str, Any]]:
+    """Move only retry-task receipts, models and performance files aside."""
+    root = Path(staging_dir).resolve()
+    task_map = _read_task_map(root / FEREBUS_TASK_MAP_FILENAME)
+    tasks = task_map.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        raise FerebusTaskRunnerError("FEREBUS task map has no tasks")
+    quarantine = Path(quarantine_dir)
+    if quarantine.is_symlink():
+        raise FerebusTaskRunnerError("FEREBUS retry quarantine is a symlink")
+    quarantine.mkdir(parents=True, exist_ok=True)
+    records = []
+    seen = set()
+    for logical_task_id in logical_task_ids:
+        task_id = _exact_int(logical_task_id, "logical task ID")
+        if task_id in seen:
+            raise FerebusTaskRunnerError(
+                "FEREBUS retry task list contains duplicate IDs"
+            )
+        seen.add(task_id)
+        if task_id >= len(tasks):
+            raise FerebusTaskRunnerError("FEREBUS retry task ID is out of range")
+        task = tasks[task_id]
+        if (
+            not isinstance(task, Mapping)
+            or task.get("task_index") != task_id + 1
+        ):
+            raise FerebusTaskRunnerError("FEREBUS retry task identity is invalid")
+        task_quarantine = quarantine / ("task-" + f"{task_id + 1:06d}")
+        for kind, raw_path in (
+            ("receipt", task.get("receipt_path")),
+            ("model", task.get("expected_model_path")),
+            ("performance", task.get("expected_performance_path")),
+        ):
+            source = _contained_file(root, raw_path, "FEREBUS " + kind)
+            destination = task_quarantine / kind / source.name
+            if destination.is_symlink():
+                raise FerebusTaskRunnerError(
+                    "FEREBUS retry quarantine destination is a symlink"
+                )
+            if source.exists() or source.is_symlink():
+                if source.is_symlink() or not source.is_file():
+                    raise FerebusTaskRunnerError(
+                        "FEREBUS retry output is not a regular file: "
+                        + str(source)
+                    )
+                if destination.exists() or destination.is_symlink():
+                    raise FerebusTaskRunnerError(
+                        "FEREBUS retry source and quarantine destination both exist"
+                    )
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                source.replace(destination)
+                records.append(
+                    {
+                        "logical_task_id": task_id,
+                        "kind": kind,
+                        "source": source.relative_to(root).as_posix(),
+                        "destination": str(destination),
+                    }
+                )
+            elif destination.exists():
+                if not destination.is_file() or destination.is_symlink():
+                    raise FerebusTaskRunnerError(
+                        "FEREBUS retry quarantine entry is invalid"
+                    )
+                records.append(
+                    {
+                        "logical_task_id": task_id,
+                        "kind": kind,
+                        "source": source.relative_to(root).as_posix(),
+                        "destination": str(destination),
+                        "already_quarantined": True,
+                    }
+                )
+    return tuple(records)
+
+
 def validate_task_receipts(staging_dir: Path) -> Dict[str, Any]:
     """Authenticate complete successful task coverage before postprocessing."""
     root = Path(staging_dir).resolve()
@@ -348,74 +542,10 @@ def validate_task_receipts(staging_dir: Path) -> Dict[str, Any]:
         payload.get("tasks") or []
     ):
         raise FerebusTaskRunnerError("FEREBUS task-map cardinality mismatch")
-    records = []
-    for task in payload["tasks"]:
-        if not isinstance(task, Mapping):
-            raise FerebusTaskRunnerError("FEREBUS task-map task must be an object")
-        receipt_path = _contained_file(root, task.get("receipt_path"), "receipt_path")
-        if receipt_path.is_symlink() or not receipt_path.is_file():
-            raise FerebusTaskRunnerError(
-                "FEREBUS task receipt is missing for task " + str(task.get("task_index"))
-            )
-        try:
-            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise FerebusTaskRunnerError("FEREBUS task receipt is unreadable") from exc
-        if not isinstance(receipt, dict):
-            raise FerebusTaskRunnerError("FEREBUS task receipt must be an object")
-        if _exact_int(receipt.get("schema_version"), "task receipt schema") != FEREBUS_TASK_RECEIPT_SCHEMA_VERSION:
-            raise FerebusTaskRunnerError("unsupported FEREBUS task receipt schema")
-        if (
-            receipt.get("task_map_sha256") != payload["task_map_sha256"]
-            or receipt.get("task_manifest_sha256") != payload["task_manifest_sha256"]
-            or receipt.get("task_index") != task.get("task_index")
-            or receipt.get("property") != task.get("property")
-            or receipt.get("atom") != task.get("atom")
-            or receipt.get("execution_kind") != execution_kind
-            or receipt.get("argv") != task.get("argv")
-            or receipt.get("executable") != payload.get("executable")
-            or receipt.get("success") is not True
-            or receipt.get("exit_code") != 0
-        ):
-            raise FerebusTaskRunnerError("FEREBUS task receipt identity/status mismatch")
-        model = receipt.get("model")
-        if not isinstance(model, dict) or model.get("path") != task.get("expected_model_path"):
-            raise FerebusTaskRunnerError("FEREBUS task receipt model binding is invalid")
-        model_path = _validate_input(root, model, "FEREBUS model")
-        performance = receipt.get("performance")
-        performance_path = None
-        if performance_required:
-            if (
-                not isinstance(performance, dict)
-                or performance.get("path") != task.get("expected_performance_path")
-            ):
-                raise FerebusTaskRunnerError(
-                    "FEREBUS task receipt performance binding is invalid"
-                )
-            performance_path = _validate_input(
-                root, performance, "FEREBUS performance receipt"
-            )
-        elif performance is not None:
-            raise FerebusTaskRunnerError(
-                "non-executed FEREBUS task must not claim native performance evidence"
-            )
-        records.append(
-            {
-                "task_index": task["task_index"],
-                "receipt_path": receipt_path.relative_to(root).as_posix(),
-                "receipt_sha256": sha256_file(receipt_path),
-                "model_path": model_path.relative_to(root).as_posix(),
-                "model_sha256": model["sha256"],
-                "performance_path": (
-                    None
-                    if performance_path is None
-                    else performance_path.relative_to(root).as_posix()
-                ),
-                "performance_sha256": (
-                    None if performance is None else performance["sha256"]
-                ),
-            }
-        )
+    records = [
+        validate_task_receipt(root, logical_task_id)
+        for logical_task_id in range(len(payload["tasks"]))
+    ]
     return {
         "task_map_path": FEREBUS_TASK_MAP_FILENAME,
         "task_map_sha256": payload["task_map_sha256"],
@@ -430,6 +560,7 @@ def validate_task_receipts(staging_dir: Path) -> Dict[str, Any]:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task-map", required=True)
+    parser.add_argument("--scheduler-task-map", default=None)
     parser.add_argument("--task-index", type=int, default=None)
     args = parser.parse_args(argv)
     task_index = args.task_index
@@ -443,6 +574,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "ICHOR scheduler array task ID is missing or invalid"
             )
         task_index = int(raw)
+    if args.scheduler_task_map is not None:
+        from .script_bundles import read_array_task_map
+
+        dense_mapping = list(read_array_task_map(args.scheduler_task_map))
+        if not 0 <= int(task_index) < len(dense_mapping):
+            raise FerebusTaskRunnerError(
+                "FEREBUS dense scheduler task ID is out of range"
+            )
+        task_index = int(dense_mapping[int(task_index)])
     return execute_task(Path(args.task_map), task_index)
 
 
@@ -458,6 +598,8 @@ __all__ = [
     "FerebusTaskRunnerError",
     "execute_task",
     "main",
+    "quarantine_task_outputs",
+    "validate_task_receipt",
     "validate_task_receipts",
     "write_imported_model_receipts",
     "write_preexisting_model_receipts",
