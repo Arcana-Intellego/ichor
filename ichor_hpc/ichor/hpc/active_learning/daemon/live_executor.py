@@ -3908,7 +3908,67 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             )
         except ValueError as exc:
             raise BackendSubmissionError(str(exc)) from exc
-        self._report_runtime_progress("resource_resolution")
+        evidence_override = None
+        resource_task_ids = submitted_task_ids
+        resource_evidence_mode = "computed"
+        resource_evidence_source = None
+        if phase_name == "ARIADNE_ARRAY" and array_size is not None:
+            from .ariadne_resource_reuse import (
+                resolve_reusable_ariadne_resource_evidence,
+            )
+
+            logical_task_ids = (
+                list(submitted_task_ids)
+                if submitted_task_ids is not None
+                else list(range(int(array_size)))
+            )
+            try:
+                resource_evidence_source = (
+                    resolve_reusable_ariadne_resource_evidence(
+                        self.campaign_dir,
+                        self.config,
+                        active_intent,
+                        expected_campaign_uid=str(state.campaign_uid),
+                        iteration=int(state.iteration),
+                        replacement_round=int(
+                            getattr(state, "replacement_round", 0)
+                        ),
+                        expected_scheduler_kind=self.scheduler_identity_kind,
+                        expected_models_version=int(state.models_version),
+                        submitted_task_ids=logical_task_ids,
+                    )
+                )
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                raise BackendSubmissionError(
+                    "ARIADNE resource-evidence reuse is unsafe: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                ) from exc
+            if resource_evidence_source is not None:
+                evidence_override = dict(resource_evidence_source.evidence)
+                resource_task_ids = (
+                    None
+                    if resource_evidence_source.already_filtered
+                    else logical_task_ids
+                )
+                resource_evidence_mode = "reused"
+                self._report_runtime_progress(
+                    "ariadne_resource_reuse",
+                    completed=len(logical_task_ids),
+                    total=len(logical_task_ids),
+                    unit="retry tasks",
+                    source_submission_identity=(
+                        resource_evidence_source.source_submission_identity
+                    ),
+                    source_attempt_id=(
+                        resource_evidence_source.source_attempt_id
+                    ),
+                )
+            else:
+                self._report_runtime_progress("resource_resolution")
+        else:
+            self._report_runtime_progress("resource_resolution")
         resolved = resolve_phase_resources(
             phase_name=phase_name,
             config=self.config,
@@ -3927,8 +3987,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 if phase_name == "ARIADNE_ARRAY"
                 else None
             ),
-            submitted_task_ids=submitted_task_ids,
+            submitted_task_ids=resource_task_ids,
+            evidence_override=evidence_override,
             require_evidence=True,
+            progress_callback=self._report_runtime_progress,
         )
         self._report_runtime_progress("script_rendering")
         try:
@@ -4015,6 +4077,32 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             **resolved.journal_payload(phase_name=phase_name),
             resource_resolution_path=str(resolution_binding["path"]),
             resource_resolution_sha256=str(resolution_binding["sha256"]),
+            resource_evidence_mode=resource_evidence_mode,
+            resource_evidence_source_submission_identity=(
+                None
+                if resource_evidence_source is None
+                else resource_evidence_source.source_submission_identity
+            ),
+            resource_evidence_source_attempt_id=(
+                None
+                if resource_evidence_source is None
+                else resource_evidence_source.source_attempt_id
+            ),
+            resource_evidence_source_resolution_path=(
+                None
+                if resource_evidence_source is None
+                else resource_evidence_source.source_resolution_path
+            ),
+            resource_evidence_source_resolution_sha256=(
+                None
+                if resource_evidence_source is None
+                else resource_evidence_source.source_resolution_sha256
+            ),
+            resource_evidence_source_tasks=(
+                None
+                if resource_evidence_source is None
+                else resource_evidence_source.source_task_count
+            ),
         )
         body = build_scheduler_script(
             phase_name=phase_name,

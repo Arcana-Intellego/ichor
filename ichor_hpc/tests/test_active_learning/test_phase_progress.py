@@ -5,10 +5,58 @@ import ichor.hpc.active_learning.cli as cli
 from ichor.hpc.active_learning.daemon import phase_progress
 from ichor.hpc.active_learning.daemon.phase_progress import (
     PhaseProgressReporter,
+    format_progress_stage,
     newest_matching_progress,
     progress_path,
     read_phase_progress_records,
 )
+
+
+def test_ariadne_resource_progress_stages_have_explicit_human_labels():
+    assert (
+        format_progress_stage("ariadne_resource_validation")
+        == "Validating ARIADNE resource inputs"
+    )
+    assert (
+        format_progress_stage("ariadne_resource_dimensions")
+        == "Computing ARIADNE local subspace dimensions"
+    )
+    assert (
+        format_progress_stage("ariadne_resource_reuse")
+        == "Reusing validated ARIADNE resource evidence"
+    )
+    assert (
+        format_progress_stage("resource_rules")
+        == "Applying scheduler resource rules"
+    )
+    assert cli._journal_operator_summary(
+        {
+            "event": "phase_activity_progress",
+            "stage": "ariadne_resource_reuse",
+            "status": "running",
+            "completed": 196,
+            "total": 196,
+            "unit": "retry tasks",
+        }
+    ) == (
+        "Reusing validated ARIADNE resource evidence: "
+        "196/196 retry tasks"
+    )
+    status_record = {
+        "stage": "ariadne_resource_reuse",
+        "status": "running",
+        "counters": {
+            "completed": 196,
+            "total": 196,
+            "unit": "retry tasks",
+        },
+    }
+    assert cli._format_generic_progress_activity(status_record) == (
+        "Reusing validated ARIADNE resource evidence."
+    )
+    assert cli._format_generic_progress_count(status_record) == (
+        "196/196 retry tasks"
+    )
 
 
 def _reporter(tmp_path, clock, events, **overrides):

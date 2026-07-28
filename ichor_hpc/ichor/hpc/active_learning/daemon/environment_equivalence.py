@@ -104,6 +104,28 @@ _PRODUCER_ROOTS: Dict[str, Tuple[Tuple[str, Tuple[str, ...]], ...]] = {
     ),
 }
 
+_RESOURCE_EVIDENCE_ROOTS: Dict[
+    str, Tuple[Tuple[str, Tuple[str, ...]], ...]
+] = {
+    "ariadne": (
+        (
+            "ichor_core/ichor/core/adversarial/geometry.py",
+            (
+                "select_local_neighbours",
+                "aligned_mass_weighted_distance",
+            ),
+        ),
+        (
+            "ichor_core/ichor/core/adversarial/subspace.py",
+            ("build_local_subspace",),
+        ),
+        (
+            "ichor_hpc/ichor/hpc/active_learning/acquisition/trajectory_pool.py",
+            ("TrajectoryPool",),
+        ),
+    ),
+}
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -342,14 +364,15 @@ def _referenced_attributes(node: ast.AST) -> Set[Tuple[str, str]]:
     return values
 
 
-def _producer_fingerprint(
+def _fingerprint_roots(
     repo: Path,
     commit: str,
     backend: str,
+    roots: Sequence[Tuple[str, Tuple[str, ...]]],
 ) -> Dict[str, Any]:
     queue = [
         (path, symbol)
-        for path, symbols in _PRODUCER_ROOTS[backend]
+        for path, symbols in roots
         for symbol in symbols
     ]
     visited: Set[Tuple[str, str]] = set()
@@ -409,6 +432,68 @@ def _producer_fingerprint(
         "backend": backend,
         "symbols": records,
         "fingerprint_sha256": _sha256_json(records),
+    }
+
+
+def _producer_fingerprint(
+    repo: Path,
+    commit: str,
+    backend: str,
+) -> Dict[str, Any]:
+    return _fingerprint_roots(
+        repo,
+        commit,
+        backend,
+        _PRODUCER_ROOTS[backend],
+    )
+
+
+def assess_resource_evidence_code_equivalence(
+    producer_generation: Mapping[str, Any],
+    current_generation: Mapping[str, Any],
+    *,
+    backend: str,
+) -> Dict[str, Any]:
+    """Compare only the code that constructs reusable resource evidence."""
+    backend_name = str(backend).strip().casefold()
+    roots = _RESOURCE_EVIDENCE_ROOTS.get(backend_name)
+    if roots is None:
+        raise ValueError(
+            "backend does not support resource-evidence equivalence: "
+            + backend_name
+        )
+    repo = _repository_root()
+    producer_commit = _require_clean_available_commit(
+        repo,
+        producer_generation,
+        label="producer",
+        require_worktree_clean=False,
+    )
+    current_commit = _require_clean_available_commit(
+        repo,
+        current_generation,
+        label="current",
+        require_worktree_clean=True,
+    )
+    producer = _fingerprint_roots(
+        repo,
+        producer_commit,
+        backend_name,
+        roots,
+    )
+    current = _fingerprint_roots(
+        repo,
+        current_commit,
+        backend_name,
+        roots,
+    )
+    return {
+        "equivalent": (
+            producer["fingerprint_sha256"]
+            == current["fingerprint_sha256"]
+        ),
+        "producer_fingerprint": producer,
+        "current_fingerprint": current,
     }
 
 
@@ -798,6 +883,7 @@ __all__ = [
     "ENVIRONMENT_EQUIVALENCE_DIRNAME",
     "ENVIRONMENT_EQUIVALENCE_SCHEMA_VERSION",
     "assess_recovery_environment",
+    "assess_resource_evidence_code_equivalence",
     "environment_equivalence_path",
     "read_environment_equivalence",
 ]

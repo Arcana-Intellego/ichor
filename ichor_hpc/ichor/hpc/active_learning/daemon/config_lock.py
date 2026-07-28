@@ -220,6 +220,87 @@ def read_config_lock(
     return validated
 
 
+def read_historical_config_by_fingerprint(
+    campaign_dir: Union[str, Path],
+    fingerprint_sha256: str,
+    *,
+    expected_campaign_uid: str,
+) -> CampaignConfig:
+    """Read one authenticated config snapshot from the current history chain."""
+    fingerprint = str(fingerprint_sha256)
+    if (
+        len(fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in fingerprint)
+    ):
+        raise ValueError("historical config fingerprint is invalid")
+    current = read_config_lock(
+        campaign_dir,
+        expected_campaign_uid=str(expected_campaign_uid),
+    )
+    current_canonical = current.get("canonical_config")
+    if isinstance(current_canonical, dict):
+        current_fingerprint = config_fingerprint(current_canonical)
+        if current_fingerprint == fingerprint:
+            return CampaignConfig.from_dict(current_canonical)
+    raw_sequence = current.get("history_sequence")
+    raw_digest = current.get("history_entry_sha256")
+    if (
+        isinstance(raw_sequence, bool)
+        or not isinstance(raw_sequence, int)
+        or raw_sequence < 0
+        or not isinstance(raw_digest, str)
+        or len(raw_digest) != 64
+        or any(character not in "0123456789abcdef" for character in raw_digest)
+    ):
+        raise FileNotFoundError(
+            "config lock has no authenticated history for fingerprint "
+            + fingerprint
+        )
+    expected_sequence = int(raw_sequence)
+    digest = raw_digest
+    seen = set()
+    while digest:
+        if digest in seen:
+            raise ValueError("config lock history contains a cycle")
+        seen.add(digest)
+        matches = list(
+            config_lock_history_dir(campaign_dir).glob("*-" + digest + ".json")
+        )
+        if len(matches) != 1:
+            raise ValueError("config lock history predecessor is missing or ambiguous")
+        entry = _read_json_object(matches[0], "config lock history entry")
+        if int(entry.get("schema_version", -1)) != CONFIG_LOCK_HISTORY_SCHEMA_VERSION:
+            raise ValueError("unsupported config lock history schema")
+        if str(entry.get("entry_sha256") or "") != _history_entry_sha256(entry):
+            raise ValueError("config lock history entry digest mismatch")
+        if str(entry.get("entry_sha256") or "") != digest:
+            raise ValueError("config lock history predecessor digest mismatch")
+        if int(entry.get("sequence", -1)) != expected_sequence:
+            raise ValueError("config lock history sequence is invalid")
+        if str(entry.get("campaign_uid") or "") != str(expected_campaign_uid):
+            raise ValueError("config lock history campaign UID mismatch")
+        canonical = entry.get("canonical_config")
+        if not isinstance(canonical, dict):
+            raise ValueError("config lock history canonical_config is missing")
+        observed_fingerprint = config_fingerprint(canonical)
+        if str(entry.get("fingerprint_sha256") or "") != observed_fingerprint:
+            raise ValueError("config lock history canonical fingerprint mismatch")
+        if observed_fingerprint == fingerprint:
+            return CampaignConfig.from_dict(canonical)
+        previous = entry.get("previous_entry_sha256")
+        if previous in (None, ""):
+            if expected_sequence != 0:
+                raise ValueError("config lock history chain ended before its root")
+            break
+        if expected_sequence <= 0:
+            raise ValueError("config lock history root has a predecessor")
+        digest = str(previous)
+        expected_sequence -= 1
+    raise FileNotFoundError(
+        "config lock history does not contain fingerprint " + fingerprint
+    )
+
+
 def restore_config_lock_from_history(
     campaign_dir: Union[str, Path],
     *,

@@ -15,7 +15,7 @@ import shutil
 import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from .cluster_profile import active_machine, profile_value
 from .phase_executor import BackendSubmissionError
@@ -1016,7 +1016,26 @@ def _directory_bytes(root: Path) -> int:
     return total
 
 
-def _ariadne_evidence(campaign_dir: Path, iteration: int, config: Any) -> Dict[str, Any]:
+def _report_resource_progress(
+    callback: Optional[Callable[..., None]],
+    stage: str,
+    **payload: Any,
+) -> None:
+    if callback is None:
+        return
+    try:
+        callback(str(stage), **payload)
+    except Exception:
+        return
+
+
+def _ariadne_evidence(
+    campaign_dir: Path,
+    iteration: int,
+    config: Any,
+    *,
+    progress_callback: Optional[Callable[..., None]] = None,
+) -> Dict[str, Any]:
     from ..acquisition.trajectory_pool import TrajectoryPool
     from ..layout import active_iteration_dir
     from ..seed_identity import read_ariadne_task_map
@@ -1034,9 +1053,23 @@ def _ariadne_evidence(campaign_dir: Path, iteration: int, config: Any) -> Dict[s
             "ARIADNE task map is not yet available: " + str(task_map_file)
         )
     task_map = read_ariadne_task_map(iter_dir, expected_iteration=int(iteration))
+    _report_resource_progress(
+        progress_callback,
+        "ariadne_resource_validation",
+        completed=1,
+        total=3,
+        unit="checks",
+    )
     pool = TrajectoryPool.load(campaign_dir)
     if str(task_map["trajectory_sha256"]) != str(pool.sha256):
         raise ValueError("ARIADNE task map trajectory SHA does not match the pool")
+    _report_resource_progress(
+        progress_callback,
+        "ariadne_resource_validation",
+        completed=2,
+        total=3,
+        unit="checks",
+    )
     version = int(task_map["models_version"])
     model_set = resolve_trained_model_set(
         campaign_dir, version, verification="metadata"
@@ -1046,6 +1079,13 @@ def _ariadne_evidence(campaign_dir: Path, iteration: int, config: Any) -> Dict[s
         raise ValueError("ARIADNE task map model-manifest SHA mismatch")
     if str(model_set.model_set_sha256) != str(task_map["model_set_sha256"]):
         raise ValueError("ARIADNE task map scientific model-set SHA mismatch")
+    _report_resource_progress(
+        progress_callback,
+        "ariadne_resource_validation",
+        completed=3,
+        total=3,
+        unit="checks",
+    )
     selected = [
         pool.frame(int(task["pool_row_index_zero_based"]))
         for task in task_map["tasks"]
@@ -1062,7 +1102,15 @@ def _ariadne_evidence(campaign_dir: Path, iteration: int, config: Any) -> Dict[s
 
         acquisition_config = config.to_acquisition_config()
         dimensions = []
-        for seed in selected:
+        _report_resource_progress(
+            progress_callback,
+            "ariadne_resource_dimensions",
+            completed=0,
+            total=len(selected),
+            unit="seeds",
+            pool_frames=int(pool.manifest.n_frames),
+        )
+        for position, seed in enumerate(selected, start=1):
             neighbours = select_local_neighbours(
                 seed,
                 pool,
@@ -1083,6 +1131,14 @@ def _ariadne_evidence(campaign_dir: Path, iteration: int, config: Any) -> Dict[s
                         acquisition_config.subspace,
                     ).dimension
                 )
+            )
+            _report_resource_progress(
+                progress_callback,
+                "ariadne_resource_dimensions",
+                completed=int(position),
+                total=len(selected),
+                unit="seeds",
+                pool_frames=int(pool.manifest.n_frames),
             )
         dimension = max(dimensions)
         dimension_source = "exact_seed_local_subspaces"
@@ -1247,6 +1303,7 @@ def collect_resource_evidence(
     staging_dir: Optional[Path] = None,
     n_atoms_override: Optional[int] = None,
     require_evidence: bool = True,
+    progress_callback: Optional[Callable[..., None]] = None,
 ) -> Dict[str, Any]:
     backend = backend_for_phase(phase_name)
     if campaign_dir is None:
@@ -1276,7 +1333,12 @@ def collect_resource_evidence(
                 staging_dir=staging_dir,
             )
         if backend == "ariadne":
-            return _ariadne_evidence(campaign_dir, int(iteration), config)
+            return _ariadne_evidence(
+                campaign_dir,
+                int(iteration),
+                config,
+                progress_callback=progress_callback,
+            )
         if backend == "ferebus":
             return _ferebus_evidence(campaign_dir)
     except (ResourceEvidenceUnavailable, ResourceEvidenceInvalid):
@@ -1833,6 +1895,7 @@ def resolve_phase_resources(
     submitted_task_ids: Optional[Sequence[int]] = None,
     require_evidence: bool = True,
     evidence_override: Optional[Dict[str, Any]] = None,
+    progress_callback: Optional[Callable[..., None]] = None,
 ) -> ResolvedPhaseResources:
     resources = config.resources
     backend = backend_for_phase(phase_name)
@@ -1863,6 +1926,7 @@ def resolve_phase_resources(
             staging_dir=None if staging_dir is None else Path(staging_dir),
             n_atoms_override=n_atoms_override,
             require_evidence=bool(require_evidence),
+            progress_callback=progress_callback,
         )
     )
     if not evidence or not isinstance(evidence.get("source"), str):
@@ -1894,6 +1958,13 @@ def resolve_phase_resources(
         raise BackendSubmissionError(
             "resource evidence contains no tasks for " + str(phase_name)
         )
+    _report_resource_progress(
+        progress_callback,
+        "resource_rules",
+        completed=0,
+        total=1,
+        unit="steps",
+    )
     if backend == "ariadne" and expected_models_version is not None:
         try:
             observed_models_version = int(evidence.get("models_version"))
@@ -2195,6 +2266,13 @@ def resolve_phase_resources(
             warnings.append(
                 "campaign root is under $HOME; use a cluster campaign filesystem for live work"
             )
+    _report_resource_progress(
+        progress_callback,
+        "resource_rules",
+        completed=1,
+        total=1,
+        unit="steps",
+    )
     return ResolvedPhaseResources(
         backend=backend,
         partition=part,

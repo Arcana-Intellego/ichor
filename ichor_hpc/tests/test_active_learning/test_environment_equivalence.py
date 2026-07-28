@@ -215,3 +215,54 @@ def test_native_runtime_change_forces_retry(tmp_path, monkeypatch):
         "native_library_paths_changed",
         "profile_module_sequence_changed",
     ]
+
+
+def test_resource_evidence_equivalence_uses_scientific_algorithm_roots(
+    tmp_path,
+    monkeypatch,
+):
+    producer = _generation(generation=2, digest="a" * 64)
+    current = _generation(generation=3, digest="b" * 64)
+    monkeypatch.setattr(module, "_repository_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        module,
+        "_require_clean_available_commit",
+        lambda *_args, label, **_kwargs: label + "-commit",
+    )
+    calls = []
+
+    def fingerprint(_repo, commit, backend, roots):
+        calls.append((commit, backend, roots))
+        return {
+            "backend": backend,
+            "symbols": [],
+            "fingerprint_sha256": "1" * 64,
+        }
+
+    monkeypatch.setattr(module, "_fingerprint_roots", fingerprint)
+
+    assessment = module.assess_resource_evidence_code_equivalence(
+        producer,
+        current,
+        backend="ariadne",
+    )
+
+    assert assessment["equivalent"] is True
+    assert [call[0] for call in calls] == [
+        "producer-commit",
+        "current-commit",
+    ]
+    flattened = {
+        (path, symbol)
+        for _commit, _backend, roots in calls
+        for path, symbols in roots
+        for symbol in symbols
+    }
+    assert (
+        "ichor_core/ichor/core/adversarial/geometry.py",
+        "aligned_mass_weighted_distance",
+    ) in flattened
+    assert (
+        "ichor_core/ichor/core/adversarial/subspace.py",
+        "build_local_subspace",
+    ) in flattened
