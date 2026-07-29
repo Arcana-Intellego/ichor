@@ -191,19 +191,16 @@ def _active_frames(
     iteration: int,
     attempts: Sequence[Mapping[str, Any]],
 ) -> List[Atoms]:
-    from .handoff_manifests import ariadne_candidate_frames
-    from .layout import active_iteration_dir
+    from .handoff_manifests import authoritative_ariadne_candidate_frames
 
     resolved_iteration = _required_integer(
         iteration,
         "replacement active iteration",
         minimum=1,
     )
-    iteration_dir = active_iteration_dir(campaign_dir, resolved_iteration)
-    manifest, _frames, accepted_records = ariadne_candidate_frames(
-        iteration_dir,
-        expected_iteration=resolved_iteration,
-        require_batch_decision=True,
+    manifest, _frames, accepted_records = authoritative_ariadne_candidate_frames(
+        campaign_dir,
+        resolved_iteration,
     )
     accepted_by_uid = {
         str(record.get("seed_uid") or ""): record for record in accepted_records

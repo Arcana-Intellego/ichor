@@ -928,7 +928,6 @@ def _run_phase_b(args, campaign, config, *, progress_reporter: Any = None):
     )
     from ..handoff_manifests import (
         PHASE_B_SELECTION_SCHEMA_VERSION,
-        ariadne_candidate_frames,
         ariadne_results_path,
         write_phase_b_selection_manifest,
     )
@@ -968,12 +967,17 @@ def _run_phase_b(args, campaign, config, *, progress_reporter: Any = None):
         return 3
 
     try:
-        from ..daemon.config_lock import canonical_config, config_fingerprint
+        from ..handoff_manifests import (
+            authoritative_ariadne_candidate_frames,
+        )
 
-        ariadne_manifest, candidate_frames, candidate_records = ariadne_candidate_frames(
-            iter_dir,
-            expected_iteration=int(args.iteration),
-            expected_config_sha256=config_fingerprint(canonical_config(config)),
+        (
+            ariadne_manifest,
+            candidate_frames,
+            candidate_records,
+        ) = authoritative_ariadne_candidate_frames(
+            campaign,
+            int(args.iteration),
         )
     except Exception as exc:
         print(

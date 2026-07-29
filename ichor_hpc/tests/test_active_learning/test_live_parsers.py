@@ -2016,6 +2016,7 @@ def _write_seeds_picked(campaign_dir, iteration, n_seeds):
     from ichor.hpc.active_learning.daemon.config_lock import (
         canonical_config,
         config_fingerprint,
+        write_config_lock,
     )
 
     campaign_dir.mkdir(parents=True, exist_ok=True)
@@ -2062,6 +2063,17 @@ def _write_seeds_picked(campaign_dir, iteration, n_seeds):
     selection_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(selection_path, payload)
     write_ariadne_task_map(iter_dir, payload)
+    decision_config = (
+        CampaignConfig.from_yaml(campaign_dir / "campaign.yaml")
+        if (campaign_dir / "campaign.yaml").is_file()
+        else CampaignConfig()
+    )
+    write_config_lock(
+        campaign_dir,
+        decision_config,
+        campaign_uid="m16-test",
+        reason="test_ariadne_intent",
+    )
     write_pre_submit_intent(
         campaign_dir,
         campaign_uid="m16-test",
@@ -2071,11 +2083,7 @@ def _write_seeds_picked(campaign_dir, iteration, n_seeds):
         decision_contract={
             "failure_threshold_fraction": 0.5,
             "config_sha256": config_fingerprint(
-                canonical_config(
-                    CampaignConfig.from_yaml(campaign_dir / "campaign.yaml")
-                    if (campaign_dir / "campaign.yaml").is_file()
-                    else CampaignConfig()
-                )
+                canonical_config(decision_config)
             ),
         },
     )

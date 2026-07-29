@@ -240,6 +240,7 @@ def read_ariadne_batch_decision(
     expected_iteration: Optional[int] = None,
     expected_campaign_uid: Optional[str] = None,
     expected_config_sha256: Optional[str] = None,
+    expected_failure_threshold_fraction: Optional[float] = None,
     require_accepted: bool = True,
     verify_current_config: bool = True,
 ) -> Dict[str, Any]:
@@ -348,6 +349,19 @@ def read_ariadne_batch_decision(
         current.get("config_sha256") or ""
     ) != str(expected_config_sha256):
         raise HandoffManifestError("ARIADNE batch decision config digest mismatch")
+    if (
+        verify_current_config
+        and expected_failure_threshold_fraction is not None
+        and not math.isclose(
+            float(current.get("failure_threshold_fraction")),
+            float(expected_failure_threshold_fraction),
+            rel_tol=0.0,
+            abs_tol=1.0e-15,
+        )
+    ):
+        raise HandoffManifestError(
+            "ARIADNE batch decision failure threshold mismatch"
+        )
     if require_accepted and not bool(current.get("accepted", False)):
         raise HandoffManifestError(
             "ARIADNE batch decision rejected: "
@@ -357,6 +371,77 @@ def read_ariadne_batch_decision(
     out["results"] = {**binding, "path": str(results_path)}
     out["current_evaluation"] = current
     return out
+
+
+def read_authoritative_ariadne_batch_decision(
+    campaign_dir: Any,
+    iteration: int,
+    *,
+    expected_campaign_uid: Optional[str] = None,
+    require_accepted: bool = True,
+) -> Dict[str, Any]:
+    """Read a batch decision against its frozen producer contract."""
+    from .config import CampaignConfig
+    from .daemon.ariadne_decision_authority import (
+        resolve_ariadne_handoff_decision_contract,
+    )
+    from .daemon.config_lock import canonical_config, config_fingerprint
+    from .layout import active_iteration_dir
+    from .seed_identity import read_ariadne_task_map
+
+    campaign = Path(campaign_dir).expanduser().resolve()
+    iter_dir = active_iteration_dir(campaign, int(iteration))
+    task_map = read_ariadne_task_map(
+        iter_dir,
+        expected_iteration=int(iteration),
+    )
+    campaign_uid = str(
+        expected_campaign_uid or task_map.get("campaign_uid") or ""
+    )
+    if not campaign_uid:
+        raise HandoffManifestError(
+            "ARIADNE task map campaign UID is missing"
+        )
+    if str(task_map.get("campaign_uid") or "") != campaign_uid:
+        raise HandoffManifestError(
+            "ARIADNE task map campaign UID mismatch"
+        )
+    try:
+        authority = resolve_ariadne_handoff_decision_contract(
+            campaign,
+            campaign_uid=campaign_uid,
+            iteration=int(iteration),
+            logical_total=int(task_map["n_tasks"]),
+            replacement_round=0,
+        )
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        raise HandoffManifestError(
+            "ARIADNE producer decision contract is invalid: "
+            + type(exc).__name__
+            + ": "
+            + str(exc)
+        ) from exc
+    if authority is None:
+        config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+        contract = {
+            "config_sha256": config_fingerprint(canonical_config(config)),
+            "failure_threshold_fraction": float(
+                config.runtime.failure_threshold_fraction
+            ),
+        }
+    else:
+        contract = dict(authority["decision_contract"])
+    return read_ariadne_batch_decision(
+        iter_dir,
+        expected_iteration=int(iteration),
+        expected_campaign_uid=campaign_uid,
+        expected_config_sha256=str(contract["config_sha256"]),
+        expected_failure_threshold_fraction=float(
+            contract["failure_threshold_fraction"]
+        ),
+        require_accepted=bool(require_accepted),
+        verify_current_config=True,
+    )
 
 
 def ariadne_landing_audit_path(iter_dir: Any) -> Path:
@@ -1472,6 +1557,29 @@ def ariadne_candidate_frames(
         frames.append(atoms)
         records.append(dict(rec))
     return manifest, frames, records
+
+
+def authoritative_ariadne_candidate_frames(
+    campaign_dir: Any,
+    iteration: int,
+    *,
+    expected_campaign_uid: Optional[str] = None,
+) -> Tuple[Dict[str, Any], List[Any], List[Dict[str, Any]]]:
+    """Return accepted candidates after producer-bound decision validation."""
+    from .layout import active_iteration_dir
+
+    campaign = Path(campaign_dir).expanduser().resolve()
+    read_authoritative_ariadne_batch_decision(
+        campaign,
+        int(iteration),
+        expected_campaign_uid=expected_campaign_uid,
+        require_accepted=True,
+    )
+    return ariadne_candidate_frames(
+        active_iteration_dir(campaign, int(iteration)),
+        expected_iteration=int(iteration),
+        require_batch_decision=False,
+    )
 
 
 def write_phase_a_sample_manifest(initial_dir: Any, payload: Dict[str, Any]) -> Path:

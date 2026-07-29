@@ -848,7 +848,10 @@ def test_reconcile_prefers_scheduler_complete_gaussian_postprocessing(
 
 
 def test_active_replacement_recovery_advances_only_with_durable_handoffs(tmp_path):
+    from ichor.hpc.active_learning.config import CampaignConfig
+
     campaign, _, _, _ = _campaign_dirs(tmp_path)
+    CampaignConfig().to_yaml(campaign / "campaign.yaml")
     iter_dir = _write_ariadne_handoff(campaign, 1, n=2)
     from ichor.hpc.active_learning.handoff_manifests import (
         read_ariadne_results_manifest,
@@ -2032,6 +2035,101 @@ def test_reconcile_reuses_accepted_ariadne_results_when_rejected_outputs_absent(
         "tasks_resubmitted": 0,
     }
     assert not report.unsafe_reasons
+
+
+def test_reconcile_uses_frozen_ariadne_contract_after_partition_change(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.config import CampaignConfig
+    from ichor.hpc.active_learning.daemon import ariadne_decision_authority
+    from ichor.hpc.active_learning.daemon.config_lock import (
+        canonical_config,
+        config_fingerprint,
+    )
+
+    _trust_marker_models(monkeypatch)
+    monkeypatch.setattr(
+        recovery_contracts_mod,
+        "verify_committed_model_version",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        reconcile_mod,
+        "_validate_recovered_state_contract",
+        lambda *a, **k: None,
+    )
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0])
+    source_config = CampaignConfig()
+    source_config.resources.ariadne.partition = "multicore_small"
+    source_config.to_yaml(campaign / "campaign.yaml")
+    source_config_sha = config_fingerprint(canonical_config(source_config))
+    state = fresh_campaign_state(
+        max_iterations=3,
+        campaign_uid="reconcile-test",
+    )
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    append_event(
+        data / "journal.ndjson",
+        "halt",
+        from_phase=CampaignPhase.PHASE_B_DIVERSITY.value,
+        iteration=1,
+        reason=(
+            "backend_submission_failed: ARIADNE batch decision config "
+            "digest mismatch"
+        ),
+    )
+    _write_ariadne_handoff(campaign, 1, n=200)
+    current_config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+    current_config.resources.ariadne.partition = "multicore"
+    current_config.to_yaml(campaign / "campaign.yaml")
+    assert config_fingerprint(canonical_config(current_config)) != source_config_sha
+
+    def frozen_contract(
+        _campaign,
+        *,
+        campaign_uid,
+        iteration,
+        logical_total,
+        replacement_round,
+    ):
+        assert campaign_uid == "reconcile-test"
+        assert iteration == 1
+        assert logical_total == 200
+        assert replacement_round == 0
+        return {
+            "decision_contract": {
+                "config_sha256": source_config_sha,
+                "failure_threshold_fraction": float(
+                    source_config.runtime.failure_threshold_fraction
+                ),
+            }
+        }
+
+    monkeypatch.setattr(
+        ariadne_decision_authority,
+        "resolve_ariadne_handoff_decision_contract",
+        frozen_contract,
+    )
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.PHASE_B_DIVERSITY
+    assert report.proposed_state.iteration == 1
+    assert report.ariadne_results_recovery == {
+        "expected_tasks": 200,
+        "accepted_tasks": 200,
+        "rejected_tasks": 0,
+        "missing_rejected_outputs": 0,
+        "tasks_resubmitted": 0,
+    }
+    assert "valid ARIADNE results handoff" in report.decision
 
 
 def test_reconcile_classifies_stale_ariadne_decision_as_cleanable(tmp_path, monkeypatch):

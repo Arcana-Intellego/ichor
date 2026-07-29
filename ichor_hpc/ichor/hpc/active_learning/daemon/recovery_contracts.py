@@ -635,7 +635,7 @@ def _require_ariadne_results_authority(
     from ..handoff_manifests import (
         ARIADNE_RESULTS_SCHEMA_VERSION,
         ariadne_results_path,
-        read_ariadne_batch_decision,
+        read_authoritative_ariadne_batch_decision,
     )
     from ..ariadne_outputs import (
         SEED_OUTPUT_MANIFEST_FILENAME,
@@ -755,9 +755,9 @@ def _require_ariadne_results_authority(
     if seen != set(task_by_seed):
         raise RecoveryContractError("ARIADNE results do not cover every task-map seed")
 
-    read_ariadne_batch_decision(
-        idir,
-        expected_iteration=int(iteration),
+    read_authoritative_ariadne_batch_decision(
+        campaign,
+        int(iteration),
         expected_campaign_uid=campaign_uid,
         require_accepted=True,
     )
@@ -771,9 +771,9 @@ def _require_ariadne_results(
     *,
     verification: str = "metadata",
 ) -> Dict[str, Any]:
-    from ..config import CampaignConfig
-    from .config_lock import canonical_config, config_fingerprint
-    from ..handoff_manifests import read_ariadne_batch_decision
+    from ..handoff_manifests import (
+        read_authoritative_ariadne_batch_decision,
+    )
 
     if verification == "authority":
         payload = _require_ariadne_results_authority(
@@ -787,14 +787,12 @@ def _require_ariadne_results(
             expected_iteration=int(iteration),
             require_nonempty=True,
         )
-    config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
-    read_ariadne_batch_decision(
-        iteration_dir(campaign, iteration),
-        expected_iteration=int(iteration),
-        expected_campaign_uid=expected_campaign_uid,
-        expected_config_sha256=config_fingerprint(canonical_config(config)),
-        require_accepted=True,
-    )
+        read_authoritative_ariadne_batch_decision(
+            campaign,
+            int(iteration),
+            expected_campaign_uid=expected_campaign_uid,
+            require_accepted=True,
+        )
     return payload
 
 

@@ -35,17 +35,25 @@ def _stage_ariadne_intent(ex, state):
     from ichor.hpc.active_learning.daemon.config_lock import (
         canonical_config,
         config_fingerprint,
+        write_config_lock,
     )
     from ichor.hpc.active_learning.daemon.state import CampaignPhase
     from ichor.hpc.active_learning.daemon.submission_intent import (
         write_pre_submit_intent,
     )
 
+    write_config_lock(
+        ex.campaign_dir,
+        ex.config,
+        campaign_uid=str(state.campaign_uid),
+        reason="test_ariadne_intent",
+    )
     write_pre_submit_intent(
         ex.campaign_dir,
         campaign_uid=str(state.campaign_uid),
         phase_name=CampaignPhase.ARIADNE_ARRAY.value,
         iteration=int(state.iteration),
+        scheduler_identity_kind="synthetic",
         decision_contract={
             "failure_threshold_fraction": float(
                 ex.config.runtime.failure_threshold_fraction

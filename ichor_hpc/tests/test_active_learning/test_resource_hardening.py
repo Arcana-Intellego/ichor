@@ -281,7 +281,8 @@ def test_phase_b_published_handoff_missing_accepted_output_is_invalid(
         lambda *_args, **_kwargs: SimpleNamespace(),
     )
     monkeypatch.setattr(
-        "ichor.hpc.active_learning.handoff_manifests.ariadne_candidate_frames",
+        "ichor.hpc.active_learning.handoff_manifests."
+        "authoritative_ariadne_candidate_frames",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             FileNotFoundError("accepted result.json missing")
         ),

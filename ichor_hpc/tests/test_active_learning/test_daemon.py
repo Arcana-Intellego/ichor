@@ -153,6 +153,106 @@ def test_daemon_journal_enriches_global_events_from_cached_state(tmp_path):
     assert event["iteration"] == 3
 
 
+def test_postprocess_completion_keeps_scientific_progress_counters(
+    tmp_path,
+    monkeypatch,
+):
+    daemon = _make_daemon(tmp_path)
+    state = fresh_campaign_state(max_iterations=20)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 15
+    result = PhaseResult(is_complete=True)
+    reporter_calls = []
+
+    class Reporter:
+        def start(self, *args, **kwargs):
+            reporter_calls.append(("start", args, kwargs))
+
+        def update(self, *args, **kwargs):
+            reporter_calls.append(("update", args, kwargs))
+
+        def fail(self, *args, **kwargs):
+            reporter_calls.append(("fail", args, kwargs))
+
+        def complete(self, *args, **kwargs):
+            reporter_calls.append(("complete", args, kwargs))
+
+    reporter = Reporter()
+    monkeypatch.setattr(
+        daemon,
+        "_verify_environment_boundary",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_verify_intent_environment_binding",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_record_queue_lifecycle",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_phase_progress_reporter",
+        lambda *args, **kwargs: reporter,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_bind_executor_progress",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        daemon.executor,
+        "postprocess",
+        lambda *args, **kwargs: result,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_transition_output_contract_error",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(daemon, "_advance", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        daemon,
+        "_complete_intent_after_advance",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(daemon, "_journal", lambda *args, **kwargs: None)
+    summary = SimpleNamespace(
+        parent_job_id="17978210",
+        n_expected=196,
+        n_observed=196,
+        n_missing=0,
+        n_completed=196,
+        n_failed=0,
+        n_tasks=196,
+    )
+
+    status = daemon._postprocess(
+        state,
+        CampaignPhase.ARIADNE_ARRAY,
+        [],
+        summary,
+    )
+
+    assert status == TickStatus.ADVANCED
+    completed = [
+        kwargs
+        for method, _args, kwargs in reporter_calls
+        if method == "complete"
+    ]
+    assert completed == [
+        {
+            "scheduler_completed_tasks": 196,
+            "scheduler_failed_tasks": 0,
+        }
+    ]
+    assert "accepted" not in completed[0]
+    assert "stage" not in completed[0]
+
+
 def test_run_acknowledges_ownership_before_environment_transition(
     tmp_path,
     monkeypatch,

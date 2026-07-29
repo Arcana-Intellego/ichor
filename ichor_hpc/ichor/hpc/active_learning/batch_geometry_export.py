@@ -38,7 +38,7 @@ from .handoff_manifests import (
     PHASE_B_SELECTION_SCHEMA_VERSION,
     ariadne_results_path,
     load_seeds_picked,
-    read_ariadne_batch_decision,
+    read_authoritative_ariadne_batch_decision,
     resolve_handoff_path,
     validate_ariadne_result,
 )
@@ -1027,12 +1027,11 @@ def _records_for_iteration(
     task_map = read_ariadne_task_map(iteration_dir, expected_iteration=iteration)
     if str(task_map.get("campaign_uid") or "") != campaign_uid:
         raise BatchGeometryExportError("ARIADNE task map campaign identity mismatch")
-    read_ariadne_batch_decision(
-        iteration_dir,
-        expected_iteration=iteration,
+    read_authoritative_ariadne_batch_decision(
+        campaign,
+        iteration,
         expected_campaign_uid=campaign_uid,
         require_accepted=True,
-        verify_current_config=False,
     )
     candidates = _read_phase_b_candidate_records(
         iteration_dir,

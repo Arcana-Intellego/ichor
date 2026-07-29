@@ -59,6 +59,7 @@ def _submit_dry_phase(e, state, phase):
     from ichor.hpc.active_learning.daemon.config_lock import (
         canonical_config,
         config_fingerprint,
+        write_config_lock,
     )
     from ichor.hpc.active_learning.daemon.submission_intent import (
         update_intent_status,
@@ -66,6 +67,12 @@ def _submit_dry_phase(e, state, phase):
     )
 
     phase_name = phase.value
+    write_config_lock(
+        e.campaign_dir,
+        e.config,
+        campaign_uid=str(state.campaign_uid),
+        reason="test_dry_phase",
+    )
     write_pre_submit_intent(
         e.campaign_dir,
         campaign_uid=str(state.campaign_uid),

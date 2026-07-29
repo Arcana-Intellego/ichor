@@ -2249,7 +2249,7 @@ class DryRunPhaseExecutor:
 
         from ..handoff_manifests import (
             PHASE_B_SELECTION_SCHEMA_VERSION,
-            ariadne_candidate_frames,
+            authoritative_ariadne_candidate_frames,
             ariadne_results_path,
             write_phase_b_selection_manifest,
         )
@@ -2278,12 +2278,13 @@ class DryRunPhaseExecutor:
         iter_dir = self._iter_dir(state.iteration)
         phase_b_dir = active_phase_b_dir(iter_dir)
         phase_b_dir.mkdir(parents=True, exist_ok=True)
-        from .config_lock import canonical_config, config_fingerprint
-
-        ariadne_manifest, candidate_frames, accepted = ariadne_candidate_frames(
-            iter_dir,
-            expected_iteration=int(state.iteration),
-            expected_config_sha256=config_fingerprint(canonical_config(self.config)),
+        (
+            ariadne_manifest,
+            candidate_frames,
+            accepted,
+        ) = authoritative_ariadne_candidate_frames(
+            self.campaign_dir,
+            int(state.iteration),
         )
         descriptor = build_descriptor_from_config(self.config)
         descriptor_indices, descriptor_rejections = partition_descriptor_frames(

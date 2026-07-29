@@ -579,10 +579,10 @@ def _phase_b_evidence_with_config(
     iteration: int,
     config: Any,
 ) -> Dict[str, Any]:
-    from ..daemon.config_lock import canonical_config, config_fingerprint
     from ..handoff_manifests import (
+        HandoffManifestError,
+        authoritative_ariadne_candidate_frames,
         ariadne_batch_decision_path,
-        ariadne_candidate_frames,
         ariadne_results_path,
     )
     from ..layout import active_iteration_dir
@@ -615,11 +615,9 @@ def _phase_b_evidence_with_config(
             config,
             iteration=int(iteration),
         )
-        payload, frames, records = ariadne_candidate_frames(
-            iter_dir,
-            expected_iteration=int(iteration),
-            expected_config_sha256=config_fingerprint(canonical_config(config)),
-            require_batch_decision=True,
+        payload, frames, records = authoritative_ariadne_candidate_frames(
+            campaign_dir,
+            int(iteration),
         )
     except (ResourceEvidenceUnavailable, ResourceEvidenceInvalid):
         raise
@@ -630,6 +628,11 @@ def _phase_b_evidence_with_config(
             + type(exc).__name__
             + ": "
             + str(exc),
+        ) from exc
+    except HandoffManifestError as exc:
+        raise ResourceEvidenceInvalid(
+            "PHASE_B_DIVERSITY",
+            "published ARIADNE handoff is invalid: " + str(exc),
         ) from exc
     frames, records, safety_filter = _phase_b_landing_safety_filter(
         frames,

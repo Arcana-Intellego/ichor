@@ -16,6 +16,7 @@ from ichor.hpc.active_learning.handoff_manifests import (
     HandoffManifestError,
     ariadne_candidate_frames,
     build_seed_selection_manifest,
+    read_ariadne_batch_decision,
     read_ariadne_results_manifest,
     seeds_picked_path,
     validate_ariadne_result,
@@ -498,6 +499,22 @@ def test_ariadne_batch_decision_boolean_is_derived_from_policy(tmp_path):
             n_rejected=0,
             accepted=False,
             reasons=["synthetic inconsistent decision"],
+        )
+
+
+def test_ariadne_batch_decision_enforces_frozen_failure_threshold(tmp_path):
+    iter_dir, _, _ = _write_canonical_handoff(tmp_path)
+
+    with pytest.raises(
+        HandoffManifestError,
+        match="failure threshold mismatch",
+    ):
+        read_ariadne_batch_decision(
+            iter_dir,
+            expected_iteration=1,
+            expected_campaign_uid=CAMPAIGN_UID,
+            expected_config_sha256="test-config",
+            expected_failure_threshold_fraction=0.25,
         )
 
 

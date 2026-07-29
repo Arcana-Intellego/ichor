@@ -3465,9 +3465,12 @@ class Daemon:
             ),
         )
         postprocess_reporter.complete(
-            stage="acceptance_publication",
-            accepted=int(getattr(summary, "n_completed", 0)),
-            failed=int(getattr(summary, "n_failed", 0)),
+            scheduler_completed_tasks=int(
+                getattr(summary, "n_completed", 0)
+            ),
+            scheduler_failed_tasks=int(
+                getattr(summary, "n_failed", 0)
+            ),
         )
         return TickStatus.ADVANCED
 
