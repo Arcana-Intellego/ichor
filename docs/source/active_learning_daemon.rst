@@ -304,7 +304,8 @@ Backend availability
      - Build from source with oneAPI/MKL and install into the active venv
      - :code:`--mode live`
      - :code:`python -c "import ariadne"`
-The :code:`ichor-al-daemon` :code:`start --mode live` command exits cleanly
+The :code:`ichor-al-daemon start` command defaults to live background
+execution and exits cleanly
 (no partial writes) if any of the above checks fail. You can also run
 the backend preflight command directly::
 

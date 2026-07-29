@@ -11,8 +11,12 @@ from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.daemon import resource_solver
 from ichor.hpc.active_learning.daemon.resource_records import (
+    ICHOR_PACKAGE_TREE_IDENTITY_KIND,
+    _ichor_package_tree_sha256,
+    capture_implementation_identity,
     read_resolution,
     resolution_payload,
+    verify_implementation_identity,
     verify_resolution,
     write_resolution,
 )
@@ -640,6 +644,113 @@ def test_resource_resolution_is_immutable_and_digest_verified(tmp_path):
     with pytest.raises(ValueError, match="different content"):
         write_resolution(tmp_path, changed)
     assert read_resolution(binding["path"])["attempt_id"] == "attempt"
+
+
+def test_resource_package_identity_ignores_editable_namespace_hooks(monkeypatch):
+    import ichor
+
+    baseline = _ichor_package_tree_sha256()
+    monkeypatch.setattr(
+        ichor,
+        "__path__",
+        list(ichor.__path__)
+        + ["__editable__.ichor_cli-4.0.3.finder.__path_hook__"],
+    )
+
+    assert _ichor_package_tree_sha256() == baseline
+
+
+def test_legacy_resource_identity_uses_authenticated_generation_fallback(
+    tmp_path,
+):
+    from ichor.hpc.active_learning.execution_identity import ensure_execution_identity
+
+    config = CampaignConfig()
+    uid = "legacy-resource-identity"
+    ensure_execution_identity(
+        tmp_path,
+        campaign_uid=uid,
+        config=config,
+        requested_mode="live",
+    )
+    identity = capture_implementation_identity(
+        tmp_path,
+        backend="diversity",
+    )
+    assert (
+        identity["ichor_package_tree_identity_kind"]
+        == ICHOR_PACKAGE_TREE_IDENTITY_KIND
+    )
+    identity.pop("ichor_package_tree_identity_kind")
+    identity["ichor_package_tree_sha256"] = "0" * 64
+
+    verify_implementation_identity(
+        identity,
+        campaign_dir=tmp_path,
+        expected_campaign_uid=uid,
+    )
+
+    identity["environment_generation_digest_sha256"] = "1" * 64
+    with pytest.raises(
+        ValueError,
+        match="environment-generation digest mismatch",
+    ):
+        verify_implementation_identity(
+            identity,
+            campaign_dir=tmp_path,
+            expected_campaign_uid=uid,
+        )
+
+
+def test_existing_legacy_resource_record_is_adopted_without_rewrite(
+    tmp_path,
+):
+    from ichor.hpc.active_learning.execution_identity import ensure_execution_identity
+
+    config = CampaignConfig()
+    uid = "legacy-resource-replay"
+    ensure_execution_identity(
+        tmp_path,
+        campaign_uid=uid,
+        config=config,
+        requested_mode="live",
+    )
+    resolved = SimpleNamespace(
+        to_dict=lambda: {
+            "backend": "diversity",
+            "cpus_per_task": 2,
+            "mem_per_cpu": "4G",
+        }
+    )
+    identity = capture_implementation_identity(
+        tmp_path,
+        backend="diversity",
+    )
+    identity.pop("ichor_package_tree_identity_kind")
+    identity["ichor_package_tree_sha256"] = "0" * 64
+    payload = resolution_payload(
+        campaign_uid=uid,
+        phase_name="PHASE_B_DIVERSITY",
+        iteration=17,
+        attempt_id="attempt",
+        submission_identity="r0000-a0001-deadbeef",
+        resolved=resolved,
+        evidence={"source": "fixture"},
+        scratch_path_template="template",
+        implementation_identity=identity,
+    )
+    binding = write_resolution(tmp_path, payload)
+    original = Path(binding["path"]).read_bytes()
+
+    replay = dict(payload)
+    replay["implementation_identity"] = capture_implementation_identity(
+        tmp_path,
+        backend="diversity",
+    )
+    replay_binding = write_resolution(tmp_path, replay)
+
+    assert replay_binding == binding
+    assert Path(binding["path"]).read_bytes() == original
 
 
 def _scratch_resolution(

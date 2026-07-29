@@ -161,7 +161,7 @@ def test_help_mentions_campaign_auto_detection_and_examples(capsys):
         parser.parse_args(["--help"])
     top = capsys.readouterr().out
     assert "campaign.yaml" in top
-    assert "ichor-al-daemon start --mode live" in top
+    assert "ichor-al-daemon start" in top
     assert "ichor-al-daemon init" in top
 
     with pytest.raises(SystemExit):
@@ -172,7 +172,8 @@ def test_help_mentions_campaign_auto_detection_and_examples(capsys):
     assert "live" in start
     assert "-b" in start
     assert "--background" in start
-    assert "ichor-al-daemon start --mode live" in start
+    assert "live mode and in the background by default" in start
+    assert "ichor-al-daemon start\n" in start
 
     with pytest.raises(SystemExit):
         parser.parse_args(["init", "--help"])

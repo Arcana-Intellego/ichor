@@ -10,7 +10,7 @@ from __future__ import annotations
 import shlex
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from .state import CampaignPhase
 from .lease import evaluate_lease_liveness
@@ -77,7 +77,7 @@ def _phase_command(campaign_dir: Path, payload: Dict[str, Any]) -> str:
     ):
         return _resume_cmd(campaign_dir)
     if phase == CampaignPhase.INIT.value:
-        return _cmd(campaign_dir, "start") + " --mode live"
+        return _cmd(campaign_dir, "start")
     return _reconcile_cmd(campaign_dir)
 
 
@@ -1307,6 +1307,24 @@ def build_status_recommendations(
 
     if _phase(payload) == CampaignPhase.HALTED.value:
         return [_halt_recommendation(campaign, payload)] + stale_pid
+
+    stop_disposition = payload.get("_presentation_stop_disposition")
+    if (
+        isinstance(stop_disposition, Mapping)
+        and str(stop_disposition.get("kind") or "") == "unreachable"
+    ):
+        return [
+            StatusRecommendation(
+                code="stop_control_invalid",
+                severity="required",
+                primary="preview reconcile before restarting the campaign",
+                why=str(
+                    stop_disposition.get("reason")
+                    or "the recorded stop boundary no longer matches campaign state"
+                ),
+                command=_reconcile_cmd(campaign),
+            )
+        ] + stale_pid
 
     allocation_transition = _allocation_check_transition_recommendation(
         campaign,

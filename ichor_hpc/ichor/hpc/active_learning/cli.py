@@ -379,8 +379,14 @@ def _stop_control_status(
     campaign: Path,
     *,
     expected_campaign_uid: Optional[str] = None,
+    state: Optional[CampaignState] = None,
 ) -> Dict[str, Any]:
-    from .daemon.stop_control import read_stop_request, stop_request_summary
+    from .daemon.stop_control import (
+        read_stop_request,
+        stop_request_disposition,
+        stop_request_summary,
+        validate_stop_request_for_recovery,
+    )
 
     try:
         request = read_stop_request(
@@ -392,10 +398,29 @@ def _stop_control_status(
             "stop_request": None,
             "stop_control_error": type(exc).__name__ + ": " + str(exc),
         }
-    return {
+    result = {
         "stop_request": stop_request_summary(request),
         "stop_control_error": None,
     }
+    if state is not None:
+        try:
+            disposition = stop_request_disposition(request, state)
+            if str(disposition.get("kind") or "") == "unreachable":
+                try:
+                    disposition = validate_stop_request_for_recovery(
+                        campaign,
+                        request,
+                        state,
+                    )
+                except Exception as exc:
+                    disposition = dict(disposition)
+                    disposition["reason"] = str(
+                        disposition.get("reason") or exc
+                    )
+            result["_presentation_stop_disposition"] = disposition
+        except Exception as exc:
+            result["stop_control_error"] = type(exc).__name__ + ": " + str(exc)
+    return result
 
 
 def _missing_state_context(campaign: Path) -> Dict[str, Any]:
@@ -2731,8 +2756,14 @@ def _status_control_problem(payload: Mapping[str, Any]) -> bool:
 def _status_overall(payload: Dict[str, Any]) -> str:
     phase = str(payload.get("phase") or "")
     code = str(_first_recommendation(payload).get("code") or "")
+    stop_disposition = payload.get("_presentation_stop_disposition")
     if _status_ownership_uncertain(payload):
         return "cannot determine safely"
+    if (
+        isinstance(stop_disposition, Mapping)
+        and str(stop_disposition.get("kind") or "") == "unreachable"
+    ):
+        return "blocked"
     if code == "reconcile_transaction_manual_review":
         return "blocked"
     if code == "reconcile_transaction_recoverable":
@@ -3339,6 +3370,14 @@ def _status_next_rows(
         automatic = "the daemon did not become ready and no new work will start"
     elif overall in {"cannot determine safely", "needs attention", "blocked", "halted"}:
         automatic = "no further work can be relied upon until this condition is reviewed"
+        if (
+            isinstance(stop_request, Mapping)
+            and str(stop_request.get("status") or "") != "completed"
+        ):
+            automatic += (
+                "; the recorded stop request remains active and will be "
+                "honoured after recovery reaches its boundary"
+            )
     elif isinstance(stop_request, Mapping):
         if daemon_active and str(stop_request.get("status") or "") != "completed":
             from .daemon.stop_control import describe_stop_request
@@ -4259,6 +4298,8 @@ def _journal_event_severity(event: Dict[str, Any]) -> str:
                 if status in {"FAILED", "FAILURE", "ERROR"}
                 else "OK"
             )
+        if queue_event == "first_sacct":
+            return "OK"
         if status == "CANCELLED" and user_cancelled:
             return "OK"
         if status in {
@@ -4967,14 +5008,10 @@ def cmd_start(args: argparse.Namespace) -> int:
                 "  " + _campaign_command(campaign, "init"),
                 file=sys.stderr,
             )
-            print(
-                "Then bind the new campaign to live mode with:",
-                file=sys.stderr,
-            )
+            print("Then start the live daemon with:", file=sys.stderr)
             print(
                 "  ichor-al-daemon start --campaign-dir "
-                + str(campaign)
-                + " --mode live",
+                + str(campaign),
                 file=sys.stderr,
             )
             return 8
@@ -5078,13 +5115,23 @@ def cmd_start(args: argparse.Namespace) -> int:
             print(formatted, file=sys.stderr)
         return 7
 
-    from .execution_identity import ExecutionIdentityError, ensure_execution_identity
+    from .execution_identity import (
+        ExecutionIdentityError,
+        ensure_execution_identity,
+        execution_identity_path,
+    )
 
     placeholder_system = config.campaign.system_name in {
         "SYSTEM",
         "CHANGE_ME_SYSTEM",
     }
-    if getattr(args, "mode", None) == "live" and placeholder_system:
+    requested_mode = getattr(args, "mode", None)
+    identity_path = execution_identity_path(campaign)
+    if requested_mode is None and not (
+        identity_path.is_file() or identity_path.is_symlink()
+    ):
+        requested_mode = "live"
+    if requested_mode == "live" and placeholder_system:
         print(
             "live mode requires campaign.system_name to be set to the real "
             "molecular system, not " + repr(config.campaign.system_name),
@@ -5096,7 +5143,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             campaign,
             campaign_uid=str(state_for_lock.campaign_uid),
             config=config,
-            requested_mode=getattr(args, "mode", None),
+            requested_mode=requested_mode,
         )
     except ExecutionIdentityError as exc:
         print("execution identity refused start: " + str(exc), file=sys.stderr)
@@ -7824,6 +7871,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         _stop_control_status(
             campaign,
             expected_campaign_uid=str(state.campaign_uid),
+            state=state,
         )
     )
     payload.update(_probe_daemon_lock(paths["lock"]))
@@ -8210,7 +8258,16 @@ def cmd_status(args: argparse.Namespace) -> int:
         except Exception:
             pass
     if bool(getattr(args, "json", False)):
-        print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
+        machine_payload = dict(payload)
+        machine_payload.pop("_presentation_stop_disposition", None)
+        print(
+            json.dumps(
+                machine_payload,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+        )
     else:
         print(
             _format_status(
@@ -8342,10 +8399,6 @@ def _scheduler_uncertain_resume_target(
         raise ValueError("halt was not produced by the daemon scheduler guard")
     if bool(state.shutdown_requested):
         raise ValueError("scheduler-uncertain state also has shutdown_requested=true")
-    if stop_request is not None and not cancel_stop_request:
-        raise ValueError(
-            "an active stop request must be cancelled explicitly before recovery"
-        )
 
     try:
         from_phase = CampaignPhase(str(context.get("from_phase") or ""))
@@ -8386,6 +8439,27 @@ def _scheduler_uncertain_resume_target(
     target.phase = from_phase
     target.lifecycle_context = None
     target.shutdown_requested = False
+    if stop_request is not None and not cancel_stop_request:
+        from .daemon.stop_control import validate_stop_request_for_recovery
+
+        disposition = validate_stop_request_for_recovery(
+            campaign,
+            stop_request,
+            target,
+        )
+        if str(disposition.get("kind") or "") not in {
+            "completed",
+            "pending_boundary",
+        }:
+            raise ValueError(
+                "the active stop request cannot be preserved while "
+                "scheduler-uncertain work is resumed: "
+                + str(
+                    disposition.get("reason")
+                    or disposition.get("kind")
+                    or "unknown disposition"
+                )
+            )
     for suffix in (
         "",
         ":UNKNOWN",
@@ -8623,6 +8697,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
                 archive_and_clear_stop_request,
                 read_resume_transaction,
                 read_stop_request,
+                validate_stop_request_for_recovery,
             )
 
             pending_resume = read_resume_transaction(campaign)
@@ -8782,6 +8857,44 @@ def cmd_resume(args: argparse.Namespace) -> int:
                                 )
                                 return 7
                             stop_request = completed_stop
+        try:
+            stop_disposition = validate_stop_request_for_recovery(
+                campaign,
+                stop_request,
+                state,
+            )
+        except Exception as exc:
+            print(
+                "the recorded stop request cannot be honoured from the "
+                "current campaign position; preview reconcile before "
+                "resuming: "
+                + str(exc),
+                file=sys.stderr,
+            )
+            return 7
+        stop_kind = str(stop_disposition.get("kind") or "none")
+        if (
+            state.shutdown_requested
+            and stop_request is not None
+            and stop_kind in {"pending_boundary", "pending_immediate"}
+        ):
+            from .daemon.stop_control import complete_stop_request
+
+            completed_stop = complete_stop_request(
+                campaign,
+                str(stop_request["request_id"]),
+                reason="shutdown_state_recovered",
+                completion_receipt=state.last_completion_receipt,
+            )
+            if completed_stop is None:
+                print(
+                    "the stopped campaign's user stop request changed before "
+                    "it could be completed",
+                    file=sys.stderr,
+                )
+                return 7
+            stop_request = completed_stop
+            stop_kind = "completed"
         if state.phase is CampaignPhase.HALTED:
             try:
                 target_state, preserved_intent = _scheduler_uncertain_resume_target(
@@ -8805,6 +8918,10 @@ def cmd_resume(args: argparse.Namespace) -> int:
             cancelling_stop = bool(
                 getattr(args, "cancel_stop_request", False)
             )
+            archive_recovered_stop = bool(
+                cancelling_stop
+                or stop_kind in {"campaign_terminal", "completed"}
+            )
             try:
                 state, resume_history = _finish_resume_transaction(
                     campaign,
@@ -8813,17 +8930,21 @@ def cmd_resume(args: argparse.Namespace) -> int:
                     after_state=target_state,
                     request_id=(
                         None
-                        if stop_request is None
+                        if stop_request is None or not archive_recovered_stop
                         else str(stop_request.get("request_id"))
                     ),
                     operation=(
                         "resume_scheduler_uncertain_cancel_stop"
                         if cancelling_stop
-                        else "resume_scheduler_uncertain"
+                        else (
+                            "resume_scheduler_uncertain_completed_stop"
+                            if archive_recovered_stop
+                            else "resume_scheduler_uncertain_with_pending_stop"
+                        )
                     ),
                     archive_status="cancelled" if cancelling_stop else "resumed",
                 )
-                if cancelling_stop:
+                if archive_recovered_stop:
                     stop_request = None
             except Exception as exc:
                 print(
@@ -9115,6 +9236,41 @@ def cmd_resume(args: argparse.Namespace) -> int:
                     phase=state.phase.value,
                     iteration=int(state.iteration),
                     resumed_scheduler_phase=cancelled_resume_phase,
+                    resume_transaction_history=str(resume_history),
+                )
+            except Exception:
+                pass
+        elif (
+            stop_request is not None
+            and stop_kind in {"campaign_terminal", "completed"}
+        ):
+            target_state = CampaignState.from_dict(state.to_dict())
+            try:
+                state, resume_history = _finish_resume_transaction(
+                    campaign,
+                    state_path,
+                    before_state=state,
+                    after_state=target_state,
+                    request_id=str(stop_request.get("request_id")),
+                    operation="resume_completed_stop",
+                    archive_status="resumed",
+                )
+                stop_request = None
+            except Exception as exc:
+                print(
+                    "could not archive the completed user stop request: "
+                    + str(exc),
+                    file=sys.stderr,
+                )
+                return 7
+            try:
+                from .daemon.journal import append_event
+
+                append_event(
+                    paths["journal"],
+                    "user_stop_resumed",
+                    phase=state.phase.value,
+                    iteration=int(state.iteration),
                     resume_transaction_history=str(resume_history),
                 )
             except Exception:
@@ -10281,6 +10437,113 @@ def _complete_reconcile_scheduler_cancellation_stop(
     if not isinstance(completed, Mapping):
         raise ValueError("scheduler cancellation stop request was not completed")
     return dict(completed)
+
+
+def _prepare_reconcile_stop_guard(
+    campaign: Path,
+    proposed_state: CampaignState,
+) -> Dict[str, Any]:
+    """Bind reconcile to one validated stop-control snapshot."""
+    from .daemon.stop_control import (
+        describe_stop_request,
+        stop_request_path,
+        validate_stop_request,
+        validate_stop_request_for_recovery,
+    )
+
+    path = stop_request_path(campaign)
+    if not path.exists():
+        return {
+            "path": path,
+            "raw": None,
+            "request": None,
+            "mutable_during_reconcile": False,
+            "description": None,
+        }
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("stop request is not a regular file: " + str(path))
+    raw = path.read_bytes()
+    try:
+        payload = json.loads(raw.decode("utf-8"), source=path)
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("stop request is unreadable: " + str(path)) from exc
+    request = validate_stop_request(
+        payload,
+        expected_campaign_uid=str(proposed_state.campaign_uid),
+    )
+    if path.read_bytes() != raw:
+        raise ValueError("stop request changed during reconcile inspection")
+    mutable_during_reconcile = bool(
+        str(request.get("mode") or "") == "immediate"
+        and request.get("cancel_jobs_requested") is True
+    )
+    if mutable_during_reconcile:
+        disposition = {
+            "kind": (
+                "completed"
+                if str(request.get("status") or "") == "completed"
+                else "cancelling"
+            ),
+            "launchable": False,
+            "preserve": True,
+        }
+    else:
+        disposition = validate_stop_request_for_recovery(
+            campaign,
+            request,
+            proposed_state,
+        )
+    return {
+        "path": path,
+        "raw": raw,
+        "request": request,
+        "disposition": disposition,
+        "mutable_during_reconcile": mutable_during_reconcile,
+        "description": describe_stop_request(request),
+    }
+
+
+def _recheck_reconcile_stop_guard(
+    campaign: Path,
+    guard: Mapping[str, Any],
+    proposed_state: CampaignState,
+) -> None:
+    """Fail before state publication if stop control changed or became unsafe."""
+    from .daemon.stop_control import (
+        stop_request_path,
+        validate_stop_request,
+        validate_stop_request_for_recovery,
+    )
+
+    path = stop_request_path(campaign)
+    expected_raw = guard.get("raw")
+    if bool(guard.get("mutable_during_reconcile", False)):
+        current = _prepare_reconcile_stop_guard(campaign, proposed_state)
+        if current.get("request") is None:
+            raise ValueError(
+                "stop request disappeared while reconcile was applying recovery"
+            )
+        return
+    if expected_raw is None:
+        if path.exists() or path.is_symlink():
+            raise ValueError(
+                "a stop request appeared while reconcile was applying recovery"
+            )
+        return
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(
+            "stop request changed type while reconcile was applying recovery"
+        )
+    observed_raw = path.read_bytes()
+    if observed_raw != expected_raw:
+        raise ValueError(
+            "stop request changed while reconcile was applying recovery"
+        )
+    request = validate_stop_request(
+        json.loads(observed_raw.decode("utf-8"), source=path),
+        expected_campaign_uid=str(proposed_state.campaign_uid),
+    )
+    validate_stop_request_for_recovery(campaign, request, proposed_state)
 
 
 def _retry_phase_from_cleaned_report(report) -> Optional[CampaignPhase]:
@@ -11577,6 +11840,13 @@ def _reconcile_presentation(
             ("active work", _reconcile_active_work(current, report, runtime_status)),
         ]
     )
+    retained_stop = str(
+        (runtime_status or {}).get("_retained_stop_description") or ""
+    )
+    if retained_stop:
+        state_rows.append(
+            ("stop request", retained_stop + "; remains active")
+        )
 
     if result == "ready to apply":
         planned.append(
@@ -11609,6 +11879,10 @@ def _reconcile_presentation(
             ("daemon", "remains stopped"),
             ("automatic campaign work", "none"),
         ]
+        if retained_stop:
+            after.append(
+                ("stop request", retained_stop + "; remains active")
+            )
 
     if result == "ready to apply":
         next_label = "run"
@@ -13877,6 +14151,37 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 9
+    stop_guard: Optional[Dict[str, Any]] = None
+    try:
+        stop_guard = _prepare_reconcile_stop_guard(
+            campaign,
+            report.proposed_state,
+        )
+    except Exception as exc:
+        stop_problem = (
+            "the user stop request is incompatible with the proposed "
+            "recovery: "
+            + _reconcile_plain_text(exc)
+        )
+        runtime_status = dict(runtime_status)
+        runtime_status["reconcile_apply_blockers"] = list(
+            runtime_status.get("reconcile_apply_blockers") or []
+        ) + [stop_problem]
+        if bool(getattr(args, "apply", False)):
+            _print_reconcile_apply_blocked(
+                campaign,
+                title="Stop Control",
+                reasons=[stop_problem],
+                next_actions=[
+                    _campaign_command(campaign, "reconcile", " --verbose")
+                ],
+            )
+            return 9
+    if stop_guard is not None and stop_guard.get("description"):
+        runtime_status = dict(runtime_status)
+        runtime_status["_retained_stop_description"] = str(
+            stop_guard["description"]
+        )
     if bool(getattr(args, "apply", False)):
         try:
             artifact_snapshot.assert_anchors_unchanged(campaign)
@@ -14570,6 +14875,12 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         print(_reconcile_plain_text(reason), file=sys.stderr)
         return 9
     try:
+        if stop_guard is not None:
+            _recheck_reconcile_stop_guard(
+                campaign,
+                stop_guard,
+                report.proposed_state,
+            )
         write_state(target_canonical, report.proposed_state)
     except Exception as exc:
         pointer_errors = _restore_reconcile_pointer_snapshots(campaign, pointer_snapshots)
@@ -15656,7 +15967,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     if str(pool_summary.get("status")) == "ok":
         print("Next:")
         print("  " + _campaign_command(campaign, "preflight"))
-        print("  Live:    " + _campaign_command(campaign, "start", " --mode live"))
+        print("  Live:    " + _campaign_command(campaign, "start"))
         print(
             "  Dry run: "
             + _campaign_command(campaign, "start", " --mode dry_run")
@@ -15997,6 +16308,7 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
     condition = str(state.get("condition") or "")
     launch_labels = {
         "ready": "ready",
+        "stop_scheduled": "ready; stop boundary retained",
         "paused": "paused",
         "reconcile_required": "reconcile required",
         "halted": "halted",
@@ -16171,6 +16483,7 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
     intentionally_paused = _preflight_reports_intentional_pause(payload)
     state_warn = bool(
         condition in {
+            "stop_scheduled",
             "paused",
             "reconcile_required",
             "complete",
@@ -16186,7 +16499,15 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
         )
     lines.append(
         _preflight_check_line(
-            "campaign pause" if intentionally_paused else "runnable state",
+            (
+                "campaign pause"
+                if intentionally_paused
+                else (
+                    "stop boundary"
+                    if condition == "stop_scheduled"
+                    else "runnable state"
+                )
+            ),
             state.get("ok"),
             state_detail or "state is not runnable",
             warn=state_warn,
@@ -16199,6 +16520,21 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
     ]
     for issue in issues[1:] if state.get("error") else issues:
         lines.append("  - " + issue)
+    if condition == "stop_scheduled":
+        stop_evidence = payload.get("_presentation_stop")
+        stop_request = (
+            stop_evidence.get("stop_request")
+            if isinstance(stop_evidence, Mapping)
+            else None
+        )
+        if isinstance(stop_request, Mapping):
+            from .daemon.stop_control import describe_stop_request
+
+            lines.append(
+                "  - "
+                + describe_stop_request(stop_request)
+                + "; the daemon will retain and honour this request"
+            )
     if state.get("contract_error"):
         lines.append("  contract error: " + str(state.get("contract_error")))
 
@@ -16612,8 +16948,23 @@ def evaluate_campaign_preflight(
                 issues.append("campaign is DONE; no live launch is required")
 
             try:
-                presentation_stop = _stop_control_status(campaign)
+                from .daemon.stop_control import (
+                    read_stop_request,
+                    stop_request_summary,
+                )
+
+                validated_stop_request = read_stop_request(
+                    campaign,
+                    expected_campaign_uid=str(state.campaign_uid),
+                )
+                presentation_stop = {
+                    "stop_request": stop_request_summary(
+                        validated_stop_request
+                    ),
+                    "stop_control_error": None,
+                }
             except Exception as exc:
+                validated_stop_request = None
                 presentation_stop = {
                     "stop_control_error": type(exc).__name__ + ": " + str(exc)
                 }
@@ -16623,9 +16974,44 @@ def evaluate_campaign_preflight(
                 condition = "blocked"
                 issues.append("user stop control could not be validated")
             elif isinstance(stop_request, Mapping):
-                if condition == "ready":
-                    condition = "paused"
-                issues.append("campaign has a user stop request")
+                from .daemon.stop_control import (
+                    validate_stop_request_for_recovery,
+                )
+
+                try:
+                    stop_disposition = validate_stop_request_for_recovery(
+                        campaign,
+                        validated_stop_request,
+                        state,
+                    )
+                except Exception as exc:
+                    stop_disposition = {
+                        "kind": "unreachable",
+                        "launchable": False,
+                        "reason": str(exc),
+                    }
+                stop_kind = str(stop_disposition.get("kind") or "")
+                if stop_kind in {"pending_boundary", "pending_immediate"}:
+                    if condition == "ready":
+                        condition = "stop_scheduled"
+                elif stop_kind == "completed":
+                    if condition == "ready":
+                        condition = "paused"
+                    issues.append(
+                        "campaign is intentionally paused; resume clears the "
+                        "completed stop"
+                    )
+                elif stop_kind == "campaign_terminal":
+                    if condition == "ready":
+                        condition = "complete"
+                else:
+                    condition = "blocked"
+                    issues.append(
+                        str(
+                            stop_disposition.get("reason")
+                            or "user stop control is not ready to launch"
+                        )
+                    )
             elif state.shutdown_requested:
                 if _is_intentionally_stopped_state(state):
                     if condition == "ready":
@@ -17177,12 +17563,12 @@ Examples:
   cd ~/campaigns/water_001
   ichor-al-daemon init
   ichor-al-daemon status
-  ichor-al-daemon start --mode live
-  ichor-al-daemon start --mode live --background
+  ichor-al-daemon start
+  ichor-al-daemon start --foreground
   ichor-al-daemon journal -e phase_submitted
   ichor-al-daemon export-batch-geometries --iteration 8
 
-  ichor-al-daemon start -c ~/campaigns/water_001 --mode live
+  ichor-al-daemon start -c ~/campaigns/water_001
 """
     parser = argparse.ArgumentParser(
         prog="ichor-al-daemon",
@@ -17209,9 +17595,9 @@ Examples:
             "--background",
             action="store_true",
             help=(
-                "Run the daemon in the background and return to the shell after "
-                "campaign ownership is confirmed. Use status to check whether "
-                "startup has completed."
+                "Explicitly run the daemon in the background (the default) and "
+                "return after campaign ownership is confirmed. Use status to "
+                "check whether startup has completed."
             ),
         )
         process_group.add_argument(
@@ -17243,15 +17629,15 @@ Examples:
         "start",
         help="Start the daemon.",
         description=(
-            "Start a campaign daemon. The first start requires an explicit "
-            "--mode; the mode is immutable thereafter. "
+            "Start a campaign daemon in live mode and in the background by "
+            "default. The first effective mode is immutable thereafter. "
             "From inside a campaign directory, --campaign-dir can be omitted."
         ),
         epilog=(
             "Examples:\n"
+            "  ichor-al-daemon start\n"
             "  ichor-al-daemon start --mode dry_run --max-ticks 10\n"
-            "  ichor-al-daemon start --mode live\n"
-            "  ichor-al-daemon start --mode live --foreground"
+            "  ichor-al-daemon start --foreground"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -17267,8 +17653,8 @@ Examples:
         choices=["live", "dry_run"],
         default=None,
         help=(
-            "Execution mode. Required on the first start and permanently "
-            "bound to the campaign execution identity."
+            "Execution mode. Defaults to live for the first start and then "
+            "reuses the campaign's permanently bound mode."
         ),
     )
     p_start.add_argument(
@@ -17370,7 +17756,7 @@ Examples:
         description=(
             "Continue an existing campaign after a normal stop or reviewed "
             "recovery. Resume preserves the campaign's previously selected "
-            "execution mode."
+            "execution mode and runs in the background by default."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -17667,7 +18053,7 @@ Examples:
             "Examples:\n"
             "  ichor-al-daemon init\n"
             "  ichor-al-daemon init -c ~/campaigns/water_001 -s pool.xyz\n"
-            "  ichor-al-daemon start --campaign-dir ~/campaigns/water_001 --mode live\n"
+            "  ichor-al-daemon start --campaign-dir ~/campaigns/water_001\n"
             "  ichor-al-daemon start --campaign-dir ~/campaigns/water_001 --mode dry_run"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,

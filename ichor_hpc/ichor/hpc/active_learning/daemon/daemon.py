@@ -1025,61 +1025,12 @@ class Daemon:
         state: CampaignState,
         request: Mapping[str, Any],
     ) -> Optional[Dict[str, str]]:
-        from .completion_receipts import (
-            read_completion_receipt,
-            receipt_dir,
-            receipt_reference,
-            validate_completion_reference,
-        )
+        from .stop_control import matching_stop_boundary_receipt
 
-        mode = str(request.get("mode") or "")
-        if mode == "after_phase":
-            expected_phase = str(request.get("target_phase") or "")
-            expected_iteration = int(request.get("target_iteration", -1))
-            expected_round: Optional[int] = int(
-                request.get("target_replacement_round", 0)
-            )
-        elif mode == "after_iteration":
-            expected_iteration = int(request.get("target_iteration", -1))
-            expected_phase = (
-                CampaignPhase.INITIAL_FEREBUS.value
-                if expected_iteration == 0
-                else CampaignPhase.STOP_CHECK.value
-            )
-            expected_round = None
-        else:
-            return None
-        matches: List[Tuple[str, Path]] = []
-        root = receipt_dir(self.campaign_dir)
-        if not root.is_dir():
-            return None
-        for path in root.glob("*.json"):
-            try:
-                payload = read_completion_receipt(path)
-                if str(payload.get("campaign_uid")) != str(state.campaign_uid):
-                    continue
-                if str(payload.get("phase")) != expected_phase:
-                    continue
-                if int(payload.get("iteration", -1)) != expected_iteration:
-                    continue
-                if expected_round is not None and int(
-                    payload.get("replacement_round", -1)
-                ) != expected_round:
-                    continue
-                reference = receipt_reference(self.campaign_dir, path)
-                validate_completion_reference(
-                    self.campaign_dir,
-                    reference,
-                    expected_campaign_uid=str(state.campaign_uid),
-                )
-                matches.append((str(payload.get("created_at_iso") or ""), path))
-            except Exception:
-                continue
-        if not matches:
-            return None
-        return receipt_reference(
+        return matching_stop_boundary_receipt(
             self.campaign_dir,
-            max(matches, key=lambda item: item[0])[1],
+            state,
+            request,
         )
 
     def _apply_cancelled_jobs_from_request(
@@ -1205,8 +1156,30 @@ class Daemon:
             )
         if request is None:
             return None
+        try:
+            from .stop_control import stop_request_disposition
+
+            stop_disposition = stop_request_disposition(request, state)
+        except Exception as exc:
+            self._journal(
+                "user_stop_control_invalid",
+                phase=state.phase.value,
+                iteration=int(state.iteration),
+                error=type(exc).__name__ + ": " + str(exc)[:180],
+            )
+            if state.is_terminal:
+                return None
+            return self._halt_scheduler_uncertain(
+                state,
+                state.phase,
+                "stop_control_invalid: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:180],
+            )
+        stop_kind = str(stop_disposition.get("kind") or "")
         mode = str(request.get("mode"))
-        if state.is_terminal:
+        if state.phase is CampaignPhase.DONE:
             from .stop_control import complete_stop_request
 
             complete_stop_request(
@@ -1216,12 +1189,14 @@ class Daemon:
                 completion_receipt=state.last_completion_receipt,
             )
             return None
-        if mode == "immediate" and str(request.get("status")) == "cancelling":
+        if state.phase is CampaignPhase.HALTED:
+            return None
+        if stop_kind == "cancelling":
             # The CLI records this state before calling scancel and then adds
             # the cancellation summary. Waiting here prevents the daemon from
             # racing ahead and persisting stale pending-job metadata.
             return TickStatus.POLLING
-        if mode == "immediate" or str(request.get("status")) == "completed":
+        if stop_kind in {"completed", "pending_immediate"}:
             return self._latch_stop_request(
                 state,
                 request,
@@ -4027,6 +4002,7 @@ class Daemon:
         return TickStatus.RETRYING
 
     def _halt(self, state: CampaignState, phase: CampaignPhase, reason: str) -> str:
+        stop_fields = self._retained_stop_request_fields(state)
         if phase.value in SBATCH_PHASES:
             try:
                 _submission_intent.mark_failed(
@@ -4044,6 +4020,7 @@ class Daemon:
             iteration=int(state.iteration),
             source="daemon",
             recovery_action=_halt_recovery_action(reason_code),
+            details=(stop_fields or None),
         )
         state.phase = CampaignPhase.HALTED
         self._persist(state)
@@ -4054,6 +4031,7 @@ class Daemon:
             reason_code=reason_code,
             recovery_action=_halt_recovery_action(reason_code),
             iteration=state.iteration,
+            **stop_fields,
         )
         return TickStatus.HALTED
 
@@ -4064,6 +4042,7 @@ class Daemon:
         reason: str,
     ) -> str:
         reason_code = _halt_reason_code(reason)
+        stop_fields = self._retained_stop_request_fields(state)
         pending_job = state.pending_jobs.get(phase.value)
         state.lifecycle_context = make_lifecycle_context(
             disposition="halted",
@@ -4078,6 +4057,7 @@ class Daemon:
                 "inspect sacct and squeue for the preserved job, then reconcile; "
                 "do not resubmit until job liveness is conclusive"
             ),
+            details=(stop_fields or None),
         )
         state.phase = CampaignPhase.HALTED
         self._persist(state)
@@ -4090,6 +4070,7 @@ class Daemon:
             preserves_pending_jobs=True,
             preserves_submission_intent=True,
             iteration=state.iteration,
+            **stop_fields,
         )
         return TickStatus.HALTED
 
@@ -4101,6 +4082,7 @@ class Daemon:
     ) -> str:
         """Halt without changing scheduler ownership or submission evidence."""
         pending_job = state.pending_jobs.get(phase.value)
+        stop_fields = self._retained_stop_request_fields(state)
         state.lifecycle_context = make_lifecycle_context(
             disposition="halted",
             reason_code="environment_drift",
@@ -4114,6 +4096,7 @@ class Daemon:
                 "preserve scheduler evidence, reconcile to a safe boundary, "
                 "then resume so the environment transition can be retried"
             ),
+            details=(stop_fields or None),
         )
         state.phase = CampaignPhase.HALTED
         self._persist(state)
@@ -4125,6 +4108,7 @@ class Daemon:
             job_id=None if pending_job is None else str(pending_job),
             preserves_pending_jobs=True,
             preserves_submission_intent=True,
+            **stop_fields,
         )
         return TickStatus.HALTED
 
@@ -4141,6 +4125,7 @@ class Daemon:
         except Exception:
             return False
         prior_phase = state.phase
+        stop_fields = self._retained_stop_request_fields(state)
         state.lifecycle_context = make_lifecycle_context(
             disposition="halted",
             reason_code="tick_exception",
@@ -4152,7 +4137,10 @@ class Daemon:
             recovery_action=(
                 "inspect LAST_EXCEPTION.json and any preserved scheduler jobs, then reconcile"
             ),
-            details={"exception_type": type(exc).__name__},
+            details={
+                "exception_type": type(exc).__name__,
+                **stop_fields,
+            },
         )
         state.phase = CampaignPhase.HALTED
         try:
@@ -4164,8 +4152,35 @@ class Daemon:
             from_phase=prior_phase.value,
             iteration=int(state.iteration),
             error=type(exc).__name__ + ": " + str(exc)[:200],
+            **stop_fields,
         )
         return True
+
+    def _retained_stop_request_fields(
+        self,
+        state: CampaignState,
+    ) -> Dict[str, Any]:
+        """Return best-effort journal evidence without changing stop control."""
+        try:
+            request = self._read_stop_control(state)
+        except Exception as exc:
+            return {
+                "stop_request_retained": True,
+                "stop_control_error": type(exc).__name__ + ": " + str(exc)[:180],
+            }
+        if request is None:
+            return {}
+        return {
+            "stop_request_retained": True,
+            "stop_request_id": str(request.get("request_id") or ""),
+            "stop_mode": str(request.get("mode") or ""),
+            "stop_status": str(request.get("status") or ""),
+            "stop_target_phase": request.get("target_phase"),
+            "stop_target_iteration": request.get("target_iteration"),
+            "stop_target_replacement_round": request.get(
+                "target_replacement_round"
+            ),
+        }
 
     def _transition_output_contract_error(
         self,
@@ -4629,7 +4644,7 @@ class Daemon:
         after: CampaignState,
         phase: CampaignPhase,
     ) -> Optional[str]:
-        if after.phase in {CampaignPhase.DONE, CampaignPhase.HALTED}:
+        if after.phase is CampaignPhase.DONE:
             return "campaign_terminal"
         mode = str(request.get("mode") or "")
         if mode == "immediate":

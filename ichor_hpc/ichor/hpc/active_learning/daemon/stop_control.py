@@ -33,6 +33,17 @@ RESUME_TRANSACTION_HISTORY_DIRNAME = "resume_transaction_history"
 RESUME_TRANSACTION_SCHEMA_VERSION = 1
 STOP_MODES = frozenset({"immediate", "after_phase", "after_iteration"})
 STOP_REQUEST_STATUSES = frozenset({"requested", "cancelling", "completed"})
+STOP_DISPOSITIONS = frozenset(
+    {
+        "none",
+        "pending_immediate",
+        "pending_boundary",
+        "cancelling",
+        "completed",
+        "campaign_terminal",
+        "unreachable",
+    }
+)
 _STATUS_TRANSITIONS = {
     "requested": frozenset({"requested", "completed"}),
     "cancelling": frozenset({"cancelling", "requested", "completed"}),
@@ -105,6 +116,216 @@ def describe_stop_request(
         prefix = "stopped" if completed else "stop requested"
         return prefix + " after iteration " + str(iteration)
     return "stop target unavailable"
+
+
+def stop_request_disposition(
+    request: Optional[Mapping[str, Any]],
+    state: CampaignState,
+) -> Dict[str, Any]:
+    """Classify whether a validated stop request permits daemon launch."""
+    if request is None:
+        return {
+            "kind": "none",
+            "launchable": not bool(state.shutdown_requested),
+            "preserve": False,
+        }
+    validated = validate_stop_request(
+        request,
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+    status = str(validated["status"])
+    mode = str(validated["mode"])
+    if status == "cancelling":
+        return {
+            "kind": "cancelling",
+            "launchable": False,
+            "preserve": True,
+        }
+    if status == "completed":
+        return {
+            "kind": "completed",
+            "launchable": False,
+            "preserve": True,
+        }
+    if state.phase is CampaignPhase.DONE:
+        return {
+            "kind": "campaign_terminal",
+            "launchable": False,
+            "preserve": True,
+        }
+    if mode == "immediate":
+        return {
+            "kind": "pending_immediate",
+            "launchable": True,
+            "preserve": True,
+        }
+    if mode == "after_iteration":
+        target_iteration = int(validated["target_iteration"])
+        if int(state.iteration) > target_iteration:
+            return {
+                "kind": "unreachable",
+                "launchable": False,
+                "preserve": True,
+                "reason": (
+                    "stop target iteration "
+                    + str(target_iteration)
+                    + " precedes campaign iteration "
+                    + str(int(state.iteration))
+                ),
+            }
+        return {
+            "kind": "pending_boundary",
+            "launchable": True,
+            "preserve": True,
+        }
+
+    target = (
+        str(validated["target_phase"]),
+        int(validated["target_iteration"]),
+        int(validated["target_replacement_round"]),
+    )
+    current = (
+        state.phase.value,
+        int(state.iteration),
+        int(state.replacement_round),
+    )
+    lifecycle = state.lifecycle_context
+    halted_origin = (
+        state.phase is CampaignPhase.HALTED
+        and isinstance(lifecycle, Mapping)
+        and (
+            str(lifecycle.get("from_phase") or ""),
+            int(state.iteration),
+            int(state.replacement_round),
+        )
+        == target
+    )
+    if current == target or halted_origin:
+        return {
+            "kind": "pending_boundary",
+            "launchable": True,
+            "preserve": True,
+        }
+    return {
+        "kind": "unreachable",
+        "launchable": False,
+        "preserve": True,
+        "reason": (
+            "stop target "
+            + repr(target)
+            + " does not match campaign position "
+            + repr(current)
+        ),
+    }
+
+
+def matching_stop_boundary_receipt(
+    campaign_dir: Union[str, Path],
+    state: CampaignState,
+    request: Mapping[str, Any],
+) -> Optional[Dict[str, str]]:
+    """Return the latest authenticated receipt for a requested boundary."""
+    from .completion_receipts import (
+        read_completion_receipt,
+        receipt_dir,
+        receipt_reference,
+        validate_completion_reference,
+    )
+
+    validated = validate_stop_request(
+        request,
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+    mode = str(validated["mode"])
+    if mode == "after_phase":
+        expected_phase = str(validated["target_phase"])
+        expected_iteration = int(validated["target_iteration"])
+        expected_round: Optional[int] = int(
+            validated["target_replacement_round"]
+        )
+    elif mode == "after_iteration":
+        expected_iteration = int(validated["target_iteration"])
+        expected_phase = (
+            CampaignPhase.INITIAL_FEREBUS.value
+            if expected_iteration == 0
+            else CampaignPhase.STOP_CHECK.value
+        )
+        expected_round = None
+    else:
+        return None
+    matches = []
+    root = receipt_dir(campaign_dir)
+    if not root.is_dir():
+        return None
+    for path in root.glob("*.json"):
+        try:
+            payload = read_completion_receipt(path)
+            if str(payload.get("campaign_uid")) != str(state.campaign_uid):
+                continue
+            if str(payload.get("phase")) != expected_phase:
+                continue
+            if int(payload.get("iteration", -1)) != expected_iteration:
+                continue
+            if expected_round is not None and int(
+                payload.get("replacement_round", -1)
+            ) != expected_round:
+                continue
+            reference = receipt_reference(campaign_dir, path)
+            validate_completion_reference(
+                campaign_dir,
+                reference,
+                expected_campaign_uid=str(state.campaign_uid),
+            )
+            matches.append((str(payload.get("created_at_iso") or ""), path))
+        except Exception:
+            continue
+    if not matches:
+        return None
+    return receipt_reference(
+        campaign_dir,
+        max(matches, key=lambda item: item[0])[1],
+    )
+
+
+def validate_stop_request_for_recovery(
+    campaign_dir: Union[str, Path],
+    request: Optional[Mapping[str, Any]],
+    proposed_state: CampaignState,
+) -> Dict[str, Any]:
+    """Require a recovery proposal to preserve a reachable stop target."""
+    disposition = stop_request_disposition(request, proposed_state)
+    if disposition["kind"] in {
+        "none",
+        "completed",
+        "campaign_terminal",
+        "pending_immediate",
+        "pending_boundary",
+    }:
+        return disposition
+    if (
+        disposition["kind"] == "unreachable"
+        and request is not None
+        and matching_stop_boundary_receipt(
+            campaign_dir,
+            proposed_state,
+            request,
+        )
+        is not None
+    ):
+        return {
+            "kind": "pending_boundary",
+            "launchable": True,
+            "preserve": True,
+            "boundary_already_completed": True,
+        }
+    if disposition["kind"] == "cancelling":
+        raise StopControlError(
+            "scheduler cancellation is still being resolved for the active "
+            "immediate stop request"
+        )
+    raise StopControlError(
+        str(disposition.get("reason") or "stop target is not reachable")
+    )
 
 
 def _canonical_digest(payload: Mapping[str, Any]) -> str:
@@ -759,6 +980,7 @@ __all__ = [
     "RESUME_TRANSACTION_FILENAME",
     "RESUME_TRANSACTION_SCHEMA_VERSION",
     "STOP_MODES",
+    "STOP_DISPOSITIONS",
     "STOP_REQUEST_FILENAME",
     "STOP_REQUEST_SCHEMA_VERSION",
     "StopControlError",
@@ -768,14 +990,17 @@ __all__ = [
     "complete_stop_request",
     "describe_stop_request",
     "install_stop_request",
+    "matching_stop_boundary_receipt",
     "prepare_resume_transaction",
     "read_resume_transaction",
     "read_stop_request",
     "stop_control_lock",
     "stop_request_history_dir",
+    "stop_request_disposition",
     "stop_request_path",
     "stop_request_summary",
     "update_resume_transaction",
     "update_stop_request",
+    "validate_stop_request_for_recovery",
     "validate_stop_request",
 ]

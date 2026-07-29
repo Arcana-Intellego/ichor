@@ -27,6 +27,7 @@ from ..versioning.manifest import sha256_file
 RESOURCE_RESOLUTION_SCHEMA_VERSION = 2
 RESOURCE_FORMULA_VERSION = "2"
 IMPLEMENTATION_IDENTITY_SCHEMA_VERSION = 1
+ICHOR_PACKAGE_TREE_IDENTITY_KIND = "explicit_import_origins_v1"
 
 
 _BACKEND_SOURCE_FILES = {
@@ -90,7 +91,7 @@ def _dependency_lock_sha256() -> str:
     return _canonical_sha256(sorted(rows))
 
 
-def _ichor_package_tree_sha256() -> str:
+def _legacy_ichor_package_tree_sha256() -> str:
     from ..execution_identity import _tree_hash
 
     roots = []
@@ -103,6 +104,12 @@ def _ichor_package_tree_sha256() -> str:
     if not roots:
         raise ValueError("ICHOR package roots cannot be inspected")
     return _tree_hash(roots)
+
+
+def _ichor_package_tree_sha256() -> str:
+    from ..execution_identity import ichor_package_tree_sha256
+
+    return ichor_package_tree_sha256()
 
 
 def capture_implementation_identity(
@@ -171,6 +178,7 @@ def capture_implementation_identity(
         "python_executable": str(Path(sys.executable).resolve()),
         "python_version": platform.python_version(),
         "ichor_package_tree_sha256": _ichor_package_tree_sha256(),
+        "ichor_package_tree_identity_kind": ICHOR_PACKAGE_TREE_IDENTITY_KIND,
         "dependency_lock_sha256": _dependency_lock_sha256(),
         "source_files": source_records,
         "environment_current": current_record,
@@ -257,15 +265,87 @@ def verify_scientific_evidence(
         )
 
 
-def verify_implementation_identity(identity: Mapping[str, Any]) -> None:
+def _verify_bound_environment_generation(
+    identity: Mapping[str, Any],
+    *,
+    campaign_dir: Path,
+    expected_campaign_uid: str,
+    current_package_digest: str,
+) -> None:
+    generation_record = identity.get("environment_generation")
+    generation_digest = identity.get("environment_generation_digest_sha256")
+    if not isinstance(generation_record, Mapping):
+        raise ValueError(
+            "resource implementation has no authenticated environment generation"
+        )
+    if (
+        not isinstance(generation_digest, str)
+        or len(generation_digest) != 64
+        or any(ch not in "0123456789abcdef" for ch in generation_digest)
+    ):
+        raise ValueError(
+            "resource implementation environment-generation digest is invalid"
+        )
+    raw_path = generation_record.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError(
+            "resource implementation environment generation has no path"
+        )
+    path = campaign_owned_path(campaign_dir, Path(raw_path))
+    expected_parent = (
+        campaign_dir.resolve()
+        / ".DATA"
+        / "ACTIVE_LEARNING"
+        / "environment_generations"
+    )
+    if path.parent.resolve() != expected_parent:
+        raise ValueError(
+            "resource implementation environment generation path is not canonical"
+        )
+    name = path.name
+    if (
+        not name.startswith("generation-")
+        or not name.endswith(".json")
+        or len(name) != len("generation-000000.json")
+    ):
+        raise ValueError(
+            "resource implementation environment generation path is not canonical"
+        )
+    generation_text = name[len("generation-") : -len(".json")]
+    if not generation_text.isdigit():
+        raise ValueError(
+            "resource implementation environment generation path is not canonical"
+        )
+    from ..execution_identity import read_environment_generation
+
+    generation = read_environment_generation(
+        campaign_dir,
+        generation=int(generation_text),
+        expected_campaign_uid=str(expected_campaign_uid),
+    )
+    if str(generation.get("digest_sha256") or "") != generation_digest:
+        raise ValueError(
+            "resource implementation environment-generation digest mismatch"
+        )
+    if (
+        str(generation.get("ichor_package_tree_sha256") or "")
+        != str(current_package_digest)
+    ):
+        raise ValueError("resource implementation ICHOR package tree has drifted")
+
+
+def verify_implementation_identity(
+    identity: Mapping[str, Any],
+    *,
+    campaign_dir: Optional[Union[str, Path]] = None,
+    expected_campaign_uid: Optional[str] = None,
+) -> None:
     if identity.get("schema_version") != IMPLEMENTATION_IDENTITY_SCHEMA_VERSION:
         raise ValueError("resource implementation identity has an unsupported schema")
     if str(identity.get("python_executable") or "") != str(Path(sys.executable).resolve()):
         raise ValueError("resource implementation Python executable has drifted")
     if str(identity.get("python_version") or "") != platform.python_version():
         raise ValueError("resource implementation Python version has drifted")
-    if str(identity.get("ichor_package_tree_sha256") or "") != _ichor_package_tree_sha256():
-        raise ValueError("resource implementation ICHOR package tree has drifted")
     if str(identity.get("dependency_lock_sha256") or "") != _dependency_lock_sha256():
         raise ValueError("resource implementation dependency environment has drifted")
     for record in _iter_file_records(identity.get("source_files") or []):
@@ -281,6 +361,44 @@ def verify_implementation_identity(identity: Mapping[str, Any]) -> None:
         raise ValueError("resource backend executable identity is invalid")
     for record in _iter_file_records(backend_executable):
         _verify_file_record(record, campaign_dir=None, label="backend executable")
+
+    recorded_digest = str(identity.get("ichor_package_tree_sha256") or "")
+    current_digest = _ichor_package_tree_sha256()
+    identity_kind = identity.get("ichor_package_tree_identity_kind")
+    bound_generation_present = identity.get("environment_generation") is not None
+    legacy_direct_match = False
+    if identity_kind is not None:
+        if identity_kind != ICHOR_PACKAGE_TREE_IDENTITY_KIND:
+            raise ValueError(
+                "resource implementation ICHOR package-tree identity kind is unsupported"
+            )
+        if recorded_digest != current_digest:
+            raise ValueError("resource implementation ICHOR package tree has drifted")
+    else:
+        try:
+            legacy_direct_match = (
+                recorded_digest == _legacy_ichor_package_tree_sha256()
+            )
+        except ValueError:
+            legacy_direct_match = False
+        if not legacy_direct_match and not bound_generation_present:
+            raise ValueError("resource implementation ICHOR package tree has drifted")
+
+    if bound_generation_present:
+        if campaign_dir is None or expected_campaign_uid is None:
+            if identity_kind is None and not legacy_direct_match:
+                raise ValueError(
+                    "resource implementation ICHOR package tree has drifted"
+                )
+        else:
+            _verify_bound_environment_generation(
+                identity,
+                campaign_dir=Path(campaign_dir).resolve(),
+                expected_campaign_uid=str(expected_campaign_uid),
+                current_package_digest=current_digest,
+            )
+    elif recorded_digest != current_digest and identity_kind is not None:
+        raise ValueError("resource implementation ICHOR package tree has drifted")
 
 
 def resolution_path(
@@ -373,7 +491,26 @@ def write_resolution(
             proposed_identity.pop("captured_at_iso", None)
             proposed_comparable["implementation_identity"] = proposed_identity
         if existing_comparable != proposed_comparable:
-            raise ValueError("resource resolution already exists with different content")
+            existing_without_identity = dict(existing_comparable)
+            proposed_without_identity = dict(proposed_comparable)
+            existing_without_identity.pop("implementation_identity", None)
+            proposed_without_identity.pop("implementation_identity", None)
+            legacy_identity = existing.get("implementation_identity")
+            legacy_replay = bool(
+                existing_without_identity == proposed_without_identity
+                and isinstance(legacy_identity, Mapping)
+                and legacy_identity.get("ichor_package_tree_identity_kind")
+                is None
+            )
+            if not legacy_replay:
+                raise ValueError(
+                    "resource resolution already exists with different content"
+                )
+            verify_implementation_identity(
+                legacy_identity,
+                campaign_dir=Path(campaign_dir).resolve(),
+                expected_campaign_uid=str(existing["campaign_uid"]),
+            )
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_json(path, proposed)
@@ -460,12 +597,17 @@ def verify_resolution(
                     "cannot infer campaign root from resource-resolution path"
                 )
         verify_scientific_evidence(campaign, payload["evidence"])
-        verify_implementation_identity(payload["implementation_identity"])
+        verify_implementation_identity(
+            payload["implementation_identity"],
+            campaign_dir=campaign,
+            expected_campaign_uid=str(payload["campaign_uid"]),
+        )
     return payload
 
 
 __all__ = [
     "IMPLEMENTATION_IDENTITY_SCHEMA_VERSION",
+    "ICHOR_PACKAGE_TREE_IDENTITY_KIND",
     "RESOURCE_FORMULA_VERSION",
     "RESOURCE_RESOLUTION_SCHEMA_VERSION",
     "capture_implementation_identity",

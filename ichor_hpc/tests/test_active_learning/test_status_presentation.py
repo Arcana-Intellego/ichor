@@ -698,27 +698,28 @@ def test_stop_and_invalid_artifacts_override_daemon_running_recommendation(tmp_p
 
 def test_halted_recovery_precedes_pending_iteration_stop(tmp_path):
     campaign = tmp_path / "campaign"
-    result = recommendations.build_status_recommendations(
-        campaign,
-        {
-            "phase": CampaignPhase.HALTED.value,
-            "latest_halt_event": {
-                "reason": (
-                    "prior_gaussian_acceptance_manifest_invalid: rejected "
-                    "pointdir is not present in POINTS.txt"
-                )
-            },
-            "stop_request": {
-                "status": "requested",
-                "request_id": "request-14",
-                "mode": "after_iteration",
-                "target_iteration": 14,
-            },
+    payload = {
+        "phase": CampaignPhase.HALTED.value,
+        "latest_halt_event": {
+            "reason": (
+                "prior_gaussian_acceptance_manifest_invalid: rejected "
+                "pointdir is not present in POINTS.txt"
+            )
         },
-    )
+        "stop_request": {
+            "status": "requested",
+            "request_id": "request-14",
+            "mode": "after_iteration",
+            "target_iteration": 14,
+        },
+    }
+    result = recommendations.build_status_recommendations(campaign, payload)
+    payload["recommendations"] = [result[0].to_dict()]
 
     assert result[0].code.startswith("halted_")
     assert "reconcile" in str(result[0].command)
+    next_rows = dict(cli._status_next_rows(payload, campaign=campaign))
+    assert "stop request remains active" in next_rows["automatic"]
 
 
 def test_allocation_environment_retry_precedes_pending_iteration_stop(tmp_path):

@@ -10,6 +10,7 @@ from ichor.hpc.active_learning.daemon.phase_executor import MockPhaseExecutor
 from ichor.hpc.active_learning.daemon.state import (
     CampaignPhase,
     fresh_campaign_state,
+    make_lifecycle_context,
     read_state,
     write_state,
 )
@@ -21,6 +22,7 @@ from ichor.hpc.active_learning.daemon.stop_control import (
     describe_stop_request,
     install_stop_request,
     read_stop_request,
+    stop_request_disposition,
     stop_request_history_dir,
     stop_request_path,
     update_stop_request,
@@ -332,6 +334,41 @@ def test_crossed_iteration_boundary_without_receipt_halts_fail_closed(tmp_path):
     halted = read_state(daemon.state_path())
     assert halted.phase is CampaignPhase.HALTED
     assert "target_passed_without_receipt" in halted.lifecycle_context["message"]
+
+
+def test_halted_state_does_not_complete_pending_iteration_stop(tmp_path):
+    daemon = _daemon(tmp_path)
+    observed = fresh_campaign_state(max_iterations=3)
+    observed.phase = CampaignPhase.AIMALL
+    observed.iteration = 2
+    request, _ = install_stop_request(
+        daemon.campaign_dir,
+        build_stop_request(observed, mode="after_iteration"),
+    )
+    halted = fresh_campaign_state(
+        max_iterations=3,
+        campaign_uid=observed.campaign_uid,
+    )
+    halted.phase = CampaignPhase.HALTED
+    halted.iteration = 2
+    halted.lifecycle_context = make_lifecycle_context(
+        disposition="halted",
+        reason_code="backend_failed",
+        message="backend failed",
+        from_phase=CampaignPhase.AIMALL,
+        iteration=2,
+        source="test",
+    )
+    write_state(daemon.state_path(), halted)
+
+    assert daemon.tick() == TickStatus.TERMINAL
+    retained = read_stop_request(daemon.campaign_dir)
+    assert retained["request_id"] == request["request_id"]
+    assert retained["status"] == "requested"
+    assert (
+        stop_request_disposition(retained, halted)["kind"]
+        == "pending_boundary"
+    )
 
 
 def test_cancelling_status_waits_for_cli_cancellation_summary(tmp_path):

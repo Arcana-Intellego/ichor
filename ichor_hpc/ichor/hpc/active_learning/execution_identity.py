@@ -1145,6 +1145,14 @@ def _ichor_package_roots() -> List[Path]:
     return sorted(roots, key=lambda value: str(value))
 
 
+def ichor_package_tree_sha256() -> str:
+    """Return a process-stable identity for the installed ICHOR packages."""
+    roots = _ichor_package_roots()
+    if not roots:
+        raise ExecutionIdentityError("ICHOR package roots cannot be inspected")
+    return _tree_hash(roots)
+
+
 def _distribution_version(name: str) -> Optional[str]:
     candidates = [name, name.replace("_", "-"), name.replace("-", "_")]
     for candidate in candidates:
@@ -1291,7 +1299,6 @@ def capture_environment_generation(
 ) -> Dict[str, Any]:
     """Capture the exact Python/package/native identity for one generation."""
     campaign = Path(campaign_dir).resolve()
-    package_roots = _ichor_package_roots()
     repo_root = _git_repository_root(Path(__file__).resolve().parent)
     git_identity = (
         _git_identity(repo_root)
@@ -1308,7 +1315,7 @@ def capture_environment_generation(
         "python_executable": str(Path(sys.executable).resolve()),
         "python_version": platform.python_version(),
         "ichor_git": git_identity,
-        "ichor_package_tree_sha256": _tree_hash(package_roots),
+        "ichor_package_tree_sha256": ichor_package_tree_sha256(),
         "dependencies": _installed_dependencies(),
         "pyferebus": _module_identity("pyferebus"),
         "ariadne": _ariadne_identity(),
@@ -2224,6 +2231,7 @@ __all__ = [
     "environment_current_path",
     "environment_generations_dir",
     "execution_identity_path",
+    "ichor_package_tree_sha256",
     "inspect_allocation_check_transition_boundary",
     "read_active_environment_generation",
     "read_execution_identity",

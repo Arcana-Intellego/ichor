@@ -37,6 +37,7 @@ from ichor.hpc.active_learning.daemon.status_recommendations import (
     recommendation_dicts,
 )
 from ichor.hpc.active_learning.daemon.stop_control import (
+    StopControlError,
     archive_and_clear_stop_request,
     build_stop_request,
     complete_stop_request,
@@ -627,6 +628,39 @@ def test_cli_preflight_prints_operator_dashboard_by_default(tmp_path, capsys, mo
     assert not out.lstrip().startswith("{")
 
 
+def test_campaign_preflight_allows_and_reports_pending_boundary_stop(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=2)
+    _write_locked_state(campaign, state)
+    install_stop_request(
+        campaign,
+        build_stop_request(state, mode="after_iteration"),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_pool_feasibility_summary",
+        lambda _campaign, _config: _pool_feasibility_payload(),
+    )
+
+    payload = cli_mod.evaluate_campaign_preflight(
+        campaign,
+        avail=_backend_availability(),
+    )
+
+    assert payload["ready"] is True, json.dumps(payload, default=str, indent=2)
+    assert payload["campaign_state"]["ok"] is True
+    assert payload["campaign_state"]["condition"] == "stop_scheduled"
+    assert payload["campaign_state"]["issues"] == []
+    assert "warnings" not in payload["campaign_state"]
+    output = cli_mod._format_preflight(payload)
+    assert "[WARN] stop boundary" in output
+    assert "stop requested after iteration 0" in output
+    assert "retain and honour this request" in output
+
+
 def test_campaign_preflight_validates_every_slurm_phase_resource_contract(
     tmp_path,
     monkeypatch,
@@ -1212,7 +1246,7 @@ def test_cli_status_init_hides_not_due_committed_artifact_errors(tmp_path, capsy
     assert "  model: not produced yet" in out
     assert "What happens next\n" in out
     assert "  run: ichor-al-daemon start" in out
-    assert " --mode live" in out
+    assert " --mode live" not in out
     assert "CommittedArtifactError" not in out
     assert "training status: problem" not in out
 
@@ -1550,7 +1584,7 @@ def test_cli_init_bootstraps_fresh_state_and_config_lock(tmp_path, capsys):
     assert state.max_iterations == 2
     assert (campaign / DEFAULT_DATA_SUBDIR / "config_lock.json").is_file()
     assert "ichor-al-daemon start --campaign-dir " in out
-    assert " --mode live" in out
+    assert " --mode live" not in out
     assert " --mode dry_run" in out
     assert "pool SHA-256" not in out
     assert "ALF (1-based)" not in out
@@ -2897,6 +2931,47 @@ def test_cli_resume_explicitly_clears_shutdown_flag(tmp_path):
     assert (stop_request_history_dir(campaign) / (request["request_id"] + ".json")).is_file()
 
 
+def test_cli_resume_archives_completed_stop_without_shutdown_flag(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=2)
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 1
+    _write_locked_state(campaign, state)
+    request, _ = install_stop_request(
+        campaign,
+        build_stop_request(state, mode="immediate"),
+    )
+    complete_stop_request(campaign, request["request_id"], reason="immediate")
+    started = []
+    monkeypatch.setattr(
+        cli_mod,
+        "cmd_start",
+        lambda args: started.append(args) or 0,
+    )
+
+    rc = main(
+        [
+            "resume",
+            "--campaign-dir",
+            str(campaign),
+            "--mode",
+            "dry_run",
+        ]
+    )
+
+    assert rc == 0
+    assert len(started) == 1
+    assert not stop_request_path(campaign).exists()
+    history = stop_request_history_dir(campaign) / (
+        request["request_id"] + ".json"
+    )
+    assert history.is_file()
+    assert json.loads(history.read_text())["archived_status"] == "resumed"
+
+
 def test_cli_resume_retains_pending_iteration_stop_during_aimall_recovery(
     tmp_path,
     capsys,
@@ -2953,6 +3028,7 @@ def test_cli_status_reports_pending_stop_request(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["stop_request"]["mode"] == "after_iteration"
     assert payload["stop_request"]["target_iteration"] == 1
+    assert "_presentation_stop_disposition" not in payload
     assert payload["next_action"].startswith("run reconcile;")
 
     assert main(["status", "--campaign-dir", str(campaign)]) == 0
@@ -2961,6 +3037,76 @@ def test_cli_status_reports_pending_stop_request(tmp_path, capsys):
     assert "after_iteration" not in out
     assert "request_id" not in out
     assert "SEED_SELECT@" not in out
+
+
+def test_reconcile_stop_guard_preserves_pending_boundary_bytes(tmp_path):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=3)
+    state.phase = CampaignPhase.AIMALL
+    state.iteration = 2
+    _write_locked_state(campaign, state)
+    request, _ = install_stop_request(
+        campaign,
+        build_stop_request(state, mode="after_iteration"),
+    )
+    original = stop_request_path(campaign).read_bytes()
+
+    guard = cli_mod._prepare_reconcile_stop_guard(campaign, state)
+
+    assert guard["request"]["request_id"] == request["request_id"]
+    assert guard["disposition"]["kind"] == "pending_boundary"
+    assert stop_request_path(campaign).read_bytes() == original
+    cli_mod._recheck_reconcile_stop_guard(campaign, guard, state)
+
+    complete_stop_request(
+        campaign,
+        request["request_id"],
+        reason="test_boundary",
+    )
+    with pytest.raises(ValueError, match="stop request changed"):
+        cli_mod._recheck_reconcile_stop_guard(campaign, guard, state)
+
+
+def test_reconcile_stop_guard_rejects_recovery_past_pending_boundary(tmp_path):
+    campaign = _campaign_with_config(tmp_path)
+    observed = fresh_campaign_state(max_iterations=3)
+    observed.phase = CampaignPhase.AIMALL
+    observed.iteration = 2
+    _write_locked_state(campaign, observed)
+    install_stop_request(
+        campaign,
+        build_stop_request(observed, mode="after_iteration"),
+    )
+    proposed = CampaignState.from_dict(observed.to_dict())
+    proposed.phase = CampaignPhase.SEED_SELECT
+    proposed.iteration = 3
+
+    with pytest.raises(StopControlError, match="precedes campaign iteration"):
+        cli_mod._prepare_reconcile_stop_guard(campaign, proposed)
+
+
+def test_reconcile_stop_guard_defers_cancelling_stop_to_scheduler_recovery(
+    tmp_path,
+):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=3)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 2
+    _write_locked_state(campaign, state)
+    request, _ = install_stop_request(
+        campaign,
+        build_stop_request(
+            state,
+            mode="immediate",
+            cancel_jobs=True,
+        ),
+    )
+
+    guard = cli_mod._prepare_reconcile_stop_guard(campaign, state)
+
+    assert guard["request"]["request_id"] == request["request_id"]
+    assert guard["disposition"]["kind"] == "cancelling"
+    assert guard["mutable_during_reconcile"] is True
 
 
 def test_reconcile_apply_refuses_malformed_stop_control(tmp_path, capsys):
@@ -3360,6 +3506,14 @@ def test_cli_stop_when_no_state_returns_4(tmp_path):
         ({"event": "queue_lifecycle_update", "status": "COMPLETED"}, "OK"),
         ({"event": "queue_lifecycle_update", "status": "PENDING"}, "WAIT"),
         ({"event": "queue_lifecycle_update", "status": "RUNNING"}, "RUN"),
+        (
+            {
+                "event": "queue_lifecycle_update",
+                "queue_event": "first_sacct",
+                "status": "FAILED",
+            },
+            "OK",
+        ),
         ({"event": "failure_action", "action": "HALT"}, "FAIL"),
         ({"event": "failure_action", "action": "RETRY"}, "WARN"),
         ({"event": "quantum_quality_summary", "accepted": False}, "FAIL"),
@@ -4899,6 +5053,78 @@ def test_cli_resume_repolls_matching_scheduler_uncertain_job(
     assert "no job was resubmitted" in capsys.readouterr().out
 
 
+def test_cli_resume_repolls_scheduler_uncertain_job_with_pending_boundary_stop(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=2)
+    phase = CampaignPhase.INITIAL_GAUSSIAN
+    job_id = "17615141"
+    state.phase = CampaignPhase.HALTED
+    state.pending_jobs[phase.value] = job_id
+    state.lifecycle_context = make_lifecycle_context(
+        disposition="halted",
+        reason_code="sacct_missing_timeout",
+        message="expected Slurm array rows remained missing",
+        from_phase=phase,
+        iteration=0,
+        source="daemon",
+        job_id=job_id,
+        scheduler_uncertain=True,
+        recovery_action="inspect accounting, then resume",
+    )
+    _write_locked_state(campaign, state)
+    submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid=str(state.campaign_uid),
+        phase_name=phase.value,
+        iteration=0,
+        expected_tasks=1150,
+    )
+    submission_intent.mark_submitted(
+        campaign,
+        phase.value,
+        0,
+        job_id,
+        expected_tasks=1150,
+    )
+    request, _ = install_stop_request(
+        campaign,
+        build_stop_request(state, mode="after_iteration"),
+    )
+    started = []
+    monkeypatch.setattr(
+        cli_mod,
+        "cmd_start",
+        lambda args: started.append(args) or 0,
+    )
+
+    rc = main(
+        [
+            "resume",
+            "--campaign-dir",
+            str(campaign),
+            "--mode",
+            "live",
+        ]
+    )
+
+    assert rc == 0
+    assert len(started) == 1
+    recovered = read_state(
+        campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+    )
+    assert recovered.phase is phase
+    retained = read_stop_request(
+        campaign,
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+    assert retained is not None
+    assert retained["request_id"] == request["request_id"]
+    assert retained["status"] == "requested"
+
+
 def test_cli_resume_refuses_scheduler_uncertain_job_with_mismatched_intent(
     tmp_path,
     capsys,
@@ -5048,15 +5274,79 @@ def test_cli_start_in_dry_run_mode_drives_state_machine(tmp_path):
     assert state.phase.value != "INIT"
 
 
-def test_cli_first_start_requires_explicit_execution_mode(tmp_path, capsys):
+def test_cli_first_start_defaults_to_live_background(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.execution_identity import (
+        read_execution_identity,
+    )
+
     campaign = _campaign_with_config(tmp_path)
+    config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+    config.campaign.system_name = "WATER"
+    config.to_yaml(campaign / "campaign.yaml")
     data = campaign / DEFAULT_DATA_SUBDIR
     data.mkdir(parents=True, exist_ok=True)
     _write_locked_state(campaign, fresh_campaign_state())
+    launched = {}
+
+    def _launch(args, selected_campaign):
+        launched["background"] = bool(args.background)
+        launched["campaign"] = selected_campaign
+        return 0
+
+    monkeypatch.setattr(cli_mod, "_launch_background_daemon", _launch)
     rc = main(["start", "--campaign-dir", str(campaign)])
 
-    assert rc == 13
-    assert "first start requires --mode live or --mode dry_run" in capsys.readouterr().err
+    assert rc == 0
+    assert launched == {
+        "background": True,
+        "campaign": campaign.resolve(),
+    }
+    identity = read_execution_identity(
+        campaign,
+        expected_campaign_uid=read_state(
+            data / DEFAULT_STATE_FILENAME
+        ).campaign_uid,
+    )
+    assert identity["mode"] == "live"
+
+
+def test_plain_start_reuses_existing_dry_run_mode(tmp_path, monkeypatch):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state()
+    _write_locked_state(campaign, state)
+    assert (
+        main(
+            [
+                "start",
+                "--campaign-dir",
+                str(campaign),
+                "--mode",
+                "dry_run",
+                "--max-ticks",
+                "0",
+                "--foreground",
+            ]
+        )
+        == 0
+    )
+    launched = {}
+    monkeypatch.setattr(
+        cli_mod,
+        "_launch_background_daemon",
+        lambda args, selected: launched.update(
+            mode=args.mode,
+            background=bool(args.background),
+            campaign=selected,
+        )
+        or 0,
+    )
+
+    assert main(["start", "--campaign-dir", str(campaign)]) == 0
+    assert launched["mode"] is None
+    assert launched["background"] is True
 
 
 def test_cli_start_missing_state_for_clean_campaign_recommends_init(tmp_path, capsys):
@@ -5106,9 +5396,7 @@ def test_live_placeholder_is_rejected_before_execution_identity_creation(
     assert main(["init", "--campaign-dir", str(campaign), "--yes"]) == 0
     capsys.readouterr()
 
-    rc = main(
-        ["start", "--campaign-dir", str(campaign), "--mode", "live", "--foreground"]
-    )
+    rc = main(["start", "--campaign-dir", str(campaign), "--foreground"])
 
     assert rc == 2
     assert "real molecular system" in capsys.readouterr().err
