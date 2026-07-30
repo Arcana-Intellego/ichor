@@ -454,7 +454,12 @@ def _patch_ariadne_retry_transition(
     )
 
 
-def _patch_phase_b_transition(monkeypatch):
+def _patch_phase_b_transition(
+    monkeypatch,
+    *,
+    accepted_tasks=193,
+    rejected_tasks=7,
+):
     from ichor.hpc.active_learning.versioning.reference_data import (
         ReferenceDataVersioning,
     )
@@ -482,11 +487,60 @@ def _patch_phase_b_transition(monkeypatch):
         "ariadne_results_recovery_summary",
         lambda *_args, **_kwargs: {
             "expected_tasks": 200,
-            "accepted_tasks": 193,
-            "rejected_tasks": 7,
-            "missing_rejected_outputs": 7,
+            "accepted_tasks": int(accepted_tasks),
+            "rejected_tasks": int(rejected_tasks),
+            "missing_rejected_outputs": int(rejected_tasks),
             "tasks_resubmitted": 0,
         },
+    )
+
+
+def _write_terminal_scalar_diversity_intent(
+    campaign,
+    state,
+    *,
+    job_id="17997698",
+    terminal_status="FAILED",
+    scheduler_kind="slurm",
+):
+    write_pre_submit_intent(
+        campaign,
+        campaign_uid=str(state.campaign_uid),
+        phase_name=state.phase.value,
+        iteration=int(state.iteration),
+        replacement_round=int(state.replacement_round),
+        expected_tasks=1,
+        scheduler_identity_kind=scheduler_kind,
+    )
+    mark_submitted(
+        campaign,
+        state.phase.value,
+        int(state.iteration),
+        str(job_id),
+        expected_tasks=1,
+    )
+    record_queue_lifecycle(
+        campaign,
+        state.phase.value,
+        int(state.iteration),
+        "terminal",
+        job_id=str(job_id),
+        status=str(terminal_status),
+        n_expected=1,
+        n_observed=1,
+        n_missing=0,
+    )
+    mark_failed(
+        campaign,
+        state.phase.value,
+        int(state.iteration),
+        "test scalar worker failure",
+    )
+    return load_intent(
+        campaign,
+        state.phase.value,
+        int(state.iteration),
+        expected_campaign_uid=str(state.campaign_uid),
     )
 
 
@@ -520,6 +574,141 @@ def test_rebind_accepts_clean_phase_b_pre_submission_retry(
     assert result["ariadne_tasks_resubmitted"] == 0
 
 
+def test_rebind_accepts_terminal_phase_b_scheduler_retry(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.PHASE_B_DIVERSITY
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    from ichor.hpc.active_learning.daemon.stop_control import (
+        build_stop_request,
+        install_stop_request,
+        stop_request_path,
+    )
+
+    install_stop_request(
+        campaign,
+        build_stop_request(state, mode="after_iteration"),
+    )
+    stop_bytes = stop_request_path(campaign).read_bytes()
+    _write_terminal_scalar_diversity_intent(campaign, state)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.cluster_profile.profile_value",
+        lambda *_args, **_kwargs: "slurm",
+    )
+    journal_events = []
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.journal.append_event",
+        lambda _path, event, **fields: journal_events.append(
+            {"event": event, **fields}
+        ),
+    )
+    _patch_phase_b_transition(
+        monkeypatch,
+        accepted_tasks=198,
+        rejected_tasks=2,
+    )
+
+    result = rebind_environment(
+        campaign,
+        config=config,
+        scheduler_ownership_clear=True,
+    )
+
+    assert result["changed"] is True
+    assert result["transition_kind"] == "phase_b_terminal_scheduler_retry"
+    assert result["producer_job_id"] == "17997698"
+    assert result["scheduler_terminal_status"] == "FAILED"
+    assert result["ariadne_accepted_tasks"] == 198
+    assert result["ariadne_rejected_tasks"] == 2
+    transition_event = journal_events[-1]
+    assert transition_event["event"] == "environment_generation_advanced"
+    assert (
+        transition_event["transition_kind"]
+        == "phase_b_terminal_scheduler_retry"
+    )
+    assert transition_event["producer_job_id"] == "17997698"
+    assert transition_event["scheduler_terminal_status"] == "FAILED"
+    assert stop_request_path(campaign).read_bytes() == stop_bytes
+
+    retry = write_pre_submit_intent(
+        campaign,
+        campaign_uid=str(state.campaign_uid),
+        phase_name=state.phase.value,
+        iteration=int(state.iteration),
+        expected_tasks=1,
+        scheduler_identity_kind="slurm",
+    )
+    history = (
+        campaign
+        / ".DATA"
+        / "ACTIVE_LEARNING"
+        / "submission_intents"
+        / "history"
+    )
+    archived = list(history.glob("PHASE_B_DIVERSITY-000001-*.json"))
+    assert retry["attempt_sequence"] == 2
+    assert retry["job_id"] is None
+    assert len(archived) == 1
+    assert json.loads(archived[0].read_text(encoding="utf-8"))["job_id"] == (
+        "17997698"
+    )
+
+
+@pytest.mark.parametrize("scheduler_kind", ["slurm", "sge"])
+def test_rebind_accepts_terminal_phase_a_scheduler_retry(
+    tmp_path,
+    monkeypatch,
+    scheduler_kind,
+):
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.PHASE_A_DIVERSITY
+    state.iteration = 0
+    state.reference_data_version = -1
+    state.models_version = -1
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    _write_terminal_scalar_diversity_intent(
+        campaign,
+        state,
+        job_id="17997000",
+        scheduler_kind=scheduler_kind,
+    )
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.cluster_profile.profile_value",
+        lambda *_args, **_kwargs: scheduler_kind,
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.recovery_contracts."
+        "phase_recovery_contract_error",
+        lambda *_args, **_kwargs: None,
+    )
+
+    result = rebind_environment(
+        campaign,
+        config=config,
+        scheduler_ownership_clear=True,
+    )
+
+    assert result["changed"] is True
+    assert result["transition_kind"] == "phase_a_terminal_scheduler_retry"
+    assert result["producer_job_id"] == "17997000"
+    assert result["scheduler_terminal_status"] == "FAILED"
+
+
 def test_rebind_rejects_phase_b_partial_output(tmp_path, monkeypatch):
     campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
     state.phase = CampaignPhase.PHASE_B_DIVERSITY
@@ -545,7 +734,7 @@ def test_rebind_rejects_phase_b_partial_output(tmp_path, monkeypatch):
         )
 
 
-def test_phase_b_transition_accepts_only_jobless_reconcile_retry_intent(
+def test_phase_b_transition_accepts_jobless_and_terminal_scheduler_retry_intents(
     tmp_path,
     monkeypatch,
 ):
@@ -555,12 +744,23 @@ def test_phase_b_transition_accepts_only_jobless_reconcile_retry_intent(
     state.reference_data_version = 0
     state.models_version = 0
     _patch_phase_b_transition(monkeypatch)
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.cluster_profile.profile_value",
+        lambda *_args, **_kwargs: "slurm",
+    )
     intent = {
+        "campaign_uid": str(state.campaign_uid),
         "phase": CampaignPhase.PHASE_B_DIVERSITY.value,
         "iteration": 1,
+        "replacement_round": 0,
+        "scheduler_identity_kind": "slurm",
+        "submission_kind": "scalar",
+        "expected_tasks": 1,
+        "submission_identity": "r0000-a0001-test",
         "status": "SUPERSEDED",
         "reason": "reconcile_apply_retry",
         "job_id": None,
+        "job_ids_seen": [],
     }
 
     result = execution_identity_module._validate_phase_b_transition_boundary(
@@ -571,7 +771,28 @@ def test_phase_b_transition_accepts_only_jobless_reconcile_retry_intent(
 
     assert result["transition_kind"] == "phase_b_pre_submission_retry"
     intent["job_id"] = "12345"
-    with pytest.raises(ExecutionIdentityError, match="jobless"):
+    intent["job_ids_seen"] = ["12345"]
+    intent["queue_lifecycle"] = {
+        "terminal_status": "FAILED",
+        "n_expected": 1,
+        "n_observed": 1,
+        "n_missing": 0,
+    }
+    terminal = execution_identity_module._validate_phase_b_transition_boundary(
+        campaign,
+        state,
+        intent_records=[intent],
+    )
+
+    assert terminal["transition_kind"] == "phase_b_terminal_scheduler_retry"
+    assert terminal["producer_job_id"] == "12345"
+    assert terminal["scheduler_terminal_status"] == "FAILED"
+
+    intent["queue_lifecycle"]["n_missing"] = 1
+    with pytest.raises(
+        ExecutionIdentityError,
+        match="exactly one terminal task",
+    ):
         execution_identity_module._validate_phase_b_transition_boundary(
             campaign,
             state,

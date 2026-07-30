@@ -7,6 +7,7 @@ message.
 """
 from __future__ import annotations
 
+import re
 import shlex
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -143,6 +144,15 @@ def _short_error(value: Any, *, limit: int = 180) -> str:
     return text
 
 
+def _plain_error(value: Any, *, limit: int = 180) -> str:
+    text = re.sub(
+        r"\b[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception):\s*",
+        "",
+        str(value or "").strip(),
+    )
+    return _short_error(" ".join(text.split()), limit=limit)
+
+
 def _contract_error(payload: Dict[str, Any]) -> str:
     contract = payload.get("state_artifact_contract_status")
     if isinstance(contract, dict):
@@ -252,6 +262,55 @@ def _allocation_check_transition_recommendation(
             "the next start can "
             + work
         ),
+        command=_resume_cmd(campaign_dir),
+    )
+
+
+def _scalar_diversity_transition_recommendation(
+    campaign_dir: Path,
+    payload: Dict[str, Any],
+) -> Optional[StatusRecommendation]:
+    phase = _phase(payload)
+    if phase not in {
+        CampaignPhase.PHASE_A_DIVERSITY.value,
+        CampaignPhase.PHASE_B_DIVERSITY.value,
+    }:
+        return None
+    evidence = payload.get("_presentation_diversity_transition")
+    if not isinstance(evidence, Mapping) or not bool(
+        evidence.get("safe", False)
+    ):
+        return None
+    if not (
+        str(payload.get("background_startup_state") or "") == "failed"
+        and str(payload.get("background_startup_stage") or "")
+        == "environment_transition"
+    ):
+        return None
+    historical_job = str(evidence.get("producer_job_id") or "")
+    terminal_status = str(evidence.get("scheduler_terminal_status") or "")
+    if historical_job:
+        detail = (
+            "the historical scalar job "
+            + historical_job
+            + " is conclusively terminal"
+            + (" (" + terminal_status.lower() + ")" if terminal_status else "")
+        )
+    else:
+        detail = "the failed attempt never acquired scheduler ownership"
+    if phase == CampaignPhase.PHASE_B_DIVERSITY.value:
+        detail += (
+            "; "
+            + str(int(evidence.get("ariadne_accepted_tasks") or 0))
+            + " accepted ARIADNE results remain authoritative and "
+            + str(int(evidence.get("ariadne_rejected_tasks") or 0))
+            + " rejected results remain excluded"
+        )
+    return StatusRecommendation(
+        code="phase_" + phase.lower() + "_ready",
+        severity="required",
+        primary="resume the daemon; the scalar diversity retry boundary is safe",
+        why=detail,
         command=_resume_cmd(campaign_dir),
     )
 
@@ -482,7 +541,7 @@ def _background_startup_failure_recommendation(
     ) != "failed":
         return None
     stage = str(payload.get("background_startup_stage") or "startup")
-    failure = _short_error(payload.get("background_startup_failure"))
+    failure = _plain_error(payload.get("background_startup_failure"))
     if stage in {"environment_transition", "config_lock"}:
         primary = "preview recovery before retrying the failed daemon startup"
         command = _reconcile_cmd(campaign)
@@ -1346,6 +1405,13 @@ def build_status_recommendations(
     scheduler_recovery = _scheduler_recovery_recommendation(campaign, payload)
     if scheduler_recovery is not None:
         return [scheduler_recovery] + stale_pid
+
+    diversity_transition = _scalar_diversity_transition_recommendation(
+        campaign,
+        payload,
+    )
+    if diversity_transition is not None:
+        return [diversity_transition] + stale_pid
 
     startup_failure = _background_startup_failure_recommendation(
         campaign,

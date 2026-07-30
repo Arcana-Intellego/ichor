@@ -661,6 +661,39 @@ def test_campaign_preflight_allows_and_reports_pending_boundary_stop(
     assert "retain and honour this request" in output
 
 
+def test_preflight_reports_proven_terminal_scalar_retry_boundary():
+    payload = {
+        "ready": True,
+        "all_backends_present": True,
+        "campaign_config": {"ok": True},
+        "pool_feasibility": {
+            "ok": True,
+            "pool_n_frames": 10000,
+            "required_pool_frames": 7340,
+        },
+        "campaign_state": {
+            "ok": True,
+            "condition": "stop_scheduled",
+            "phase": CampaignPhase.PHASE_B_DIVERSITY.value,
+            "iteration": 17,
+            "issues": [],
+        },
+        "_presentation_diversity_transition": {
+            "safe": True,
+            "transition_kind": "phase_b_terminal_scheduler_retry",
+            "producer_job_id": "17997698",
+            "scheduler_terminal_status": "FAILED",
+        },
+        "next_action": "resume the daemon",
+    }
+
+    output = cli_mod._format_preflight(payload)
+
+    assert "[OK] diversity retry boundary" in output
+    assert "job 17997698" in output
+    assert "permits a clean scalar retry" in output
+
+
 def test_campaign_preflight_validates_every_slurm_phase_resource_contract(
     tmp_path,
     monkeypatch,
@@ -3754,6 +3787,47 @@ def test_reconcile_defers_environment_transition_for_completed_stop(
     assert deferred is True
 
 
+@pytest.mark.parametrize(
+    ("safe", "command_fragment", "effect_fragment"),
+    [
+        (True, "preflight", "verify the reported startup blocker"),
+        (False, "reconcile", "resume would repeat the same refusal"),
+    ],
+)
+def test_reconcile_environment_failure_never_recommends_known_failing_resume(
+    tmp_path,
+    monkeypatch,
+    safe,
+    command_fragment,
+    effect_fragment,
+):
+    state = fresh_campaign_state(max_iterations=40)
+    state.phase = CampaignPhase.PHASE_B_DIVERSITY
+    state.iteration = 17
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.execution_identity."
+        "inspect_scalar_diversity_transition_boundary",
+        lambda *_args, **_kwargs: {
+            "safe": bool(safe),
+            "reason": "terminal lifecycle evidence is incomplete",
+        },
+    )
+
+    problem, command, effect = (
+        cli_mod._reconcile_environment_failure_guidance(
+            tmp_path,
+            state,
+            "ExecutionIdentityError: terminal lifecycle evidence is incomplete",
+        )
+    )
+
+    assert "ExecutionIdentityError" not in problem
+    assert "terminal lifecycle evidence is incomplete" in problem
+    assert command_fragment in command
+    assert " resume " not in (" " + command + " ")
+    assert effect_fragment in effect
+
+
 def test_reconcile_stopped_state_is_not_runnable_and_hides_resolved_halt(
     tmp_path,
     capsys,
@@ -4023,6 +4097,84 @@ def test_reconcile_preview_clean_pause_recommends_resume_without_apply(
     assert "Planned changes" not in output
     assert "ichor-al-daemon resume" in output
     assert "--apply" not in output
+
+
+@pytest.mark.parametrize(
+    ("safe", "expected_result", "expected_text"),
+    [
+        (
+            True,
+            "no reconcile changes needed",
+            "ichor-al-daemon resume",
+        ),
+        (
+            False,
+            "blocked",
+            "resume would repeat the same refusal",
+        ),
+    ],
+)
+def test_reconcile_preview_uses_scalar_transition_verdict_before_resume(
+    tmp_path,
+    capsys,
+    monkeypatch,
+    safe,
+    expected_result,
+    expected_text,
+):
+    state = fresh_campaign_state(
+        max_iterations=40,
+        campaign_uid="presentation-test",
+    )
+    state.phase = CampaignPhase.PHASE_B_DIVERSITY
+    state.iteration = 17
+    state.reference_data_version = 16
+    state.models_version = 16
+    data = tmp_path / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True)
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    report = SimpleNamespace(
+        proposed_state=state,
+        unsafe_reasons=[],
+        blocking_artifacts=[],
+        active_submission_intents=[],
+        decision="PHASE_B_DIVERSITY: authoritative ARIADNE results are ready",
+    )
+    contract = {
+        "contract_ok": True,
+        "selected_phase": CampaignPhase.PHASE_B_DIVERSITY.value,
+        "missing_or_invalid_inputs": [],
+        "protected_artifacts": [],
+    }
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.execution_identity."
+        "inspect_scalar_diversity_transition_boundary",
+        lambda *_args, **_kwargs: {
+            "safe": bool(safe),
+            "reason": "terminal scheduler lifecycle is incomplete",
+        },
+    )
+
+    cli_mod._print_reconcile_operator_report(
+        tmp_path,
+        report,
+        contract,
+        mode="dry_run",
+        proposed_state_path=data / "state.json.proposed",
+        runtime_status={
+            "background_startup_state": "failed",
+            "background_startup_stage": "environment_transition",
+            "reconcile_apply_blockers": [],
+        },
+    )
+    output = capsys.readouterr().out
+
+    assert "Preview result: " + expected_result in output
+    assert expected_text in output
+    if safe:
+        assert "--apply" not in output
+    else:
+        assert "ichor-al-daemon resume" not in output
 
 
 def test_reconcile_preview_describes_rebuildable_allocation_sample(

@@ -751,6 +751,70 @@ def test_allocation_environment_retry_precedes_pending_iteration_stop(tmp_path):
     assert cli._status_overall(payload) == "stopped and ready to continue"
 
 
+def test_terminal_phase_b_retry_overrides_stale_startup_failure(tmp_path):
+    campaign = tmp_path / "campaign"
+    payload = {
+        "phase": CampaignPhase.PHASE_B_DIVERSITY.value,
+        "iteration": 17,
+        "background_startup_state": "failed",
+        "background_startup_stage": "environment_transition",
+        "background_startup_failure": (
+            "ExecutionIdentityError: historical retry intent must be jobless"
+        ),
+        "_presentation_diversity_transition": {
+            "safe": True,
+            "transition_kind": "phase_b_terminal_scheduler_retry",
+            "producer_job_id": "17997698",
+            "scheduler_terminal_status": "FAILED",
+            "ariadne_accepted_tasks": 198,
+            "ariadne_rejected_tasks": 2,
+        },
+        "stop_request": {
+            "status": "requested",
+            "request_id": "request-17",
+            "mode": "after_iteration",
+            "target_iteration": 17,
+        },
+    }
+
+    result = recommendations.build_status_recommendations(campaign, payload)
+    payload["recommendations"] = [result[0].to_dict()]
+
+    assert result[0].code == "phase_phase_b_diversity_ready"
+    assert "17997698" in result[0].why
+    assert "198 accepted ARIADNE results" in result[0].why
+    assert str(result[0].command).startswith("ichor-al-daemon resume")
+    assert cli._status_overall(payload) == "stopped with a pending stop request"
+    assert "ready for one Phase B retry" in cli._status_current_activity(payload)
+
+
+def test_unsafe_diversity_transition_reports_actual_startup_failure(tmp_path):
+    campaign = tmp_path / "campaign"
+    payload = {
+        "phase": CampaignPhase.PHASE_B_DIVERSITY.value,
+        "iteration": 17,
+        "background_startup_state": "failed",
+        "background_startup_stage": "environment_transition",
+        "background_startup_failure": (
+            "ExecutionIdentityError: terminal scheduler lifecycle is incomplete"
+        ),
+        "_presentation_diversity_transition": {
+            "safe": False,
+            "reason": "terminal scheduler lifecycle is incomplete",
+        },
+    }
+
+    result = recommendations.build_status_recommendations(campaign, payload)
+    payload["recommendations"] = [result[0].to_dict()]
+
+    assert result[0].code == "background_startup_failed"
+    assert "terminal scheduler lifecycle is incomplete" in result[0].why
+    assert (
+        cli._status_plain_reason(payload, result[0].code)
+        == "terminal scheduler lifecycle is incomplete"
+    )
+
+
 def test_conflicting_allocation_evidence_precedes_pending_stop(tmp_path):
     campaign = tmp_path / "campaign"
     payload = {

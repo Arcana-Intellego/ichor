@@ -79,6 +79,122 @@ def submission_kind_for_phase(phase_name: str) -> str:
     return "scalar" if str(phase_name) in _SCALAR_SUBMISSION_PHASES else "array"
 
 
+def classify_scalar_diversity_retry_intent(
+    intent: Mapping[str, Any],
+    *,
+    expected_campaign_uid: str,
+    expected_phase: str,
+    expected_iteration: int,
+    expected_replacement_round: int,
+    expected_scheduler_kind: str,
+) -> Dict[str, Any]:
+    """Validate one terminal scalar-diversity attempt for an exact retry."""
+    phase = str(expected_phase)
+    if phase not in _SCALAR_SUBMISSION_PHASES:
+        raise ValueError("scalar diversity retry phase is unsupported: " + phase)
+    scheduler_kind = str(expected_scheduler_kind).strip().lower()
+    if scheduler_kind not in {"slurm", "sge", "synthetic"}:
+        raise ValueError("scalar diversity retry scheduler kind is invalid")
+    expected_identity = (
+        str(expected_campaign_uid),
+        phase,
+        int(expected_iteration),
+        int(expected_replacement_round),
+        scheduler_kind,
+    )
+    observed_identity = (
+        str(intent.get("campaign_uid") or ""),
+        str(intent.get("phase") or ""),
+        intent.get("iteration"),
+        intent.get("replacement_round"),
+        str(intent.get("scheduler_identity_kind") or "").strip().lower(),
+    )
+    if observed_identity != expected_identity:
+        raise ValueError(
+            "scalar diversity retry intent identity does not match campaign state"
+        )
+    if intent.get("submission_kind") != "scalar":
+        raise ValueError("scalar diversity retry intent is not a scalar submission")
+    if intent.get("expected_tasks") != 1:
+        raise ValueError(
+            "scalar diversity retry intent must record exactly one expected task"
+        )
+
+    status = str(intent.get("status") or "")
+    reason = str(intent.get("reason") or "")
+    if status != "FAILED" and not (
+        status == "SUPERSEDED" and reason == "reconcile_apply_retry"
+    ):
+        raise ValueError(
+            "scalar diversity retry intent status is not safely terminal: "
+            + (status or "missing")
+        )
+
+    submission_identity = str(intent.get("submission_identity") or "")
+    if not submission_identity:
+        raise ValueError(
+            "scalar diversity retry intent lacks a submission identity"
+        )
+    job_id = intent.get("job_id")
+    if job_id in (None, "", False):
+        return {
+            "retry_evidence_kind": "jobless_pre_submit_retry",
+            "phase": phase,
+            "iteration": int(expected_iteration),
+            "replacement_round": int(expected_replacement_round),
+            "scheduler_identity_kind": scheduler_kind,
+            "producer_submission_identity": submission_identity,
+            "producer_job_id": None,
+            "scheduler_terminal_status": None,
+            "scheduler_n_expected": 0,
+            "scheduler_n_observed": 0,
+            "scheduler_n_missing": 0,
+        }
+
+    validated_job_id = _validate_job_identity(job_id, scheduler_kind)
+    job_ids_seen = intent.get("job_ids_seen")
+    if (
+        not isinstance(job_ids_seen, list)
+        or validated_job_id not in job_ids_seen
+        or len(job_ids_seen) != len(set(job_ids_seen))
+    ):
+        raise ValueError(
+            "scalar diversity retry intent JobID history is incomplete or conflicting"
+        )
+    lifecycle = intent.get("queue_lifecycle")
+    if not isinstance(lifecycle, Mapping):
+        raise ValueError(
+            "scalar diversity retry intent lacks terminal scheduler lifecycle evidence"
+        )
+    terminal_identity = (
+        str(lifecycle.get("terminal_status") or ""),
+        lifecycle.get("n_expected"),
+        lifecycle.get("n_observed"),
+        lifecycle.get("n_missing"),
+    )
+    if terminal_identity[0] not in {"COMPLETED", "FAILED"} or (
+        terminal_identity[1:]
+        != (1, 1, 0)
+    ):
+        raise ValueError(
+            "scalar diversity retry scheduler lifecycle must prove exactly "
+            "one terminal task with no missing accounting"
+        )
+    return {
+        "retry_evidence_kind": "terminal_scheduler_retry",
+        "phase": phase,
+        "iteration": int(expected_iteration),
+        "replacement_round": int(expected_replacement_round),
+        "scheduler_identity_kind": scheduler_kind,
+        "producer_submission_identity": submission_identity,
+        "producer_job_id": validated_job_id,
+        "scheduler_terminal_status": terminal_identity[0],
+        "scheduler_n_expected": 1,
+        "scheduler_n_observed": 1,
+        "scheduler_n_missing": 0,
+    }
+
+
 def _validate_job_identity(value: Any, scheduler_identity_kind: str) -> str:
     text = str(value)
     if scheduler_identity_kind == "slurm":

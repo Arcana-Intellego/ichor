@@ -10,6 +10,7 @@ import ichor.hpc.active_learning.daemon.submission_intent as intent_module
 from ichor.hpc.active_learning.daemon.submission_intent import (
     aimall_postprocess_task_contract,
     classify_completed_unsubmitted_intents,
+    classify_scalar_diversity_retry_intent,
     intent_path,
     load_intent,
     mark_completed,
@@ -40,6 +41,129 @@ def test_submission_intent_rejects_fractional_task_count(tmp_path):
             phase_name="GAUSSIAN",
             iteration=1,
             expected_tasks=1.5,
+        )
+
+
+def _scalar_retry_intent(
+    *,
+    phase="PHASE_B_DIVERSITY",
+    scheduler="slurm",
+    status="FAILED",
+    reason="worker failed",
+    job_id="17997698",
+    terminal_status="FAILED",
+):
+    return {
+        "campaign_uid": "intent-test",
+        "phase": phase,
+        "iteration": 17 if phase == "PHASE_B_DIVERSITY" else 0,
+        "replacement_round": 0,
+        "scheduler_identity_kind": scheduler,
+        "submission_kind": "scalar",
+        "expected_tasks": 1,
+        "submission_identity": "r0000-a0001-test",
+        "status": status,
+        "reason": reason,
+        "job_id": job_id,
+        "job_ids_seen": [] if job_id is None else [job_id],
+        "queue_lifecycle": {
+            "terminal_status": terminal_status,
+            "n_expected": 1,
+            "n_observed": 1,
+            "n_missing": 0,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("phase", "scheduler", "terminal_status"),
+    [
+        ("PHASE_A_DIVERSITY", "slurm", "COMPLETED"),
+        ("PHASE_A_DIVERSITY", "sge", "FAILED"),
+        ("PHASE_B_DIVERSITY", "slurm", "FAILED"),
+        ("PHASE_B_DIVERSITY", "sge", "COMPLETED"),
+    ],
+)
+def test_scalar_diversity_retry_accepts_exact_terminal_scheduler_evidence(
+    phase,
+    scheduler,
+    terminal_status,
+):
+    intent = _scalar_retry_intent(
+        phase=phase,
+        scheduler=scheduler,
+        terminal_status=terminal_status,
+    )
+
+    result = classify_scalar_diversity_retry_intent(
+        intent,
+        expected_campaign_uid="intent-test",
+        expected_phase=phase,
+        expected_iteration=int(intent["iteration"]),
+        expected_replacement_round=0,
+        expected_scheduler_kind=scheduler,
+    )
+
+    assert result["retry_evidence_kind"] == "terminal_scheduler_retry"
+    assert result["producer_job_id"] == "17997698"
+    assert result["scheduler_terminal_status"] == terminal_status
+
+
+def test_scalar_diversity_retry_accepts_jobless_failed_attempt():
+    intent = _scalar_retry_intent(job_id=None)
+
+    result = classify_scalar_diversity_retry_intent(
+        intent,
+        expected_campaign_uid="intent-test",
+        expected_phase="PHASE_B_DIVERSITY",
+        expected_iteration=17,
+        expected_replacement_round=0,
+        expected_scheduler_kind="slurm",
+    )
+
+    assert result["retry_evidence_kind"] == "jobless_pre_submit_retry"
+    assert result["producer_job_id"] is None
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda value: value.update(status="SUBMITTED"), "safely terminal"),
+        (
+            lambda value: value["queue_lifecycle"].update(n_missing=1),
+            "exactly one terminal task",
+        ),
+        (
+            lambda value: value["queue_lifecycle"].update(
+                terminal_status="CANCELLED"
+            ),
+            "exactly one terminal task",
+        ),
+        (
+            lambda value: value.update(expected_tasks=2),
+            "exactly one expected task",
+        ),
+        (
+            lambda value: value.update(job_ids_seen=[]),
+            "JobID history",
+        ),
+    ],
+)
+def test_scalar_diversity_retry_rejects_ambiguous_terminal_evidence(
+    mutation,
+    message,
+):
+    intent = _scalar_retry_intent()
+    mutation(intent)
+
+    with pytest.raises(ValueError, match=message):
+        classify_scalar_diversity_retry_intent(
+            intent,
+            expected_campaign_uid="intent-test",
+            expected_phase="PHASE_B_DIVERSITY",
+            expected_iteration=17,
+            expected_replacement_round=0,
+            expected_scheduler_kind="slurm",
         )
 
 

@@ -2536,6 +2536,47 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
         str(payload.get("background_startup_state") or "") == "failed"
         and not daemon_active
     ):
+        diversity_transition = payload.get(
+            "_presentation_diversity_transition"
+        )
+        if (
+            str(payload.get("background_startup_stage") or "")
+            == "environment_transition"
+            and isinstance(diversity_transition, Mapping)
+            and bool(diversity_transition.get("safe", False))
+        ):
+            job_id = str(
+                diversity_transition.get("producer_job_id") or ""
+            )
+            if phase == CampaignPhase.PHASE_B_DIVERSITY.value:
+                return (
+                    "The previous Phase B job"
+                    + (" " + job_id if job_id else "")
+                    + " is terminal; "
+                    + str(
+                        int(
+                            diversity_transition.get(
+                                "ariadne_accepted_tasks"
+                            )
+                            or 0
+                        )
+                    )
+                    + " accepted ARIADNE results are ready for one Phase B retry; "
+                    + str(
+                        int(
+                            diversity_transition.get(
+                                "ariadne_rejected_tasks"
+                            )
+                            or 0
+                        )
+                    )
+                    + " rejected results remain excluded."
+                )
+            return (
+                "The previous bootstrap diversity job"
+                + (" " + job_id if job_id else "")
+                + " is terminal; bootstrap diversity is ready to retry."
+            )
         stage = str(payload.get("background_startup_stage") or "startup")
         return (
             "The last daemon startup failed during "
@@ -3294,6 +3335,19 @@ def _status_plain_reason(payload: Dict[str, Any], code: str) -> Optional[str]:
     if code == "scheduler_terminal_recovery_resume":
         return "the previous scheduler job is conclusively terminal and only local validation or retry preparation remains"
     if code == "background_startup_failed":
+        failure = str(payload.get("background_startup_failure") or "").strip()
+        failure = re.sub(
+            r"\b[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception):\s*",
+            "",
+            failure,
+        )
+        failure = " ".join(failure.split())
+        if failure:
+            return (
+                failure
+                if len(failure) <= 240
+                else failure[:237] + "..."
+            )
         return "the previous background process stopped before daemon startup completed"
     if code in {
         "runtime_probe_failed",
@@ -8159,6 +8213,28 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "safe": False,
                 "reason": type(exc).__name__ + ": " + str(exc),
             }
+    if state.phase in {
+        CampaignPhase.PHASE_A_DIVERSITY,
+        CampaignPhase.PHASE_B_DIVERSITY,
+    }:
+        try:
+            from .execution_identity import (
+                inspect_scalar_diversity_transition_boundary,
+            )
+
+            presentation_payload[
+                "_presentation_diversity_transition"
+            ] = inspect_scalar_diversity_transition_boundary(
+                campaign,
+                state,
+            )
+        except Exception as exc:
+            presentation_payload[
+                "_presentation_diversity_transition"
+            ] = {
+                "safe": False,
+                "reason": type(exc).__name__ + ": " + str(exc),
+            }
     if isinstance(aimall_postprocess_recovery_status, Mapping):
         presentation_payload[
             "_presentation_aimall_postprocess_recovery"
@@ -8218,6 +8294,18 @@ def cmd_status(args: argparse.Namespace) -> int:
     ):
         payload["_presentation_scheduler_recovery"] = dict(
             scheduler_recovery_status
+        )
+    if (
+        not bool(getattr(args, "json", False))
+        and isinstance(
+            presentation_payload.get(
+                "_presentation_diversity_transition"
+            ),
+            Mapping,
+        )
+    ):
+        payload["_presentation_diversity_transition"] = dict(
+            presentation_payload["_presentation_diversity_transition"]
         )
     if (
         not bool(getattr(args, "json", False))
@@ -11463,6 +11551,7 @@ def _reconcile_presentation(
     scheduler_name = _scheduler_display_name(intents=active_intents)
     proposed = report.proposed_state
     allocation_transition: Optional[Dict[str, Any]] = None
+    diversity_transition: Optional[Dict[str, Any]] = None
     if proposed.phase in {
         CampaignPhase.INITIAL_ALLOCATION_CHECK,
         CampaignPhase.ALLOCATION_CHECK,
@@ -11478,6 +11567,24 @@ def _reconcile_presentation(
             )
         except Exception as exc:
             allocation_transition = {
+                "safe": False,
+                "reason": type(exc).__name__ + ": " + str(exc),
+            }
+    if proposed.phase in {
+        CampaignPhase.PHASE_A_DIVERSITY,
+        CampaignPhase.PHASE_B_DIVERSITY,
+    }:
+        try:
+            from .execution_identity import (
+                inspect_scalar_diversity_transition_boundary,
+            )
+
+            diversity_transition = inspect_scalar_diversity_transition_boundary(
+                campaign,
+                proposed,
+            )
+        except Exception as exc:
+            diversity_transition = {
                 "safe": False,
                 "reason": type(exc).__name__ + ": " + str(exc),
             }
@@ -11499,6 +11606,22 @@ def _reconcile_presentation(
         blockers.append(
             "allocation-check recovery is unsafe: "
             + str(allocation_transition.get("reason") or "unknown allocation evidence")
+        )
+    failed_diversity_transition = bool(
+        str((runtime_status or {}).get("background_startup_state") or "")
+        == "failed"
+        and str((runtime_status or {}).get("background_startup_stage") or "")
+        == "environment_transition"
+        and isinstance(diversity_transition, Mapping)
+        and not bool(diversity_transition.get("safe", False))
+    )
+    if failed_diversity_transition:
+        blockers.append(
+            "scalar diversity environment transition is unsafe: "
+            + str(
+                diversity_transition.get("reason")
+                or "terminal retry evidence is incomplete"
+            )
         )
     blocked_changes = list(getattr(config_review, "blocked_changes", []) or [])
     blockers.extend(
@@ -11945,6 +12068,13 @@ def _reconcile_presentation(
         next_label = "run"
         next_command = _campaign_command(campaign, "config-check", " --human")
         next_effect = "review the configuration changes that cannot be applied here"
+    elif failed_diversity_transition:
+        next_label = "run"
+        next_command = _campaign_command(campaign, "reconcile", " --verbose")
+        next_effect = (
+            "review the scalar diversity transition evidence; resume would "
+            "repeat the same refusal"
+        )
     elif (runtime_status or {}).get("reconcile_apply_blockers"):
         next_label = "run"
         next_command = _campaign_command(campaign, "status")
@@ -13133,6 +13263,46 @@ def _advance_environment_after_reconcile(
         scheduler_ownership_clear=True,
     )
     return transition, False
+
+
+def _reconcile_environment_failure_guidance(
+    campaign: Path,
+    state: CampaignState,
+    detail: str,
+) -> Tuple[str, str, str]:
+    """Choose a truthful follow-up after a committed reconcile transition fails."""
+    next_command = _campaign_command(campaign, "preflight")
+    next_effect = "verify the reported startup blocker before attempting to resume"
+    if state.phase in {
+        CampaignPhase.PHASE_A_DIVERSITY,
+        CampaignPhase.PHASE_B_DIVERSITY,
+    }:
+        try:
+            from .execution_identity import (
+                inspect_scalar_diversity_transition_boundary,
+            )
+
+            transition_evidence = inspect_scalar_diversity_transition_boundary(
+                campaign,
+                state,
+            )
+        except Exception:
+            transition_evidence = {"safe": False}
+        if not bool(transition_evidence.get("safe", False)):
+            next_command = _campaign_command(
+                campaign,
+                "reconcile",
+                " --verbose",
+            )
+            next_effect = (
+                "review the scalar diversity transition evidence; resume "
+                "would repeat the same refusal"
+            )
+    problem = (
+        "the software-environment transition failed: "
+        + _reconcile_plain_text(detail)
+    )
+    return problem, next_command, next_effect
 
 
 def _scratch_intent_index(campaign: Path) -> Dict[str, Dict[str, Any]]:
@@ -15220,12 +15390,19 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         )
     except Exception as exc:
         detail = type(exc).__name__ + ": " + str(exc)
+        problem, next_command, next_effect = (
+            _reconcile_environment_failure_guidance(
+                campaign,
+                report.proposed_state,
+                detail,
+            )
+        )
         _print_reconcile_follow_up_required(
             campaign,
             report.proposed_state,
-            problem="the installed software environment could not be recorded safely",
-            next_command=_campaign_command(campaign, "resume"),
-            next_effect="retry the software-environment transition and continue the campaign",
+            problem=problem,
+            next_command=next_command,
+            next_effect=next_effect,
             verbose_detail=(detail if bool(getattr(args, "verbose", False)) else None),
         )
         return 13
@@ -16537,6 +16714,35 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
             )
     if state.get("contract_error"):
         lines.append("  contract error: " + str(state.get("contract_error")))
+    diversity_transition = payload.get(
+        "_presentation_diversity_transition"
+    )
+    if (
+        isinstance(diversity_transition, Mapping)
+        and bool(diversity_transition.get("safe", False))
+    ):
+        job_id = str(diversity_transition.get("producer_job_id") or "")
+        detail = (
+            "ready; terminal scheduler evidence"
+            + (" for job " + job_id if job_id else "")
+            + " permits a clean scalar retry"
+        )
+        lines.append(
+            _preflight_check_line(
+                "diversity retry boundary",
+                True,
+                detail,
+            )
+        )
+    elif (
+        verbose
+        and isinstance(diversity_transition, Mapping)
+        and diversity_transition.get("reason")
+    ):
+        lines.append(
+            "  diversity transition: "
+            + _reconcile_plain_text(diversity_transition.get("reason"))
+        )
 
     lines.append("")
     lines.append("Trajectory Pool")
@@ -16677,6 +16883,13 @@ def _preflight_launch_advice(
     stop = payload.get("_presentation_stop")
     if isinstance(stop, Mapping):
         status_payload.update(dict(stop))
+    diversity_transition = payload.get(
+        "_presentation_diversity_transition"
+    )
+    if isinstance(diversity_transition, Mapping):
+        status_payload["_presentation_diversity_transition"] = dict(
+            diversity_transition
+        )
 
     lock = _probe_daemon_lock(paths["lock"])
     status_payload.update(lock)
@@ -16911,6 +17124,7 @@ def evaluate_campaign_preflight(
     presentation_state: Optional[CampaignState] = None
     presentation_contract: Optional[Dict[str, Any]] = None
     presentation_stop: Dict[str, Any] = {}
+    presentation_diversity_transition: Optional[Dict[str, Any]] = None
     presentation_config_review: Dict[str, Any] = {
         "state": "unavailable",
         "n_allowed": 0,
@@ -17125,6 +17339,29 @@ def evaluate_campaign_preflight(
                             + str(exc)
                         )
 
+            if state.phase in {
+                CampaignPhase.PHASE_A_DIVERSITY,
+                CampaignPhase.PHASE_B_DIVERSITY,
+            }:
+                try:
+                    from .execution_identity import (
+                        inspect_scalar_diversity_transition_boundary,
+                    )
+
+                    presentation_diversity_transition = (
+                        inspect_scalar_diversity_transition_boundary(
+                            campaign,
+                            state,
+                        )
+                    )
+                except Exception as exc:
+                    presentation_diversity_transition = {
+                        "safe": False,
+                        "phase": state.phase.value,
+                        "iteration": int(state.iteration),
+                        "reason": type(exc).__name__ + ": " + str(exc),
+                    }
+
             state_summary = {
                 "ok": not issues,
                 "condition": condition,
@@ -17146,6 +17383,9 @@ def evaluate_campaign_preflight(
     payload["_presentation_artifact_contract"] = presentation_contract
     payload["_presentation_stop"] = presentation_stop
     payload["_presentation_config_review"] = presentation_config_review
+    payload["_presentation_diversity_transition"] = (
+        presentation_diversity_transition
+    )
     return payload
 
 
