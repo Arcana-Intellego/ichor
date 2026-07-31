@@ -1054,41 +1054,68 @@ class Daemon:
         *,
         reason: str,
         completion_receipt: Optional[Mapping[str, Any]] = None,
-    ) -> str:
-        from .stop_control import complete_stop_request, describe_stop_request
-
-        self._apply_cancelled_jobs_from_request(state, request)
-        state.shutdown_requested = True
-        state.lifecycle_context = make_lifecycle_context(
-            disposition="stopped",
-            reason_code="user_stop_request",
-            message=describe_stop_request(request, completed=True),
-            from_phase=state.phase,
-            iteration=int(state.iteration),
-            source="daemon_stop_control",
-            scheduler_uncertain=any(bool(value) for value in state.pending_jobs.values()),
-            recovery_action="use resume to continue from the recorded phase",
-            details={
-                "request_id": str(request.get("request_id")),
-                "mode": str(request.get("mode")),
-                "target_phase": request.get("target_phase"),
-                "target_iteration": request.get("target_iteration"),
-                "target_replacement_round": request.get("target_replacement_round"),
-            },
+    ) -> Optional[str]:
+        from .stop_control import (
+            complete_stop_request_locked,
+            describe_stop_request,
+            read_stop_request,
+            stop_control_lock,
         )
-        self._persist(state)
-        if str(request.get("status")) == "completed":
-            completed = dict(request)
-        else:
-            completed = complete_stop_request(
+
+        request_id = str(request.get("request_id"))
+        with stop_control_lock(self.campaign_dir):
+            current = read_stop_request(
                 self.campaign_dir,
-                str(request.get("request_id")),
-                reason=str(reason),
-                completion_receipt=completion_receipt,
+                expected_campaign_uid=str(state.campaign_uid),
             )
+            if (
+                current is None
+                or str(current.get("request_id")) != request_id
+            ):
+                return None
+            if str(current.get("status")) == "cancelling":
+                return None
+            request = current
+            self._apply_cancelled_jobs_from_request(state, request)
+            state.shutdown_requested = True
+            state.lifecycle_context = make_lifecycle_context(
+                disposition="stopped",
+                reason_code="user_stop_request",
+                message=describe_stop_request(request, completed=True),
+                from_phase=state.phase,
+                iteration=int(state.iteration),
+                source="daemon_stop_control",
+                scheduler_uncertain=any(
+                    bool(value) for value in state.pending_jobs.values()
+                ),
+                recovery_action="use resume to continue from the recorded phase",
+                details={
+                    "request_id": request_id,
+                    "mode": str(request.get("mode")),
+                    "target_phase": request.get("target_phase"),
+                    "target_iteration": request.get("target_iteration"),
+                    "target_replacement_round": request.get(
+                        "target_replacement_round"
+                    ),
+                },
+            )
+            self._persist(state)
+            if str(request.get("status")) == "completed":
+                completed = dict(request)
+            else:
+                completed = complete_stop_request_locked(
+                    self.campaign_dir,
+                    request_id,
+                    reason=str(reason),
+                    completion_receipt=completion_receipt,
+                )
+                if completed is None:
+                    raise RuntimeError(
+                        "stop request disappeared while its boundary was committed"
+                    )
         self._journal(
             "user_stop_boundary_reached",
-            request_id=str(request.get("request_id")),
+            request_id=request_id,
             mode=str(request.get("mode")),
             phase=state.phase.value,
             iteration=int(state.iteration),
@@ -1108,7 +1135,7 @@ class Daemon:
             from_phase=state.phase.value,
             iteration=int(state.iteration),
             stop_mode=str(request.get("mode")),
-            request_id=str(request.get("request_id")),
+            request_id=request_id,
         )
         return TickStatus.SHUTDOWN
 
@@ -2705,11 +2732,13 @@ class Daemon:
         ):
             if str(terminal_stop.get("status")) == "cancelling":
                 return TickStatus.POLLING
-            return self._latch_stop_request(
+            latched = self._latch_stop_request(
                 state,
                 terminal_stop,
                 reason="scheduler_cancellation_completed",
             )
+            if latched is not None:
+                return latched
 
         self._finish_scheduler_progress(
             phase,
@@ -4659,8 +4688,8 @@ class Daemon:
         before: CampaignState,
         after: CampaignState,
         phase: CampaignPhase,
+        request: Optional[Mapping[str, Any]],
     ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-        request = self._read_stop_control(before)
         if request is None:
             return None, None
         if (
@@ -4735,20 +4764,6 @@ class Daemon:
             phase,
             state_updates,
         )
-        stop_request, stop_reason = self._prepare_stop_control_for_transition(
-            before=before,
-            after=after,
-            phase=phase,
-        )
-        try:
-            after = CampaignState.from_dict(after.to_dict())
-        except Exception as exc:
-            raise ValueError(
-                "prospective campaign state is invalid: "
-                + type(exc).__name__
-                + ": "
-                + str(exc)
-            ) from exc
         if not bool(
             getattr(
                 self.executor,
@@ -4772,52 +4787,103 @@ class Daemon:
                 snapshotted = decision_contract.get("config_sha256")
                 if isinstance(snapshotted, str) and snapshotted:
                     receipt_config_sha = snapshotted
-        receipt_path = write_completion_receipt(
-            self.campaign_dir,
-            campaign_uid=str(before.campaign_uid),
-            phase=phase.value,
-            iteration=int(before.iteration),
-            replacement_round=int(getattr(before, "replacement_round", 0)),
-            config_sha256=receipt_config_sha,
-            state_before=before,
-            state_after=after,
-            next_phase=next_phase.value,
-            next_iteration=int(next_iteration),
-            state_updates=state_updates,
-            evidence=evidence,
-            job_id=job_id or (str(intent.get("job_id")) if intent and intent.get("job_id") else None),
-            expected_tasks=(
-                expected_tasks
-                if expected_tasks is not None
-                else (int(intent["expected_tasks"]) if intent and intent.get("expected_tasks") is not None else None)
-            ),
-            submission_identity=(
-                str(intent.get("submission_identity"))
-                if intent and intent.get("submission_identity")
-                else None
-            ),
+        from .stop_control import (
+            complete_stop_request_locked,
+            read_stop_request,
+            stop_control_lock,
         )
-        after.last_completion_receipt = receipt_reference(self.campaign_dir, receipt_path)
-        self._persist(after)
-        destination.__dict__.clear()
-        destination.__dict__.update(copy.deepcopy(after.__dict__))
-        if stop_request is not None and stop_reason is not None:
-            from .stop_control import complete_stop_request
 
+        stop_request: Optional[Dict[str, Any]] = None
+        stop_reason: Optional[str] = None
+        stop_completion_error: Optional[Exception] = None
+        with stop_control_lock(self.campaign_dir):
+            current_request = read_stop_request(
+                self.campaign_dir,
+                expected_campaign_uid=str(before.campaign_uid),
+            )
+            working_after = CampaignState.from_dict(after.to_dict())
+            stop_request, stop_reason = self._prepare_stop_control_for_transition(
+                before=before,
+                after=working_after,
+                phase=phase,
+                request=current_request,
+            )
             try:
-                complete_stop_request(
-                    self.campaign_dir,
-                    str(stop_request.get("request_id")),
-                    reason=str(stop_reason),
-                    completion_receipt=after.last_completion_receipt,
-                )
+                working_after = CampaignState.from_dict(working_after.to_dict())
             except Exception as exc:
+                raise ValueError(
+                    "prospective campaign state is invalid: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                ) from exc
+            receipt_path = write_completion_receipt(
+                self.campaign_dir,
+                campaign_uid=str(before.campaign_uid),
+                phase=phase.value,
+                iteration=int(before.iteration),
+                replacement_round=int(getattr(before, "replacement_round", 0)),
+                config_sha256=receipt_config_sha,
+                state_before=before,
+                state_after=working_after,
+                next_phase=next_phase.value,
+                next_iteration=int(next_iteration),
+                state_updates=state_updates,
+                evidence=evidence,
+                job_id=job_id or (
+                    str(intent.get("job_id"))
+                    if intent and intent.get("job_id")
+                    else None
+                ),
+                expected_tasks=(
+                    expected_tasks
+                    if expected_tasks is not None
+                    else (
+                        int(intent["expected_tasks"])
+                        if intent and intent.get("expected_tasks") is not None
+                        else None
+                    )
+                ),
+                submission_identity=(
+                    str(intent.get("submission_identity"))
+                    if intent and intent.get("submission_identity")
+                    else None
+                ),
+            )
+            working_after.last_completion_receipt = receipt_reference(
+                self.campaign_dir,
+                receipt_path,
+            )
+            self._persist(working_after)
+            destination.__dict__.clear()
+            destination.__dict__.update(copy.deepcopy(working_after.__dict__))
+            if stop_request is not None and stop_reason is not None:
+                try:
+                    completed = complete_stop_request_locked(
+                        self.campaign_dir,
+                        str(stop_request.get("request_id")),
+                        reason=str(stop_reason),
+                        completion_receipt=working_after.last_completion_receipt,
+                    )
+                    if completed is None:
+                        raise RuntimeError(
+                            "stop request disappeared while its boundary was committed"
+                        )
+                except Exception as exc:
+                    stop_completion_error = exc
+        after = working_after
+        if stop_request is not None and stop_reason is not None:
+            if stop_completion_error is not None:
                 self._journal(
                     "stop_request_completion_deferred",
                     request_id=str(stop_request.get("request_id")),
                     phase=phase.value,
                     iteration=int(before.iteration),
-                    error=type(exc).__name__ + ": " + str(exc)[:180],
+                    error=(
+                        type(stop_completion_error).__name__
+                        + ": "
+                        + str(stop_completion_error)[:180]
+                    ),
                     completion_receipt=dict(after.last_completion_receipt or {}),
                 )
             else:

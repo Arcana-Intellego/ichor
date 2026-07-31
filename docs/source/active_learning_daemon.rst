@@ -655,6 +655,12 @@ honoured by ordinary ``resume``. Withdraw it explicitly only when intended::
 
     ichor-al-daemon resume --campaign-dir . --cancel-stop-request
 
+This command also works while the daemon is running. It atomically withdraws
+only a pending ``--after-phase`` or ``--after-iteration`` request and leaves
+the existing daemon running; it does not start another process or contact the
+scheduler. Immediate stops, scheduler cancellation in progress, and completed
+stops cannot be withdrawn. Use ordinary ``resume`` after a completed stop.
+
 The control file lives at
 ``.DATA/ACTIVE_LEARNING/stop_request.json``. Archived requests are retained
 under ``.DATA/ACTIVE_LEARNING/stop_request_history/`` for user provenance.

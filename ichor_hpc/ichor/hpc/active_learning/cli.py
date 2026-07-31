@@ -576,12 +576,118 @@ def _probe_daemon_lease(
             clock_skew_tolerance_seconds=int(clock_skew_tolerance_seconds),
         )
         status["lease_liveness"] = liveness.disposition
+        status["lease_fresh"] = bool(liveness.fresh)
+        status["lease_stale"] = bool(liveness.stale)
         status["lease_age_seconds"] = liveness.age_seconds
         if liveness.error:
             status["lease_probe_error"] = liveness.error
     except Exception as exc:
         status["lease_probe_error"] = type(exc).__name__ + ": " + str(exc)
     return status
+
+
+def _daemon_control_ownership(
+    state: CampaignState,
+    lock_status: Mapping[str, Any],
+    lease_status: Mapping[str, Any],
+) -> Tuple[str, str]:
+    """Classify whether a live daemon safely owns the control plane."""
+    lock_held = lock_status.get("lock_held")
+    heartbeat = lease_status.get("lease_heartbeat")
+    lease_fresh = lease_status.get("lease_fresh") is True
+    lease_uid = (
+        str(heartbeat.get("campaign_uid") or "")
+        if isinstance(heartbeat, Mapping)
+        else ""
+    )
+    matching_lease = lease_fresh and lease_uid == str(state.campaign_uid)
+    if lock_held is True and matching_lease:
+        return "active", "daemon lock held with a fresh matching lease"
+    if lock_held is False and not lease_fresh:
+        return "inactive", "daemon lock is free and no fresh lease exists"
+    if lock_held is True and not lease_fresh:
+        return (
+            "inconclusive",
+            "daemon lock is held but no fresh authenticated lease is available",
+        )
+    if lock_held is False and lease_fresh:
+        return (
+            "inconclusive",
+            "a fresh daemon lease exists without matching lock ownership",
+        )
+    return (
+        "inconclusive",
+        str(lock_status.get("lock_probe_error") or "daemon lock is inconclusive"),
+    )
+
+
+def _cancel_running_boundary_stop_request(
+    campaign: Path,
+    paths: Mapping[str, Path],
+    state: CampaignState,
+) -> int:
+    from .daemon.stop_control import (
+        StopControlError,
+        cancel_pending_boundary_stop_request,
+        describe_stop_request,
+        read_stop_request,
+    )
+
+    try:
+        request = read_stop_request(
+            campaign,
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        if request is None:
+            print(
+                "no pending boundary stop request is active; the daemon "
+                "remains running"
+            )
+            return 0
+        expected_request_id = str(request.get("request_id"))
+        cancelled, archive_path, changed = (
+            cancel_pending_boundary_stop_request(
+                campaign,
+                expected_campaign_uid=str(state.campaign_uid),
+                expected_request_id=expected_request_id,
+            )
+        )
+    except (OSError, StopControlError) as exc:
+        print("stop request was not cancelled: " + str(exc), file=sys.stderr)
+        return 7
+    if cancelled is None:
+        print("stop request was not cancelled because it no longer exists")
+        return 0
+    try:
+        journal_state = read_state(paths["state"])
+    except Exception:
+        journal_state = state
+    if changed:
+        try:
+            from .daemon.journal import append_event
+
+            append_event(
+                paths["journal"],
+                "user_stop_request_cancelled",
+                phase=journal_state.phase.value,
+                iteration=int(journal_state.iteration),
+                request_id=str(cancelled.get("request_id")),
+                mode=str(cancelled.get("mode")),
+                target_phase=cancelled.get("target_phase"),
+                target_iteration=cancelled.get("target_iteration"),
+                target_replacement_round=cancelled.get(
+                    "target_replacement_round"
+                ),
+                daemon_was_running=True,
+                archive_path=(
+                    None if archive_path is None else str(archive_path)
+                ),
+            )
+        except Exception:
+            pass
+    print("cancelled: " + describe_stop_request(cancelled))
+    print("the existing daemon remains running; no campaign work was restarted")
+    return 0
 
 
 def _pid_is_alive(pid: Any) -> bool:
@@ -3558,6 +3664,20 @@ def _status_next_rows(
     reason = _status_plain_reason(payload, code)
     if reason and not no_action:
         rows.append(("because", reason))
+    if (
+        daemon_active
+        and isinstance(stop_request, Mapping)
+        and str(stop_request.get("status") or "") == "requested"
+        and str(stop_request.get("mode") or "")
+        in {"after_phase", "after_iteration"}
+    ):
+        rows.append(
+            (
+                "cancel stop request",
+                _campaign_command(campaign, "resume")
+                + " --cancel-stop-request",
+            )
+        )
     rows.append((command_label, command))
     return rows
 
@@ -8743,18 +8863,38 @@ def cmd_resume(args: argparse.Namespace) -> int:
             print("state.json invalid: " + str(exc), file=sys.stderr)
             return 5
         lock_status = _probe_daemon_lock(paths["lock"])
-        if lock_status.get("lock_held") is not False:
-            print(
-                "cannot resume while daemon lock ownership is active or inconclusive",
-                file=sys.stderr,
-            )
-            return 7
         stale_seconds, skew_seconds = _runtime_liveness_policy(campaign)
         lease_status = _probe_daemon_lease(
             paths["lease"],
             stale_seconds=stale_seconds,
             clock_skew_tolerance_seconds=skew_seconds,
         )
+        if bool(getattr(args, "cancel_stop_request", False)):
+            ownership, ownership_reason = _daemon_control_ownership(
+                state,
+                lock_status,
+                lease_status,
+            )
+            if ownership == "active":
+                return _cancel_running_boundary_stop_request(
+                    campaign,
+                    paths,
+                    state,
+                )
+            if ownership == "inconclusive":
+                print(
+                    "cannot safely cancel the stop request while daemon "
+                    "ownership is inconclusive: "
+                    + ownership_reason,
+                    file=sys.stderr,
+                )
+                return 7
+        if lock_status.get("lock_held") is not False:
+            print(
+                "cannot resume while daemon lock ownership is active or inconclusive",
+                file=sys.stderr,
+            )
+            return 7
         if lease_status.get("lease_fresh") is True:
             print(
                 "cannot resume while a fresh daemon lease exists",
@@ -18071,8 +18211,9 @@ Examples:
         "--cancel-stop-request",
         action="store_true",
         help=(
-            "Archive and cancel an unfinished boundary stop request before "
-            "resuming. A completed user stop is cleared by ordinary resume."
+            "Withdraw an unfinished after-phase or after-iteration stop "
+            "request. If the daemon is already running, it remains running; "
+            "a completed user stop is cleared by ordinary resume."
         ),
     )
     add_background_options(p_resume)

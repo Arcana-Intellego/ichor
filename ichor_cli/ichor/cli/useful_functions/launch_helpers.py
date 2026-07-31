@@ -70,6 +70,7 @@ class DetachedLaunchResult:
     acknowledged: bool = False
     startup_pending: bool = False
     startup_state: Optional[str] = None
+    control_completed: bool = False
 
 
 def build_daemon_argv(
@@ -270,6 +271,26 @@ def launch_daemon_detached_checked(
     startup_payload = read_background_startup(startup_path)
     startup_state = str(startup_payload.get("state") or "") or None
     ready = bool(startup_payload.get("ready_at_iso")) or startup_state == "ready"
+    control_completed = bool(
+        command == "resume"
+        and cancel_stop_request
+        and returncode == 0
+        and not acknowledged
+    )
+    if control_completed:
+        update_background_startup(
+            startup_path,
+            launch_id,
+            state="stopped",
+            stage="control_completed",
+            exit_code=0,
+        )
+        startup_state = "stopped"
+        acknowledged = True
+        try:
+            pid_path.unlink()
+        except FileNotFoundError:
+            pass
     readiness_error = None
     if startup_state == "failed":
         readiness_error = str(
@@ -310,6 +331,7 @@ def launch_daemon_detached_checked(
             returncode is None and not acknowledged and startup_state != "failed"
         ),
         startup_state=startup_state,
+        control_completed=control_completed,
     )
 
 

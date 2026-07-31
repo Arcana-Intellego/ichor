@@ -18,6 +18,7 @@ from ichor.hpc.active_learning.daemon.stop_control import (
     STOP_REQUEST_SCHEMA_VERSION,
     StopControlError,
     build_stop_request,
+    cancel_pending_boundary_stop_request,
     complete_stop_request,
     describe_stop_request,
     install_stop_request,
@@ -130,6 +131,68 @@ def test_stop_request_is_idempotent_and_immediate_supersedes_drain(tmp_path):
     assert (stop_request_history_dir(daemon.campaign_dir) / (created["request_id"] + ".json")).is_file()
 
 
+@pytest.mark.parametrize("mode", ["after_phase", "after_iteration"])
+def test_pending_boundary_stop_can_be_cancelled_idempotently(tmp_path, mode):
+    daemon = _daemon(tmp_path)
+    state = fresh_campaign_state(max_iterations=3)
+    state.phase = CampaignPhase.AIMALL
+    state.iteration = 2
+    request, _ = install_stop_request(
+        daemon.campaign_dir,
+        build_stop_request(state, mode=mode, phase_started=True),
+    )
+
+    cancelled, history, changed = cancel_pending_boundary_stop_request(
+        daemon.campaign_dir,
+        expected_campaign_uid=state.campaign_uid,
+        expected_request_id=request["request_id"],
+    )
+
+    assert changed is True
+    assert cancelled is not None
+    assert cancelled["request_id"] == request["request_id"]
+    assert history is not None and history.is_file()
+    assert not stop_request_path(daemon.campaign_dir).exists()
+    assert json.loads(history.read_text())["archived_status"] == "cancelled"
+
+    repeated, repeated_history, repeated_changed = (
+        cancel_pending_boundary_stop_request(
+            daemon.campaign_dir,
+            expected_campaign_uid=state.campaign_uid,
+            expected_request_id=request["request_id"],
+        )
+    )
+    assert repeated_changed is False
+    assert repeated is not None
+    assert repeated["request_id"] == request["request_id"]
+    assert repeated_history == history
+
+
+@pytest.mark.parametrize("completed", [False, True])
+def test_immediate_stop_cannot_be_cancelled(tmp_path, completed):
+    daemon = _daemon(tmp_path)
+    state = fresh_campaign_state(max_iterations=3)
+    request, _ = install_stop_request(
+        daemon.campaign_dir,
+        build_stop_request(state, mode="immediate"),
+    )
+    if completed:
+        complete_stop_request(
+            daemon.campaign_dir,
+            request["request_id"],
+            reason="immediate",
+        )
+
+    with pytest.raises(StopControlError):
+        cancel_pending_boundary_stop_request(
+            daemon.campaign_dir,
+            expected_campaign_uid=state.campaign_uid,
+            expected_request_id=request["request_id"],
+        )
+
+    assert stop_request_path(daemon.campaign_dir).is_file()
+
+
 def test_malformed_stop_request_fails_closed(tmp_path):
     daemon = _daemon(tmp_path)
     path = stop_request_path(daemon.campaign_dir)
@@ -175,6 +238,39 @@ def test_immediate_stop_is_latched_by_daemon_not_cli(tmp_path):
     assert control["request_id"] == request["request_id"]
     assert control["status"] == "completed"
     assert control["completion_reason"] == "immediate"
+
+
+def test_cancelled_boundary_request_cannot_latch_from_stale_daemon_copy(tmp_path):
+    daemon = _daemon(tmp_path)
+    state = fresh_campaign_state(max_iterations=3)
+    state.phase = CampaignPhase.AIMALL
+    state.iteration = 2
+    write_state(daemon.state_path(), state)
+    request, _ = install_stop_request(
+        daemon.campaign_dir,
+        build_stop_request(
+            state,
+            mode="after_iteration",
+            phase_started=True,
+        ),
+    )
+    cancel_pending_boundary_stop_request(
+        daemon.campaign_dir,
+        expected_campaign_uid=state.campaign_uid,
+        expected_request_id=request["request_id"],
+    )
+
+    assert (
+        daemon._latch_stop_request(
+            state,
+            request,
+            reason="active_iteration_completed",
+        )
+        is None
+    )
+    persisted = read_state(daemon.state_path())
+    assert persisted.shutdown_requested is False
+    assert persisted.lifecycle_context is None
 
 
 def test_after_phase_stops_before_an_unstarted_phase(tmp_path):
@@ -233,6 +329,38 @@ def test_after_phase_finishes_started_phase_and_binds_completion_receipt(tmp_pat
     assert boundary["target_phase"] == CampaignPhase.PHASE_A_DIVERSITY.value
     assert boundary["target_iteration"] == 0
     assert boundary["target_replacement_round"] == 0
+
+    with pytest.raises(StopControlError, match="unfinished boundary"):
+        cancel_pending_boundary_stop_request(
+            daemon.campaign_dir,
+            expected_campaign_uid=state.campaign_uid,
+            expected_request_id=control["request_id"],
+        )
+
+
+def test_cancelled_after_phase_request_does_not_stop_completed_phase(tmp_path):
+    daemon = _daemon(tmp_path)
+    state = fresh_campaign_state(max_iterations=3)
+    state.phase = CampaignPhase.PHASE_A_DIVERSITY
+    state.pending_jobs[CampaignPhase.PHASE_A_DIVERSITY.value] = "101"
+    write_state(daemon.state_path(), state)
+    request, _ = install_stop_request(
+        daemon.campaign_dir,
+        build_stop_request(state, mode="after_phase", phase_started=True),
+    )
+    cancel_pending_boundary_stop_request(
+        daemon.campaign_dir,
+        expected_campaign_uid=state.campaign_uid,
+        expected_request_id=request["request_id"],
+    )
+
+    assert daemon.tick() == TickStatus.ADVANCED
+
+    advanced = read_state(daemon.state_path())
+    assert advanced.phase is not CampaignPhase.PHASE_A_DIVERSITY
+    assert advanced.shutdown_requested is False
+    assert advanced.lifecycle_context is None
+    assert read_stop_request(daemon.campaign_dir) is None
 
 
 def test_historical_same_phase_receipt_does_not_satisfy_new_drain(tmp_path):

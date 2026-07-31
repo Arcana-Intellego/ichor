@@ -3044,6 +3044,186 @@ def test_cli_resume_retains_pending_iteration_stop_during_aimall_recovery(
     assert "active stop request retained" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("mode", ["after_phase", "after_iteration"])
+def test_cli_resume_cancels_boundary_stop_while_daemon_is_running(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    mode,
+):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=40)
+    state.phase = CampaignPhase.AIMALL
+    state.iteration = 14
+    _write_locked_state(campaign, state)
+    request, _ = install_stop_request(
+        campaign,
+        build_stop_request(state, mode=mode, phase_started=True),
+    )
+    state_path = campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+    state_before = state_path.read_bytes()
+    monkeypatch.setattr(
+        cli_mod,
+        "_probe_daemon_lock",
+        lambda _path: {"lock_held": True},
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_probe_daemon_lease",
+        lambda _path, **_kwargs: {
+            "lease_fresh": True,
+            "lease_heartbeat": {"campaign_uid": state.campaign_uid},
+        },
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "cmd_start",
+        lambda _args: pytest.fail("live cancellation must not start a daemon"),
+    )
+
+    rc = main(
+        [
+            "resume",
+            "--campaign-dir",
+            str(campaign),
+            "--cancel-stop-request",
+        ]
+    )
+
+    assert rc == 0
+    assert state_path.read_bytes() == state_before
+    assert not stop_request_path(campaign).exists()
+    history = stop_request_history_dir(campaign) / (
+        request["request_id"] + ".json"
+    )
+    assert json.loads(history.read_text())["archived_status"] == "cancelled"
+    events = list(iter_events(campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson"))
+    cancelled = [
+        event
+        for event in events
+        if event.get("event") == "user_stop_request_cancelled"
+    ]
+    assert len(cancelled) == 1
+    assert cancelled[0]["daemon_was_running"] is True
+    output = capsys.readouterr().out
+    assert "the existing daemon remains running" in output
+
+
+def test_cli_live_stop_cancellation_rejects_immediate_request(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=3)
+    _write_locked_state(campaign, state)
+    request, _ = install_stop_request(
+        campaign,
+        build_stop_request(state, mode="immediate"),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_probe_daemon_lock",
+        lambda _path: {"lock_held": True},
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_probe_daemon_lease",
+        lambda _path, **_kwargs: {
+            "lease_fresh": True,
+            "lease_heartbeat": {"campaign_uid": state.campaign_uid},
+        },
+    )
+
+    rc = main(
+        [
+            "resume",
+            "--campaign-dir",
+            str(campaign),
+            "--cancel-stop-request",
+        ]
+    )
+
+    assert rc == 7
+    assert read_stop_request(campaign)["request_id"] == request["request_id"]
+    assert "immediate stop requests cannot be cancelled" in capsys.readouterr().err
+
+
+def test_cli_live_stop_cancellation_is_idempotent_without_request(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=3)
+    _write_locked_state(campaign, state)
+    monkeypatch.setattr(
+        cli_mod,
+        "_probe_daemon_lock",
+        lambda _path: {"lock_held": True},
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_probe_daemon_lease",
+        lambda _path, **_kwargs: {
+            "lease_fresh": True,
+            "lease_heartbeat": {"campaign_uid": state.campaign_uid},
+        },
+    )
+
+    rc = main(
+        [
+            "resume",
+            "--campaign-dir",
+            str(campaign),
+            "--cancel-stop-request",
+        ]
+    )
+
+    assert rc == 0
+    assert "no pending boundary stop request" in capsys.readouterr().out
+
+
+def test_cli_live_stop_cancellation_requires_matching_lock_and_lease(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=3)
+    _write_locked_state(campaign, state)
+    request, _ = install_stop_request(
+        campaign,
+        build_stop_request(state, mode="after_iteration"),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_probe_daemon_lock",
+        lambda _path: {"lock_held": True},
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_probe_daemon_lease",
+        lambda _path, **_kwargs: {
+            "lease_fresh": False,
+            "lease_heartbeat": None,
+        },
+    )
+
+    rc = main(
+        [
+            "resume",
+            "--campaign-dir",
+            str(campaign),
+            "--cancel-stop-request",
+        ]
+    )
+
+    assert rc == 7
+    assert read_stop_request(campaign)["request_id"] == request["request_id"]
+    assert "ownership is inconclusive" in capsys.readouterr().err
+
+
 def test_cli_status_reports_pending_stop_request(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
     data = campaign / DEFAULT_DATA_SUBDIR
@@ -3070,6 +3250,53 @@ def test_cli_status_reports_pending_stop_request(tmp_path, capsys):
     assert "after_iteration" not in out
     assert "request_id" not in out
     assert "SEED_SELECT@" not in out
+
+
+def test_cli_status_offers_live_boundary_stop_cancellation(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=2)
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 1
+    _write_locked_state(campaign, state)
+    install_stop_request(
+        campaign,
+        build_stop_request(state, mode="after_iteration"),
+    )
+    heartbeat = {
+        "schema_version": 2,
+        "owner_token": "a" * 32,
+        "time": cli_mod.time.time(),
+        "pid": 12345,
+        "host": "test-host",
+        "phase": state.phase.value,
+        "iteration": state.iteration,
+        "campaign_uid": state.campaign_uid,
+    }
+    monkeypatch.setattr(
+        cli_mod,
+        "_probe_daemon_lock",
+        lambda _path: {"lock_held": True},
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_probe_daemon_lease",
+        lambda _path, **_kwargs: {
+            "lease_heartbeat": heartbeat,
+            "lease_fresh": True,
+            "lease_stale": False,
+        },
+    )
+
+    assert main(["status", "--campaign-dir", str(campaign)]) == 0
+    output = capsys.readouterr().out
+
+    assert "cancel stop request:" in output
+    assert "resume --campaign-dir" in output
+    assert "--cancel-stop-request" in output
 
 
 def test_reconcile_stop_guard_preserves_pending_boundary_bytes(tmp_path):

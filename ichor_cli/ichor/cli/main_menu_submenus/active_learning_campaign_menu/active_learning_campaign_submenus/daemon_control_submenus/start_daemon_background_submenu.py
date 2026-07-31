@@ -243,7 +243,12 @@ class StartDaemonBackgroundFunctions:
             print("Failed to launch detached daemon: " + str(exc))
             user_input_free_flow("Press enter to return to the menu: ", "")
             return
-        if result.exited_during_startup:
+        if getattr(result, "control_completed", False):
+            print(
+                "Pending boundary stop request cancelled; the existing daemon "
+                "remains running."
+            )
+        elif result.exited_during_startup:
             print(
                 "Detached daemon exited during startup with code "
                 + str(result.returncode)
@@ -269,10 +274,16 @@ class StartDaemonBackgroundFunctions:
             + quoted_campaign
             + " --last-n 40"
         )
-        _log_info(
-            "Background daemon launched for campaign " + str(campaign_dir)
-            + " with PID " + str(result.pid)
-        )
+        if getattr(result, "control_completed", False):
+            _log_info(
+                "Pending boundary stop cancellation completed for campaign "
+                + str(campaign_dir)
+            )
+        else:
+            _log_info(
+                "Background daemon launched for campaign " + str(campaign_dir)
+                + " with PID " + str(result.pid)
+            )
         user_input_free_flow("Press enter to return to the menu: ", "")
 
 
@@ -345,7 +356,7 @@ START_DAEMON_BACKGROUND_FIELD_SPECS = [
     spec(
         "cancel_stop_request",
         "bool",
-        prompt="Withdraw a pending stop request before resume? ",
+        prompt="Withdraw a pending boundary stop request? ",
         item_text="Set pending stop-request cancellation",
         display_path="cancel_stop_request",
     ),

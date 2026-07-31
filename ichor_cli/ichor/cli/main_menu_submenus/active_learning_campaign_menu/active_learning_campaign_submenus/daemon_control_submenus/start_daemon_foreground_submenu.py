@@ -275,7 +275,7 @@ START_DAEMON_FOREGROUND_FIELD_SPECS = [
     spec(
         "cancel_stop_request",
         "bool",
-        prompt="Withdraw a pending stop request before resume? ",
+        prompt="Withdraw a pending boundary stop request? ",
         item_text="Set pending stop-request cancellation",
         display_path="cancel_stop_request",
     ),

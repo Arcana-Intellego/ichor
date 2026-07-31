@@ -1907,6 +1907,39 @@ def test_detached_launch_timeout_keeps_child_and_publishes_tracking_pid(
     assert result.pid_path.read_text(encoding="utf-8") == "3141\n"
 
 
+def test_detached_resume_boundary_cancellation_is_control_completion(
+    tmp_path,
+    monkeypatch,
+):
+    import ichor.cli.useful_functions.launch_helpers as helpers
+
+    class Child:
+        pid = 2719
+
+        @staticmethod
+        def poll():
+            return 0
+
+    monkeypatch.setattr(
+        helpers,
+        "_popen_detached",
+        lambda argv, log_path, *, env: Child(),
+    )
+
+    result = helpers.launch_daemon_detached_checked(
+        tmp_path,
+        command="resume",
+        mode="live",
+        cancel_stop_request=True,
+        startup_timeout_seconds=1.0,
+    )
+
+    assert result.control_completed is True
+    assert result.exited_during_startup is False
+    assert result.startup_state == "stopped"
+    assert not result.pid_path.exists()
+
+
 def test_launch_helpers_builds_resume_argv_with_config(tmp_path):
     from ichor.cli.useful_functions.launch_helpers import build_daemon_argv
 

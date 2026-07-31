@@ -873,26 +873,39 @@ def update_stop_request(
     **updates: Any,
 ) -> Optional[Dict[str, Any]]:
     with stop_control_lock(campaign_dir):
-        current = read_stop_request(campaign_dir)
-        if current is None or str(current.get("request_id")) != str(request_id):
-            return None
-        updated = dict(current)
-        updated.update(updates)
-        new_status = str(updated.get("status"))
-        old_status = str(current.get("status"))
-        if new_status not in _STATUS_TRANSITIONS.get(old_status, frozenset()):
-            raise StopControlError(
-                "illegal stop-request transition: "
-                + old_status
-                + " -> "
-                + new_status
-            )
-        validated = validate_stop_request(
-            updated,
-            expected_campaign_uid=str(current["campaign_uid"]),
+        return _update_stop_request_locked(
+            campaign_dir,
+            request_id,
+            **updates,
         )
-        atomic_write_json(stop_request_path(campaign_dir), validated)
-        return validated
+
+
+def _update_stop_request_locked(
+    campaign_dir: Union[str, Path],
+    request_id: str,
+    **updates: Any,
+) -> Optional[Dict[str, Any]]:
+    """Update one request while the caller holds ``stop_control_lock``."""
+    current = read_stop_request(campaign_dir)
+    if current is None or str(current.get("request_id")) != str(request_id):
+        return None
+    updated = dict(current)
+    updated.update(updates)
+    new_status = str(updated.get("status"))
+    old_status = str(current.get("status"))
+    if new_status not in _STATUS_TRANSITIONS.get(old_status, frozenset()):
+        raise StopControlError(
+            "illegal stop-request transition: "
+            + old_status
+            + " -> "
+            + new_status
+        )
+    validated = validate_stop_request(
+        updated,
+        expected_campaign_uid=str(current["campaign_uid"]),
+    )
+    atomic_write_json(stop_request_path(campaign_dir), validated)
+    return validated
 
 
 def complete_stop_request(
@@ -902,7 +915,29 @@ def complete_stop_request(
     reason: str,
     completion_receipt: Optional[Mapping[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    return update_stop_request(
+    with stop_control_lock(campaign_dir):
+        return complete_stop_request_locked(
+            campaign_dir,
+            request_id,
+            reason=reason,
+            completion_receipt=completion_receipt,
+        )
+
+
+def complete_stop_request_locked(
+    campaign_dir: Union[str, Path],
+    request_id: str,
+    *,
+    reason: str,
+    completion_receipt: Optional[Mapping[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Complete one request while the caller holds ``stop_control_lock``."""
+    current = read_stop_request(campaign_dir)
+    if current is None or str(current.get("request_id")) != str(request_id):
+        return None
+    if str(current.get("status")) == "completed":
+        return current
+    return _update_stop_request_locked(
         campaign_dir,
         request_id,
         status="completed",
@@ -954,6 +989,121 @@ def archive_and_clear_stop_request(
         return target
 
 
+def _read_cancelled_boundary_history(
+    campaign_dir: Union[str, Path],
+    request_id: str,
+    *,
+    expected_campaign_uid: str,
+) -> Optional[Tuple[Dict[str, Any], Path]]:
+    target = stop_request_history_dir(campaign_dir) / (str(request_id) + ".json")
+    if not target.exists():
+        return None
+    if target.is_symlink() or not target.is_file():
+        raise StopControlError(
+            "stop-request history entry is not a regular file: " + str(target)
+        )
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise StopControlError(
+            "stop-request history entry is unreadable: " + str(target)
+        ) from exc
+    if not isinstance(payload, Mapping):
+        raise StopControlError("stop-request history entry must be a JSON object")
+    if str(payload.get("archived_status") or "") != "cancelled":
+        raise StopControlError(
+            "stop-request history entry does not record cancellation"
+        )
+    _validate_timestamp(
+        payload.get("archived_at_iso"),
+        "stop-request history archived_at_iso",
+    )
+    request = validate_stop_request(
+        payload,
+        expected_campaign_uid=str(expected_campaign_uid),
+    )
+    if str(request.get("request_id")) != str(request_id):
+        raise StopControlError("stop-request history identity mismatch")
+    return request, target
+
+
+def cancel_pending_boundary_stop_request(
+    campaign_dir: Union[str, Path],
+    *,
+    expected_campaign_uid: str,
+    expected_request_id: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Path], bool]:
+    """Atomically withdraw one pending after-phase/iteration request.
+
+    Returns ``(request, history_path, changed)``.  A matching cancelled
+    history record makes an interrupted or repeated call idempotent.
+    """
+    with stop_control_lock(campaign_dir):
+        current = read_stop_request(
+            campaign_dir,
+            expected_campaign_uid=str(expected_campaign_uid),
+        )
+        if current is None:
+            if expected_request_id is None:
+                return None, None, False
+            prior = _read_cancelled_boundary_history(
+                campaign_dir,
+                str(expected_request_id),
+                expected_campaign_uid=str(expected_campaign_uid),
+            )
+            if prior is None:
+                return None, None, False
+            request, target = prior
+            return request, target, False
+        request_id = str(current.get("request_id"))
+        if (
+            expected_request_id is not None
+            and request_id != str(expected_request_id)
+        ):
+            raise StopControlError(
+                "stop request changed before it could be cancelled"
+            )
+        if str(current.get("status")) != "requested":
+            raise StopControlError(
+                "only an unfinished boundary stop request can be cancelled"
+            )
+        if str(current.get("mode")) not in {"after_phase", "after_iteration"}:
+            raise StopControlError(
+                "immediate stop requests cannot be cancelled"
+            )
+        history = stop_request_history_dir(campaign_dir)
+        if history.is_symlink():
+            raise StopControlError("stop-request history path is a symlink")
+        history.mkdir(parents=True, exist_ok=True)
+        target = history / (request_id + ".json")
+        if target.exists():
+            prior = _read_cancelled_boundary_history(
+                campaign_dir,
+                request_id,
+                expected_campaign_uid=str(expected_campaign_uid),
+            )
+            if prior is None:
+                raise StopControlError(
+                    "stop-request history changed during cancellation"
+                )
+            prior_request, target = prior
+            if any(
+                prior_request.get(key) != value
+                for key, value in current.items()
+            ):
+                raise StopControlError(
+                    "stop-request history conflicts with the active request"
+                )
+        else:
+            target = _archive_locked(
+                campaign_dir,
+                current,
+                status="cancelled",
+            )
+        stop_request_path(campaign_dir).unlink()
+        return dict(current), target, True
+
+
 def stop_request_summary(request: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
     if request is None:
         return None
@@ -987,7 +1137,9 @@ __all__ = [
     "archive_and_clear_stop_request",
     "archive_resume_transaction",
     "build_stop_request",
+    "cancel_pending_boundary_stop_request",
     "complete_stop_request",
+    "complete_stop_request_locked",
     "describe_stop_request",
     "install_stop_request",
     "matching_stop_boundary_receipt",
