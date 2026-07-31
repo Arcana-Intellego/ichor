@@ -2410,6 +2410,20 @@ def _status_progress_rows(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
         and not _status_active_job_count(payload)
         and not scheduler_intents
     ):
+        if scheduler_assessment.recovery_state == "legacy_unverified":
+            return [
+                ("reusable outputs", "none from legacy recovery evidence"),
+                (
+                    "retry work",
+                    str(scheduler_assessment.retry_tasks)
+                    + " task"
+                    + (
+                        ""
+                        if scheduler_assessment.retry_tasks == 1
+                        else "s"
+                    ),
+                ),
+            ]
         if scheduler_assessment.recovery_state == "validated":
             return [
                 (
@@ -2766,6 +2780,16 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
             return (
                 "The interrupted diversity publication was incomplete; its "
                 "single scheduler job is ready to be rerun."
+            )
+        if scheduler_assessment.recovery_state == "legacy_unverified":
+            retry = scheduler_assessment.retry_tasks
+            return (
+                "Older scheduler recovery evidence cannot safely authorise "
+                "output reuse; "
+                + str(retry)
+                + " affected task"
+                + ("" if retry == 1 else "s")
+                + " will be retried."
             )
         if scheduler_assessment.recovery_state == "validated":
             reusable = scheduler_assessment.reusable_outputs
@@ -3408,6 +3432,15 @@ def _status_phase_outcome(payload: Dict[str, Any]) -> str:
             )
         retry = int(scheduler_recovery.get("n_retry") or 0)
         reusable = int(scheduler_recovery.get("n_reusable") or 0)
+        if scheduler_recovery.get("state") == "legacy_unverified":
+            return (
+                "the daemon will retry "
+                + str(retry)
+                + " task"
+                + ("" if retry == 1 else "s")
+                + " because older recovery evidence cannot safely authorise "
+                "scientific output reuse"
+            )
         if scheduler_recovery.get("state") == "validated":
             return (
                 "the daemon will retain "
@@ -5462,10 +5495,17 @@ def cmd_start(args: argparse.Namespace) -> int:
             config.runtime.scheduler_command_timeout_seconds
         )
 
-        def _live_scheduler_poller(job_id):
+        def _live_scheduler_poller(
+            job_id,
+            *,
+            expected_job_name=None,
+            expected_owner=None,
+        ):
             return scheduler_backend.poll_job(
                 job_id,
                 timeout_seconds=scheduler_timeout,
+                expected_job_name=expected_job_name,
+                expected_owner=expected_owner,
             )
 
         sacct_poller = _live_scheduler_poller
@@ -5635,6 +5675,8 @@ def _lookup_active_slurm_job_for_cancel(
 ) -> Dict[str, Any]:
     cmd = [
         "squeue",
+        "--user",
+        current_scheduler_user(),
         "-j",
         str(job_id),
         "--noheader",
@@ -5752,6 +5794,12 @@ def _confirm_cancelled_slurm_job(
 
     deadline = time.monotonic() + float(confirmation_timeout_seconds)
     last_reason = "scheduler has not confirmed cancellation"
+    expected_job_name = (
+        str(intent.get("expected_job_name") or "")
+        if isinstance(intent, Mapping)
+        else ""
+    )
+    expected_owner = current_scheduler_user() if expected_job_name else None
     while True:
         observations: Sequence[Any] = ()
         summary = None
@@ -5759,6 +5807,8 @@ def _confirm_cancelled_slurm_job(
             observations = poll_job(
                 job_id,
                 timeout_seconds=int(command_timeout_seconds),
+                expected_job_name=(expected_job_name or None),
+                expected_owner=expected_owner,
             )
             summary = aggregate_states(
                 job_id,
@@ -5782,6 +5832,16 @@ def _confirm_cancelled_slurm_job(
                 lookup.get("error") or "unknown error"
             )
         elif lookup.get("active"):
+            rows = list(lookup.get("rows") or [])
+            if expected_job_name and not _job_name_matches_expected(
+                rows,
+                [expected_job_name],
+            ):
+                return False, "scheduler identity changed during cancellation"
+            if expected_owner and any(
+                str(row.get("owner") or "") != expected_owner for row in rows
+            ):
+                return False, "scheduler owner changed during cancellation"
             last_reason = "job remains active or completing in squeue"
         elif summary is not None and summary.is_terminal and not summary.n_missing:
             if campaign_dir is not None and intent is not None:
@@ -5815,10 +5875,15 @@ def _confirm_cancelled_slurm_job(
 
 def _job_name_matches_expected(rows: Sequence[Dict[str, Any]], expected_names: Sequence[str]) -> bool:
     expected = {str(name) for name in expected_names if str(name)}
-    if not expected:
-        return True
+    if not expected or not rows:
+        return False
     actual = {str(row.get("job_name") or "") for row in rows}
-    return bool(actual.intersection(expected))
+    return (
+        bool(actual)
+        and "" not in actual
+        and len(actual) == 1
+        and actual.issubset(expected)
+    )
 
 
 def _collect_stop_cancel_jobs(campaign: Path, state: Any) -> Dict[str, Dict[str, Any]]:
@@ -6002,6 +6067,8 @@ def _record_inactive_scheduler_terminal_evidence(
         job_id,
         timeout_seconds=int(timeout_seconds),
         cancellation_requested=True,
+        expected_job_name=expected_name,
+        expected_owner=current_scheduler_user(),
     )
     classification = classify_terminal_scheduler_evidence(
         campaign,
@@ -6080,6 +6147,16 @@ def _confirm_cancelled_scheduler_job(
                 job_id,
                 timeout_seconds=int(command_timeout_seconds),
                 cancellation_requested=True,
+                expected_job_name=(
+                    str(intent.get("expected_job_name") or "")
+                    if isinstance(intent, Mapping)
+                    else None
+                ),
+                expected_owner=(
+                    current_scheduler_user()
+                    if isinstance(intent, Mapping)
+                    else None
+                ),
             )
             summary = aggregate_states(
                 job_id,
@@ -6609,7 +6686,7 @@ def _cancel_recorded_scheduler_jobs(
         missing_owner = any(
             not str(row.get("owner") or "") for row in rows
         )
-        if missing_owner and scheduler_kind != "slurm":
+        if missing_owner:
             failed.append(
                 {
                     "job_id": job_id,
@@ -6688,16 +6765,19 @@ def _cancel_recorded_scheduler_jobs(
             for record in item.get("intents", [])
             if str(record.get("job_id") or "") == str(job_id)
         ]
-        if len(intent_records) > 1:
+        if len(intent_records) != 1:
             failed.append(
                 {
                     "job_id": job_id,
                     "scheduler_identity_kind": scheduler_kind,
-                    "reason": "multiple submission intents claim the same scheduler job",
+                    "reason": (
+                        "scheduler cancellation requires exactly one "
+                        "submission intent for the job"
+                    ),
                 }
             )
             continue
-        producer_intent = intent_records[0] if intent_records else None
+        producer_intent = intent_records[0]
         ok, message = _run_scheduler_cancel(
             job_id,
             scheduler_kind=scheduler_kind,
@@ -7893,6 +7973,8 @@ def _load_scheduler_recovery_status(
     """Read bounded cancellation recovery evidence for human status output."""
     from .daemon.phase_executor import SBATCH_PHASES
     from .daemon.scheduler_recovery import (
+        PHASE_RECOVERY_LEDGER_SCHEMA_VERSION,
+        SCHEDULER_TERMINAL_RECEIPT_SCHEMA_VERSION,
         phase_recovery_ledger_path,
         read_phase_recovery_ledger,
         scheduler_terminal_recoveries,
@@ -7911,9 +7993,14 @@ def _load_scheduler_recovery_status(
         if not recoveries:
             return None
         latest_by_task: Dict[int, Mapping[str, Any]] = {}
+        latest_receipt_schema_by_task: Dict[int, int] = {}
         for recovery in recoveries:
             for outcome in recovery["receipt"].get("outcomes", []):
-                latest_by_task[int(outcome["logical_task_id"])] = outcome
+                logical_task_id = int(outcome["logical_task_id"])
+                latest_by_task[logical_task_id] = outcome
+                latest_receipt_schema_by_task[logical_task_id] = int(
+                    recovery["receipt"].get("schema_version") or 0
+                )
         scheduler_completed = sum(
             1
             for outcome in latest_by_task.values()
@@ -7921,6 +8008,16 @@ def _load_scheduler_recovery_status(
             and outcome.get("exit_code") == [0, 0]
         )
         scheduler_retry = len(latest_by_task) - scheduler_completed
+        legacy_retry_tasks = sum(
+            1
+            for task_id, outcome in latest_by_task.items()
+            if latest_receipt_schema_by_task.get(task_id)
+            != SCHEDULER_TERMINAL_RECEIPT_SCHEMA_VERSION
+            or not (
+                str(outcome.get("status") or "") == "COMPLETED"
+                and outcome.get("exit_code") == [0, 0]
+            )
+        )
         receipt_digests = {
             str(recovery["receipt"]["receipt_sha256"])
             for recovery in recoveries
@@ -7946,6 +8043,18 @@ def _load_scheduler_recovery_status(
             replacement_round=int(state.replacement_round),
         )
         if not ledger_path.exists() and not ledger_path.is_symlink():
+            if any(
+                schema != SCHEDULER_TERMINAL_RECEIPT_SCHEMA_VERSION
+                for schema in latest_receipt_schema_by_task.values()
+            ):
+                status.update(
+                    {
+                        "state": "legacy_unverified",
+                        "n_reusable": 0,
+                        "n_retry": int(legacy_retry_tasks),
+                        "reason": "legacy_scheduler_identity_unproven",
+                    }
+                )
             return status
         ledger = read_phase_recovery_ledger(ledger_path)
         identity = (
@@ -7968,6 +8077,19 @@ def _load_scheduler_recovery_status(
             if isinstance(record, Mapping)
         }
         if ledger_receipts != receipt_digests:
+            return status
+        if (
+            int(ledger.get("schema_version") or 0)
+            != PHASE_RECOVERY_LEDGER_SCHEMA_VERSION
+        ):
+            status.update(
+                {
+                    "state": "legacy_unverified",
+                    "n_reusable": 0,
+                    "n_retry": len(latest_by_task),
+                    "reason": "legacy_recovery_authority_unproven",
+                }
+            )
             return status
         status.update(
             {
@@ -9987,7 +10109,11 @@ def _resolve_terminal_submission_intents_for_apply(
                 }
             )
             continue
-        queue_lookup = scheduler_backend.find_active_job_by_id(job_id)
+        queue_lookup = scheduler_backend.find_active_job_by_id(
+            job_id,
+            expected_job_name=expected_job_name,
+            expected_owner=current_scheduler_user(),
+        )
         if queue_lookup.inconclusive:
             blocking.append({
                 "phase": phase,
@@ -10010,7 +10136,11 @@ def _resolve_terminal_submission_intents_for_apply(
             })
             continue
         try:
-            observations = scheduler_backend.poll_job(job_id)
+            observations = scheduler_backend.poll_job(
+                job_id,
+                expected_job_name=expected_job_name,
+                expected_owner=current_scheduler_user(),
+            )
         except Exception as exc:
             blocking.append({
                 "phase": phase,
@@ -11925,6 +12055,13 @@ def _reconcile_presentation(
         if isinstance(item, Mapping)
     ]
     if scheduler_cancellation:
+        legacy_scheduler_recovery = any(
+            item.get("terminal_receipt")
+            and not Path(str(item["terminal_receipt"])).name.endswith(
+                "-v2.json"
+            )
+            for item in scheduler_cancellation
+        )
         completed = sum(
             int(item.get("n_completed") or 0)
             for item in scheduler_cancellation
@@ -11933,25 +12070,42 @@ def _reconcile_presentation(
             int(item.get("n_retry") or 0)
             for item in scheduler_cancellation
         )
-        planned.append(
-            (
-                "scheduler recovery",
-                "preserve "
-                + str(completed)
-                + " scheduler-completed task"
-                + ("" if completed == 1 else "s")
-                + " as candidate"
-                + ("" if completed == 1 else "s")
-                + " for local output validation after resume; "
-                + str(retry)
-                + " unfinished task"
-                + ("" if retry == 1 else "s")
-                + " will be retried",
+        if legacy_scheduler_recovery:
+            retry += completed
+            planned.append(
+                (
+                    "scheduler recovery",
+                    "retain the older terminal records for task accounting, "
+                    "but retry all "
+                    + str(retry)
+                    + " affected task"
+                    + ("" if retry == 1 else "s")
+                    + "; their output cannot be trusted for reuse",
+                )
             )
-        )
-        reason_parts.append(
-            "cancelled scheduler work has exact recoverable task outcomes"
-        )
+            reason_parts.append(
+                "older scheduler recovery evidence requires conservative retry"
+            )
+        else:
+            planned.append(
+                (
+                    "scheduler recovery",
+                    "preserve "
+                    + str(completed)
+                    + " scheduler-completed task"
+                    + ("" if completed == 1 else "s")
+                    + " as candidate"
+                    + ("" if completed == 1 else "s")
+                    + " for local output validation after resume; "
+                    + str(retry)
+                    + " unfinished task"
+                    + ("" if retry == 1 else "s")
+                    + " will be retried",
+                )
+            )
+            reason_parts.append(
+                "cancelled scheduler work has exact recoverable task outcomes"
+            )
 
     revalidation = getattr(report, "aimall_quality_revalidation", None)
     if isinstance(revalidation, Mapping) and revalidation.get("state") in {
@@ -13523,16 +13677,31 @@ def _scratch_scheduler_state(
     job_id: str,
     expected_task_count: Optional[int] = None,
     scheduler_kind: str = "slurm",
+    expected_job_name: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Return active, inactive, or inconclusive for one recorded scheduler job."""
     from .submit import sacct_poll
 
     backend = get_scheduler_backend(scheduler_kind)
+    identity_kwargs = (
+        {
+            "expected_job_name": expected_job_name,
+            "expected_owner": current_scheduler_user(),
+        }
+        if expected_job_name
+        else {}
+    )
     try:
         if scheduler_kind == "slurm":
-            queue = sacct_poll.find_active_job_by_id_detailed(str(job_id))
+            queue = sacct_poll.find_active_job_by_id_detailed(
+                str(job_id),
+                **identity_kwargs,
+            )
         else:
-            queue = backend.find_active_job_by_id(str(job_id))
+            queue = backend.find_active_job_by_id(
+                str(job_id),
+                **identity_kwargs,
+            )
     except Exception as exc:
         return "inconclusive", type(exc).__name__ + ": " + str(exc)
     if bool(getattr(queue, "inconclusive", False)):
@@ -13547,9 +13716,15 @@ def _scratch_scheduler_state(
         return "active", backend.display_name + " reports active rows"
     try:
         if scheduler_kind == "slurm":
-            observations = sacct_poll.poll_job(str(job_id))
+            observations = sacct_poll.poll_job(
+                str(job_id),
+                **identity_kwargs,
+            )
         else:
-            observations = backend.poll_job(str(job_id))
+            observations = backend.poll_job(
+                str(job_id),
+                **identity_kwargs,
+            )
     except Exception as exc:
         return (
             "inconclusive",
@@ -13637,7 +13812,9 @@ def _scratch_attempt_report(campaign: Path) -> List[Dict[str, Any]]:
         group["task_statuses"].add(str(record.get("status") or "prepared"))
         group["job_ids"].add(str(record.get("job_id") or ""))
     intent_index = _scratch_intent_index(campaign)
-    scheduler_cache: Dict[Tuple[str, Optional[int], str], Tuple[str, str]] = {}
+    scheduler_cache: Dict[
+        Tuple[str, Optional[int], str, str], Tuple[str, str]
+    ] = {}
     output: List[Dict[str, Any]] = [dict(item) for item in invalid]
     for group in grouped.values():
         attempt_id = str(group["attempt_id"])
@@ -13646,6 +13823,7 @@ def _scratch_attempt_report(campaign: Path) -> List[Dict[str, Any]]:
         scheduler_kind = str(
             intent.get("scheduler_identity_kind") or "slurm"
         ).strip().lower()
+        expected_job_name = str(intent.get("expected_job_name") or "")
         expected_tasks: Optional[int] = None
         expected_tasks_error: Optional[str] = None
         if intent.get("expected_tasks") is not None:
@@ -13669,19 +13847,24 @@ def _scratch_attempt_report(campaign: Path) -> List[Dict[str, Any]]:
                 job_states[job_id] = "inconclusive"
                 scheduler_reasons[job_id] = expected_tasks_error
                 continue
-            cache_key = (job_id, expected_tasks, scheduler_kind)
+            cache_key = (
+                job_id,
+                expected_tasks,
+                scheduler_kind,
+                expected_job_name,
+            )
             if cache_key not in scheduler_cache:
-                if scheduler_kind == "slurm":
-                    scheduler_cache[cache_key] = _scratch_scheduler_state(
-                        job_id,
-                        expected_task_count=expected_tasks,
-                    )
-                else:
-                    scheduler_cache[cache_key] = _scratch_scheduler_state(
-                        job_id,
-                        expected_task_count=expected_tasks,
-                        scheduler_kind=scheduler_kind,
-                    )
+                scratch_kwargs: Dict[str, Any] = {
+                    "expected_task_count": expected_tasks,
+                }
+                if scheduler_kind != "slurm":
+                    scratch_kwargs["scheduler_kind"] = scheduler_kind
+                if expected_job_name:
+                    scratch_kwargs["expected_job_name"] = expected_job_name
+                scheduler_cache[cache_key] = _scratch_scheduler_state(
+                    job_id,
+                    **scratch_kwargs,
+                )
             scheduler_state, reason = scheduler_cache[cache_key]
             job_states[job_id] = scheduler_state
             scheduler_reasons[job_id] = reason

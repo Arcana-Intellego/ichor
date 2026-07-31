@@ -229,6 +229,8 @@ def qstat_observations(rows: Sequence[SgeQueueRow]) -> List[JobObservation]:
                 if row.native_task_id is None
                 else row.parent_job_id + "." + str(row.native_task_id)
             ),
+            job_name=row.job_name,
+            owner=row.owner,
         )
         for row in rows
     ]
@@ -355,6 +357,8 @@ def qacct_observations(
                 elapsed_seconds=_optional_duration_seconds(record, "ru_wallclock"),
                 raw_status="failed=" + str(failed) + " exit_status=" + str(exit_status),
                 job_id_raw=raw_id,
+                job_name=str(record.get("jobname") or "") or None,
+                owner=str(record.get("owner") or "") or None,
             )
         )
     return observations
@@ -439,6 +443,8 @@ def poll_job(
     qacct_runner: Callable[..., Any] = subprocess.run,
     timeout_seconds: int = 60,
     cancellation_requested: bool = False,
+    expected_job_name: Optional[str] = None,
+    expected_owner: Optional[str] = None,
 ) -> List[JobObservation]:
     parent = validate_sge_parent_job_id(job_id)
     queue_rows = [
@@ -472,7 +478,16 @@ def poll_job(
     # Live ownership wins over accounting during the brief SGE reporting race.
     for observation in qstat_observations(queue_rows):
         merged[observation.job_id] = observation
-    return [merged[key] for key in sorted(merged)]
+    observations = [merged[key] for key in sorted(merged)]
+    for observation in observations:
+        if (
+            expected_job_name is not None
+            and observation.job_name != str(expected_job_name)
+        ):
+            raise RuntimeError("SGE job-name identity mismatch")
+        if expected_owner is not None and observation.owner != str(expected_owner):
+            raise RuntimeError("SGE owner identity mismatch")
+    return observations
 
 
 def find_active_job_by_id_detailed(
@@ -480,6 +495,8 @@ def find_active_job_by_id_detailed(
     *,
     qstat_runner: Callable[..., Any] = subprocess.run,
     timeout_seconds: int = 60,
+    expected_job_name: Optional[str] = None,
+    expected_owner: Optional[str] = None,
 ) -> JobQueueLookup:
     try:
         parent = validate_sge_parent_job_id(job_id)
@@ -497,9 +514,33 @@ def find_active_job_by_id_detailed(
             inconclusive=True,
             error=type(exc).__name__ + ": " + str(exc),
         )
+    identity_rows = [
+        {
+            "job_id": row.logical_job_id,
+            "state": row.state,
+            "job_name": row.job_name,
+            "owner": row.owner,
+        }
+        for row in rows
+    ]
+    if any(
+        expected_job_name is not None and row.job_name != str(expected_job_name)
+        for row in rows
+    ) or any(
+        expected_owner is not None and row.owner != str(expected_owner)
+        for row in rows
+    ):
+        return JobQueueLookup(
+            active=False,
+            inconclusive=True,
+            rows=[(row.logical_job_id, row.state) for row in rows],
+            identity_rows=identity_rows,
+            error="SGE queue identity mismatch",
+        )
     return JobQueueLookup(
         active=bool(rows),
         rows=[(row.logical_job_id, row.state) for row in rows],
+        identity_rows=identity_rows,
     )
 
 

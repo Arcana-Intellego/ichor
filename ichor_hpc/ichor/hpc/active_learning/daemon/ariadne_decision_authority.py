@@ -110,6 +110,10 @@ def _recovery_source_identities(
     )
     if not path.exists() and not path.is_symlink():
         return ()
+    # A published ARIADNE decision is already scientific authority.  Legacy
+    # ledgers remain admissible here only to recover its frozen producer
+    # identities; new output reuse is gated separately by the v2 recovery
+    # writer and validator before publication.
     ledger = read_phase_recovery_ledger(path)
     identity = (
         str(ledger.get("campaign_uid") or ""),

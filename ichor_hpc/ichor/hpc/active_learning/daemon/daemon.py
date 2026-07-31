@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 import copy
+import getpass
 import hashlib
 import inspect
 import secrets
@@ -1760,6 +1761,15 @@ class Daemon:
                 existing = None
                 lookup_inconclusive = True
             if existing:
+                if active_intent is None:
+                    return self._halt_scheduler_uncertain(
+                        state,
+                        phase,
+                        "scheduler_job_has_no_submission_intent: "
+                        + str(existing)
+                        + "; refusing to adopt work without an authenticated "
+                        "attempt identity",
+                    )
                 existing_job_id = str(existing)
                 expected_tasks = self._expected_tasks_for_adoption(
                     active_intent,
@@ -1801,12 +1811,13 @@ class Daemon:
                     expected_tasks=expected_tasks,
                 )
                 return TickStatus.SUBMITTED
-            if active_intent is not None and lookup_inconclusive:
+            if lookup_inconclusive:
                 return self._halt_scheduler_uncertain(
                     state,
                     phase,
-                    "active_submission_adoption_inconclusive: "
-                    "sacct lookup failed or was inconclusive; refusing to supersede active intent",
+                    "scheduler_adoption_inconclusive: "
+                    "the scheduler lookup failed or returned unverified "
+                    "identity evidence; refusing to submit replacement work",
                 )
         if (
             active_intent is not None
@@ -1823,7 +1834,13 @@ class Daemon:
                 if recovered is not None:
                     return recovered
             if active_job_id is not None and self.job_liveness_checker is not None:
-                liveness = self._check_job_liveness(str(active_job_id))
+                liveness = self._check_job_liveness(
+                    str(active_job_id),
+                    expected_job_name=str(
+                        active_intent.get("expected_job_name") or ""
+                    ),
+                    expected_owner=getpass.getuser(),
+                )
                 if liveness is not None and bool(getattr(liveness, "active", False)):
                     expected_tasks = self._expected_tasks_for_adoption(
                         active_intent,
@@ -2170,6 +2187,8 @@ class Daemon:
         job_id: str,
         *,
         expected_task_count: Optional[int] = None,
+        expected_job_name: Optional[str] = None,
+        expected_owner: Optional[str] = None,
     ) -> Sequence[JobObservation]:
         """Poll sacct without masking a TypeError raised inside the poller."""
         try:
@@ -2177,6 +2196,8 @@ class Daemon:
         except (TypeError, ValueError):
             accepts_expected = True
             accepts_timeout = True
+            accepts_job_name = True
+            accepts_owner = True
         else:
             has_kwargs = any(
                 parameter.kind is inspect.Parameter.VAR_KEYWORD
@@ -2190,6 +2211,10 @@ class Daemon:
                 "timeout_seconds" in signature.parameters
                 or has_kwargs
             )
+            accepts_job_name = (
+                "expected_job_name" in signature.parameters or has_kwargs
+            )
+            accepts_owner = "expected_owner" in signature.parameters or has_kwargs
         kwargs: Dict[str, Any] = {}
         if accepts_expected:
             kwargs["expected_task_count"] = expected_task_count
@@ -2197,6 +2222,10 @@ class Daemon:
             kwargs["timeout_seconds"] = int(
                 self.config.runtime.scheduler_command_timeout_seconds
             )
+        if accepts_job_name:
+            kwargs["expected_job_name"] = expected_job_name
+        if accepts_owner:
+            kwargs["expected_owner"] = expected_owner
         return self.sacct_poller(str(job_id), **kwargs)
 
     def _adopt_accounted_intent_job(
@@ -2225,6 +2254,10 @@ class Daemon:
             observations = self._poll_sacct(
                 str(job_id),
                 expected_task_count=expected_tasks,
+                expected_job_name=str(
+                    active_intent.get("expected_job_name") or ""
+                ),
+                expected_owner=getpass.getuser(),
             )
         except RuntimeError as exc:
             return self._halt_scheduler_uncertain(
@@ -2409,6 +2442,24 @@ class Daemon:
     def _on_pending(self, state: CampaignState, phase: CampaignPhase, job_id: str) -> str:
         """Called while a SLURM job for `phase` is in flight."""
         expected_tasks = self._expected_tasks_for_pending(state, phase, job_id)
+        scheduler_identity = self._scheduler_identity_for_job(
+            state,
+            phase,
+            job_id,
+        )
+        if scheduler_identity is None and self._strict_artifact_checks_enabled():
+            return self._halt_scheduler_uncertain(
+                state,
+                phase,
+                "scheduler_job_identity_unavailable_for_active_job: "
+                + phase.value
+                + " job_id="
+                + str(job_id),
+            )
+        scheduler_identity = scheduler_identity or {
+            "expected_job_name": None,
+            "expected_owner": None,
+        }
         if expected_tasks is None and self._strict_artifact_checks_enabled():
             return self._halt_scheduler_uncertain(
                 state,
@@ -2428,13 +2479,17 @@ class Daemon:
             observations = self._poll_sacct(
                 job_id,
                 expected_task_count=expected_tasks,
+                **scheduler_identity,
             )
         except RuntimeError as exc:
             error_key = str(job_id) + ":ERROR"
             current = int(state.sacct_empty_streak.get(error_key, 0)) + 1
             state.sacct_empty_streak[error_key] = current
             self._persist(state)
-            liveness = self._check_job_liveness(job_id)
+            liveness = self._check_job_liveness(
+                job_id,
+                **scheduler_identity,
+            )
             max_errors = int(
                 getattr(self.config.runtime, "poll_sacct_error_max_ticks", 10)
             )
@@ -2542,7 +2597,10 @@ class Daemon:
             current = state.sacct_empty_streak.get(job_id, 0) + 1
             state.sacct_empty_streak[job_id] = current
             self._persist(state)
-            liveness = self._check_job_liveness(job_id)
+            liveness = self._check_job_liveness(
+                job_id,
+                **scheduler_identity,
+            )
             if self._liveness_blocks_accounting_timeout(liveness):
                 self._journal_sparse_accounting_liveness(
                     phase=phase,
@@ -2604,7 +2662,10 @@ class Daemon:
                 getattr(self.config.runtime, "poll_sacct_unknown_max_ticks", 3)
             )
             if max_unknown > 0 and current >= max_unknown:
-                liveness = self._check_job_liveness(job_id)
+                liveness = self._check_job_liveness(
+                    job_id,
+                    **scheduler_identity,
+                )
                 self._journal(
                     "sacct_unknown_timeout",
                     phase=phase.value,
@@ -2640,7 +2701,10 @@ class Daemon:
             current = state.sacct_empty_streak.get(missing_key, 0) + 1
             state.sacct_empty_streak[missing_key] = current
             self._persist(state)
-            liveness = self._check_job_liveness(job_id)
+            liveness = self._check_job_liveness(
+                job_id,
+                **scheduler_identity,
+            )
             if self._liveness_blocks_accounting_timeout(liveness):
                 self._journal_sparse_accounting_liveness(
                     phase=phase,
@@ -3100,6 +3164,39 @@ class Daemon:
             return self._infer_expected_tasks_from_artifacts(state, phase)
         return expected if expected > 0 else self._infer_expected_tasks_from_artifacts(state, phase)
 
+    def _scheduler_identity_for_job(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+        job_id: str,
+    ) -> Optional[Dict[str, str]]:
+        try:
+            intent = _submission_intent.load_intent(
+                self.campaign_dir,
+                phase.value,
+                int(state.iteration),
+                expected_campaign_uid=str(state.campaign_uid),
+            )
+        except Exception as exc:
+            self._journal(
+                "submission_intent_read_failed",
+                phase=phase.value,
+                iteration=int(state.iteration),
+                error=str(exc)[:200],
+            )
+            return None
+        if not isinstance(intent, Mapping):
+            return None
+        if str(intent.get("job_id") or "") != str(job_id):
+            return None
+        expected_name = str(intent.get("expected_job_name") or "")
+        if not expected_name:
+            return None
+        return {
+            "expected_job_name": expected_name,
+            "expected_owner": getpass.getuser(),
+        }
+
     def _expected_tasks_for_adoption(
         self,
         active_intent: Optional[Dict[str, Any]],
@@ -3153,11 +3250,34 @@ class Daemon:
                     count += 1
         return count if count > 0 else None
 
-    def _check_job_liveness(self, job_id: str) -> Optional[Any]:
+    def _check_job_liveness(
+        self,
+        job_id: str,
+        *,
+        expected_job_name: Optional[str] = None,
+        expected_owner: Optional[str] = None,
+    ) -> Optional[Any]:
         if self.job_liveness_checker is None:
             return None
         try:
-            return self.job_liveness_checker(str(job_id))
+            try:
+                signature = inspect.signature(self.job_liveness_checker)
+            except (TypeError, ValueError):
+                kwargs = {
+                    "expected_job_name": expected_job_name,
+                    "expected_owner": expected_owner,
+                }
+            else:
+                has_kwargs = any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in signature.parameters.values()
+                )
+                kwargs = {}
+                if "expected_job_name" in signature.parameters or has_kwargs:
+                    kwargs["expected_job_name"] = expected_job_name
+                if "expected_owner" in signature.parameters or has_kwargs:
+                    kwargs["expected_owner"] = expected_owner
+            return self.job_liveness_checker(str(job_id), **kwargs)
         except Exception as exc:
             return SimpleNamespace(
                 active=False,

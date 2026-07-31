@@ -1,6 +1,9 @@
 """Crash-recovery + state-integrity guards (P3): A24/A25 adopt-or-submit, the sacct-by-name
 lookup, the manifest robustness (A4/A55), the current_version dir guard (A54), and the
 reference_scales validation (A31)."""
+import getpass
+from types import SimpleNamespace
+
 import pytest
 
 from ichor.hpc.active_learning.config import CampaignConfig
@@ -81,6 +84,10 @@ def _active_state(phase):
 
 
 def test_daemon_adopts_inflight_sbatch_job(tmp_path):
+    from ichor.hpc.active_learning.daemon.submission_intent import (
+        write_pre_submit_intent,
+    )
+
     d = Daemon(
         campaign_dir=tmp_path, config=CampaignConfig(),
         executor=_ExplodingExecutor(),
@@ -88,9 +95,32 @@ def test_daemon_adopts_inflight_sbatch_job(tmp_path):
     )
     d.state_path().parent.mkdir(parents=True, exist_ok=True)  # the daemon makes this at campaign start
     state = _active_state(CampaignPhase.FEREBUS)
+    write_pre_submit_intent(
+        tmp_path,
+        campaign_uid=state.campaign_uid,
+        phase_name="FEREBUS",
+        iteration=1,
+    )
     status = d._on_phase_entry(state, state.phase)
     assert status == TickStatus.SUBMITTED
     assert state.pending_jobs["FEREBUS"] == "987654"  # adopted, not resubmitted
+
+
+def test_daemon_refuses_orphan_job_without_submission_intent(tmp_path):
+    d = Daemon(
+        campaign_dir=tmp_path,
+        config=CampaignConfig(),
+        executor=_ExplodingExecutor(),
+        job_finder=lambda state, phase: "987654",
+    )
+    d.state_path().parent.mkdir(parents=True, exist_ok=True)
+    state = _active_state(CampaignPhase.FEREBUS)
+
+    status = d._on_phase_entry(state, state.phase)
+
+    assert status == TickStatus.HALTED
+    assert read_state(d.state_path()).phase is CampaignPhase.HALTED
+    assert state.pending_jobs.get("FEREBUS") is None
 
 
 def test_strict_daemon_halts_on_unmanifested_committed_training_pointdir(tmp_path):
@@ -165,6 +195,28 @@ def test_submission_intent_exists_before_executor_calls_sbatch(tmp_path):
     state = _active_state(CampaignPhase.FEREBUS)
     status = d._on_phase_entry(state, state.phase)
     assert status == TickStatus.SUBMITTED
+
+
+def test_scheduler_adoption_uncertainty_blocks_first_submission(tmp_path):
+    d = Daemon(
+        campaign_dir=tmp_path,
+        config=CampaignConfig(),
+        executor=_SubmittingExecutor(),
+        job_finder=lambda state, phase: SimpleNamespace(
+            job_id=None,
+            inconclusive=True,
+            rows=[],
+            error="scheduler identity unavailable",
+        ),
+    )
+    d.state_path().parent.mkdir(parents=True, exist_ok=True)
+    state = _active_state(CampaignPhase.FEREBUS)
+
+    status = d._on_phase_entry(state, state.phase)
+
+    assert status == TickStatus.HALTED
+    assert read_state(d.state_path()).phase is CampaignPhase.HALTED
+    assert state.pending_jobs.get("FEREBUS") is None
 
 
 def test_active_submission_intent_requires_successful_adoption_check(tmp_path):
@@ -363,19 +415,37 @@ def _stub_sacct(stdout, returncode=0):
 
 def test_find_running_job_returns_base_id_of_nonterminal():
     from ichor.hpc.active_learning.submit.sacct_poll import find_running_job_by_name
-    runner = _stub_sacct("555_0|RUNNING\n555_1|PENDING\n")
+    owner = getpass.getuser()
+    runner = _stub_sacct(
+        "555_0|555_0|camp-FEREBUS-1|"
+        + owner
+        + "|RUNNING\n555_1|555_1|camp-FEREBUS-1|"
+        + owner
+        + "|PENDING\n"
+    )
     assert find_running_job_by_name("camp-FEREBUS-1", sacct_runner=runner) == "555"
 
 
 def test_find_running_job_ignores_terminal_states():
     from ichor.hpc.active_learning.submit.sacct_poll import find_running_job_by_name
-    runner = _stub_sacct("555_0|COMPLETED\n555_1|FAILED\n")
+    owner = getpass.getuser()
+    runner = _stub_sacct(
+        "555_0|555_0|x|"
+        + owner
+        + "|COMPLETED\n555_1|555_1|x|"
+        + owner
+        + "|FAILED\n"
+    )
     assert find_running_job_by_name("x", sacct_runner=runner) is None
 
 
 def test_find_running_job_does_not_adopt_unknown_state():
     from ichor.hpc.active_learning.submit.sacct_poll import find_running_job_by_name
-    runner = _stub_sacct("555_0|WEIRD_NEW_STATE\n")
+    runner = _stub_sacct(
+        "555_0|555_0|x|"
+        + getpass.getuser()
+        + "|WEIRD_NEW_STATE\n"
+    )
     assert find_running_job_by_name("x", sacct_runner=runner) is None
 
 
@@ -397,7 +467,13 @@ def test_live_job_finder_checks_new_and_legacy_uid_prefixes():
         seen.append(name)
         if name.startswith("abcdefghijkl-"):
             return _stub_sacct("")()
-        return _stub_sacct("555_0|RUNNING\n")()
+        return _stub_sacct(
+            "555_0|555_0|"
+            + name
+            + "|"
+            + getpass.getuser()
+            + "|RUNNING\n"
+        )()
 
     finder = make_live_job_finder(sacct_runner=runner)
     lookup = finder(
@@ -422,8 +498,15 @@ def test_live_job_finder_uses_squeue_fallback_when_sacct_has_no_rows():
         return _stub_sacct("")()
 
     def squeue_runner(cmd, **kwargs):
-        squeue_seen.append(cmd[cmd.index("--name") + 1])
-        return _stub_sacct("999_[0-4%2]|PENDING|abcdefghijkl-GAUSSIAN-2\n")()
+        name = cmd[cmd.index("--name") + 1]
+        squeue_seen.append(name)
+        return _stub_sacct(
+            "999_[0-4%2]|PENDING|"
+            + name
+            + "|"
+            + getpass.getuser()
+            + "\n"
+        )()
 
     finder = make_live_job_finder(
         sacct_runner=sacct_runner,

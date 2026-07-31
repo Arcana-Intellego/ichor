@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import io
 import os
 import re
 import subprocess
+import tarfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Set, Tuple, Union
@@ -22,15 +24,32 @@ from .resource_records import read_resolution, verify_scientific_evidence
 from .state import CampaignPhase, atomic_write_json
 
 
-ENVIRONMENT_EQUIVALENCE_SCHEMA_VERSION = 1
+ENVIRONMENT_EQUIVALENCE_SCHEMA_VERSION = 2
+LEGACY_ENVIRONMENT_EQUIVALENCE_SCHEMA_VERSION = 1
 ENVIRONMENT_EQUIVALENCE_DIRNAME = "environment_equivalences"
+SCIENTIFIC_FINGERPRINT_ALGORITHM = "repository_module_closure_v2"
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_ACTIVE_LEARNING_PREFIX = "ichor.hpc.active_learning"
-_ACTIVE_LEARNING_REPO_ROOT = Path(
-    "ichor_hpc/ichor/hpc/active_learning"
+_GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+_REPOSITORY_NAMESPACE_ROOTS = {
+    "ichor.core": Path("ichor_core/ichor/core"),
+    "ichor.hpc": Path("ichor_hpc/ichor/hpc"),
+    "ichor.cli": Path("ichor_cli/ichor/cli"),
+}
+_NON_RUNTIME_PATH_PREFIXES = (
+    ".github/",
+    "docs/",
+    "ichor_cli/tests/",
+    "ichor_core/tests/",
+    "ichor_hpc/tests/",
 )
+_NON_RUNTIME_BASENAMES = {
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "README.md",
+}
+_GIT_SOURCE_TREE_CACHE: Dict[Tuple[str, str], Dict[str, str]] = {}
 
 _PHASE_BACKEND = {
     "PHASE_A_DIVERSITY": "diversity",
@@ -190,10 +209,22 @@ def _repository_root() -> Path:
     return Path(output).resolve()
 
 
-def _git_text(repo: Path, commit: str, relative_path: str) -> str:
+def _git_python_sources(repo: Path, commit: str) -> Dict[str, str]:
+    identity = (str(repo.resolve()), str(commit))
+    cached = _GIT_SOURCE_TREE_CACHE.get(identity)
+    if cached is not None:
+        return cached
     try:
         raw = subprocess.run(
-            ["git", "show", commit + ":" + relative_path],
+            [
+                "git",
+                "archive",
+                "--format=tar",
+                str(commit),
+                "ichor_core/ichor/core",
+                "ichor_hpc/ichor/hpc",
+                "ichor_cli/ichor/cli",
+            ],
             cwd=str(repo),
             check=True,
             capture_output=True,
@@ -201,16 +232,39 @@ def _git_text(repo: Path, commit: str, relative_path: str) -> str:
         ).stdout
     except (OSError, subprocess.SubprocessError) as exc:
         raise ValueError(
+            "ICHOR Python source tree is unavailable at Git commit " + commit
+        ) from exc
+    sources: Dict[str, str] = {}
+    try:
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
+            for member in archive.getmembers():
+                name = str(member.name).replace("\\", "/")
+                if not member.isfile() or not name.endswith(".py"):
+                    continue
+                handle = archive.extractfile(member)
+                if handle is None:
+                    raise ValueError("Git archive member is unreadable: " + name)
+                sources[name] = handle.read().decode("utf-8")
+    except (tarfile.TarError, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError(
+            "ICHOR Python source tree cannot be decoded at Git commit " + commit
+        ) from exc
+    if len(_GIT_SOURCE_TREE_CACHE) >= 4:
+        _GIT_SOURCE_TREE_CACHE.pop(next(iter(_GIT_SOURCE_TREE_CACHE)))
+    _GIT_SOURCE_TREE_CACHE[identity] = sources
+    return sources
+
+
+def _git_text(repo: Path, commit: str, relative_path: str) -> str:
+    sources = _git_python_sources(repo, commit)
+    try:
+        return sources[str(relative_path).replace("\\", "/")]
+    except KeyError as exc:
+        raise ValueError(
             "required producer source is unavailable at Git commit "
             + commit
             + ": "
             + relative_path
-        ) from exc
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError(
-            "producer source is not UTF-8: " + relative_path
         ) from exc
 
 
@@ -225,6 +279,8 @@ def _require_clean_available_commit(
     if not isinstance(git_identity, Mapping):
         raise ValueError(label + " environment has no Git identity")
     commit = _required_text(git_identity.get("commit"), label + " Git commit")
+    if not _GIT_COMMIT_RE.fullmatch(commit):
+        raise ValueError(label + " environment has an invalid Git commit")
     if git_identity.get("tracked_tree_clean") is not True:
         raise ValueError(label + " ICHOR source tree was not clean")
     try:
@@ -295,73 +351,233 @@ def _node_digest(node: ast.AST) -> str:
     ).hexdigest()
 
 
-def _local_module_path(current_path: str, node: ast.ImportFrom) -> Optional[str]:
-    if node.level:
-        base = Path(current_path).parent
-        for _ in range(max(0, int(node.level) - 1)):
-            base = base.parent
-        target = base / Path(*(str(node.module or "").split(".")))
-    elif str(node.module or "") == _ACTIVE_LEARNING_PREFIX:
-        target = _ACTIVE_LEARNING_REPO_ROOT
-    elif str(node.module or "").startswith(_ACTIVE_LEARNING_PREFIX + "."):
-        suffix = str(node.module)[len(_ACTIVE_LEARNING_PREFIX) + 1 :]
-        target = _ACTIVE_LEARNING_REPO_ROOT / Path(*suffix.split("."))
-    else:
+def _module_identity_for_path(relative_path: str) -> Tuple[str, bool]:
+    path = Path(relative_path)
+    for namespace, root in sorted(
+        _REPOSITORY_NAMESPACE_ROOTS.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        try:
+            suffix = path.relative_to(root)
+        except ValueError:
+            continue
+        if suffix.suffix != ".py":
+            raise ValueError("repository-local Python path is invalid: " + relative_path)
+        parts = list(suffix.with_suffix("").parts)
+        is_package = bool(parts and parts[-1] == "__init__")
+        if is_package:
+            parts.pop()
+        module = namespace + ("." + ".".join(parts) if parts else "")
+        return module, is_package
+    raise ValueError("producer path is outside the ICHOR package roots: " + relative_path)
+
+
+def _repository_namespace(module: str) -> Optional[Tuple[str, Path]]:
+    for namespace, root in sorted(
+        _REPOSITORY_NAMESPACE_ROOTS.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        if module == namespace or module.startswith(namespace + "."):
+            return namespace, root
+    return None
+
+
+def _git_path_exists(
+    repo: Path,
+    commit: str,
+    relative_path: str,
+    cache: Dict[Tuple[str, str], bool],
+) -> bool:
+    identity = (commit, relative_path)
+    if identity not in cache:
+        cache[identity] = (
+            str(relative_path).replace("\\", "/")
+            in _git_python_sources(repo, commit)
+        )
+    return bool(cache[identity])
+
+
+def _resolve_repository_module(
+    repo: Path,
+    commit: str,
+    module: str,
+    existence_cache: Dict[Tuple[str, str], bool],
+    *,
+    required: bool = False,
+) -> Optional[str]:
+    root_identity = _repository_namespace(str(module))
+    if root_identity is None:
         return None
-    return target.as_posix() + ".py"
+    namespace, root = root_identity
+    suffix = str(module)[len(namespace) :].lstrip(".")
+    base = root / Path(*suffix.split(".")) if suffix else root
+    candidates = (
+        base.with_suffix(".py").as_posix(),
+        (base / "__init__.py").as_posix(),
+    )
+    for candidate in candidates:
+        if _git_path_exists(repo, commit, candidate, existence_cache):
+            return candidate
+    if required:
+        raise ValueError(
+            "repository-local import is unavailable at "
+            + commit
+            + ": "
+            + str(module)
+        )
+    return None
 
 
-def _local_imports(
+def _absolute_import_module(current_path: str, node: ast.ImportFrom) -> str:
+    if not node.level:
+        return str(node.module or "")
+    current_module, is_package = _module_identity_for_path(current_path)
+    package = current_module if is_package else current_module.rpartition(".")[0]
+    parts = package.split(".") if package else []
+    remove = int(node.level) - 1
+    if remove > len(parts):
+        raise ValueError("relative repository import escapes its package")
+    base = parts[: len(parts) - remove] if remove else parts
+    if node.module:
+        base.extend(str(node.module).split("."))
+    return ".".join(base)
+
+
+def _module_digest(tree: ast.Module) -> str:
+    normalised = ast.parse(ast.unparse(tree))
+    for candidate in ast.walk(normalised):
+        body = getattr(candidate, "body", None)
+        if (
+            isinstance(body, list)
+            and body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            del body[0]
+    return hashlib.sha256(
+        ast.dump(
+            normalised,
+            annotate_fields=True,
+            include_attributes=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _repository_import_targets(
+    repo: Path,
+    commit: str,
     current_path: str,
     tree: ast.Module,
-) -> Tuple[Dict[str, Tuple[str, str]], Dict[str, str]]:
-    direct: Dict[str, Tuple[str, str]] = {}
-    modules: Dict[str, str] = {}
-    for node in tree.body:
-        if isinstance(node, ast.ImportFrom):
-            target_path = _local_module_path(current_path, node)
-            if target_path is None:
-                continue
+    existence_cache: Dict[Tuple[str, str], bool],
+) -> Tuple[Set[str], Tuple[str, ...]]:
+    targets: Set[str] = set()
+    unresolved_dynamic = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                target = _resolve_repository_module(
+                    repo,
+                    commit,
+                    str(alias.name),
+                    existence_cache,
+                    required=_repository_namespace(str(alias.name)) is not None,
+                )
+                if target is not None:
+                    targets.add(target)
+        elif isinstance(node, ast.ImportFrom):
+            module = _absolute_import_module(current_path, node)
+            target = _resolve_repository_module(
+                repo,
+                commit,
+                module,
+                existence_cache,
+                required=_repository_namespace(module) is not None,
+            )
+            if target is not None:
+                targets.add(target)
             for alias in node.names:
                 if alias.name == "*":
                     continue
-                direct[str(alias.asname or alias.name)] = (
-                    target_path,
-                    str(alias.name),
+                child_module = (
+                    module + "." + str(alias.name)
+                    if module
+                    else str(alias.name)
                 )
-        elif isinstance(node, ast.Import):
-            for alias in node.names:
-                name = str(alias.name)
-                if name == _ACTIVE_LEARNING_PREFIX:
-                    target = _ACTIVE_LEARNING_REPO_ROOT
-                elif name.startswith(_ACTIVE_LEARNING_PREFIX + "."):
-                    suffix = name[len(_ACTIVE_LEARNING_PREFIX) + 1 :]
-                    target = _ACTIVE_LEARNING_REPO_ROOT / Path(*suffix.split("."))
-                else:
-                    continue
-                modules[str(alias.asname or name.split(".")[0])] = (
-                    target.as_posix() + ".py"
+                child = _resolve_repository_module(
+                    repo,
+                    commit,
+                    child_module,
+                    existence_cache,
+                    required=False,
                 )
-    return direct, modules
+                if child is not None:
+                    targets.add(child)
+        elif isinstance(node, ast.Call):
+            function = node.func
+            dynamic_import = (
+                isinstance(function, ast.Name) and function.id == "__import__"
+            ) or (
+                isinstance(function, ast.Attribute)
+                and function.attr == "import_module"
+            )
+            if not dynamic_import:
+                continue
+            if (
+                node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+            ):
+                module = str(node.args[0].value)
+                target = _resolve_repository_module(
+                    repo,
+                    commit,
+                    module,
+                    existence_cache,
+                    required=_repository_namespace(module) is not None,
+                )
+                if target is not None:
+                    targets.add(target)
+            else:
+                unresolved_dynamic.append(current_path)
+    return targets, tuple(sorted(set(unresolved_dynamic)))
 
 
-def _referenced_names(node: ast.AST) -> Set[str]:
-    return {
-        str(candidate.id)
-        for candidate in ast.walk(node)
-        if isinstance(candidate, ast.Name) and isinstance(candidate.ctx, ast.Load)
-    }
+def _changed_paths(repo: Path, producer_commit: str, current_commit: str) -> Set[str]:
+    if producer_commit == current_commit:
+        return set()
+    try:
+        output = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--name-only",
+                "--diff-filter=ACDMRTUXB",
+                producer_commit,
+                current_commit,
+                "--",
+            ],
+            cwd=str(repo),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("changed repository paths cannot be established") from exc
+    return {line.strip().replace("\\", "/") for line in output.splitlines() if line.strip()}
 
 
-def _referenced_attributes(node: ast.AST) -> Set[Tuple[str, str]]:
-    values = set()
-    for candidate in ast.walk(node):
-        if (
-            isinstance(candidate, ast.Attribute)
-            and isinstance(candidate.value, ast.Name)
-        ):
-            values.add((str(candidate.value.id), str(candidate.attr)))
-    return values
+def _is_non_runtime_path(path: str) -> bool:
+    normalised = str(path).replace("\\", "/")
+    return (
+        normalised in _NON_RUNTIME_BASENAMES
+        or normalised.endswith(".md")
+        or any(normalised.startswith(prefix) for prefix in _NON_RUNTIME_PATH_PREFIXES)
+        or "/tests/" in normalised
+    )
 
 
 def _fingerprint_roots(
@@ -370,69 +586,111 @@ def _fingerprint_roots(
     backend: str,
     roots: Sequence[Tuple[str, Tuple[str, ...]]],
 ) -> Dict[str, Any]:
-    queue = [
-        (path, symbol)
+    root_symbols = {
+        str(path): tuple(str(symbol) for symbol in symbols)
         for path, symbols in roots
-        for symbol in symbols
-    ]
-    visited: Set[Tuple[str, str]] = set()
-    source_cache: Dict[str, Tuple[ast.Module, Dict[str, ast.AST]]] = {}
+    }
+    queue = list(root_symbols)
+    visited: Set[str] = set()
+    existence_cache: Dict[Tuple[str, str], bool] = {}
     records = []
+    unresolved_dynamic: Set[str] = set()
     while queue:
-        path, symbol = queue.pop(0)
-        identity = (path, symbol)
-        if identity in visited:
+        path = str(queue.pop(0)).replace("\\", "/")
+        if path in visited:
             continue
-        visited.add(identity)
-        if len(visited) > 512:
-            raise ValueError("producer symbol closure exceeds the safety limit")
-        if path not in source_cache:
-            source = _git_text(repo, commit, path)
-            try:
-                tree = ast.parse(source, filename=path)
-            except SyntaxError as exc:
-                raise ValueError(
-                    "producer source cannot be parsed at " + commit + ": " + path
-                ) from exc
-            source_cache[path] = (tree, _top_level_symbols(tree))
-        tree, symbols = source_cache[path]
-        node = symbols.get(symbol)
-        if node is None:
-            direct_imports, _module_imports = _local_imports(path, tree)
-            if symbol in direct_imports:
-                queue.append(direct_imports[symbol])
-                continue
+        visited.add(path)
+        if len(visited) > 2048:
+            raise ValueError("producer module closure exceeds the safety limit")
+        source = _git_text(repo, commit, path)
+        try:
+            tree = ast.parse(source, filename=path)
+        except SyntaxError as exc:
             raise ValueError(
-                "producer symbol is unavailable at "
-                + commit
-                + ": "
-                + path
-                + ":"
-                + symbol
-            )
+                "producer source cannot be parsed at " + commit + ": " + path
+            ) from exc
+        symbols = _top_level_symbols(tree)
+        for symbol in root_symbols.get(path, ()):
+            if symbol not in symbols:
+                raise ValueError(
+                    "producer symbol is unavailable at "
+                    + commit
+                    + ": "
+                    + path
+                    + ":"
+                    + symbol
+                )
+        targets, unresolved = _repository_import_targets(
+            repo,
+            commit,
+            path,
+            tree,
+            existence_cache,
+        )
+        unresolved_dynamic.update(unresolved)
+        queue.extend(sorted(targets.difference(visited)))
+        module_name, _is_package = _module_identity_for_path(path)
         records.append(
             {
                 "path": path,
-                "symbol": symbol,
-                "ast_sha256": _node_digest(node),
+                "module": module_name,
+                "ast_sha256": _module_digest(tree),
             }
         )
-        direct_imports, module_imports = _local_imports(path, tree)
-        for name in sorted(_referenced_names(node)):
-            if name in symbols:
-                queue.append((path, name))
-            elif name in direct_imports:
-                queue.append(direct_imports[name])
-        for module_name, attribute in sorted(_referenced_attributes(node)):
-            target_path = module_imports.get(module_name)
-            if target_path is not None:
-                queue.append((target_path, attribute))
-    records.sort(key=lambda item: (item["path"], item["symbol"]))
-    return {
+    records.sort(key=lambda item: item["path"])
+    fingerprint_payload = {
+        "algorithm": SCIENTIFIC_FINGERPRINT_ALGORITHM,
         "backend": backend,
-        "symbols": records,
-        "fingerprint_sha256": _sha256_json(records),
+        "roots": [
+            {"path": path, "symbols": list(root_symbols[path])}
+            for path in sorted(root_symbols)
+        ],
+        "modules": records,
+        "unresolved_dynamic_import_modules": sorted(unresolved_dynamic),
     }
+    return {
+        **fingerprint_payload,
+        "covered_paths": sorted(visited),
+        "fingerprint_sha256": _sha256_json(fingerprint_payload),
+    }
+
+
+def _uncovered_runtime_changes(
+    repo: Path,
+    producer_commit: str,
+    current_commit: str,
+    *fingerprints: Mapping[str, Any],
+) -> Tuple[str, ...]:
+    covered = {
+        str(path)
+        for fingerprint in fingerprints
+        for path in fingerprint.get("covered_paths", [])
+    }
+    return tuple(
+        sorted(
+            path
+            for path in _changed_paths(repo, producer_commit, current_commit)
+            if path not in covered and not _is_non_runtime_path(path)
+        )
+    )
+
+
+def _unresolved_dynamic_import_modules(
+    *fingerprints: Mapping[str, Any],
+) -> Tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                str(module)
+                for fingerprint in fingerprints
+                for module in fingerprint.get(
+                    "unresolved_dynamic_import_modules",
+                    [],
+                )
+                if str(module)
+            }
+        )
+    )
 
 
 def _producer_fingerprint(
@@ -487,13 +745,29 @@ def assess_resource_evidence_code_equivalence(
         backend_name,
         roots,
     )
+    uncovered = _uncovered_runtime_changes(
+        repo,
+        producer_commit,
+        current_commit,
+        producer,
+        current,
+    )
+    unresolved_dynamic = _unresolved_dynamic_import_modules(
+        producer,
+        current,
+    )
     return {
         "equivalent": (
             producer["fingerprint_sha256"]
             == current["fingerprint_sha256"]
+            and not uncovered
+            and not unresolved_dynamic
         ),
+        "fingerprint_algorithm": SCIENTIFIC_FINGERPRINT_ALGORITHM,
         "producer_fingerprint": producer,
         "current_fingerprint": current,
+        "uncovered_runtime_changes": list(uncovered),
+        "unresolved_dynamic_import_modules": list(unresolved_dynamic),
     }
 
 
@@ -598,6 +872,7 @@ def environment_equivalence_path(
     replacement_round: int,
     submission_identity: str,
     current_generation: int,
+    schema_version: int = ENVIRONMENT_EQUIVALENCE_SCHEMA_VERSION,
 ) -> Path:
     phase_name = _phase_name(phase)
     identity = _safe_identity(submission_identity, "submission_identity")
@@ -611,6 +886,11 @@ def environment_equivalence_path(
         + identity
         + "-to-g"
         + f"{_exact_nonnegative_int(current_generation, 'current_generation'):06d}"
+        + (
+            ""
+            if int(schema_version) == LEGACY_ENVIRONMENT_EQUIVALENCE_SCHEMA_VERSION
+            else "-v" + str(int(schema_version))
+        )
         + ".json"
     )
     return (
@@ -624,7 +904,11 @@ def environment_equivalence_path(
 
 def _validate_proof(payload: Mapping[str, Any]) -> Dict[str, Any]:
     data = dict(payload)
-    if data.get("schema_version") != ENVIRONMENT_EQUIVALENCE_SCHEMA_VERSION:
+    schema_version = data.get("schema_version")
+    if schema_version not in {
+        LEGACY_ENVIRONMENT_EQUIVALENCE_SCHEMA_VERSION,
+        ENVIRONMENT_EQUIVALENCE_SCHEMA_VERSION,
+    }:
         raise ValueError("environment equivalence schema version is unsupported")
     _required_text(data.get("campaign_uid"), "campaign_uid")
     _phase_name(data.get("phase"))
@@ -647,6 +931,41 @@ def _validate_proof(payload: Mapping[str, Any]) -> Dict[str, Any]:
         not isinstance(value, str) or not value for value in data["reasons"]
     ):
         raise ValueError("environment equivalence reasons are invalid")
+    if schema_version == ENVIRONMENT_EQUIVALENCE_SCHEMA_VERSION:
+        if data.get("fingerprint_algorithm") != SCIENTIFIC_FINGERPRINT_ALGORITHM:
+            raise ValueError("environment equivalence fingerprint algorithm is invalid")
+        for field in ("producer_fingerprint", "current_fingerprint"):
+            value = data.get(field)
+            if value is not None and (
+                not isinstance(value, Mapping)
+                or value.get("algorithm") != SCIENTIFIC_FINGERPRINT_ALGORITHM
+            ):
+                raise ValueError(
+                    "environment equivalence " + field + " is invalid"
+                )
+        uncovered = data.get("uncovered_runtime_changes")
+        if not isinstance(uncovered, list) or any(
+            not isinstance(value, str) or not value for value in uncovered
+        ):
+            raise ValueError(
+                "environment equivalence uncovered runtime changes are invalid"
+            )
+        if bool(data.get("equivalent")) and uncovered:
+            raise ValueError(
+                "equivalent environment proof has uncovered runtime changes"
+            )
+        unresolved_dynamic = data.get("unresolved_dynamic_import_modules")
+        if not isinstance(unresolved_dynamic, list) or any(
+            not isinstance(value, str) or not value
+            for value in unresolved_dynamic
+        ):
+            raise ValueError(
+                "environment equivalence unresolved dynamic imports are invalid"
+            )
+        if bool(data.get("equivalent")) and unresolved_dynamic:
+            raise ValueError(
+                "equivalent environment proof has unresolved dynamic imports"
+            )
     unsigned = dict(data)
     recorded = unsigned.pop("proof_sha256", None)
     if _sha256_json(unsigned) != recorded:
@@ -764,6 +1083,8 @@ def assess_recovery_environment(
 
     producer_fingerprint: Optional[Dict[str, Any]] = None
     current_fingerprint: Optional[Dict[str, Any]] = None
+    uncovered_runtime_changes: Tuple[str, ...] = ()
+    unresolved_dynamic_import_modules: Tuple[str, ...] = ()
     if producer_digest != str(current_generation["digest_sha256"]):
         try:
             repo = _repository_root()
@@ -789,12 +1110,32 @@ def assess_recovery_environment(
                 current_commit,
                 backend,
             )
+            uncovered_runtime_changes = _uncovered_runtime_changes(
+                repo,
+                producer_commit,
+                current_commit,
+                producer_fingerprint,
+                current_fingerprint,
+            )
+            unresolved_dynamic_import_modules = (
+                _unresolved_dynamic_import_modules(
+                    producer_fingerprint,
+                    current_fingerprint,
+                )
+            )
             checks["producer_code"] = (
                 producer_fingerprint["fingerprint_sha256"]
                 == current_fingerprint["fingerprint_sha256"]
+                and not uncovered_runtime_changes
+                and not unresolved_dynamic_import_modules
             )
             if not checks["producer_code"]:
-                reasons.append("scientific_producer_code_changed")
+                if unresolved_dynamic_import_modules:
+                    reasons.append("dynamic_repository_import_unresolved")
+                elif uncovered_runtime_changes:
+                    reasons.append("uncovered_runtime_code_changed")
+                else:
+                    reasons.append("scientific_producer_code_changed")
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             checks["producer_code"] = False
             reasons.append(
@@ -809,6 +1150,7 @@ def assess_recovery_environment(
     equivalent = not reasons
     payload: Dict[str, Any] = {
         "schema_version": ENVIRONMENT_EQUIVALENCE_SCHEMA_VERSION,
+        "fingerprint_algorithm": SCIENTIFIC_FINGERPRINT_ALGORITHM,
         "campaign_uid": campaign_uid,
         "phase": phase,
         "iteration": _exact_nonnegative_int(intent.get("iteration"), "iteration"),
@@ -839,6 +1181,10 @@ def assess_recovery_environment(
         "checks": checks,
         "producer_fingerprint": producer_fingerprint,
         "current_fingerprint": current_fingerprint,
+        "uncovered_runtime_changes": list(uncovered_runtime_changes),
+        "unresolved_dynamic_import_modules": list(
+            unresolved_dynamic_import_modules
+        ),
         "equivalent": bool(equivalent),
         "reasons": list(dict.fromkeys(reasons)),
         "recorded_at_iso": _now_iso(),
@@ -882,6 +1228,8 @@ def assess_recovery_environment(
 __all__ = [
     "ENVIRONMENT_EQUIVALENCE_DIRNAME",
     "ENVIRONMENT_EQUIVALENCE_SCHEMA_VERSION",
+    "LEGACY_ENVIRONMENT_EQUIVALENCE_SCHEMA_VERSION",
+    "SCIENTIFIC_FINGERPRINT_ALGORITHM",
     "assess_recovery_environment",
     "assess_resource_evidence_code_equivalence",
     "environment_equivalence_path",

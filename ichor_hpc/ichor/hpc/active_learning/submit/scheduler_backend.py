@@ -88,6 +88,8 @@ class SchedulerBackend:
         queue_runner: Optional[Callable[..., Any]] = None,
         timeout_seconds: int = 60,
         cancellation_requested: bool = False,
+        expected_job_name: Optional[str] = None,
+        expected_owner: Optional[str] = None,
     ):
         raise NotImplementedError
 
@@ -97,6 +99,8 @@ class SchedulerBackend:
         *,
         queue_runner: Optional[Callable[..., Any]] = None,
         timeout_seconds: int = 60,
+        expected_job_name: Optional[str] = None,
+        expected_owner: Optional[str] = None,
     ):
         raise NotImplementedError
 
@@ -222,6 +226,8 @@ class SlurmScheduler(SchedulerBackend):
         queue_runner: Optional[Callable[..., Any]] = None,
         timeout_seconds: int = 60,
         cancellation_requested: bool = False,
+        expected_job_name: Optional[str] = None,
+        expected_owner: Optional[str] = None,
     ):
         del queue_runner, cancellation_requested
         return _call_with_supported_kwargs(
@@ -229,6 +235,8 @@ class SlurmScheduler(SchedulerBackend):
             job_id,
             sacct_runner=accounting_runner,
             timeout_seconds=int(timeout_seconds),
+            expected_job_name=expected_job_name,
+            expected_owner=expected_owner,
         )
 
     def find_active_job_by_id(
@@ -237,12 +245,16 @@ class SlurmScheduler(SchedulerBackend):
         *,
         queue_runner: Optional[Callable[..., Any]] = None,
         timeout_seconds: int = 60,
+        expected_job_name: Optional[str] = None,
+        expected_owner: Optional[str] = None,
     ):
         return _call_with_supported_kwargs(
             sacct_poll.find_active_job_by_id_detailed,
             job_id,
             squeue_runner=queue_runner,
             timeout_seconds=int(timeout_seconds),
+            expected_job_name=expected_job_name,
+            expected_owner=expected_owner,
         )
 
     def find_running_job_by_name(
@@ -260,6 +272,7 @@ class SlurmScheduler(SchedulerBackend):
             squeue_runner=queue_runner,
             use_squeue_fallback=True,
             timeout_seconds=int(timeout_seconds),
+            expected_owner=getpass.getuser(),
         )
 
     def find_accounted_job_by_name(
@@ -281,6 +294,7 @@ class SlurmScheduler(SchedulerBackend):
             use_squeue_fallback=True,
             submission_kind=submission_kind,
             timeout_seconds=int(timeout_seconds),
+            expected_owner=getpass.getuser(),
         )
 
     def cancellation_lookup(
@@ -296,6 +310,8 @@ class SlurmScheduler(SchedulerBackend):
                 queue_runner,
                 [
                     "squeue",
+                    "--user",
+                    getpass.getuser(),
                     "-j",
                     parent,
                     "--noheader",
@@ -462,6 +478,8 @@ class SgeScheduler(SchedulerBackend):
         queue_runner: Callable[..., Any] = subprocess.run,
         timeout_seconds: int = 60,
         cancellation_requested: bool = False,
+        expected_job_name: Optional[str] = None,
+        expected_owner: Optional[str] = None,
     ):
         return sge.poll_job(
             job_id,
@@ -469,6 +487,8 @@ class SgeScheduler(SchedulerBackend):
             qstat_runner=queue_runner,
             timeout_seconds=int(timeout_seconds),
             cancellation_requested=bool(cancellation_requested),
+            expected_job_name=expected_job_name,
+            expected_owner=expected_owner,
         )
 
     def find_active_job_by_id(
@@ -477,11 +497,15 @@ class SgeScheduler(SchedulerBackend):
         *,
         queue_runner: Callable[..., Any] = subprocess.run,
         timeout_seconds: int = 60,
+        expected_job_name: Optional[str] = None,
+        expected_owner: Optional[str] = None,
     ):
         return sge.find_active_job_by_id_detailed(
             job_id,
             qstat_runner=queue_runner,
             timeout_seconds=int(timeout_seconds),
+            expected_job_name=expected_job_name,
+            expected_owner=expected_owner,
         )
 
     def find_running_job_by_name(

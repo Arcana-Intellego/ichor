@@ -225,6 +225,7 @@ def test_mixed_attempt_recovery_uses_original_frozen_contract(
         scheduler_recovery,
         "read_phase_recovery_ledger",
         lambda _path: {
+            "schema_version": 1,
             "campaign_uid": CAMPAIGN_UID,
             "phase": "ARIADNE_ARRAY",
             "iteration": 15,
@@ -287,6 +288,7 @@ def test_mixed_attempt_recovery_rejects_contradictory_contracts(
         scheduler_recovery,
         "read_phase_recovery_ledger",
         lambda _path: {
+            "schema_version": 1,
             "campaign_uid": CAMPAIGN_UID,
             "phase": "ARIADNE_ARRAY",
             "iteration": 15,

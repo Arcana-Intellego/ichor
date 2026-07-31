@@ -2134,7 +2134,25 @@ def test_cli_stop_cancel_jobs_records_cancellation_without_rewriting_state(
     phase = CampaignPhase.PHASE_A_DIVERSITY.value
     state.pending_jobs[phase] = "123"
     write_state(campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME, state)
-    expected_name = live_job_name(state.campaign_uid, phase, 0)
+    submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=phase,
+        iteration=0,
+        expected_tasks=1,
+    )
+    submission_intent.mark_submitted(
+        campaign,
+        phase,
+        0,
+        "123",
+        expected_tasks=1,
+    )
+    expected_name = submission_intent.load_intent(
+        campaign,
+        phase,
+        0,
+    )["expected_job_name"]
     cancelled = []
     monkeypatch.setattr(
         cli_mod,
@@ -2142,7 +2160,12 @@ def test_cli_stop_cancel_jobs_records_cancellation_without_rewriting_state(
         lambda job_id: {
             "active": True,
             "inconclusive": False,
-            "rows": [{"job_id": str(job_id), "state": "RUNNING", "job_name": expected_name}],
+            "rows": [{
+                "job_id": str(job_id),
+                "state": "RUNNING",
+                "job_name": expected_name,
+                "owner": cli_mod.current_scheduler_user(),
+            }],
             "error": None,
         },
     )
@@ -2169,6 +2192,50 @@ def test_cli_stop_cancel_jobs_records_cancellation_without_rewriting_state(
     assert request["status"] == "requested"
     assert request["cancellation_summary"]["cancelled"][0]["job_id"] == "123"
     assert "Slurm cancellation: 1 cancelled" in out
+
+
+def test_cli_stop_refuses_active_job_without_submission_intent(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state()
+    phase = CampaignPhase.PHASE_A_DIVERSITY.value
+    state.pending_jobs[phase] = "123"
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    expected_name = live_job_name(
+        state.campaign_uid,
+        phase,
+        int(state.iteration),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_lookup_active_slurm_job_for_cancel",
+        lambda _job_id: {
+            "active": True,
+            "inconclusive": False,
+            "rows": [
+                {
+                    "job_id": "123",
+                    "state": "RUNNING",
+                    "job_name": expected_name,
+                    "owner": cli_mod.current_scheduler_user(),
+                }
+            ],
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_run_scancel",
+        lambda _job_id: pytest.fail(
+            "a job without an authenticated intent must not be cancelled"
+        ),
+    )
+
+    assert main(["stop", "--campaign-dir", str(campaign), "--cancel-jobs"]) == 10
 
 
 def test_cli_stop_cancel_jobs_records_mixed_terminal_task_evidence(
@@ -2220,6 +2287,7 @@ def test_cli_stop_cancel_jobs_records_mixed_terminal_task_evidence(
                     "job_id": str(job_id),
                     "state": "RUNNING",
                     "job_name": expected_name,
+                    "owner": cli_mod.current_scheduler_user(),
                 }
             ],
             "error": None,
@@ -2241,6 +2309,8 @@ def test_cli_stop_cancel_jobs_records_mixed_terminal_task_evidence(
             ),
             exit_code=((0, 0) if task_id == 0 else (0, 15)),
             elapsed_seconds=30,
+            job_name=expected_name,
+            owner=cli_mod.current_scheduler_user(),
         )
         for task_id in range(4)
     ]
@@ -2698,7 +2768,12 @@ def test_cli_stop_cancel_jobs_records_ferebus_intent_for_daemon_cleanup(
         lambda job_id: {
             "active": True,
             "inconclusive": False,
-            "rows": [{"job_id": str(job_id), "state": "PENDING", "job_name": expected_name}],
+            "rows": [{
+                "job_id": str(job_id),
+                "state": "PENDING",
+                "job_name": expected_name,
+                "owner": cli_mod.current_scheduler_user(),
+            }],
             "error": None,
         },
     )
@@ -2751,7 +2826,12 @@ def test_cli_stop_cancel_jobs_uses_intents_when_state_missing(
         lambda job_id: {
             "active": True,
             "inconclusive": False,
-            "rows": [{"job_id": str(job_id), "state": "RUNNING", "job_name": expected_name}],
+            "rows": [{
+                "job_id": str(job_id),
+                "state": "RUNNING",
+                "job_name": expected_name,
+                "owner": cli_mod.current_scheduler_user(),
+            }],
             "error": None,
         },
     )
@@ -2806,7 +2886,12 @@ def test_cli_stop_cancel_jobs_uses_intents_when_state_corrupt(
         lambda job_id: {
             "active": True,
             "inconclusive": False,
-            "rows": [{"job_id": str(job_id), "state": "RUNNING", "job_name": expected_name}],
+            "rows": [{
+                "job_id": str(job_id),
+                "state": "RUNNING",
+                "job_name": expected_name,
+                "owner": cli_mod.current_scheduler_user(),
+            }],
             "error": None,
         },
     )
@@ -2923,7 +3008,12 @@ def test_cli_stop_cancel_jobs_refuses_campaign_job_name_mismatch(
         lambda job_id: {
             "active": True,
             "inconclusive": False,
-            "rows": [{"job_id": str(job_id), "state": "RUNNING", "job_name": "other-campaign"}],
+            "rows": [{
+                "job_id": str(job_id),
+                "state": "RUNNING",
+                "job_name": "other-campaign",
+                "owner": cli_mod.current_scheduler_user(),
+            }],
             "error": None,
         },
     )
@@ -2940,6 +3030,78 @@ def test_cli_stop_cancel_jobs_refuses_campaign_job_name_mismatch(
     assert "scheduler job name mismatch" in err
     stopped = read_state(data / DEFAULT_STATE_FILENAME)
     assert stopped.pending_jobs[phase] == "321"
+
+
+@pytest.mark.parametrize("case", ["missing_owner", "mixed_names"])
+def test_cli_stop_cancel_jobs_requires_all_rows_to_match_identity(
+    tmp_path,
+    monkeypatch,
+    case,
+):
+    campaign = _campaign_with_config(tmp_path)
+    data = campaign / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state()
+    phase = CampaignPhase.INITIAL_GAUSSIAN.value
+    state.pending_jobs[phase] = "321"
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=phase,
+        iteration=int(state.iteration),
+        expected_tasks=1,
+    )
+    submission_intent.mark_submitted(
+        campaign,
+        phase,
+        int(state.iteration),
+        "321",
+        expected_tasks=1,
+    )
+    expected_name = submission_intent.load_intent(
+        campaign,
+        phase,
+        int(state.iteration),
+    )["expected_job_name"]
+    rows = [
+        {
+            "job_id": "321_0",
+            "state": "RUNNING",
+            "job_name": expected_name,
+            "owner": cli_mod.current_scheduler_user(),
+        }
+    ]
+    if case == "missing_owner":
+        rows[0]["owner"] = ""
+    else:
+        rows.append(
+            {
+                "job_id": "321_1",
+                "state": "PENDING",
+                "job_name": "unrelated-job",
+                "owner": cli_mod.current_scheduler_user(),
+            }
+        )
+    monkeypatch.setattr(
+        cli_mod,
+        "_lookup_active_slurm_job_for_cancel",
+        lambda _job_id: {
+            "active": True,
+            "inconclusive": False,
+            "rows": rows,
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_run_scancel",
+        lambda _job_id: pytest.fail(
+            "incomplete scheduler identity must not reach scancel"
+        ),
+    )
+
+    assert main(["stop", "--campaign-dir", str(campaign), "--cancel-jobs"]) == 10
 
 
 def test_cli_resume_explicitly_clears_shutdown_flag(tmp_path):

@@ -1,4 +1,5 @@
 """Tests for ichor.hpc.active_learning.daemon.daemon."""
+import getpass
 import json
 import time
 from pathlib import Path
@@ -621,6 +622,17 @@ def _partial_array_poll(job_id, **kw):
 def test_phase_entry_adopts_active_intent_job_id_when_squeue_active(tmp_path):
     campaign = tmp_path / "campaign"
     cfg = CampaignConfig(max_iterations=1)
+    liveness_calls = []
+
+    def job_liveness(job_id, **kwargs):
+        liveness_calls.append((str(job_id), dict(kwargs)))
+        return SimpleNamespace(
+            active=True,
+            inconclusive=False,
+            rows=[(str(job_id) + "_[0-4%2]", "PENDING")],
+            error=None,
+        )
+
     d = Daemon(
         campaign_dir=campaign,
         config=cfg,
@@ -630,12 +642,7 @@ def test_phase_entry_adopts_active_intent_job_id_when_squeue_active(tmp_path):
             inconclusive=False,
             rows=[],
         ),
-        job_liveness_checker=lambda job_id: SimpleNamespace(
-            active=True,
-            inconclusive=False,
-            rows=[(str(job_id) + "_[0-4%2]", "PENDING")],
-            error=None,
-        ),
+        job_liveness_checker=job_liveness,
     )
     d.data_dir().mkdir(parents=True, exist_ok=True)
     state = fresh_campaign_state(max_iterations=1)
@@ -667,6 +674,15 @@ def test_phase_entry_adopts_active_intent_job_id_when_squeue_active(tmp_path):
     )
     assert intent["status"] == "ADOPTED"
     assert intent["job_id"] == "888"
+    assert liveness_calls == [
+        (
+            "888",
+            {
+                "expected_job_name": intent["expected_job_name"],
+                "expected_owner": getpass.getuser(),
+            },
+        )
+    ]
 
 
 def test_missing_sacct_rows_keep_polling_when_squeue_still_active(tmp_path):
@@ -703,6 +719,48 @@ def test_missing_sacct_rows_keep_polling_when_squeue_still_active(tmp_path):
     assert intent["status"] == "SUBMITTED"
     events = list(iter_events(d.journal_path()))
     assert not any(e.get("event") == "sacct_missing_timeout" for e in events)
+
+
+def test_pending_poll_binds_accounting_and_liveness_to_intent_identity(tmp_path):
+    poll_calls = []
+    liveness_calls = []
+
+    def poll(job_id, **kwargs):
+        poll_calls.append((str(job_id), dict(kwargs)))
+        return _partial_array_poll(job_id)
+
+    def liveness(job_id, **kwargs):
+        liveness_calls.append((str(job_id), dict(kwargs)))
+        return SimpleNamespace(
+            active=True,
+            inconclusive=False,
+            rows=[(str(job_id) + "_[2-4]", "PENDING")],
+            error=None,
+        )
+
+    d = _make_daemon(
+        tmp_path,
+        sacct=poll,
+        job_liveness_checker=liveness,
+    )
+    _install_pending_array_state(d)
+    intent = submission_intent.load_intent(
+        d.campaign_dir,
+        CampaignPhase.INITIAL_AIMALL.value,
+        0,
+    )
+
+    assert d.tick() == TickStatus.POLLING
+    expected_identity = {
+        "expected_job_name": intent["expected_job_name"],
+        "expected_owner": getpass.getuser(),
+    }
+    assert poll_calls[0][0] == "777"
+    assert {
+        key: poll_calls[0][1][key]
+        for key in expected_identity
+    } == expected_identity
+    assert liveness_calls == [("777", expected_identity)]
 
 
 def test_missing_sacct_rows_keep_polling_when_squeue_inconclusive(tmp_path):

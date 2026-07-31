@@ -512,6 +512,14 @@ def _scheduler_recovery_recommendation(
             + " retry task"
             + ("" if scheduler.retry_tasks == 1 else "s")
         )
+    elif scheduler.recovery_state == "legacy_unverified":
+        primary = (
+            "resume the campaign to retry "
+            + str(scheduler.retry_tasks)
+            + " task"
+            + ("" if scheduler.retry_tasks == 1 else "s")
+            + " whose older recovery evidence cannot authorise reuse"
+        )
     else:
         primary = (
             "resume the campaign to validate "
@@ -525,8 +533,11 @@ def _scheduler_recovery_recommendation(
         severity="required",
         primary=primary,
         why=(
-            "authenticated terminal scheduler evidence proves the old job is "
-            "no longer active"
+            "the older recovery record is retained for task accounting but "
+            "cannot be used to trust scientific output"
+            if scheduler.recovery_state == "legacy_unverified"
+            else "authenticated terminal scheduler evidence proves the old "
+            "job is no longer active"
         ),
         command=_resume_cmd(campaign),
     )

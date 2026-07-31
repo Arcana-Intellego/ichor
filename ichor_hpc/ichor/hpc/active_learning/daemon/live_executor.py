@@ -101,6 +101,7 @@ from .cluster_profile import (
 from .state import CampaignPhase, atomic_write_json
 from .job_names import live_job_name
 from .scheduler_recovery import (
+    SCHEDULER_TERMINAL_RECEIPT_SCHEMA_VERSION,
     scheduler_terminal_recoveries,
     write_phase_recovery_ledger,
 )
@@ -1978,6 +1979,18 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         for recovery in recoveries:
             intent = recovery["intent"]
             identity = str(intent.get("submission_identity") or "")
+            if (
+                recovery.get("receipt", {}).get("schema_version")
+                != SCHEDULER_TERMINAL_RECEIPT_SCHEMA_VERSION
+            ):
+                assessments[identity] = {
+                    "equivalent": False,
+                    "reasons": ["legacy_scheduler_identity_unproven"],
+                    "proof": None,
+                    "path": None,
+                    "sha256": None,
+                }
+                continue
             recorded_scheduler = str(
                 intent.get("scheduler_identity_kind") or "slurm"
             ).strip().lower()
@@ -4028,6 +4041,24 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 ) from exc
             if resource_evidence_source is not None:
                 evidence_override = dict(resource_evidence_source.evidence)
+                evidence_override["resource_evidence_reuse"] = {
+                    "schema_version": 1,
+                    "fingerprint_algorithm": (
+                        resource_evidence_source.fingerprint_algorithm
+                    ),
+                    "equivalence_basis": (
+                        resource_evidence_source.equivalence_basis
+                    ),
+                    "source_submission_identity": (
+                        resource_evidence_source.source_submission_identity
+                    ),
+                    "source_attempt_id": (
+                        resource_evidence_source.source_attempt_id
+                    ),
+                    "source_resolution_sha256": (
+                        resource_evidence_source.source_resolution_sha256
+                    ),
+                }
                 resource_task_ids = (
                     None
                     if resource_evidence_source.already_filtered
@@ -4183,6 +4214,16 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 None
                 if resource_evidence_source is None
                 else resource_evidence_source.source_task_count
+            ),
+            resource_evidence_fingerprint_algorithm=(
+                None
+                if resource_evidence_source is None
+                else resource_evidence_source.fingerprint_algorithm
+            ),
+            resource_evidence_equivalence_basis=(
+                None
+                if resource_evidence_source is None
+                else resource_evidence_source.equivalence_basis
             ),
         )
         body = build_scheduler_script(
@@ -6129,6 +6170,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 ),
             )
             if recovery_ledger_path.exists() or recovery_ledger_path.is_symlink():
+                # This lineage is consumed only after the ARIADNE publication
+                # exists.  Pending recovery cannot reach this path until the
+                # executor has written a v2 ledger, while historical v1
+                # publications must remain readable by existing campaigns.
                 recovery_ledger = read_phase_recovery_ledger(
                     recovery_ledger_path
                 )
@@ -7587,11 +7632,18 @@ def make_live_job_liveness_checker(
     """Return a live-mode checker for an existing scheduler JobID."""
     backend = get_scheduler_backend(scheduler_kind or _configured_scheduler())
 
-    def _checker(job_id):
+    def _checker(
+        job_id,
+        *,
+        expected_job_name=None,
+        expected_owner=None,
+    ):
         return backend.find_active_job_by_id(
             job_id,
             queue_runner=(squeue_runner or subprocess.run),
             timeout_seconds=int(timeout_seconds),
+            expected_job_name=expected_job_name,
+            expected_owner=expected_owner,
         )
 
     return _checker

@@ -7,6 +7,7 @@ separate recovery ledger.
 from __future__ import annotations
 
 from ..strict_json import strict_json as json
+import getpass
 import hashlib
 import re
 from datetime import datetime, timezone
@@ -22,8 +23,10 @@ from .state import CampaignPhase, atomic_write_json
 from .submission_intent import intent_submitted_logical_task_ids
 
 
-SCHEDULER_TERMINAL_RECEIPT_SCHEMA_VERSION = 1
-PHASE_RECOVERY_LEDGER_SCHEMA_VERSION = 1
+SCHEDULER_TERMINAL_RECEIPT_SCHEMA_VERSION = 2
+LEGACY_SCHEDULER_TERMINAL_RECEIPT_SCHEMA_VERSION = 1
+PHASE_RECOVERY_LEDGER_SCHEMA_VERSION = 2
+LEGACY_PHASE_RECOVERY_LEDGER_SCHEMA_VERSION = 1
 SCHEDULER_TERMINAL_RECEIPT_DIRNAME = "scheduler_terminal_receipts"
 PHASE_RECOVERY_LEDGER_DIRNAME = "phase_recovery_ledgers"
 
@@ -217,9 +220,13 @@ def _pre_cancel_never_started(
     parent_job_id: str,
     submission_kind: str,
     expected_tasks: int,
+    expected_job_name: str,
+    expected_owner: str,
 ) -> bool:
     if len(rows) != int(expected_tasks) or not all(
         str(row.get("state") or "") in _SGE_NEVER_STARTED_STATES
+        and str(row.get("job_name") or "") == str(expected_job_name)
+        and str(row.get("owner") or "") == str(expected_owner)
         for row in rows
     ):
         return False
@@ -273,6 +280,7 @@ def classify_terminal_scheduler_evidence(
     if scheduler_kind not in {"slurm", "sge"}:
         raise ValueError("unsupported scheduler identity in submission intent")
 
+    expected_owner = getpass.getuser()
     accounting_exception: Optional[str] = None
     if (
         scheduler_kind == "sge"
@@ -282,6 +290,8 @@ def classify_terminal_scheduler_evidence(
             parent_job_id=str(identity["job_id"]),
             submission_kind=str(identity["submission_kind"]),
             expected_tasks=int(identity["expected_tasks"]),
+            expected_job_name=str(identity["expected_job_name"]),
+            expected_owner=expected_owner,
         )
     ):
         accounting_exception = "sge_deleted_before_start"
@@ -303,6 +313,14 @@ def classify_terminal_scheduler_evidence(
             int, Tuple[JobStatus, Optional[Tuple[int, int]]]
         ] = {}
         for observation in observations:
+            if observation.job_name != str(identity["expected_job_name"]):
+                raise ValueError(
+                    "scheduler accounting job name does not match submission intent"
+                )
+            if observation.owner != expected_owner:
+                raise ValueError(
+                    "scheduler accounting owner does not match the current account"
+                )
             scheduler_task_id = _scheduler_index(
                 observation,
                 parent_job_id=str(identity["job_id"]),
@@ -402,6 +420,16 @@ def classify_terminal_scheduler_evidence(
     ).hexdigest()
     return {
         **identity,
+        "scheduler_owner": expected_owner,
+        "scheduler_identity_verified": True,
+        "scheduler_observation_sha256": _sha256_json(
+            {
+                "job_id": identity["job_id"],
+                "job_name": identity["expected_job_name"],
+                "owner": expected_owner,
+                "outcomes": outcomes,
+            }
+        ),
         "scheduler_acceptance": "accepted",
         "logical_task_ids": list(logical_task_ids),
         "logical_task_set_sha256": task_set_sha256,
@@ -438,6 +466,16 @@ def classify_unaccepted_scheduler_intent(
     ]
     return {
         **identity,
+        "scheduler_owner": getpass.getuser(),
+        "scheduler_identity_verified": True,
+        "scheduler_observation_sha256": _sha256_json(
+            {
+                "job_id": None,
+                "job_name": identity["expected_job_name"],
+                "owner": getpass.getuser(),
+                "outcomes": outcomes,
+            }
+        ),
         "scheduler_acceptance": "not_accepted",
         "logical_task_ids": list(logical_task_ids),
         "logical_task_set_sha256": hashlib.sha256(
@@ -459,10 +497,11 @@ def scheduler_terminal_receipt_path(
     iteration: int,
     replacement_round: int,
     submission_identity: str,
+    schema_version: Optional[int] = None,
 ) -> Path:
     phase_name = _phase_name(phase)
     identity = _safe_identity(submission_identity, "submission_identity")
-    filename = (
+    base = (
         phase_name
         + "-"
         + f"{_exact_nonnegative_int(iteration, 'iteration'):06d}"
@@ -470,13 +509,21 @@ def scheduler_terminal_receipt_path(
         + f"{_exact_nonnegative_int(replacement_round, 'replacement_round'):04d}"
         + "-"
         + identity
-        + ".json"
     )
-    return (
+    root = (
         _operational_root(campaign_dir)
         / SCHEDULER_TERMINAL_RECEIPT_DIRNAME
-        / filename
     )
+    if schema_version is None:
+        current = root / (base + "-v2.json")
+        legacy = root / (base + ".json")
+        return current if current.exists() or not legacy.exists() else legacy
+    suffix = (
+        ""
+        if int(schema_version) == LEGACY_SCHEDULER_TERMINAL_RECEIPT_SCHEMA_VERSION
+        else "-v" + str(int(schema_version))
+    )
+    return root / (base + suffix + ".json")
 
 
 def _validate_terminal_receipt(
@@ -486,7 +533,11 @@ def _validate_terminal_receipt(
     campaign_dir: Optional[Union[str, Path]] = None,
 ) -> Dict[str, Any]:
     data = dict(payload)
-    if data.get("schema_version") != SCHEDULER_TERMINAL_RECEIPT_SCHEMA_VERSION:
+    schema_version = data.get("schema_version")
+    if schema_version not in {
+        LEGACY_SCHEDULER_TERMINAL_RECEIPT_SCHEMA_VERSION,
+        SCHEDULER_TERMINAL_RECEIPT_SCHEMA_VERSION,
+    }:
         raise ValueError("scheduler terminal receipt schema version is unsupported")
     acceptance = data.get("scheduler_acceptance")
     if acceptance not in {"accepted", "not_accepted"}:
@@ -500,6 +551,20 @@ def _validate_terminal_receipt(
             "scheduler terminal receipt acceptance state contradicts its JobID"
         )
     _required_text(data.get("recorded_at_iso"), "recorded_at_iso")
+    if schema_version == SCHEDULER_TERMINAL_RECEIPT_SCHEMA_VERSION:
+        scheduler_owner = _required_text(
+            data.get("scheduler_owner"),
+            "scheduler_owner",
+        )
+        if scheduler_owner != getpass.getuser():
+            raise ValueError("scheduler terminal receipt owner mismatch")
+        if data.get("scheduler_identity_verified") is not True:
+            raise ValueError("scheduler terminal receipt identity is unverified")
+        observation_digest = str(data.get("scheduler_observation_sha256") or "")
+        if not _SHA256_RE.fullmatch(observation_digest):
+            raise ValueError(
+                "scheduler terminal receipt observation digest is invalid"
+            )
     logical_task_ids = data.get("logical_task_ids")
     if not isinstance(logical_task_ids, list):
         raise ValueError("scheduler terminal receipt logical task IDs are invalid")
@@ -555,6 +620,19 @@ def _validate_terminal_receipt(
             completed.append(logical_id)
         else:
             retry.append(logical_id)
+    if schema_version == SCHEDULER_TERMINAL_RECEIPT_SCHEMA_VERSION:
+        expected_observation_digest = _sha256_json(
+            {
+                "job_id": identity["job_id"],
+                "job_name": identity["expected_job_name"],
+                "owner": data["scheduler_owner"],
+                "outcomes": outcomes,
+            }
+        )
+        if data.get("scheduler_observation_sha256") != expected_observation_digest:
+            raise ValueError(
+                "scheduler terminal receipt observation digest mismatch"
+            )
     if data.get("completed_logical_task_ids") != completed:
         raise ValueError("scheduler terminal receipt completed-task summary mismatch")
     if data.get("retry_logical_task_ids") != retry:
@@ -631,6 +709,7 @@ def write_scheduler_terminal_receipt(
         iteration=int(identity["iteration"]),
         replacement_round=int(identity["replacement_round"]),
         submission_identity=str(identity["submission_identity"]),
+        schema_version=SCHEDULER_TERMINAL_RECEIPT_SCHEMA_VERSION,
     )
     if path.exists() or path.is_symlink():
         existing = read_scheduler_terminal_receipt(
@@ -764,17 +843,27 @@ def phase_recovery_ledger_path(
     phase: Any,
     iteration: int,
     replacement_round: int,
+    schema_version: Optional[int] = None,
 ) -> Path:
     phase_name = _phase_name(phase)
-    filename = (
+    base = (
         phase_name
         + "-"
         + f"{_exact_nonnegative_int(iteration, 'iteration'):06d}"
         + "-r"
         + f"{_exact_nonnegative_int(replacement_round, 'replacement_round'):04d}"
-        + ".json"
     )
-    return _operational_root(campaign_dir) / PHASE_RECOVERY_LEDGER_DIRNAME / filename
+    root = _operational_root(campaign_dir) / PHASE_RECOVERY_LEDGER_DIRNAME
+    if schema_version is None:
+        current = root / (base + "-v2.json")
+        legacy = root / (base + ".json")
+        return current if current.exists() or not legacy.exists() else legacy
+    suffix = (
+        ""
+        if int(schema_version) == LEGACY_PHASE_RECOVERY_LEDGER_SCHEMA_VERSION
+        else "-v" + str(int(schema_version))
+    )
+    return root / (base + suffix + ".json")
 
 
 def write_phase_recovery_ledger(
@@ -817,6 +906,7 @@ def write_phase_recovery_ledger(
         phase=data["phase"],
         iteration=int(data["iteration"]),
         replacement_round=int(data["replacement_round"]),
+        schema_version=PHASE_RECOVERY_LEDGER_SCHEMA_VERSION,
     )
     if path.parent.is_symlink():
         raise ValueError("phase recovery ledger directory is a symlink")
@@ -851,7 +941,11 @@ def _validate_phase_recovery_ledger(
     campaign_dir: Optional[Union[str, Path]] = None,
 ) -> Dict[str, Any]:
     data = dict(payload)
-    if data.get("schema_version") != PHASE_RECOVERY_LEDGER_SCHEMA_VERSION:
+    schema_version = data.get("schema_version")
+    if schema_version not in {
+        LEGACY_PHASE_RECOVERY_LEDGER_SCHEMA_VERSION,
+        PHASE_RECOVERY_LEDGER_SCHEMA_VERSION,
+    }:
         raise ValueError("phase recovery ledger schema version is unsupported")
     _required_text(data.get("campaign_uid"), "campaign_uid")
     _phase_name(data.get("phase"))
@@ -1090,27 +1184,34 @@ def _validate_phase_recovery_ledger(
             )
 
         terminal_receipts_by_identity: Dict[str, Mapping[str, Any]] = {}
+        legacy_source_identities = set()
         latest_source_by_task: Dict[int, str] = {}
         for submission_identity, record in source_by_identity.items():
+            recorded_path = Path(str(record["path"])).expanduser()
+            receipt = read_scheduler_terminal_receipt(
+                recorded_path,
+                expected_intent=intent_by_identity[submission_identity],
+                campaign_dir=campaign,
+            )
             expected_path = scheduler_terminal_receipt_path(
                 campaign,
                 phase=data["phase"],
                 iteration=int(data["iteration"]),
                 replacement_round=int(data["replacement_round"]),
                 submission_identity=submission_identity,
+                schema_version=int(receipt["schema_version"]),
             )
-            recorded_path = Path(str(record["path"])).expanduser()
             if recorded_path.resolve(strict=False) != expected_path.resolve(
                 strict=False
             ):
                 raise ValueError(
                     "phase recovery terminal receipt path is not canonical"
                 )
-            receipt = read_scheduler_terminal_receipt(
-                expected_path,
-                expected_intent=intent_by_identity[submission_identity],
-                campaign_dir=campaign,
-            )
+            if (
+                receipt.get("schema_version")
+                == LEGACY_SCHEDULER_TERMINAL_RECEIPT_SCHEMA_VERSION
+            ):
+                legacy_source_identities.add(submission_identity)
             if (
                 str(receipt.get("receipt_sha256") or "")
                 != str(record["receipt_sha256"])
@@ -1134,7 +1235,30 @@ def _validate_phase_recovery_ledger(
                 latest_source_by_task[
                     int(outcome["logical_task_id"])
                 ] = submission_identity
+        if schema_version == PHASE_RECOVERY_LEDGER_SCHEMA_VERSION:
+            for submission_identity in legacy_source_identities:
+                equivalence_record = equivalence_by_identity[submission_identity]
+                if (
+                    equivalence_record.get("equivalent") is not False
+                    or equivalence_record.get("path") is not None
+                    or equivalence_record.get("sha256") is not None
+                    or "legacy_scheduler_identity_unproven"
+                    not in set(equivalence_record.get("reasons") or [])
+                ):
+                    raise ValueError(
+                        "legacy scheduler evidence is not marked for safe retry"
+                    )
+            legacy_latest_tasks = {
+                int(task_id)
+                for task_id, submission_identity in latest_source_by_task.items()
+                if submission_identity in legacy_source_identities
+            }
+            if not legacy_latest_tasks.issubset(set(retry_ids)):
+                raise ValueError(
+                    "legacy scheduler evidence cannot authorise reusable output"
+                )
         from .environment_equivalence import (
+            ENVIRONMENT_EQUIVALENCE_SCHEMA_VERSION,
             environment_equivalence_path,
             read_environment_equivalence,
         )
@@ -1151,7 +1275,16 @@ def _validate_phase_recovery_ledger(
                 replacement_round=int(data["replacement_round"]),
                 submission_identity=submission_identity,
                 current_generation=int(proof["current_generation"]),
+                schema_version=int(proof["schema_version"]),
             )
+            if (
+                schema_version == PHASE_RECOVERY_LEDGER_SCHEMA_VERSION
+                and proof.get("schema_version")
+                != ENVIRONMENT_EQUIVALENCE_SCHEMA_VERSION
+            ):
+                raise ValueError(
+                    "phase recovery ledger uses a legacy equivalence proof"
+                )
             if (
                 proof_path.resolve(strict=False)
                 != expected_proof_path.resolve(strict=False)
@@ -1273,9 +1406,24 @@ def read_phase_recovery_ledger(path: Union[str, Path]) -> Dict[str, Any]:
     )
 
 
+def require_current_phase_recovery_authority(
+    payload: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Require evidence written under the complete reuse-authority contract."""
+    data = dict(payload)
+    if data.get("schema_version") != PHASE_RECOVERY_LEDGER_SCHEMA_VERSION:
+        raise ValueError(
+            "legacy phase recovery evidence cannot authorise reusable output; "
+            "the affected tasks must be prepared for retry"
+        )
+    return data
+
+
 __all__ = [
     "PHASE_RECOVERY_LEDGER_DIRNAME",
     "PHASE_RECOVERY_LEDGER_SCHEMA_VERSION",
+    "LEGACY_PHASE_RECOVERY_LEDGER_SCHEMA_VERSION",
+    "LEGACY_SCHEDULER_TERMINAL_RECEIPT_SCHEMA_VERSION",
     "SCHEDULER_TERMINAL_RECEIPT_DIRNAME",
     "SCHEDULER_TERMINAL_RECEIPT_SCHEMA_VERSION",
     "classify_terminal_scheduler_evidence",
@@ -1284,6 +1432,7 @@ __all__ = [
     "phase_recovery_ledger_path",
     "read_phase_recovery_ledger",
     "read_scheduler_terminal_receipt",
+    "require_current_phase_recovery_authority",
     "scheduler_terminal_receipt_path",
     "scheduler_terminal_recoveries",
     "validate_scheduler_terminal_receipt",

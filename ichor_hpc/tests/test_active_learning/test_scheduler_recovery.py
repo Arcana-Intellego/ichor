@@ -3,30 +3,47 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import getpass
 import hashlib
+import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from ichor.hpc.active_learning.daemon import environment_equivalence
+from ichor.hpc.active_learning.daemon import (
+    environment_equivalence,
+    scheduler_recovery,
+)
 from ichor.hpc.active_learning.daemon.array_recovery import (
     PARTIAL_RECOVERY_PHASES,
 )
 from ichor.hpc.active_learning.daemon.live_executor import (
     LIVE_POSTPROCESS_IMPLEMENTED,
+    LiveBackendsPhaseExecutor,
 )
 from ichor.hpc.active_learning.daemon.phase_executor import SBATCH_PHASES
 from ichor.hpc.active_learning.daemon.state import atomic_write_json
+from ichor.hpc.active_learning.cli import (
+    _load_scheduler_recovery_status,
+    _status_current_activity,
+)
 from ichor.hpc.active_learning.daemon.submission_intent import (
     expected_job_name,
     intent_dir,
 )
 from ichor.hpc.active_learning.daemon.scheduler_recovery import (
+    LEGACY_PHASE_RECOVERY_LEDGER_SCHEMA_VERSION,
+    LEGACY_SCHEDULER_TERMINAL_RECEIPT_SCHEMA_VERSION,
     classify_terminal_scheduler_evidence,
     classify_unaccepted_scheduler_intent,
     load_scheduler_terminal_receipt,
     phase_recovery_ledger_path,
     read_phase_recovery_ledger,
+    read_scheduler_terminal_receipt,
+    require_current_phase_recovery_authority,
     scheduler_terminal_recoveries,
+    scheduler_terminal_receipt_path,
     write_phase_recovery_ledger,
     write_scheduler_terminal_receipt,
 )
@@ -142,6 +159,7 @@ def test_exact_terminal_classification_covers_every_scheduler_phase(
                 0,
                 JobStatus.COMPLETED,
                 job_id=intent["job_id"],
+                job_name=intent["expected_job_name"],
             )
         ]
         if scalar
@@ -150,12 +168,14 @@ def test_exact_terminal_classification_covers_every_scheduler_phase(
                 0,
                 JobStatus.COMPLETED,
                 job_id=intent["job_id"],
+                job_name=intent["expected_job_name"],
             ),
             _observation(
                 1,
                 JobStatus.CANCELLED,
                 exit_code=(0, 15),
                 job_id=intent["job_id"],
+                job_name=intent["expected_job_name"],
             ),
         ]
     )
@@ -166,6 +186,8 @@ def test_exact_terminal_classification_covers_every_scheduler_phase(
             exit_code=(0, 0),
             elapsed_seconds=120,
             raw_status=JobStatus.COMPLETED.value,
+            job_name=intent["expected_job_name"],
+            owner=getpass.getuser(),
         )
 
     classified = classify_terminal_scheduler_evidence(
@@ -187,6 +209,7 @@ def _observation(
     *,
     exit_code=(0, 0),
     job_id: str = "17923151",
+    job_name: str | None = None,
 ):
     return JobObservation(
         job_id=job_id + "_" + str(task_id),
@@ -194,6 +217,8 @@ def _observation(
         exit_code=exit_code,
         elapsed_seconds=120 + task_id,
         raw_status=status.value,
+        job_name=(job_name or _intent(job_id=job_id)["expected_job_name"]),
+        owner=getpass.getuser(),
     )
 
 
@@ -207,7 +232,10 @@ def _source_digest(records):
 
 def _write_environment_proof(tmp_path, intent, *, current_generation=9):
     payload = {
-        "schema_version": 1,
+        "schema_version": environment_equivalence.ENVIRONMENT_EQUIVALENCE_SCHEMA_VERSION,
+        "fingerprint_algorithm": (
+            environment_equivalence.SCIENTIFIC_FINGERPRINT_ALGORITHM
+        ),
         "campaign_uid": intent["campaign_uid"],
         "phase": intent["phase"],
         "iteration": intent["iteration"],
@@ -228,6 +256,8 @@ def _write_environment_proof(tmp_path, intent, *, current_generation=9):
         "checks": {},
         "producer_fingerprint": None,
         "current_fingerprint": None,
+        "uncovered_runtime_changes": [],
+        "unresolved_dynamic_import_modules": [],
         "equivalent": True,
         "reasons": [],
         "recorded_at_iso": "2026-07-28T00:00:00+00:00",
@@ -286,6 +316,8 @@ def _write_terminal_source(
                 exit_code=((0, 0) if status is JobStatus.COMPLETED else (0, 15)),
                 elapsed_seconds=120,
                 raw_status=status.value,
+                job_name=intent["expected_job_name"],
+                owner=getpass.getuser(),
             )
         ]
     else:
@@ -299,6 +331,7 @@ def _write_terminal_source(
                 ),
                 exit_code=((0, 0) if task_id in completed else (0, 15)),
                 job_id=intent["job_id"],
+                job_name=intent["expected_job_name"],
             )
             for task_id in range(intent["expected_tasks"])
         ]
@@ -332,6 +365,45 @@ def _write_terminal_source(
     }
 
 
+def _write_legacy_terminal_source(
+    tmp_path,
+    intent,
+    *,
+    completed_task_ids,
+):
+    source = _write_terminal_source(
+        tmp_path,
+        intent,
+        completed_task_ids=completed_task_ids,
+    )
+    current_path = Path(source["path"])
+    payload = json.loads(current_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = (
+        LEGACY_SCHEDULER_TERMINAL_RECEIPT_SCHEMA_VERSION
+    )
+    payload.pop("scheduler_owner", None)
+    payload.pop("scheduler_identity_verified", None)
+    payload.pop("scheduler_observation_sha256", None)
+    payload.pop("receipt_sha256", None)
+    payload["receipt_sha256"] = scheduler_recovery._sha256_json(payload)
+    legacy_path = scheduler_terminal_receipt_path(
+        tmp_path,
+        phase=intent["phase"],
+        iteration=intent["iteration"],
+        replacement_round=intent["replacement_round"],
+        submission_identity=intent["submission_identity"],
+        schema_version=LEGACY_SCHEDULER_TERMINAL_RECEIPT_SCHEMA_VERSION,
+    )
+    atomic_write_json(legacy_path, payload)
+    current_path.unlink()
+    return {
+        "path": str(legacy_path),
+        "receipt_sha256": payload["receipt_sha256"],
+        "job_id": intent["job_id"],
+        "submission_identity": intent["submission_identity"],
+    }
+
+
 def test_mixed_slurm_terminal_outcomes_preserve_only_zero_exit_completions(
     tmp_path,
 ):
@@ -354,6 +426,45 @@ def test_mixed_slurm_terminal_outcomes_preserve_only_zero_exit_completions(
     assert classified["retry_logical_task_ids"] == [1, 2, 3]
     assert classified["n_completed"] == 1
     assert classified["n_retry"] == 3
+
+
+@pytest.mark.parametrize(
+    "job_name,owner,match",
+    [
+        ("foreign-job", getpass.getuser(), "job name"),
+        (_intent()["expected_job_name"], "foreign-owner", "owner"),
+        (_intent()["expected_job_name"], None, "owner"),
+    ],
+)
+def test_terminal_classification_requires_exact_scheduler_identity(
+    tmp_path,
+    job_name,
+    owner,
+    match,
+):
+    observation = _observation(0, JobStatus.COMPLETED)
+    observation = JobObservation(
+        job_id=observation.job_id,
+        status=observation.status,
+        exit_code=observation.exit_code,
+        elapsed_seconds=observation.elapsed_seconds,
+        raw_status=observation.raw_status,
+        job_id_raw=observation.job_id_raw,
+        job_name=job_name,
+        owner=owner,
+    )
+    observations = [observation] + [
+        _observation(task_id, JobStatus.CANCELLED, exit_code=(0, 15))
+        for task_id in range(1, 4)
+    ]
+
+    with pytest.raises(ValueError, match=match):
+        classify_terminal_scheduler_evidence(
+            tmp_path,
+            _intent(),
+            observations,
+            queue_active=False,
+        )
 
 
 @pytest.mark.parametrize(
@@ -413,8 +524,17 @@ def test_incomplete_or_contradictory_terminal_accounting_fails_closed(
 def test_sge_uses_normalised_zero_based_task_ids(tmp_path):
     intent = _intent(scheduler="sge", expected_tasks=2)
     observations = [
-        _observation(0, JobStatus.COMPLETED),
-        _observation(1, JobStatus.CANCELLED, exit_code=(137, 0)),
+        _observation(
+            0,
+            JobStatus.COMPLETED,
+            job_name=intent["expected_job_name"],
+        ),
+        _observation(
+            1,
+            JobStatus.CANCELLED,
+            exit_code=(137, 0),
+            job_name=intent["expected_job_name"],
+        ),
     ]
 
     classified = classify_terminal_scheduler_evidence(
@@ -439,9 +559,24 @@ def test_sge_deleted_before_start_requires_complete_queued_or_held_evidence(
         [],
         queue_active=False,
         pre_cancel_rows=[
-            {"job_id": "17923151_0", "state": "qw"},
-            {"job_id": "17923151_1", "state": "hqw"},
-            {"job_id": "17923151_2", "state": "qw"},
+            {
+                "job_id": "17923151_0",
+                "state": "qw",
+                "job_name": intent["expected_job_name"],
+                "owner": getpass.getuser(),
+            },
+            {
+                "job_id": "17923151_1",
+                "state": "hqw",
+                "job_name": intent["expected_job_name"],
+                "owner": getpass.getuser(),
+            },
+            {
+                "job_id": "17923151_2",
+                "state": "qw",
+                "job_name": intent["expected_job_name"],
+                "owner": getpass.getuser(),
+            },
         ],
     )
     assert classified["accounting_exception"] == "sge_deleted_before_start"
@@ -455,8 +590,18 @@ def test_sge_deleted_before_start_requires_complete_queued_or_held_evidence(
             [],
             queue_active=False,
             pre_cancel_rows=[
-                {"job_id": "17923151_0", "state": "qw"},
-                {"job_id": "17923151_1", "state": "qw"},
+                {
+                    "job_id": "17923151_0",
+                    "state": "qw",
+                    "job_name": intent["expected_job_name"],
+                    "owner": getpass.getuser(),
+                },
+                {
+                    "job_id": "17923151_1",
+                    "state": "qw",
+                    "job_name": intent["expected_job_name"],
+                    "owner": getpass.getuser(),
+                },
             ],
         )
 
@@ -544,12 +689,173 @@ def test_terminal_receipt_is_idempotent_and_rejects_changed_evidence(tmp_path):
 
     changed = deepcopy(classification)
     changed["outcomes"][0]["raw_status"] = "changed"
-    with pytest.raises(ValueError, match="different evidence"):
+    with pytest.raises(
+        ValueError,
+        match="observation digest mismatch|different evidence",
+    ):
         write_scheduler_terminal_receipt(
             tmp_path,
             intent,
             changed,
         )
+
+
+def test_legacy_terminal_receipt_remains_readable_but_forces_retry(tmp_path):
+    intent = _intent(expected_tasks=2)
+    source = _write_legacy_terminal_source(
+        tmp_path,
+        intent,
+        completed_task_ids=[0],
+    )
+
+    receipt = read_scheduler_terminal_receipt(
+        source["path"],
+        expected_intent=intent,
+        campaign_dir=tmp_path,
+    )
+    assert receipt["schema_version"] == 1
+    assert load_scheduler_terminal_receipt(tmp_path, intent) == receipt
+
+    executor = object.__new__(LiveBackendsPhaseExecutor)
+    assessments = executor._scheduler_recovery_environment_assessments(
+        [{"intent": intent, "receipt": receipt}]
+    )
+    assert assessments[intent["submission_identity"]] == {
+        "equivalent": False,
+        "reasons": ["legacy_scheduler_identity_unproven"],
+        "proof": None,
+        "path": None,
+        "sha256": None,
+    }
+
+    status = _load_scheduler_recovery_status(
+        tmp_path,
+        SimpleNamespace(
+            campaign_uid=intent["campaign_uid"],
+            phase=SimpleNamespace(value=intent["phase"]),
+            iteration=intent["iteration"],
+            replacement_round=intent["replacement_round"],
+        ),
+    )
+    assert status["state"] == "legacy_unverified"
+    assert status["n_reusable"] == 0
+    assert status["n_retry"] == 2
+    activity = _status_current_activity(
+        {
+            "phase": intent["phase"],
+            "iteration": intent["iteration"],
+            "replacement_round": intent["replacement_round"],
+            "pending_jobs": {},
+            "active_submission_intents": [],
+            "_presentation_scheduler_recovery": status,
+        }
+    )
+    assert "cannot safely authorise output reuse" in activity
+    assert "2 affected tasks will be retried" in activity
+
+
+def test_v2_ledger_accepts_legacy_receipt_only_for_safe_retry(tmp_path):
+    intent = _intent(expected_tasks=2)
+    source = _write_legacy_terminal_source(
+        tmp_path,
+        intent,
+        completed_task_ids=[0],
+    )
+    ledger = {
+        "campaign_uid": intent["campaign_uid"],
+        "phase": intent["phase"],
+        "iteration": intent["iteration"],
+        "replacement_round": intent["replacement_round"],
+        "source_receipt_sha256": _source_digest([source]),
+        "source_terminal_receipts": [source],
+        "environment_equivalences": [
+            {
+                "submission_identity": intent["submission_identity"],
+                "equivalent": False,
+                "reasons": ["legacy_scheduler_identity_unproven"],
+                "path": None,
+                "sha256": None,
+            }
+        ],
+        "reusable_logical_task_ids": [],
+        "retry_logical_task_ids": [0, 1],
+        "recovery_lineage": [],
+    }
+
+    written = write_phase_recovery_ledger(tmp_path, ledger)
+    assert written["schema_version"] == 2
+    assert written["n_reusable"] == 0
+    assert written["n_retry"] == 2
+
+    unsafe = dict(
+        ledger,
+        reusable_logical_task_ids=[0],
+        retry_logical_task_ids=[1],
+        recovery_lineage=[],
+    )
+    with pytest.raises(
+        ValueError,
+        match="lineage does not cover|cannot authorise reusable output",
+    ):
+        scheduler_recovery._validate_phase_recovery_ledger(
+            {
+                **unsafe,
+                "schema_version": 2,
+                "n_reusable": 1,
+                "n_retry": 1,
+                "recorded_at_iso": "2026-07-28T00:00:00+00:00",
+                "ledger_sha256": "0" * 64,
+            },
+            campaign_dir=tmp_path,
+        )
+
+
+def test_legacy_phase_ledger_is_readable_but_not_reuse_authority(tmp_path):
+    intent = _intent(expected_tasks=2)
+    source = _write_legacy_terminal_source(
+        tmp_path,
+        intent,
+        completed_task_ids=[0],
+    )
+    payload = {
+        "schema_version": LEGACY_PHASE_RECOVERY_LEDGER_SCHEMA_VERSION,
+        "campaign_uid": intent["campaign_uid"],
+        "phase": intent["phase"],
+        "iteration": intent["iteration"],
+        "replacement_round": intent["replacement_round"],
+        "source_receipt_sha256": _source_digest([source]),
+        "source_terminal_receipts": [source],
+        "environment_equivalences": [
+            {
+                "submission_identity": intent["submission_identity"],
+                "equivalent": False,
+                "reasons": ["legacy evidence"],
+                "path": None,
+                "sha256": None,
+            }
+        ],
+        "reusable_logical_task_ids": [],
+        "retry_logical_task_ids": [0, 1],
+        "n_reusable": 0,
+        "n_retry": 2,
+        "recovery_lineage": [],
+        "recorded_at_iso": "2026-07-28T00:00:00+00:00",
+    }
+    payload["ledger_sha256"] = scheduler_recovery._sha256_json(payload)
+    path = phase_recovery_ledger_path(
+        tmp_path,
+        phase=intent["phase"],
+        iteration=intent["iteration"],
+        replacement_round=intent["replacement_round"],
+        schema_version=LEGACY_PHASE_RECOVERY_LEDGER_SCHEMA_VERSION,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, payload)
+
+    legacy = read_phase_recovery_ledger(path)
+    assert legacy["schema_version"] == 1
+    with pytest.raises(ValueError, match="cannot authorise reusable output"):
+        require_current_phase_recovery_authority(legacy)
 
 
 @pytest.mark.parametrize(

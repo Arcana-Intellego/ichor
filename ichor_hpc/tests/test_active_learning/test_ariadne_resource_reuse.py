@@ -170,7 +170,10 @@ def _resource_fixture(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(
         reuse,
         "assess_resource_evidence_code_equivalence",
-        lambda *_a, **_k: {"equivalent": True},
+        lambda *_a, **_k: {
+            "equivalent": True,
+            "fingerprint_algorithm": "repository_module_closure_v2",
+        },
     )
     return campaign, current_config, evidence
 
@@ -959,6 +962,14 @@ def test_live_retry_submission_filters_reused_evidence_before_rendering(
     assert selected["logical_n_tasks"] == 200
     assert selected["submitted_logical_task_ids"] == retry_ids
     assert selected["gradient_dimensions"] == dimensions[4:]
+    assert selected["resource_evidence_reuse"] == {
+        "schema_version": 1,
+        "fingerprint_algorithm": "repository_module_closure_v2",
+        "equivalence_basis": "same_environment_generation",
+        "source_submission_identity": "r0000-a0001-source",
+        "source_attempt_id": "attempt-1",
+        "source_resolution_sha256": "a" * 64,
+    }
     assert progress[0] == (
         "ariadne_resource_reuse",
         {
@@ -977,3 +988,7 @@ def test_live_retry_submission_filters_reused_evidence_before_rendering(
     assert event["resource_evidence_mode"] == "reused"
     assert event["resource_evidence_source_tasks"] == 200
     assert event["resource_evidence_source_resolution_sha256"] == "a" * 64
+    assert (
+        event["resource_evidence_fingerprint_algorithm"]
+        == "repository_module_closure_v2"
+    )

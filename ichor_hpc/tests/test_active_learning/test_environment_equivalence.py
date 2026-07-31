@@ -1,9 +1,12 @@
 """Scientific environment-equivalence proofs for cancelled task reuse."""
 
+import json
 from pathlib import Path
+import subprocess
 
 from ichor.hpc.active_learning.daemon import environment_equivalence as module
 from ichor.hpc.active_learning import execution_identity
+from ichor.hpc.active_learning.daemon.state import atomic_write_json
 
 
 def _intent():
@@ -121,6 +124,44 @@ def test_identical_scientific_environment_is_reusable(tmp_path, monkeypatch):
     assert Path(assessment["path"]).is_file()
 
 
+def test_legacy_equivalence_proof_remains_readable_but_is_separate(tmp_path, monkeypatch):
+    producer = _generation(generation=2, digest="a" * 64)
+    current = _generation(generation=3, digest="a" * 64)
+    _patch_environment_readers(
+        monkeypatch,
+        producer=producer,
+        current=current,
+    )
+    assessment = module.assess_recovery_environment(
+        tmp_path,
+        intent=_intent(),
+        current_scheduler_kind="slurm",
+    )
+    current_path = Path(assessment["path"])
+    payload = json.loads(current_path.read_text(encoding="utf-8"))
+    payload["schema_version"] = (
+        module.LEGACY_ENVIRONMENT_EQUIVALENCE_SCHEMA_VERSION
+    )
+    payload.pop("fingerprint_algorithm", None)
+    payload.pop("uncovered_runtime_changes", None)
+    payload.pop("unresolved_dynamic_import_modules", None)
+    payload.pop("proof_sha256", None)
+    payload["proof_sha256"] = module._sha256_json(payload)
+    legacy_path = module.environment_equivalence_path(
+        tmp_path,
+        phase=payload["phase"],
+        iteration=payload["iteration"],
+        replacement_round=payload["replacement_round"],
+        submission_identity=payload["submission_identity"],
+        current_generation=payload["current_generation"],
+        schema_version=module.LEGACY_ENVIRONMENT_EQUIVALENCE_SCHEMA_VERSION,
+    )
+    atomic_write_json(legacy_path, payload)
+
+    assert module.read_environment_equivalence(legacy_path) == payload
+    assert current_path != legacy_path
+
+
 def test_changed_producer_code_forces_retry(tmp_path, monkeypatch):
     producer = _generation(generation=2, digest="a" * 64)
     current = _generation(generation=3, digest="b" * 64)
@@ -139,12 +180,19 @@ def test_changed_producer_code_forces_retry(tmp_path, monkeypatch):
         module,
         "_producer_fingerprint",
         lambda _repo, commit, backend: {
+            "algorithm": module.SCIENTIFIC_FINGERPRINT_ALGORITHM,
             "backend": backend,
-            "symbols": [],
+            "modules": [],
+            "covered_paths": [],
             "fingerprint_sha256": (
                 "1" * 64 if commit == "producer-commit" else "2" * 64
             ),
         },
+    )
+    monkeypatch.setattr(
+        module,
+        "_uncovered_runtime_changes",
+        lambda *_args, **_kwargs: (),
     )
 
     assessment = module.assess_recovery_environment(
@@ -234,12 +282,19 @@ def test_resource_evidence_equivalence_uses_scientific_algorithm_roots(
     def fingerprint(_repo, commit, backend, roots):
         calls.append((commit, backend, roots))
         return {
+            "algorithm": module.SCIENTIFIC_FINGERPRINT_ALGORITHM,
             "backend": backend,
-            "symbols": [],
+            "modules": [],
+            "covered_paths": [],
             "fingerprint_sha256": "1" * 64,
         }
 
     monkeypatch.setattr(module, "_fingerprint_roots", fingerprint)
+    monkeypatch.setattr(
+        module,
+        "_uncovered_runtime_changes",
+        lambda *_args, **_kwargs: (),
+    )
 
     assessment = module.assess_resource_evidence_code_equivalence(
         producer,
@@ -266,3 +321,100 @@ def test_resource_evidence_equivalence_uses_scientific_algorithm_roots(
         "ichor_core/ichor/core/adversarial/subspace.py",
         "build_local_subspace",
     ) in flattened
+
+
+def test_unresolved_dynamic_repository_import_blocks_equivalence(
+    tmp_path,
+    monkeypatch,
+):
+    producer = _generation(generation=2, digest="a" * 64)
+    current = _generation(generation=3, digest="b" * 64)
+    monkeypatch.setattr(module, "_repository_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        module,
+        "_require_clean_available_commit",
+        lambda *_args, label, **_kwargs: label + "-commit",
+    )
+    monkeypatch.setattr(
+        module,
+        "_fingerprint_roots",
+        lambda _repo, _commit, backend, _roots: {
+            "algorithm": module.SCIENTIFIC_FINGERPRINT_ALGORITHM,
+            "backend": backend,
+            "modules": [],
+            "covered_paths": [],
+            "unresolved_dynamic_import_modules": [
+                "ichor_hpc/ichor/hpc/active_learning/producer.py"
+            ],
+            "fingerprint_sha256": "1" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_uncovered_runtime_changes",
+        lambda *_args, **_kwargs: (),
+    )
+
+    assessment = module.assess_resource_evidence_code_equivalence(
+        producer,
+        current,
+        backend="ariadne",
+    )
+
+    assert assessment["equivalent"] is False
+    assert assessment["unresolved_dynamic_import_modules"]
+
+
+def test_v2_producer_closure_covers_audit_escape_dependencies():
+    repo = Path(
+        subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=Path(__file__).resolve().parent,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    ariadne = module._producer_fingerprint(repo, commit, "ariadne")
+    gaussian = module._producer_fingerprint(repo, commit, "gaussian")
+
+    assert ariadne["algorithm"] == module.SCIENTIFIC_FINGERPRINT_ALGORITHM
+    assert "ichor_core/ichor/core/atoms/atoms.py" in ariadne["covered_paths"]
+    assert (
+        "ichor_core/ichor/core/adversarial/geometry.py"
+        in ariadne["covered_paths"]
+    )
+    assert (
+        "ichor_core/ichor/core/files/gaussian/gjf.py"
+        in gaussian["covered_paths"]
+    )
+
+
+def test_uncovered_runtime_change_blocks_equivalence(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        module,
+        "_changed_paths",
+        lambda *_args, **_kwargs: {
+            "ichor_core/ichor/core/unresolved_dynamic_dependency.py",
+            "docs/recovery.md",
+        },
+    )
+
+    uncovered = module._uncovered_runtime_changes(
+        tmp_path,
+        "producer",
+        "current",
+        {"covered_paths": ["ichor_hpc/ichor/hpc/active_learning/producer.py"]},
+    )
+
+    assert uncovered == (
+        "ichor_core/ichor/core/unresolved_dynamic_dependency.py",
+    )

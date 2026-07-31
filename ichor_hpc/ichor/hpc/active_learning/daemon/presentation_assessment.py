@@ -10,7 +10,9 @@ from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, Mapping, Tuple
 
 
-_TERMINAL_RECOVERY_STATES = frozenset({"awaiting_validation", "validated"})
+_TERMINAL_RECOVERY_STATES = frozenset(
+    {"awaiting_validation", "legacy_unverified", "validated"}
+)
 _CONFIG_REVIEW_STATES = frozenset(
     {"unchanged", "allowed", "blocked", "invalid", "unavailable"}
 )
@@ -165,7 +167,7 @@ def _terminal_recovery(
             recovery.get(
                 (
                     "n_retry"
-                    if state == "validated"
+                    if state in {"legacy_unverified", "validated"}
                     else "n_scheduler_retry"
                 )
             )

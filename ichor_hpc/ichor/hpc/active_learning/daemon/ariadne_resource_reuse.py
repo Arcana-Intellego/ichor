@@ -17,6 +17,7 @@ from ..versioning.manifest import sha256_file
 from ..versioning.trained_models import resolve_trained_model_set
 from .config_lock import read_historical_config_by_fingerprint
 from .environment_equivalence import (
+    SCIENTIFIC_FINGERPRINT_ALGORITHM,
     assess_resource_evidence_code_equivalence,
 )
 from .filesystem import campaign_owned_path
@@ -37,6 +38,8 @@ class ReusableAriadneResourceEvidence:
     source_resolution_sha256: str
     source_task_count: int
     already_filtered: bool
+    fingerprint_algorithm: str = SCIENTIFIC_FINGERPRINT_ALGORITHM
+    equivalence_basis: str = "same_environment_generation"
 
 
 def _exact_int(value: Any, label: str, *, minimum: int = 0) -> int:
@@ -254,7 +257,7 @@ def _candidate_is_compatible(
     task_map_file: Path,
     logical_total: int,
     submitted_task_ids: Sequence[int],
-) -> Tuple[Tuple[int, ...], bool, bool]:
+) -> Tuple[Tuple[int, ...], bool, bool, str]:
     if str(intent.get("scheduler_identity_kind") or "slurm").lower() != str(
         expected_scheduler_kind
     ).lower():
@@ -310,6 +313,7 @@ def _candidate_is_compatible(
     )
     if _dimension_contract(source_config) != _dimension_contract(current_config):
         raise ValueError("ARIADNE resource-evidence configuration changed")
+    equivalence_basis = "same_environment_generation"
     if (
         str(producer_generation.get("digest_sha256"))
         != str(current_generation.get("digest_sha256"))
@@ -321,10 +325,17 @@ def _candidate_is_compatible(
         )
         if not bool(code["equivalent"]):
             raise ValueError("ARIADNE resource-evidence producer code changed")
-    return _validated_dimensions(
+        equivalence_basis = str(code["fingerprint_algorithm"])
+    dimensions, already_filtered, full_coverage = _validated_dimensions(
         evidence,
         logical_total=int(logical_total),
         submitted_task_ids=submitted_task_ids,
+    )
+    return (
+        dimensions,
+        already_filtered,
+        full_coverage,
+        equivalence_basis,
     )
 
 
@@ -414,6 +425,7 @@ def resolve_reusable_ariadne_resource_evidence(
                 dimensions,
                 already_filtered,
                 full_coverage,
+                equivalence_basis,
             ) = _candidate_is_compatible(
                 campaign,
                 current_config,
@@ -446,6 +458,7 @@ def resolve_reusable_ariadne_resource_evidence(
                 dict(payload["evidence"]),
                 dimensions,
                 already_filtered,
+                equivalence_basis,
             )
         )
     if not compatible:
@@ -474,6 +487,7 @@ def resolve_reusable_ariadne_resource_evidence(
         evidence,
         _dimensions,
         already_filtered,
+        equivalence_basis,
     ) = selected
     return ReusableAriadneResourceEvidence(
         evidence=evidence,
@@ -483,6 +497,8 @@ def resolve_reusable_ariadne_resource_evidence(
         source_resolution_sha256=str(digest),
         source_task_count=int(evidence["n_tasks"]),
         already_filtered=bool(already_filtered),
+        fingerprint_algorithm=SCIENTIFIC_FINGERPRINT_ALGORITHM,
+        equivalence_basis=str(equivalence_basis),
     )
 
 

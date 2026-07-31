@@ -7,7 +7,7 @@ by JobID. This module parses "sacct" output into a structured
 
 Typical command:
 
-    sacct -j <id> --format=JobID,JobIDRaw,State,ExitCode,Elapsed -X -P -n
+    sacct -j <id> --format=JobID,JobIDRaw,JobName,User,State,ExitCode,ElapsedRaw -X -P -n
 
   - '-X' excludes ".batch" / ".extern" sub-steps (we want job-level state).
   - '-P' uses pipe-delimited output (no decorative padding).
@@ -26,6 +26,7 @@ uses to decide between "scrub one task" vs "abort the iteration".
 from __future__ import annotations
 
 import subprocess
+import getpass
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -160,6 +161,8 @@ class JobObservation:
     raw_status: Optional[str] = None
     parse_error: Optional[str] = None
     job_id_raw: Optional[str] = None
+    job_name: Optional[str] = None
+    owner: Optional[str] = None
 
     @property
     def is_terminal(self) -> bool:
@@ -217,6 +220,7 @@ class JobQueueLookup:
     active: bool
     inconclusive: bool = False
     rows: List[Tuple[str, str]] = field(default_factory=list)
+    identity_rows: List[Dict[str, str]] = field(default_factory=list)
     error: Optional[str] = None
 
     def __bool__(self) -> bool:
@@ -270,19 +274,25 @@ def _parse_exit_code(text: str) -> Optional[Tuple[int, int]]:
 def parse_sacct_output(stdout: str) -> List[JobObservation]:
     """Parse pipe-delimited ('-P') sacct output into a list of JobObservation.
 
-    The production contract is the five columns
-    ``JobID|JobIDRaw|State|ExitCode|Elapsed``.  Four-column rows from injected
-    test runners remain accepted and treat the single identity as both logical
-    and raw.  Rows whose logical JobID is empty are skipped silently. Unknown
-    JobStatus values map to JobStatus.UNKNOWN rather than raising, so the
-    caller can decide how to handle truly weird output.
+    The production contract is the seven columns
+    ``JobID|JobIDRaw|JobName|User|State|ExitCode|Elapsed``.  Historical five-
+    and four-column rows remain parseable, but carry no owner/name evidence and
+    therefore cannot authorise production adoption, reuse or cancellation.
     """
     observations: List[JobObservation] = []
     for line in stdout.splitlines():
         if not line.strip():
             continue
         parts = line.split("|")
-        if len(parts) == 5:
+        job_name = None
+        owner = None
+        if len(parts) == 7:
+            job_id = parts[0].strip()
+            job_id_raw = parts[1].strip()
+            job_name = parts[2].strip() or None
+            owner = parts[3].strip() or None
+            state, exit_code, elapsed = parts[4], parts[5], parts[6]
+        elif len(parts) == 5:
             job_id = parts[0].strip()
             job_id_raw = parts[1].strip()
             state, exit_code, elapsed = parts[2], parts[3], parts[4]
@@ -317,8 +327,33 @@ def parse_sacct_output(stdout: str) -> List[JobObservation]:
             raw_status=state.strip(),
             parse_error="; ".join(parse_errors) or None,
             job_id_raw=job_id_raw or None,
+            job_name=job_name,
+            owner=owner,
         ))
     return observations
+
+
+def _scheduler_identity_error(
+    observations: Sequence[JobObservation],
+    *,
+    expected_job_name: Optional[str],
+    expected_owner: Optional[str],
+) -> Optional[str]:
+    if expected_job_name is None and expected_owner is None:
+        return None
+    problems = []
+    for observation in observations:
+        if expected_job_name is not None and observation.job_name != expected_job_name:
+            problems.append(
+                "job name " + repr(observation.job_name) + " != " + repr(expected_job_name)
+            )
+        if expected_owner is not None and observation.owner != expected_owner:
+            problems.append(
+                "owner " + repr(observation.owner) + " != " + repr(expected_owner)
+            )
+    if not problems:
+        return None
+    return "scheduler identity mismatch: " + "; ".join(dict.fromkeys(problems))
 
 
 def aggregate_states(
@@ -480,6 +515,8 @@ def poll_job(
     sacct_runner: Optional[Callable[..., Any]] = None,
     extra_args: Sequence[str] = (),
     timeout_seconds: int = 60,
+    expected_job_name: Optional[str] = None,
+    expected_owner: Optional[str] = None,
 ) -> List[JobObservation]:
     """Run 'sacct -j <id> ...' and return the parsed observations.
 
@@ -492,7 +529,7 @@ def poll_job(
     cmd = [
         "sacct",
         "-j", str(job_id),
-        "--format=JobID,JobIDRaw,State%40,ExitCode,ElapsedRaw",
+        "--format=JobID,JobIDRaw,JobName%200,User%100,State%40,ExitCode,ElapsedRaw",
         "--array", "-X", "-P", "-n",
     ] + list(extra_args)
     try:
@@ -513,7 +550,15 @@ def poll_job(
             "sacct exited with code " + str(return_code) + ": " + repr(stderr)
         )
     stdout = getattr(completed, "stdout", "") or ""
-    return parse_sacct_output(stdout)
+    observations = parse_sacct_output(stdout)
+    identity_error = _scheduler_identity_error(
+        observations,
+        expected_job_name=expected_job_name,
+        expected_owner=expected_owner,
+    )
+    if identity_error is not None:
+        raise RuntimeError(identity_error)
+    return observations
 
 
 def _squeue_invalid_job_id(stderr: str) -> bool:
@@ -530,6 +575,8 @@ def find_active_job_by_id_detailed(
     *,
     squeue_runner: Optional[Callable[..., Any]] = None,
     timeout_seconds: int = 60,
+    expected_job_name: Optional[str] = None,
+    expected_owner: Optional[str] = None,
 ) -> JobQueueLookup:
     """Return whether ``squeue`` still shows a Slurm job or array as active.
 
@@ -544,8 +591,10 @@ def find_active_job_by_id_detailed(
         "squeue",
         "-j", str(job_id),
         "--noheader",
-        "--format=%i|%T",
+        "--format=%i|%T|%j|%u",
     ]
+    if expected_owner:
+        cmd[1:1] = ["--user", str(expected_owner)]
     try:
         requested_parent = validate_parent_job_id(job_id)
         completed = run_scheduler_command(
@@ -574,29 +623,73 @@ def find_active_job_by_id_detailed(
         )
     stdout = getattr(completed, "stdout", "") or ""
     rows: List[Tuple[str, str]] = []
+    identity_rows: List[Dict[str, str]] = []
     for line in stdout.splitlines():
         if not line.strip():
             continue
-        parts = line.split("|", 1)
-        if len(parts) != 2:
-            return JobQueueLookup(active=False, inconclusive=True, rows=rows, error="malformed squeue row")
+        parts = line.split("|", 3)
+        if len(parts) != 4:
+            return JobQueueLookup(
+                active=False,
+                inconclusive=True,
+                rows=rows,
+                identity_rows=identity_rows,
+                error="malformed squeue identity row",
+            )
         jid = parts[0].strip()
         if not jid:
             continue
         try:
             row_parent = parse_squeue_job_id(jid)
         except ValueError as exc:
-            return JobQueueLookup(active=False, inconclusive=True, rows=rows, error=str(exc))
+            return JobQueueLookup(
+                active=False,
+                inconclusive=True,
+                rows=rows,
+                identity_rows=identity_rows,
+                error=str(exc),
+            )
         if row_parent != requested_parent:
             return JobQueueLookup(
                 active=False,
                 inconclusive=True,
                 rows=rows + [(jid, parts[1].strip())],
+                identity_rows=identity_rows,
                 error="squeue returned a foreign JobID for " + requested_parent,
             )
         state = parts[1].strip() if len(parts) > 1 else ""
+        job_name = parts[2].strip()
+        owner = parts[3].strip()
+        if expected_job_name is not None and job_name != str(expected_job_name):
+            return JobQueueLookup(
+                active=False,
+                inconclusive=True,
+                rows=rows,
+                identity_rows=identity_rows,
+                error="squeue returned a job-name mismatch for " + requested_parent,
+            )
+        if expected_owner is not None and owner != str(expected_owner):
+            return JobQueueLookup(
+                active=False,
+                inconclusive=True,
+                rows=rows,
+                identity_rows=identity_rows,
+                error="squeue returned an owner mismatch for " + requested_parent,
+            )
         rows.append((jid, state))
-    return JobQueueLookup(active=bool(rows), rows=rows)
+        identity_rows.append(
+            {
+                "job_id": jid,
+                "state": state,
+                "job_name": job_name,
+                "owner": owner,
+            }
+        )
+    return JobQueueLookup(
+        active=bool(rows),
+        rows=rows,
+        identity_rows=identity_rows,
+    )
 
 
 @dataclass(frozen=True)
@@ -604,6 +697,7 @@ class JobNameLookup:
     job_id: Optional[str]
     inconclusive: bool = False
     rows: List[Tuple[str, str]] = field(default_factory=list)
+    identity_rows: List[Dict[str, str]] = field(default_factory=list)
     error: Optional[str] = None
 
     def __bool__(self) -> bool:
@@ -625,6 +719,7 @@ class JobNameAccountingLookup:
     failed: bool = False
     inconclusive: bool = False
     rows: List[Tuple[str, str]] = field(default_factory=list)
+    identity_rows: List[Dict[str, str]] = field(default_factory=list)
     error: Optional[str] = None
 
     def __bool__(self) -> bool:
@@ -636,6 +731,7 @@ def find_active_job_by_name_detailed(
     *,
     squeue_runner: Optional[Callable[..., Any]] = None,
     timeout_seconds: int = 60,
+    expected_owner: Optional[str] = None,
 ) -> JobNameLookup:
     """Find an active Slurm job by name using ``squeue``.
 
@@ -644,11 +740,13 @@ def find_active_job_by_name_detailed(
     """
     if squeue_runner is None:
         squeue_runner = subprocess.run
+    owner = str(expected_owner or getpass.getuser())
     cmd = [
         "squeue",
+        "--user", owner,
         "--name", str(name),
         "--noheader",
-        "--format=%i|%T|%j",
+        "--format=%i|%T|%j|%u",
     ]
     try:
         completed = run_scheduler_command(
@@ -674,6 +772,7 @@ def find_active_job_by_name_detailed(
             error="squeue exited with code " + str(return_code) + ": " + repr(stderr),
         )
     rows: List[Tuple[str, str]] = []
+    identity_rows: List[Dict[str, str]] = []
     active_ids = set()
     for line in (getattr(completed, "stdout", "") or "").splitlines():
         if not line.strip():
@@ -682,27 +781,67 @@ def find_active_job_by_name_detailed(
         job_id = parts[0].strip() if len(parts) > 0 else ""
         state = parts[1].strip() if len(parts) > 1 else ""
         job_name = parts[2].strip() if len(parts) > 2 else ""
+        row_owner = parts[3].strip() if len(parts) > 3 else ""
+        if len(parts) != 4:
+            return JobNameLookup(
+                None,
+                inconclusive=True,
+                rows=rows,
+                identity_rows=identity_rows,
+                error="malformed squeue name-identity row",
+            )
         if not job_id:
             continue
         try:
             base_id = parse_squeue_job_id(job_id)
         except ValueError as exc:
-            return JobNameLookup(None, inconclusive=True, rows=rows, error=str(exc))
-        if job_name and job_name != str(name):
-            continue
+            return JobNameLookup(
+                None,
+                inconclusive=True,
+                rows=rows,
+                identity_rows=identity_rows,
+                error=str(exc),
+            )
+        if job_name != str(name) or row_owner != owner:
+            return JobNameLookup(
+                None,
+                inconclusive=True,
+                rows=rows,
+                identity_rows=identity_rows,
+                error="squeue returned foreign name or owner evidence",
+            )
         rows.append((job_id, state))
+        identity_rows.append(
+            {
+                "job_id": job_id,
+                "state": state,
+                "job_name": job_name,
+                "owner": row_owner,
+            }
+        )
         active_ids.add(base_id)
     if not active_ids:
-        return JobNameLookup(None, inconclusive=False, rows=rows)
+        return JobNameLookup(
+            None,
+            inconclusive=False,
+            rows=rows,
+            identity_rows=identity_rows,
+        )
     if len(active_ids) > 1:
         return JobNameLookup(
             None,
             inconclusive=True,
             rows=rows,
+            identity_rows=identity_rows,
             error="multiple active jobs share expected name: "
             + repr(sorted(active_ids)),
         )
-    return JobNameLookup(sorted(active_ids)[0], inconclusive=False, rows=rows)
+    return JobNameLookup(
+        sorted(active_ids)[0],
+        inconclusive=False,
+        rows=rows,
+        identity_rows=identity_rows,
+    )
 
 
 def find_accounted_job_by_name_detailed(
@@ -714,13 +853,16 @@ def find_accounted_job_by_name_detailed(
     use_squeue_fallback: bool = False,
     submission_kind: Optional[str] = None,
     timeout_seconds: int = 60,
+    expected_owner: Optional[str] = None,
 ) -> JobNameAccountingLookup:
     """Return active or terminal accounting evidence for one expected job name."""
     if sacct_runner is None:
         sacct_runner = subprocess.run
+    owner = str(expected_owner or getpass.getuser())
     cmd = [
-        "sacct", "--name", str(name),
-        "--format=JobID,JobIDRaw,State%40,ExitCode,ElapsedRaw", "--array", "-X", "-P", "-n",
+        "sacct", "--user", owner, "--name", str(name),
+        "--format=JobID,JobIDRaw,JobName%200,User%100,State%40,ExitCode,ElapsedRaw",
+        "--array", "-X", "-P", "-n",
     ]
     try:
         completed = run_scheduler_command(
@@ -746,7 +888,27 @@ def find_accounted_job_by_name_detailed(
             error="sacct exited with code " + str(return_code) + ": " + repr(stderr),
         )
     observations = parse_sacct_output(getattr(completed, "stdout", "") or "")
+    identity_error = _scheduler_identity_error(
+        observations,
+        expected_job_name=str(name),
+        expected_owner=owner,
+    )
+    if identity_error is not None:
+        return JobNameAccountingLookup(
+            None,
+            inconclusive=True,
+            error=identity_error,
+        )
     rows = [(str(o.job_id), str(o.status.value)) for o in observations]
+    identity_rows = [
+        {
+            "job_id": str(observation.job_id),
+            "state": str(observation.status.value),
+            "job_name": str(observation.job_name or ""),
+            "owner": str(observation.owner or ""),
+        }
+        for observation in observations
+    ]
     base_ids = sorted({_base_allocation_id(o.job_id) for o in observations})
     if not base_ids:
         if use_squeue_fallback:
@@ -754,6 +916,7 @@ def find_accounted_job_by_name_detailed(
                 name,
                 squeue_runner=squeue_runner,
                 timeout_seconds=int(timeout_seconds),
+                expected_owner=owner,
             )
             if active.job_id:
                 return JobNameAccountingLookup(
@@ -761,12 +924,14 @@ def find_accounted_job_by_name_detailed(
                     terminal=False,
                     inconclusive=False,
                     rows=list(active.rows),
+                    identity_rows=list(active.identity_rows),
                 )
             if active.inconclusive:
                 return JobNameAccountingLookup(
                     None,
                     inconclusive=True,
                     rows=list(active.rows),
+                    identity_rows=list(active.identity_rows),
                     error=active.error,
                 )
         return JobNameAccountingLookup(None, rows=rows)
@@ -775,6 +940,7 @@ def find_accounted_job_by_name_detailed(
             None,
             inconclusive=True,
             rows=rows,
+            identity_rows=identity_rows,
             error="multiple jobs share expected name: " + repr(base_ids),
         )
     job_id = base_ids[0]
@@ -791,6 +957,7 @@ def find_accounted_job_by_name_detailed(
             name,
             squeue_runner=squeue_runner,
             timeout_seconds=int(timeout_seconds),
+            expected_owner=owner,
         )
         if active.job_id:
             return JobNameAccountingLookup(
@@ -798,12 +965,14 @@ def find_accounted_job_by_name_detailed(
                 terminal=False,
                 inconclusive=False,
                 rows=list(active.rows),
+                identity_rows=list(active.identity_rows),
             )
         if active.inconclusive:
             return JobNameAccountingLookup(
                 None,
                 inconclusive=True,
                 rows=rows + list(active.rows),
+                identity_rows=identity_rows + list(active.identity_rows),
                 error=active.error,
             )
     if int(summary.n_unknown) > 0:
@@ -811,6 +980,7 @@ def find_accounted_job_by_name_detailed(
             None,
             inconclusive=True,
             rows=rows,
+            identity_rows=identity_rows,
             error="sacct returned UNKNOWN rows for expected job name",
         )
     if int(summary.n_tasks) <= 0 or int(summary.n_observed) <= 0:
@@ -818,6 +988,7 @@ def find_accounted_job_by_name_detailed(
             None,
             inconclusive=True,
             rows=rows,
+            identity_rows=identity_rows,
             error="sacct returned no usable rows for expected job name",
         )
     if int(summary.n_pending_or_running) > 0:
@@ -827,6 +998,7 @@ def find_accounted_job_by_name_detailed(
             successful=False,
             failed=False,
             rows=rows,
+            identity_rows=identity_rows,
         )
     if bool(summary.is_fully_successful):
         return JobNameAccountingLookup(
@@ -835,6 +1007,7 @@ def find_accounted_job_by_name_detailed(
             successful=True,
             failed=False,
             rows=rows,
+            identity_rows=identity_rows,
         )
     if bool(summary.is_terminal):
         return JobNameAccountingLookup(
@@ -843,11 +1016,13 @@ def find_accounted_job_by_name_detailed(
             successful=False,
             failed=True,
             rows=rows,
+            identity_rows=identity_rows,
         )
     return JobNameAccountingLookup(
         None,
         inconclusive=True,
         rows=rows,
+        identity_rows=identity_rows,
         error="sacct rows are not conclusively active or terminal",
     )
 
@@ -859,22 +1034,23 @@ def find_running_job_by_name_detailed(
     squeue_runner: Optional[Callable[..., Any]] = None,
     use_squeue_fallback: bool = False,
     timeout_seconds: int = 60,
+    expected_owner: Optional[str] = None,
 ) -> JobNameLookup:
     """Look for a still-running (or queued) SLURM job with this --job-name and return its JobID,
     or None.
 
-    used on phase entry / after a reconcile to spot a job a crash orphaned, so the daemon can adopt
-    and poll it rather than submit a duplicate that would race it into the same staging dirs
-    (A24/A25). only NON-terminal states count -- a COMPLETED/FAILED job of the same name from an
-    earlier run must not be adopted. returns the base allocation id (array task suffix dropped) so
-    the caller polls the whole array. best-effort: any sacct hiccup just returns None and the caller
-    falls back to submitting, which is the normal path.
+    Used on phase entry or after reconcile to spot a job orphaned by a crash,
+    so the daemon can adopt and poll it instead of submitting a duplicate.
+    Only non-terminal states count.  Accounting or identity uncertainty is
+    returned explicitly and must block adoption and resubmission.
     """
     if sacct_runner is None:
         sacct_runner = subprocess.run
+    owner = str(expected_owner or getpass.getuser())
     cmd = [
-        "sacct", "--name", str(name),
-        "--format=JobID,JobIDRaw,State%40", "--array", "-X", "-P", "-n",
+        "sacct", "--user", owner, "--name", str(name),
+        "--format=JobID,JobIDRaw,JobName%200,User%100,State%40",
+        "--array", "-X", "-P", "-n",
     ]
     try:
         completed = run_scheduler_command(
@@ -900,20 +1076,24 @@ def find_running_job_by_name_detailed(
     stdout = getattr(completed, "stdout", "") or ""
     non_terminal = set()
     rows: List[Tuple[str, str]] = []
+    identity_rows: List[Dict[str, str]] = []
     for line in stdout.splitlines():
         if not line.strip():
             continue
         parts = line.split("|")
-        if len(parts) >= 3:
-            job_id = parts[0].strip()
-            job_id_raw = parts[1].strip()
-            raw_state = parts[2]
-        elif len(parts) == 2:
-            job_id = parts[0].strip()
-            job_id_raw = job_id
-            raw_state = parts[1]
-        else:
-            continue
+        if len(parts) != 5:
+            return JobNameLookup(
+                None,
+                inconclusive=True,
+                rows=rows,
+                identity_rows=identity_rows,
+                error="malformed sacct name-identity row",
+            )
+        job_id = parts[0].strip()
+        job_id_raw = parts[1].strip()
+        job_name = parts[2].strip()
+        row_owner = parts[3].strip()
+        raw_state = parts[4]
         if not job_id:
             continue
         if not job_id_raw:
@@ -921,10 +1101,27 @@ def find_running_job_by_name_detailed(
                 None,
                 inconclusive=True,
                 rows=rows,
+                identity_rows=identity_rows,
                 error="sacct returned an empty JobIDRaw",
+            )
+        if job_name != str(name) or row_owner != owner:
+            return JobNameLookup(
+                None,
+                inconclusive=True,
+                rows=rows,
+                identity_rows=identity_rows,
+                error="sacct returned foreign name or owner evidence",
             )
         status = JobStatus.from_sacct(raw_state)
         rows.append((job_id, status.value))
+        identity_rows.append(
+            {
+                "job_id": job_id,
+                "state": status.value,
+                "job_name": job_name,
+                "owner": row_owner,
+            }
+        )
         if status in NON_TERMINAL_STATES:
             # 123_4 -> 123 (and 123.batch -> 123): adopt the whole allocation, not a sub-step.
             base = _base_allocation_id(job_id)
@@ -935,19 +1132,31 @@ def find_running_job_by_name_detailed(
                 name,
                 squeue_runner=squeue_runner,
                 timeout_seconds=int(timeout_seconds),
+                expected_owner=owner,
             )
             if fallback.job_id or fallback.inconclusive:
                 return fallback
-        return JobNameLookup(None, inconclusive=False, rows=rows)
+        return JobNameLookup(
+            None,
+            inconclusive=False,
+            rows=rows,
+            identity_rows=identity_rows,
+        )
     if len(non_terminal) > 1:
         return JobNameLookup(
             None,
             inconclusive=True,
             rows=rows,
+            identity_rows=identity_rows,
             error="multiple active jobs share expected name: "
             + repr(sorted(non_terminal)),
         )
-    return JobNameLookup(sorted(non_terminal)[0], inconclusive=False, rows=rows)
+    return JobNameLookup(
+        sorted(non_terminal)[0],
+        inconclusive=False,
+        rows=rows,
+        identity_rows=identity_rows,
+    )
 
 
 def find_running_job_by_name(
@@ -957,6 +1166,7 @@ def find_running_job_by_name(
     squeue_runner: Optional[Callable[..., Any]] = None,
     use_squeue_fallback: bool = False,
     timeout_seconds: int = 60,
+    expected_owner: Optional[str] = None,
 ) -> Optional[str]:
     return find_running_job_by_name_detailed(
         name,
@@ -964,4 +1174,5 @@ def find_running_job_by_name(
         squeue_runner=squeue_runner,
         use_squeue_fallback=use_squeue_fallback,
         timeout_seconds=int(timeout_seconds),
+        expected_owner=expected_owner,
     ).job_id

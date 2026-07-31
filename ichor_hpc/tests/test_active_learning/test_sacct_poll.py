@@ -361,9 +361,16 @@ def test_out_of_range_array_task_is_unknown_even_when_expected_rows_are_complete
 
 def test_poll_job_invokes_sacct_with_correct_flags():
     runner = _StubRunner(
-        result=_StubResult(stdout="42|42|COMPLETED|0:0|00:00:01\n")
+        result=_StubResult(
+            stdout="42|42|ichor-job|test-user|COMPLETED|0:0|00:00:01\n"
+        )
     )
-    obs = poll_job("42", sacct_runner=runner)
+    obs = poll_job(
+        "42",
+        sacct_runner=runner,
+        expected_job_name="ichor-job",
+        expected_owner="test-user",
+    )
     assert obs[0].job_id == "42"
     assert obs[0].status is JobStatus.COMPLETED
     # Single sacct call with the expected flag set.
@@ -371,7 +378,10 @@ def test_poll_job_invokes_sacct_with_correct_flags():
     call = runner.calls[0]
     assert call[0] == "sacct"
     assert "-j" in call and "42" in call
-    assert "--format=JobID,JobIDRaw,State%40,ExitCode,ElapsedRaw" in call
+    assert (
+        "--format=JobID,JobIDRaw,JobName%200,User%100,State%40,ExitCode,ElapsedRaw"
+        in call
+    )
     assert "--array" in call and "-X" in call and "-P" in call and "-n" in call
 
 
@@ -389,9 +399,19 @@ def test_poll_job_passes_through_extra_args():
 
 def test_find_active_job_by_id_uses_squeue_rows():
     runner = _StubRunner(
-        result=_StubResult(stdout="16153025_[6-9%2]|PENDING\n16153025_4|RUNNING\n")
+        result=_StubResult(
+            stdout=(
+                "16153025_[6-9%2]|PENDING|ichor-job|test-user\n"
+                "16153025_4|RUNNING|ichor-job|test-user\n"
+            )
+        )
     )
-    lookup = find_active_job_by_id_detailed("16153025", squeue_runner=runner)
+    lookup = find_active_job_by_id_detailed(
+        "16153025",
+        squeue_runner=runner,
+        expected_job_name="ichor-job",
+        expected_owner="test-user",
+    )
     assert lookup.active
     assert not lookup.inconclusive
     assert lookup.rows == [
@@ -399,7 +419,7 @@ def test_find_active_job_by_id_uses_squeue_rows():
         ("16153025_4", "RUNNING"),
     ]
     call = runner.calls[0]
-    assert call[:3] == ["squeue", "-j", "16153025"]
+    assert call[:5] == ["squeue", "--user", "test-user", "-j", "16153025"]
     assert "--noheader" in call
 
 
@@ -435,14 +455,20 @@ def test_find_active_job_by_id_invalid_job_id_is_conclusive_inactive():
 
 def test_find_active_job_by_name_uses_squeue_rows():
     runner = _StubRunner(
-        result=_StubResult(stdout="16153025_[6-9%2]|PENDING|camp-GAUSSIAN-1\n")
+        result=_StubResult(
+            stdout="16153025_[6-9%2]|PENDING|camp-GAUSSIAN-1|test-user\n"
+        )
     )
-    lookup = find_active_job_by_name_detailed("camp-GAUSSIAN-1", squeue_runner=runner)
+    lookup = find_active_job_by_name_detailed(
+        "camp-GAUSSIAN-1",
+        squeue_runner=runner,
+        expected_owner="test-user",
+    )
     assert lookup.job_id == "16153025"
     assert not lookup.inconclusive
     assert lookup.rows == [("16153025_[6-9%2]", "PENDING")]
     call = runner.calls[0]
-    assert call[:2] == ["squeue", "--name"]
+    assert call[:3] == ["squeue", "--user", "test-user"]
     assert "camp-GAUSSIAN-1" in call
 
 
@@ -450,13 +476,17 @@ def test_find_active_job_by_name_multiple_active_rows_is_inconclusive():
     runner = _StubRunner(
         result=_StubResult(
             stdout=(
-                "16153025_0|RUNNING|camp-GAUSSIAN-1\n"
-                "16153026_0|PENDING|camp-GAUSSIAN-1\n"
+                "16153025_0|RUNNING|camp-GAUSSIAN-1|test-user\n"
+                "16153026_0|PENDING|camp-GAUSSIAN-1|test-user\n"
             )
         )
     )
 
-    lookup = find_active_job_by_name_detailed("camp-GAUSSIAN-1", squeue_runner=runner)
+    lookup = find_active_job_by_name_detailed(
+        "camp-GAUSSIAN-1",
+        squeue_runner=runner,
+        expected_owner="test-user",
+    )
 
     assert lookup.job_id is None
     assert lookup.inconclusive
@@ -469,10 +499,17 @@ def test_accounted_name_lookup_does_not_treat_partial_terminal_array_as_terminal
     )
 
     sacct_runner = _StubRunner(
-        result=_StubResult(stdout="123_0|FAILED|1:0|00:00:01\n")
+        result=_StubResult(
+            stdout=(
+                "123_0|123_0|camp-GAUSSIAN-1|test-user|"
+                "FAILED|1:0|00:00:01\n"
+            )
+        )
     )
     squeue_runner = _StubRunner(
-        result=_StubResult(stdout="123_1|PENDING|camp-GAUSSIAN-1\n")
+        result=_StubResult(
+            stdout="123_1|PENDING|camp-GAUSSIAN-1|test-user\n"
+        )
     )
 
     lookup = find_accounted_job_by_name_detailed(
@@ -481,6 +518,7 @@ def test_accounted_name_lookup_does_not_treat_partial_terminal_array_as_terminal
         sacct_runner=sacct_runner,
         squeue_runner=squeue_runner,
         use_squeue_fallback=True,
+        expected_owner="test-user",
     )
 
     assert lookup.job_id == "123"
@@ -497,8 +535,8 @@ def test_accounted_name_lookup_uses_logical_ids_from_recent_slurm():
     sacct_runner = _StubRunner(
         result=_StubResult(
             stdout=(
-                "17615141_0|17615143|COMPLETED|0:0|39\n"
-                "17615141_1|17615144|COMPLETED|0:0|36\n"
+                "17615141_0|17615143|camp-GAUSSIAN-0|test-user|COMPLETED|0:0|39\n"
+                "17615141_1|17615144|camp-GAUSSIAN-0|test-user|COMPLETED|0:0|36\n"
             )
         )
     )
@@ -508,6 +546,7 @@ def test_accounted_name_lookup_uses_logical_ids_from_recent_slurm():
         expected_task_count=2,
         sacct_runner=sacct_runner,
         submission_kind="array",
+        expected_owner="test-user",
     )
 
     assert lookup.job_id == "17615141"
@@ -515,38 +554,48 @@ def test_accounted_name_lookup_uses_logical_ids_from_recent_slurm():
     assert lookup.successful
     assert not lookup.failed
     assert (
-        "--format=JobID,JobIDRaw,State%40,ExitCode,ElapsedRaw"
+        "--format=JobID,JobIDRaw,JobName%200,User%100,State%40,ExitCode,ElapsedRaw"
         in sacct_runner.calls[0]
     )
 
 
 def test_running_name_lookup_uses_logical_id_not_physical_raw_id():
     sacct_runner = _StubRunner(
-        result=_StubResult(stdout="17615141_7|17615150|RUNNING\n")
+        result=_StubResult(
+            stdout=(
+                "17615141_7|17615150|camp-GAUSSIAN-0|"
+                "test-user|RUNNING\n"
+            )
+        )
     )
 
     lookup = find_running_job_by_name_detailed(
         "camp-GAUSSIAN-0",
         sacct_runner=sacct_runner,
+        expected_owner="test-user",
     )
 
     assert lookup.job_id == "17615141"
     assert lookup.rows == [("17615141_7", "RUNNING")]
     assert (
-        "--format=JobID,JobIDRaw,State%40" in sacct_runner.calls[0]
+        "--format=JobID,JobIDRaw,JobName%200,User%100,State%40"
+        in sacct_runner.calls[0]
     )
 
 
 def test_find_running_job_by_name_can_fallback_to_squeue_when_sacct_empty():
     sacct_runner = _StubRunner(result=_StubResult(stdout=""))
     squeue_runner = _StubRunner(
-        result=_StubResult(stdout="16153025_0|RUNNING|camp-AIMALL-1\n")
+        result=_StubResult(
+            stdout="16153025_0|RUNNING|camp-AIMALL-1|test-user\n"
+        )
     )
     lookup = find_running_job_by_name_detailed(
         "camp-AIMALL-1",
         sacct_runner=sacct_runner,
         squeue_runner=squeue_runner,
         use_squeue_fallback=True,
+        expected_owner="test-user",
     )
     assert lookup.job_id == "16153025"
     assert sacct_runner.calls
@@ -558,8 +607,8 @@ def test_find_running_job_by_name_multiple_squeue_rows_is_inconclusive():
     squeue_runner = _StubRunner(
         result=_StubResult(
             stdout=(
-                "16153025_0|RUNNING|camp-AIMALL-1\n"
-                "16153026_0|PENDING|camp-AIMALL-1\n"
+                "16153025_0|RUNNING|camp-AIMALL-1|test-user\n"
+                "16153026_0|PENDING|camp-AIMALL-1|test-user\n"
             )
         )
     )
@@ -569,8 +618,79 @@ def test_find_running_job_by_name_multiple_squeue_rows_is_inconclusive():
         sacct_runner=sacct_runner,
         squeue_runner=squeue_runner,
         use_squeue_fallback=True,
+        expected_owner="test-user",
     )
 
     assert lookup.job_id is None
     assert lookup.inconclusive
     assert "multiple active jobs" in str(lookup.error)
+
+
+@pytest.mark.parametrize(
+    "job_name,owner",
+    [
+        ("foreign-job", "test-user"),
+        ("ichor-job", "foreign-user"),
+        ("ichor-job", ""),
+    ],
+)
+def test_poll_job_rejects_incomplete_or_foreign_identity(job_name, owner):
+    runner = _StubRunner(
+        result=_StubResult(
+            stdout=(
+                "42|42|"
+                + job_name
+                + "|"
+                + owner
+                + "|COMPLETED|0:0|1\n"
+            )
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="scheduler identity mismatch"):
+        poll_job(
+            "42",
+            sacct_runner=runner,
+            expected_job_name="ichor-job",
+            expected_owner="test-user",
+        )
+
+
+def test_job_id_liveness_rejects_mixed_names_under_one_parent():
+    runner = _StubRunner(
+        result=_StubResult(
+            stdout=(
+                "42_0|RUNNING|ichor-job|test-user\n"
+                "42_1|PENDING|other-job|test-user\n"
+            )
+        )
+    )
+
+    lookup = find_active_job_by_id_detailed(
+        "42",
+        squeue_runner=runner,
+        expected_job_name="ichor-job",
+        expected_owner="test-user",
+    )
+
+    assert not lookup.active
+    assert lookup.inconclusive
+    assert "job-name mismatch" in str(lookup.error)
+
+
+def test_name_adoption_rejects_foreign_owner():
+    runner = _StubRunner(
+        result=_StubResult(
+            stdout="42|RUNNING|ichor-job|foreign-user\n"
+        )
+    )
+
+    lookup = find_active_job_by_name_detailed(
+        "ichor-job",
+        squeue_runner=runner,
+        expected_owner="test-user",
+    )
+
+    assert lookup.job_id is None
+    assert lookup.inconclusive
+    assert "foreign name or owner" in str(lookup.error)

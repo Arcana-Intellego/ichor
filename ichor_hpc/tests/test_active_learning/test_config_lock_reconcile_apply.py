@@ -1,4 +1,5 @@
 import argparse
+import getpass
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -2362,6 +2363,11 @@ def test_reconcile_apply_resolves_cancelled_intent_when_squeue_invalid_job_id(
     write_config_lock(campaign, config)
     _write_config(campaign, config)
     _write_submitted_initial_ferebus_intent(campaign)
+    submitted_intent = submission_intent.load_intent(
+        campaign,
+        CampaignPhase.INITIAL_FEREBUS.value,
+        0,
+    )
 
     def fake_run(cmd, **kwargs):
         if cmd[0] == "squeue":
@@ -2374,7 +2380,15 @@ def test_reconcile_apply_resolves_cancelled_intent_when_squeue_invalid_job_id(
             return SimpleNamespace(
                 returncode=0,
                 stdout="".join(
-                    "16218598_" + str(index) + "|CANCELLED by 494098|0:0|00:00:00\n"
+                    "16218598_"
+                    + str(index)
+                    + "|16218598_"
+                    + str(index)
+                    + "|"
+                    + str(submitted_intent["expected_job_name"])
+                    + "|"
+                    + getpass.getuser()
+                    + "|CANCELLED by 494098|0:0|0\n"
                     for index in range(12)
                 ),
                 stderr="",
