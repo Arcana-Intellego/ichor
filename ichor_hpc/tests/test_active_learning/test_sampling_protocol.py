@@ -738,6 +738,101 @@ def test_scale_model_uses_previous_result_json_motion_history(tmp_path):
     )
 
 
+def test_sampling_history_cache_hit_does_not_reopen_result_payloads(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning import sampling_history
+
+    _write_strict_history(tmp_path, movement=0.2)
+    expected = sampling_history.load_or_build_sampling_history(
+        tmp_path,
+        iteration=1,
+    )
+
+    def _unexpected(*_args, **_kwargs):
+        raise AssertionError("warm history cache reopened scientific payloads")
+
+    monkeypatch.setattr(
+        sampling_history,
+        "read_historical_ariadne_records",
+        _unexpected,
+    )
+    monkeypatch.setattr(sampling_history, "_load_result", _unexpected)
+
+    observed = sampling_history.load_or_build_sampling_history(
+        tmp_path,
+        iteration=1,
+    )
+    assert observed == expected
+
+
+def test_corrupt_sampling_history_cache_is_ignored_and_rebuilt(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning import sampling_history
+
+    _write_strict_history(tmp_path, movement=0.2)
+    sampling_history.load_or_build_sampling_history(tmp_path, iteration=1)
+    records_path = next(
+        (
+            tmp_path
+            / ".DATA"
+            / "CACHE"
+            / "SAMPLING_HISTORY"
+            / "iteration-000001"
+        ).glob("*/records.json")
+    )
+    records_path.write_text("{}\n", encoding="utf-8")
+    original = sampling_history.read_historical_ariadne_records
+    calls = {"count": 0}
+
+    def _counted(*args, **kwargs):
+        calls["count"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        sampling_history,
+        "read_historical_ariadne_records",
+        _counted,
+    )
+    rebuilt = sampling_history.load_or_build_sampling_history(
+        tmp_path,
+        iteration=1,
+    )
+
+    assert calls["count"] == 1
+    assert rebuilt["records"][0]["metrics"]["movement_rmsd_ang"] == pytest.approx(
+        0.2
+    )
+
+
+def test_sampling_history_cache_path_failure_uses_strict_history(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning import sampling_history
+
+    _write_strict_history(tmp_path, movement=0.2)
+    monkeypatch.setattr(
+        sampling_history,
+        "_cache_paths",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("injected cache-path failure")
+        ),
+    )
+
+    observed = sampling_history.load_or_build_sampling_history(
+        tmp_path,
+        iteration=1,
+    )
+
+    assert observed["records"][0]["metrics"]["movement_rmsd_ang"] == pytest.approx(
+        0.2
+    )
+
+
 def test_scale_model_uses_one_primary_movement_value_per_result(tmp_path):
     _write_strict_history(
         tmp_path,
@@ -1053,3 +1148,6 @@ def test_preview_uses_campaign_history_without_writing_manifests(tmp_path):
     assert not sampling_scale_model_path(iter2).exists()
     assert not sampling_protocol_resolved_path(iter2).exists()
     assert not sampling_protocol_audit_path(iter2).exists()
+    assert not (
+        tmp_path / ".DATA" / "CACHE" / "SAMPLING_HISTORY"
+    ).exists()

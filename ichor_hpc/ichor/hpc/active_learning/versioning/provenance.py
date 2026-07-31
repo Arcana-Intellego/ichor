@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from ..strict_json import strict_json as json
 from dataclasses import dataclass
+import hashlib
 import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
@@ -51,6 +52,10 @@ _PROVENANCE_LOCK_FILENAME = ".provenance.lock"
 _INDEX_LOCK_FILENAME = "seed_frame_id_index.lock"
 _RECENT_SEEDS_LOCK_FILENAME = "recent_seeds.lock"
 _DEFAULT_LOCK_TIMEOUT_SECONDS = 30.0
+COMMITTED_SEED_EXCLUSION_CACHE_SCHEMA_VERSION = 1
+COMMITTED_SEED_EXCLUSION_CACHE_SUBDIR = (
+    Path(".DATA") / "CACHE" / "SEED_SELECT" / "committed_seed_exclusions"
+)
 
 
 @contextmanager
@@ -125,6 +130,8 @@ __all__ = [
     "load_index",
     "load_training_seed_frame_ids",
     "repair_index_from_committed_pointdirs",
+    "repair_index_from_committed_allocations",
+    "records_from_committed_allocations",
     "seed_frame_ids_from_committed_pointdirs",
     "append_recent_seeds",
     "load_recent_seeds_payload",
@@ -142,6 +149,10 @@ INDEX_SCHEMA_VERSION = 2
 
 class ProvenanceError(RuntimeError):
     """Raised on malformed provenance JSON or index files."""
+
+
+class AllocationSeedEvidenceUnavailable(ProvenanceError):
+    """Raised when a legacy campaign lacks authenticated allocation snapshots."""
 
 
 def _exact_integer(value: Any, label: str, *, minimum: int = 0) -> int:
@@ -796,6 +807,328 @@ def _resolved_reference_entries(reference_data_dir: Union[str, Path]):
     return versioning.resolve(current, verification="index").entries
 
 
+def _canonical_payload_sha256(payload: Any) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _allocation_seed_cache_identity(
+    *,
+    campaign_uid: str,
+    trajectory_sha256: str,
+    reference_version: int,
+    cumulative_view_sha256: str,
+    head_manifest_sha256: str,
+    accepted_entry_count: int,
+) -> Dict[str, Any]:
+    return {
+        "campaign_uid": str(campaign_uid),
+        "trajectory_sha256": str(trajectory_sha256),
+        "reference_version": int(reference_version),
+        "cumulative_view_sha256": str(cumulative_view_sha256),
+        "head_manifest_sha256": str(head_manifest_sha256),
+        "accepted_entry_count": int(accepted_entry_count),
+        "algorithm": "allocation_snapshot_seed_exclusions_v1",
+    }
+
+
+def _committed_allocation_records(
+    campaign_dir: Path,
+    reference_data_dir: Path,
+    *,
+    expected_trajectory_sha256: str,
+    artifact_snapshot: Any = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    from ..layout import COMMITTED_VERSION_NAME_WIDTH
+    from ..point_allocation import accepted_attempts, read_point_allocation
+    from .manifest import read_manifest, sha256_file
+    from .reference_data import (
+        REFERENCE_DATA_VERSION_FILENAME,
+        ReferenceDataVersioning,
+    )
+
+    versioning, current, view, identity = _allocation_seed_authority_identity(
+        reference_data_dir,
+        expected_trajectory_sha256=expected_trajectory_sha256,
+        artifact_snapshot=artifact_snapshot,
+    )
+    if current is None:
+        return [], identity
+    records: List[Dict[str, Any]] = []
+    for version in range(int(current) + 1):
+        version_root = versioning.iteration_path(version)
+        reference_manifest = version_root / REFERENCE_DATA_VERSION_FILENAME
+        if reference_manifest.is_symlink() or not reference_manifest.is_file():
+            raise AllocationSeedEvidenceUnavailable(
+                "committed reference version lacks allocation authority"
+            )
+        payload = json.loads(
+            reference_manifest.read_text(encoding="utf-8"),
+            source=reference_manifest,
+        )
+        context = str(payload.get("source_context") or "")
+        source_iteration = payload.get("source_iteration")
+        if (
+            str(payload.get("campaign_uid") or "") != str(view.campaign_uid)
+            or int(payload.get("reference_data_version", -1)) != version
+            or context not in {"bootstrap", "active"}
+            or isinstance(source_iteration, bool)
+            or not isinstance(source_iteration, int)
+            or source_iteration < 0
+        ):
+            raise ProvenanceError("committed allocation binding header is invalid")
+        allocation_name = (
+            "POINT_ALLOCATION.version-"
+            + str(version).zfill(COMMITTED_VERSION_NAME_WIDTH)
+            + ".json"
+        )
+        allocation_path = version_root / allocation_name
+        if allocation_path.is_symlink() or not allocation_path.is_file():
+            raise AllocationSeedEvidenceUnavailable(
+                "committed reference version lacks its allocation snapshot"
+            )
+        expected_sha = _sha256_text(
+            payload.get("point_allocation_sha256"),
+            "reference allocation snapshot SHA",
+        )
+        directory_manifest = read_manifest(version_root)
+        if directory_manifest.get(allocation_name) != expected_sha:
+            raise ProvenanceError(
+                "committed directory manifest does not bind its allocation snapshot"
+            )
+        if sha256_file(allocation_path) != expected_sha:
+            raise ProvenanceError("committed allocation snapshot SHA mismatch")
+        allocation = read_point_allocation(
+            allocation_path,
+            history_dir=version_root / ".point_allocation_history",
+            expected_campaign_uid=str(view.campaign_uid),
+            expected_context=context,
+            expected_iteration=int(source_iteration),
+        )
+        if not bool((allocation.get("summary") or {}).get("complete", False)):
+            raise ProvenanceError("committed allocation snapshot is incomplete")
+        attempts = sorted(
+            accepted_attempts(allocation),
+            key=lambda record: int(record["slot_id"]),
+        )
+        entries = [
+            entry
+            for entry in view.entries
+            if int(entry.introduced_in_version) == version
+        ]
+        if len(attempts) != len(entries):
+            raise ProvenanceError(
+                "committed allocation accepted count disagrees with reference data"
+            )
+        for attempt, entry in zip(attempts, entries):
+            observed = (
+                str(attempt.get("candidate_id") or ""),
+                int(attempt.get("slot_id", -1)),
+                str(attempt.get("split") or ""),
+                int(attempt.get("round", 0)),
+                Path(str(attempt.get("pointdir") or "")).name,
+            )
+            expected = (
+                str(entry.candidate_id),
+                int(entry.slot_id),
+                str(entry.split),
+                int(entry.replacement_round),
+                Path(str(entry.source_pointdir)).name,
+            )
+            if observed != expected:
+                raise ProvenanceError(
+                    "committed allocation attempt identity disagrees with reference data"
+                )
+            trajectory_sha = str(
+                attempt.get("trajectory_sha256") or expected_trajectory_sha256
+            )
+            if trajectory_sha != str(expected_trajectory_sha256):
+                raise ProvenanceError(
+                    "committed allocation trajectory identity mismatch"
+                )
+            frame_id = attempt.get("seed_frame_id")
+            if frame_id is None:
+                frame_id = attempt.get("frame_id")
+            if frame_id is not None and (
+                isinstance(frame_id, bool)
+                or not isinstance(frame_id, int)
+                or frame_id < 0
+            ):
+                raise ProvenanceError(
+                    "committed allocation seed frame ID is invalid"
+                )
+            records.append(
+                {
+                    "iteration": int(version),
+                    "pointdir_name": str(entry.pointdir_name),
+                    "seed_frame_id": (
+                        None if frame_id is None else int(frame_id)
+                    ),
+                    "trajectory_sha256": str(expected_trajectory_sha256),
+                }
+            )
+    records = sorted(
+        (_normalise_index_record(record) for record in records),
+        key=lambda record: (record["iteration"], record["pointdir_name"]),
+    )
+    if len(records) != int(identity["accepted_entry_count"]):
+        raise ProvenanceError("committed allocation record count is incomplete")
+    return records, identity
+
+
+def _allocation_seed_authority_identity(
+    reference_data_dir: Path,
+    *,
+    expected_trajectory_sha256: str,
+    artifact_snapshot: Any = None,
+):
+    from .reference_data import ReferenceDataVersioning
+
+    versioning = ReferenceDataVersioning(reference_data_dir)
+    current = versioning.current_version()
+    if current is None:
+        identity = _allocation_seed_cache_identity(
+            campaign_uid="uncommitted",
+            trajectory_sha256=expected_trajectory_sha256,
+            reference_version=-1,
+            cumulative_view_sha256="0" * 64,
+            head_manifest_sha256="0" * 64,
+            accepted_entry_count=0,
+        )
+        return versioning, None, None, identity
+    view = (
+        artifact_snapshot.reference_view(int(current))
+        if artifact_snapshot is not None
+        else versioning.resolve(int(current), verification="authority")
+    )
+    identity = _allocation_seed_cache_identity(
+        campaign_uid=str(view.campaign_uid),
+        trajectory_sha256=expected_trajectory_sha256,
+        reference_version=int(current),
+        cumulative_view_sha256=str(view.cumulative_view_sha256),
+        head_manifest_sha256=str(view.head_manifest_sha256),
+        accepted_entry_count=int(len(view.entries)),
+    )
+    return versioning, int(current), view, identity
+
+
+def records_from_committed_allocations(
+    campaign_dir: Union[str, Path],
+    reference_data_dir: Union[str, Path],
+    *,
+    expected_trajectory_sha256: str,
+    artifact_snapshot: Any = None,
+) -> List[Dict[str, Any]]:
+    """Return authority-bound committed seed records without pointdir scans."""
+    import portalocker
+    from ..daemon.filesystem import campaign_owned_path
+
+    campaign = Path(campaign_dir)
+    reference_root = Path(reference_data_dir)
+    _versioning, _current, _view, identity = _allocation_seed_authority_identity(
+        reference_root,
+        expected_trajectory_sha256=str(expected_trajectory_sha256),
+        artifact_snapshot=artifact_snapshot,
+    )
+    try:
+        cache_root = campaign_owned_path(
+            campaign, COMMITTED_SEED_EXCLUSION_CACHE_SUBDIR
+        )
+        cache_root.mkdir(parents=True, exist_ok=True)
+    except (OSError, ValueError):
+        records, _ = _committed_allocation_records(
+            campaign,
+            reference_root,
+            expected_trajectory_sha256=str(expected_trajectory_sha256),
+            artifact_snapshot=artifact_snapshot,
+        )
+        return records
+    cache_id = _canonical_payload_sha256(identity)
+    cache_path = cache_root / (cache_id + ".json")
+    lock_path = cache_root / (cache_id + ".lock")
+    if lock_path.is_symlink():
+        records, _ = _committed_allocation_records(
+            campaign,
+            reference_root,
+            expected_trajectory_sha256=str(expected_trajectory_sha256),
+            artifact_snapshot=artifact_snapshot,
+        )
+        return records
+    try:
+        with portalocker.Lock(str(lock_path), mode="a", timeout=30):
+            if cache_path.exists() or cache_path.is_symlink():
+                try:
+                    if cache_path.is_symlink() or not cache_path.is_file():
+                        raise ValueError("committed-seed cache is unsafe")
+                    cached = json.loads(
+                        cache_path.read_text(encoding="utf-8"), source=cache_path
+                    )
+                    if (
+                        cached.get("schema_version")
+                        != COMMITTED_SEED_EXCLUSION_CACHE_SCHEMA_VERSION
+                        or cached.get("identity") != identity
+                        or cached.get("records_sha256")
+                        != _canonical_payload_sha256(cached.get("records"))
+                    ):
+                        raise ValueError("committed-seed cache identity mismatch")
+                    cached_records = [
+                        _normalise_index_record(record)
+                        for record in cached.get("records", [])
+                    ]
+                    if len(cached_records) != int(identity["accepted_entry_count"]):
+                        raise ValueError("committed-seed cache record count mismatch")
+                    if any(
+                        record["trajectory_sha256"]
+                        != str(expected_trajectory_sha256)
+                        for record in cached_records
+                    ):
+                        raise ValueError("committed-seed cache trajectory mismatch")
+                    return cached_records
+                except Exception:
+                    cache_path.unlink(missing_ok=True)
+            records, rebuilt_identity = _committed_allocation_records(
+                campaign,
+                reference_root,
+                expected_trajectory_sha256=str(expected_trajectory_sha256),
+                artifact_snapshot=artifact_snapshot,
+            )
+            if rebuilt_identity != identity:
+                raise ProvenanceError(
+                    "reference authority changed while deriving seed exclusions"
+                )
+            atomic_write_json(
+                cache_path,
+                {
+                    "schema_version": COMMITTED_SEED_EXCLUSION_CACHE_SCHEMA_VERSION,
+                    "identity": identity,
+                    "records": records,
+                    "records_sha256": _canonical_payload_sha256(records),
+                },
+            )
+            for sibling in cache_root.glob("*.json"):
+                if (
+                    sibling != cache_path
+                    and sibling.is_file()
+                    and not sibling.is_symlink()
+                ):
+                    sibling.unlink(missing_ok=True)
+    except Exception:
+        records, _ = _committed_allocation_records(
+            campaign,
+            reference_root,
+            expected_trajectory_sha256=str(expected_trajectory_sha256),
+            artifact_snapshot=artifact_snapshot,
+        )
+        return records
+    return records
+
+
 def seed_frame_ids_from_committed_pointdirs(
     reference_data_dir: Union[str, Path],
     *,
@@ -877,11 +1210,39 @@ def repair_index_from_committed_pointdirs(
         return added
 
 
+def repair_index_from_committed_allocations(
+    campaign_dir: Union[str, Path],
+    reference_data_dir: Union[str, Path],
+    *,
+    expected_trajectory_sha256: str,
+    artifact_snapshot: Any = None,
+) -> int:
+    """Repair the compatibility index from hash-bound allocation snapshots."""
+    truth = records_from_committed_allocations(
+        campaign_dir,
+        reference_data_dir,
+        expected_trajectory_sha256=str(expected_trajectory_sha256),
+        artifact_snapshot=artifact_snapshot,
+    )
+    before = {
+        (record["iteration"], record["pointdir_name"])
+        for record in load_index(campaign_dir).get("records", [])
+    }
+    if truth:
+        upsert_index_records(campaign_dir, records=truth)
+    return sum(
+        1
+        for record in truth
+        if (record["iteration"], record["pointdir_name"]) not in before
+    )
+
+
 def load_training_seed_frame_ids(
     campaign_dir: Union[str, Path],
     reference_data_dir: Optional[Union[str, Path]] = None,
     *,
     expected_trajectory_sha256: Optional[str] = None,
+    artifact_snapshot: Any = None,
 ) -> Set[int]:
     """Return the set of stable trajectory frame_ids that have already been
     used as seeds for committed QM reference-data points.
@@ -891,30 +1252,59 @@ def load_training_seed_frame_ids(
     Frames whose `seed_frame_id` is ``None`` (synthetic / no-pool) are
     silently ignored.
 
-    The flat index is the fast path, but a crash between commit() and the
-    index-append loop can leave it short of what is actually committed. When
-    `training_dir` is given we also scan the committed pointdir sidecars and
-    union them in, so a truncated index can never make SEED_SELECT re-pick a
-    frame that is already in the QM reference data. Reading only -- the index is not
-    rewritten here.
+    When the trajectory identity is supplied, the hot path derives exclusions
+    from hash-bound allocation snapshots and repairs the compatibility index.
+    Older callers that do not supply that identity retain the legacy
+    pointdir-sidecar union so their behaviour is unchanged.
     """
-    data = load_index(campaign_dir)
-    result: Set[int] = set()
-    for rec in data.get("records", []):
-        if (
-            expected_trajectory_sha256 is not None
-            and rec["trajectory_sha256"] != str(expected_trajectory_sha256)
-        ):
-            continue
-        fid = rec.get("seed_frame_id")
-        if isinstance(fid, int):
-            result.add(int(fid))
+    try:
+        index_payload = load_index(campaign_dir)
+        indexed = {
+            int(record["seed_frame_id"])
+            for record in index_payload.get("records", [])
+            if isinstance(record.get("seed_frame_id"), int)
+            and (
+                expected_trajectory_sha256 is None
+                or record["trajectory_sha256"]
+                == str(expected_trajectory_sha256)
+            )
+        }
+    except Exception:
+        indexed = set()
+    if reference_data_dir is not None and expected_trajectory_sha256 is not None:
+        try:
+            records = records_from_committed_allocations(
+                campaign_dir,
+                reference_data_dir,
+                expected_trajectory_sha256=str(expected_trajectory_sha256),
+                artifact_snapshot=artifact_snapshot,
+            )
+            try:
+                upsert_index_records(campaign_dir, records=records)
+            except Exception:
+                # The flat index is compatibility-only; authority-derived
+                # exclusions remain complete even when its repair fails.
+                pass
+            derived = {
+                int(record["seed_frame_id"])
+                for record in records
+                if isinstance(record.get("seed_frame_id"), int)
+            }
+            return indexed | derived
+        except AllocationSeedEvidenceUnavailable:
+            return indexed | seed_frame_ids_from_committed_pointdirs(
+                reference_data_dir,
+                expected_trajectory_sha256=expected_trajectory_sha256,
+            )
+
     if reference_data_dir is not None:
-        result |= seed_frame_ids_from_committed_pointdirs(
-            reference_data_dir,
-            expected_trajectory_sha256=expected_trajectory_sha256,
+        indexed.update(
+            seed_frame_ids_from_committed_pointdirs(
+                reference_data_dir,
+                expected_trajectory_sha256=expected_trajectory_sha256,
+            )
         )
-    return result
+    return indexed
 
 
 # ---------------------------------------------------------------------------

@@ -759,6 +759,9 @@ class DryRunPhaseExecutor:
     def _seed_selection_prepare_context(self, _state, _pool) -> None:
         return None
 
+    def _seed_selection_assert_publication_authority(self, _state, _pool) -> None:
+        return None
+
     def _seed_selection_progress_callback(self, _state):
         return None
 
@@ -978,27 +981,8 @@ class DryRunPhaseExecutor:
             return {}
         ensure_index(self.campaign_dir)
         progress_callback = self._seed_selection_progress_callback(state)
-        if progress_callback is not None:
-            progress_callback(
-                "loading",
-                {"completed": 0, "total": 2},
-            )
         pool = self._seed_selection_pool(state)
-        if progress_callback is not None:
-            progress_callback(
-                "loading",
-                {"completed": 2, "total": 2},
-            )
         self._seed_selection_prepare_context(state, pool)
-        # refresh reference scales per acquisition.references.refresh_policy.
-        self._maybe_refresh_reference_scales(state)
-        from ..sampling_protocol import resolve_or_load_sampling_protocol
-
-        resolved_protocol = resolve_or_load_sampling_protocol(
-            self.campaign_dir,
-            self.config,
-            iteration=int(state.iteration),
-        )
 
         from ..custom_bootstrap import read_custom_bootstrap_manifest
 
@@ -1020,21 +1004,70 @@ class DryRunPhaseExecutor:
 
         # Exclude stable frame identities that have already produced committed
         # reference data before any stochastic or model-based seed scoring.
+        if progress_callback is not None:
+            progress_callback(
+                "seed_exclusions",
+                {"completed": 0, "total": 3},
+            )
         if self.config.seed_selection.exclude_committed_seed_frames:
             training_forbidden = load_training_seed_frame_ids(
                 self.campaign_dir,
                 reference_data_dir=self.campaign_dir / self.reference_data_dir_name,
                 expected_trajectory_sha256=pool.sha256,
+                artifact_snapshot=getattr(
+                    self, "_committed_artifact_snapshot", None
+                ),
             )
         else:
             training_forbidden = set()
+        if progress_callback is not None:
+            progress_callback(
+                "seed_exclusions",
+                {"completed": 1, "total": 3},
+            )
         recent_forbidden = load_recent_seed_frame_ids(
             self.campaign_dir,
             expected_trajectory_sha256=pool.sha256,
         )
+        if progress_callback is not None:
+            progress_callback(
+                "seed_exclusions",
+                {"completed": 2, "total": 3},
+            )
         forbidden = frozenset(
             bootstrap_forbidden | training_forbidden | recent_forbidden
         )
+        if progress_callback is not None:
+            progress_callback(
+                "seed_exclusions",
+                {
+                    "completed": 3,
+                    "total": 3,
+                    "excluded": int(len(forbidden)),
+                },
+            )
+
+        from ..sampling_protocol import resolve_or_load_sampling_protocol
+
+        if progress_callback is not None:
+            progress_callback(
+                "sampling_protocol",
+                {"completed": 0, "total": 1},
+            )
+        resolved_protocol = resolve_or_load_sampling_protocol(
+            self.campaign_dir,
+            self.config,
+            iteration=int(state.iteration),
+            trajectory_pool=pool,
+        )
+        if progress_callback is not None:
+            progress_callback(
+                "sampling_protocol",
+                {"completed": 1, "total": 1},
+            )
+
+        # Refresh reference scales per acquisition.references.refresh_policy.
+        self._maybe_refresh_reference_scales(state)
 
         training_atoms = self._seed_selection_population(pool)
         training_frame_ids = list(pool.frame_ids())
@@ -1261,6 +1294,7 @@ class DryRunPhaseExecutor:
         }
         seeds_picked_payload["diagnostics"] = diagnostics_payload
         from ..seed_identity import write_ariadne_task_map
+        self._seed_selection_assert_publication_authority(state, pool)
         if progress_callback is not None:
             progress_callback(
                 "publishing",
@@ -2211,6 +2245,15 @@ class DryRunPhaseExecutor:
             "rejected": [],
         })
         self.artefact_log.append(str(manifest_path))
+        try:
+            from ..sampling_history import prewarm_sampling_history_cache
+
+            prewarm_sampling_history_cache(
+                iter_dir,
+                iteration=int(state.iteration),
+            )
+        except Exception:
+            pass
         decision_contract = self._decision_contract_for_submission(
             state,
             "ARIADNE_ARRAY",

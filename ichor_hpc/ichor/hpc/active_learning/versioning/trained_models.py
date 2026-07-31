@@ -129,6 +129,180 @@ class TrainedModelSet:
         return tuple(task.model.path for task in self.tasks)
 
 
+@dataclass(frozen=True)
+class CurrentModelFileBinding:
+    """One current model payload admitted for a SEED_SELECT consumer."""
+
+    path: Path
+    size: int
+    mtime_ns: int
+    sha256: str
+
+
+def _verify_current_model_payloads(
+    campaign_dir: Union[str, Path],
+    model_set: TrainedModelSet,
+    *,
+    expected_bindings: Optional[Sequence[CurrentModelFileBinding]] = None,
+    progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+) -> Tuple[CurrentModelFileBinding, ...]:
+    from ..daemon.filesystem import campaign_owned_path
+
+    campaign = Path(campaign_dir).resolve()
+    versioning = TrainedModelVersioning(trained_models_dir(campaign))
+    expected_root = versioning.iteration_path(int(model_set.version)).resolve()
+    if model_set.root.resolve() != expected_root:
+        raise TrainedModelError("current model snapshot root is not canonical")
+    expected_by_path = (
+        None
+        if expected_bindings is None
+        else {binding.path.resolve(): binding for binding in expected_bindings}
+    )
+    bindings: List[CurrentModelFileBinding] = []
+    seen = set()
+    total = len(model_set.tasks)
+    for position, task in enumerate(model_set.tasks, start=1):
+        record = task.model
+        path = campaign_owned_path(campaign, Path(record.path))
+        if path.resolve() != (model_set.root / record.relative_path).resolve():
+            raise TrainedModelError("current model payload path identity mismatch")
+        try:
+            path.resolve().relative_to(expected_root)
+        except ValueError as exc:
+            raise TrainedModelError("current model payload escapes its snapshot") from exc
+        if path.is_symlink() or not path.is_file():
+            raise TrainedModelError(
+                "current model payload is missing or unsafe: " + str(path)
+            )
+        resolved = path.resolve()
+        if resolved in seen:
+            raise TrainedModelError("current model payload is duplicated")
+        seen.add(resolved)
+        stat = path.stat()
+        if int(stat.st_size) != int(record.size):
+            raise TrainedModelError("current model payload size mismatch: " + str(path))
+        digest = sha256_file(path)
+        if digest != str(record.sha256):
+            raise TrainedModelError("current model payload hash mismatch: " + str(path))
+        binding = CurrentModelFileBinding(
+            path=resolved,
+            size=int(stat.st_size),
+            mtime_ns=int(stat.st_mtime_ns),
+            sha256=digest,
+        )
+        if expected_by_path is not None:
+            expected = expected_by_path.get(resolved)
+            if expected is None or (
+                int(expected.size) != int(binding.size)
+                or str(expected.sha256) != str(binding.sha256)
+            ):
+                raise TrainedModelError(
+                    "current model payload changed after consumer admission: "
+                    + str(path)
+                )
+        bindings.append(binding)
+        if progress_callback is not None:
+            try:
+                progress_callback(
+                    "model_authority",
+                    {
+                        "completed": int(position),
+                        "total": int(total),
+                    },
+                )
+            except Exception:
+                pass
+    if expected_by_path is not None and set(expected_by_path) != seen:
+        raise TrainedModelError("current model payload inventory changed")
+    return tuple(bindings)
+
+
+def load_trained_models_from_snapshot(
+    campaign_dir: Union[str, Path],
+    models_version: int,
+    *,
+    snapshot: Any,
+    expected_campaign_uid: str,
+    progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+):
+    """Load only the current model payloads from an authority snapshot."""
+    from ichor.core.models import Models
+
+    campaign = Path(campaign_dir).resolve()
+    version = _safe_int(models_version, "models_version", minimum=0)
+    reference_versioning = ReferenceDataVersioning(campaign / "QM_REFERENCE_DATA")
+    model_versioning = TrainedModelVersioning(trained_models_dir(campaign))
+    if reference_versioning.current_version() != version:
+        raise TrainedModelError(
+            "current reference-data pointer does not match the seed-selection model version"
+        )
+    if model_versioning.current_version() != version:
+        raise TrainedModelError(
+            "current trained-model pointer does not match the seed-selection model version"
+        )
+    reference_view = snapshot.reference_view(version)
+    model_set = snapshot.model_set(version)
+    if str(reference_view.campaign_uid) != str(expected_campaign_uid):
+        raise TrainedModelError("reference-data campaign identity mismatch")
+    if str(model_set.campaign_uid) != str(expected_campaign_uid):
+        raise TrainedModelError("trained-model campaign identity mismatch")
+    if (
+        int(model_set.reference_data_version) != version
+        or str(model_set.reference_data_head_manifest_sha256)
+        != str(reference_view.head_manifest_sha256)
+        or str(model_set.reference_data_view_sha256)
+        != str(reference_view.cumulative_view_sha256)
+    ):
+        raise TrainedModelError("trained-model reference-data binding mismatch")
+    if progress_callback is not None:
+        try:
+            progress_callback(
+                "model_authority",
+                {"completed": 0, "total": int(len(model_set.tasks))},
+            )
+        except Exception:
+            pass
+    bindings = _verify_current_model_payloads(
+        campaign,
+        model_set,
+        progress_callback=progress_callback,
+    )
+    if progress_callback is not None:
+        try:
+            progress_callback("models", {"completed": 0, "total": 1})
+        except Exception:
+            pass
+    models = Models.from_model_files(model_set.root, model_set.model_paths)
+    for binding in bindings:
+        stat = binding.path.stat()
+        if (
+            int(stat.st_size) != int(binding.size)
+            or int(stat.st_mtime_ns) != int(binding.mtime_ns)
+        ):
+            raise TrainedModelError(
+                "current model payload changed while it was being parsed: "
+                + str(binding.path)
+            )
+    if progress_callback is not None:
+        try:
+            progress_callback("models", {"completed": 1, "total": 1})
+        except Exception:
+            pass
+    return model_set, models, bindings
+
+
+def assert_current_model_payloads_unchanged(
+    campaign_dir: Union[str, Path],
+    model_set: TrainedModelSet,
+    bindings: Sequence[CurrentModelFileBinding],
+) -> None:
+    _verify_current_model_payloads(
+        campaign_dir,
+        model_set,
+        expected_bindings=bindings,
+    )
+
+
 class TrainedModelVersioning(VersionedDirectory):
     def update_current(self, target_version: int) -> None:
         committed = self.list_committed_versions()
@@ -1351,6 +1525,7 @@ __all__ = [
     "TrainedModelFile",
     "TrainedModelTask",
     "TrainedModelSet",
+    "CurrentModelFileBinding",
     "TrainedModelVersioning",
     "trained_model_set_path",
     "trained_models_commit_lock_path",
@@ -1361,4 +1536,6 @@ __all__ = [
     "resolve_trained_model_chain",
     "resolve_trained_model_set",
     "load_trained_models",
+    "load_trained_models_from_snapshot",
+    "assert_current_model_payloads_unchanged",
 ]

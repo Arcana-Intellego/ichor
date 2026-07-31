@@ -2278,7 +2278,12 @@ def _status_progress_rows(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
         else None
     )
     if seed_record is not None:
-        elapsed = _format_elapsed_seconds(seed_record.get("elapsed_seconds"))
+        elapsed = _format_elapsed_seconds(
+            seed_record.get(
+                "stage_elapsed_seconds",
+                seed_record.get("elapsed_seconds"),
+            )
+        )
         rows: List[Tuple[str, str]] = []
         completed = _event_int(seed_record, "completed")
         total = _event_int(seed_record, "total")
@@ -2421,6 +2426,30 @@ def _format_journal_detail_value(key: str, value: Any) -> str:
     return _format_value(value)
 
 
+_SEED_SELECTION_PROGRESS_FORMATTER_STAGES = frozenset(
+    {
+        "trajectory_authority",
+        "trajectory_coordinates",
+        "model_authority",
+        "models",
+        "model_factors",
+        "features",
+        "seed_exclusions",
+        "sampling_protocol",
+        "reference_neighbours",
+        "reference_scales",
+        "filtering",
+        "random",
+        "variance",
+        "shortlist",
+        "d_optimal",
+        "publishing",
+        "failed",
+        "complete",
+    }
+)
+
+
 def _format_seed_selection_progress(record: Dict[str, Any]) -> str:
     stage = str(record.get("stage") or "loading")
     completed = _event_int(record, "completed")
@@ -2431,7 +2460,9 @@ def _format_seed_selection_progress(record: Dict[str, Any]) -> str:
         else ""
     )
     details: List[str] = []
-    elapsed_seconds = _round_journal_seconds(record.get("elapsed_seconds"))
+    elapsed_seconds = _round_journal_seconds(
+        record.get("stage_elapsed_seconds", record.get("elapsed_seconds"))
+    )
     if elapsed_seconds is not None and elapsed_seconds >= 1:
         hours, remainder = divmod(elapsed_seconds, 3600)
         minutes, seconds = divmod(remainder, 60)
@@ -2450,8 +2481,26 @@ def _format_seed_selection_progress(record: Dict[str, Any]) -> str:
 
     if stage == "loading":
         return _finish("Loading and validating the trajectory pool and models" + count)
+    if stage == "trajectory_authority":
+        return _finish("Validating trajectory-pool authority" + count)
+    if stage == "trajectory_coordinates":
+        cache_status = str(record.get("cache_status") or "")
+        verb = "Restoring cached" if cache_status == "hit" else "Preparing"
+        return _finish(verb + " trajectory coordinates" + count)
+    if stage == "model_authority":
+        return _finish("Validating current-model authority" + count)
+    if stage == "models":
+        return _finish("Loading current models" + count)
+    if stage == "model_factors":
+        return _finish("Restoring or computing model factors" + count)
     if stage == "features":
-        return _finish("Building cached trajectory features" + count)
+        cache_status = str(record.get("cache_status") or "")
+        verb = "Restoring cached" if cache_status == "hit" else "Preparing cached"
+        return _finish(verb + " trajectory features" + count)
+    if stage == "seed_exclusions":
+        return _finish("Resolving committed and recent seed exclusions" + count)
+    if stage == "sampling_protocol":
+        return _finish("Resolving sampling history and protocol" + count)
     if stage == "reference_neighbours":
         return _finish("Finding reference-scale neighbours" + count)
     if stage == "reference_scales":

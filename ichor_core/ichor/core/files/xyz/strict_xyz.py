@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 import re
 from pathlib import Path
-from typing import List, Union
+from typing import Iterator, List, TextIO, Tuple, Union
 
 from ichor.core.atoms import Atom, Atoms
 
@@ -16,24 +16,24 @@ class XYZParseError(ValueError):
     """Raised when an XYZ file does not satisfy the complete frame grammar."""
 
 
-def read_xyz_frames(path: Union[str, Path]) -> List[Atoms]:
-    """Read every complete XYZ frame without skipping undeclared records."""
-    source = Path(path)
-    try:
-        with source.open("r", encoding="utf-8", newline=None) as handle:
-            records = list(enumerate(handle, start=1))
-    except (OSError, UnicodeError) as exc:
-        raise XYZParseError("XYZ file is unreadable: " + str(source)) from exc
+def _numbered_lines(handle: TextIO) -> Iterator[Tuple[int, str]]:
+    for line_number, line in enumerate(handle, start=1):
+        yield line_number, line
 
-    frames: List[Atoms] = []
-    cursor = 0
-    n_records = len(records)
-    while cursor < n_records:
-        while cursor < n_records and not records[cursor][1].strip():
-            cursor += 1
-        if cursor >= n_records:
-            break
-        count_line_number, count_line = records[cursor]
+
+def _iter_xyz_frames(handle: TextIO) -> Iterator[Atoms]:
+    """Parse XYZ frames from an open text stream using the complete grammar."""
+    records = _numbered_lines(handle)
+    while True:
+        try:
+            count_line_number, count_line = next(records)
+        except StopIteration:
+            return
+        while not count_line.strip():
+            try:
+                count_line_number, count_line = next(records)
+            except StopIteration:
+                return
         count_text = count_line.strip()
         if _ATOM_COUNT_PATTERN.fullmatch(count_text) is None:
             raise XYZParseError(
@@ -42,17 +42,19 @@ def read_xyz_frames(path: Union[str, Path]) -> List[Atoms]:
                 + " must contain only a non-negative atom count"
             )
         atom_count = int(count_text)
-        cursor += 1
-        if cursor >= n_records:
+        try:
+            next(records)  # The comment line is mandatory and may be empty.
+        except StopIteration:
             raise XYZParseError(
                 "XYZ frame beginning on line "
                 + str(count_line_number)
                 + " has no comment line"
             )
-        cursor += 1  # The comment line is mandatory and may be empty.
         atoms = Atoms()
-        for atom_offset in range(atom_count):
-            if cursor >= n_records:
+        for _atom_offset in range(atom_count):
+            try:
+                line_number, atom_line = next(records)
+            except StopIteration:
                 raise XYZParseError(
                     "XYZ frame beginning on line "
                     + str(count_line_number)
@@ -60,8 +62,6 @@ def read_xyz_frames(path: Union[str, Path]) -> List[Atoms]:
                     + str(atom_count)
                     + " atom records"
                 )
-            line_number, atom_line = records[cursor]
-            cursor += 1
             fields = atom_line.split()
             if len(fields) < 4:
                 raise XYZParseError(
@@ -94,8 +94,24 @@ def read_xyz_frames(path: Union[str, Path]) -> List[Atoms]:
                     + repr(fields[0])
                 ) from exc
             atoms.add(atom)
-        frames.append(atoms)
-    return frames
+        yield atoms
 
 
-__all__ = ["XYZParseError", "read_xyz_frames"]
+def iter_xyz_frames(path: Union[str, Path]) -> Iterator[Atoms]:
+    """Yield every complete XYZ frame without materialising the full file."""
+    source = Path(path)
+    try:
+        with source.open("r", encoding="utf-8", newline=None) as handle:
+            yield from _iter_xyz_frames(handle)
+    except XYZParseError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise XYZParseError("XYZ file is unreadable: " + str(source)) from exc
+
+
+def read_xyz_frames(path: Union[str, Path]) -> List[Atoms]:
+    """Read every complete XYZ frame without skipping undeclared records."""
+    return list(iter_xyz_frames(path))
+
+
+__all__ = ["XYZParseError", "iter_xyz_frames", "read_xyz_frames"]

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from .strict_json import strict_json as json
 import math
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -233,41 +234,9 @@ def _coords(payload: Dict[str, Any], *names: str) -> Optional[List[List[float]]]
 
 
 def _per_atom_displacements(result: Dict[str, Any]) -> List[float]:
-    start = _coords(result, "seed_coordinates", "initial_coordinates")
-    final = _coords(result, "final_coordinates")
-    if start is None or final is None or len(start) != len(final):
-        return []
-    atom_types = result.get("atom_types")
-    if (
-        not isinstance(atom_types, list)
-        or len(atom_types) != len(start)
-        or any(not isinstance(symbol, str) or not symbol for symbol in atom_types)
-    ):
-        return []
-    try:
-        from ichor.core.adversarial.geometry import aligned_per_atom_displacements
-        from ichor.core.atoms import Atom, Atoms
+    from .sampling_history import per_atom_displacements
 
-        reference = Atoms(
-            [
-                Atom(str(symbol), float(coords[0]), float(coords[1]), float(coords[2]))
-                for symbol, coords in zip(atom_types, start)
-            ]
-        )
-        mobile = Atoms(
-            [
-                Atom(str(symbol), float(coords[0]), float(coords[1]), float(coords[2]))
-                for symbol, coords in zip(atom_types, final)
-            ]
-        )
-        displacements = aligned_per_atom_displacements(reference, mobile)
-    except Exception:
-        return []
-    return [
-        float(value)
-        for value in displacements
-        if _finite_nonnegative(value) is not None
-    ]
+    return per_atom_displacements(result)
 
 
 def _history_policy_context(iter_dir: Path) -> Tuple[Optional[Dict[str, Any]], str]:
@@ -311,6 +280,7 @@ def _collect_history(
     *,
     window: int,
     normalise_history: bool,
+    write_history_cache: bool = True,
 ) -> Dict[str, Any]:
     movement_values: List[float] = []
     fallback_movement_values: List[float] = []
@@ -348,14 +318,96 @@ def _collect_history(
         "iterations": [],
     }
     from .layout import active_iteration_dir
+    from .sampling_history import load_or_build_sampling_history
 
     start = max(1, int(iteration) - int(window))
+    previous_iterations = [
+        previous
+        for previous in range(start, int(iteration))
+        if active_iteration_dir(campaign_dir, previous).exists()
+    ]
+
+    def _load_history(previous: int):
+        try:
+            return load_or_build_sampling_history(
+                campaign_dir,
+                iteration=int(previous),
+                write_cache=bool(write_history_cache),
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            return exc
+
+    history_by_iteration: Dict[int, Any] = {}
+    if previous_iterations:
+        with ThreadPoolExecutor(
+            max_workers=max(1, min(4, len(previous_iterations)))
+        ) as executor:
+            loaded = executor.map(_load_history, previous_iterations)
+            history_by_iteration = dict(zip(previous_iterations, loaded))
     if int(iteration) > 0 and int(window) > 0:
         for previous in range(start, int(iteration)):
             iter_dir = active_iteration_dir(campaign_dir, previous)
             if not iter_dir.exists():
                 continue
-            records, counts = _accepted_history_records_for_iteration(iter_dir)
+            history_payload = history_by_iteration.get(previous)
+            try:
+                if isinstance(history_payload, Exception):
+                    raise history_payload
+                if not isinstance(history_payload, dict):
+                    raise ValueError("sampling history is unavailable")
+                cached_records = list(history_payload.get("records") or [])
+                records = [
+                    (
+                        iter_dir,
+                        {
+                            "seed_id": int(record["seed_id"]),
+                            "seed_uid": str(record.get("seed_uid") or ""),
+                            "landing_safety": {
+                                "accepted": True,
+                                "metrics": dict(record.get("metrics") or {}),
+                            },
+                            "_cached_per_atom_displacements": list(
+                                record.get("per_atom_displacements") or []
+                            ),
+                            "_cached_result_json_read": bool(
+                                record.get("result_json_read", False)
+                            ),
+                        },
+                        "strict_audit_and_results_cache",
+                    )
+                    for record in cached_records
+                ]
+                counts = {
+                    "n_seen": len(records),
+                    "n_used": len(records),
+                    "n_audit_records_seen": len(records),
+                    "n_results_records_seen": len(records),
+                    "n_audit_records_used": len(records),
+                    "n_results_records_used": len(records),
+                    "n_skipped_malformed_record": 0,
+                    "n_skipped_handoff_rejected": 0,
+                    "n_skipped_landing_rejected": 0,
+                    "n_skipped_missing_landing_safety": 0,
+                    "n_skipped_no_usable_metrics": 0,
+                    "n_deduplicated_fallback_records": 0,
+                    "n_fallback_results_records_used": 0,
+                }
+            except (FileNotFoundError, ValueError):
+                records, counts = [], {
+                    "n_seen": 0,
+                    "n_used": 0,
+                    "n_audit_records_seen": 0,
+                    "n_results_records_seen": 0,
+                    "n_audit_records_used": 0,
+                    "n_results_records_used": 0,
+                    "n_skipped_malformed_record": 1,
+                    "n_skipped_handoff_rejected": 0,
+                    "n_skipped_landing_rejected": 0,
+                    "n_skipped_missing_landing_safety": 0,
+                    "n_skipped_no_usable_metrics": 0,
+                    "n_deduplicated_fallback_records": 0,
+                    "n_fallback_results_records_used": 0,
+                }
             for key in history_filter:
                 history_filter[key] += int(counts.get(key, 0))
             if not records:
@@ -429,15 +481,11 @@ def _collect_history(
                     value = _finite_positive(metrics.get(key))
                     if value is not None:
                         dest.append(float(value))
-                result_path = _result_path(iter_dir, record)
-                if result_path is None or not result_path.is_file():
-                    continue
-                result = _json(result_path)
-                if not isinstance(result, dict):
+                if not bool(record.get("_cached_result_json_read", False)):
                     continue
                 n_result_json += 1
                 for index, displacement in enumerate(
-                    _per_atom_displacements(result)
+                    list(record.get("_cached_per_atom_displacements") or [])
                 ):
                     value = _finite_nonnegative(displacement)
                     if value is not None:
@@ -545,6 +593,7 @@ def build_sampling_scale_model(
     *,
     geometry_scale_payload: Optional[Dict[str, Any]] = None,
     write_manifest: bool = True,
+    history_cache_write: bool = True,
     model_version: int = SAMPLING_SCALE_MODEL_MODEL_VERSION,
     normalise_history: bool = True,
 ) -> Dict[str, Any]:
@@ -579,6 +628,7 @@ def build_sampling_scale_model(
         int(iteration),
         window=window,
         normalise_history=bool(normalise_history),
+        write_history_cache=bool(history_cache_write),
     )
     movement_median = _percentile(history["movement_values"], 0.50)
     if movement_median is not None:

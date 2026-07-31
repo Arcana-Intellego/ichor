@@ -120,6 +120,48 @@ class _Posterior:
         )
 
 
+class _FactorModel:
+    prop = "iqa"
+    ntrain = 3
+    nfeats = 1
+    jitter = 1.0e-8
+    numeric_identity = "f" * 64
+
+    def __init__(self):
+        self.x = np.arange(3, dtype=np.float64).reshape(-1, 1)
+        self._covariance = np.asarray(
+            [
+                [1.2, 0.2, 0.1],
+                [0.2, 1.1, 0.3],
+                [0.1, 0.3, 1.3],
+            ],
+            dtype=np.float64,
+        )
+        self.lower_cholesky_calls = 0
+        self.installed = None
+
+    @property
+    def lower_cholesky(self):
+        self.lower_cholesky_calls += 1
+        return np.linalg.cholesky(
+            self._covariance + self.jitter * np.eye(self.ntrain)
+        )
+
+    def prior_covariance(self, left, right):
+        left_ids = np.asarray(left, dtype=int).reshape(-1)
+        right_ids = np.asarray(right, dtype=int).reshape(-1)
+        return self._covariance[np.ix_(left_ids, right_ids)]
+
+    def install_lower_cholesky(self, factor, *, expected_numeric_identity):
+        assert expected_numeric_identity == self.numeric_identity
+        self.installed = np.asarray(factor)
+
+
+class _FactorPosterior:
+    def __init__(self, model):
+        self._property_models = {"O1": model}
+
+
 def _cache(tmp_path, posterior, progress=None):
     return SeedSelectionRuntimeCache(
         tmp_path / "campaign",
@@ -206,6 +248,93 @@ def test_corrupt_variance_cache_is_ignored_and_rebuilt(tmp_path):
     )
 
     assert rebuilt_posterior.variance_calls == 3
+
+
+def test_model_factor_cache_reuses_validated_factor_without_recomputing(tmp_path):
+    first_model = _FactorModel()
+    first = SeedSelectionRuntimeCache(
+        tmp_path / "campaign",
+        pool=None,
+        posterior=_FactorPosterior(first_model),
+        model_set_sha256="b" * 64,
+        model_manifest_sha256="c" * 64,
+        iteration=2,
+        model_file_sha256_by_atom={"O1": "d" * 64},
+    )
+    assert first.ensure_model_factors() == {"O1": "published"}
+    assert first_model.lower_cholesky_calls == 1
+
+    second_model = _FactorModel()
+    second = SeedSelectionRuntimeCache(
+        tmp_path / "campaign",
+        pool=None,
+        posterior=_FactorPosterior(second_model),
+        model_set_sha256="b" * 64,
+        model_manifest_sha256="c" * 64,
+        iteration=3,
+        model_file_sha256_by_atom={"O1": "d" * 64},
+    )
+    assert second.ensure_model_factors() == {"O1": "hit"}
+    assert second_model.lower_cholesky_calls == 0
+    np.testing.assert_allclose(
+        second_model.installed,
+        np.linalg.cholesky(
+            second_model._covariance
+            + second_model.jitter * np.eye(second_model.ntrain)
+        ),
+    )
+
+
+def test_corrupt_model_factor_cache_is_recomputed(tmp_path):
+    import gc
+
+    first_model = _FactorModel()
+    cache = SeedSelectionRuntimeCache(
+        tmp_path / "campaign",
+        pool=None,
+        posterior=_FactorPosterior(first_model),
+        model_set_sha256="b" * 64,
+        model_manifest_sha256="c" * 64,
+        iteration=2,
+        model_file_sha256_by_atom={"O1": "d" * 64},
+    )
+    cache.ensure_model_factors()
+    factor_path = next(
+        (cache.root / "model_factors" / ("b" * 24)).glob("*.npy")
+    )
+    del cache, first_model
+    gc.collect()
+    with factor_path.open("r+b") as handle:
+        handle.seek(-8, 2)
+        handle.write(b"\xff" * 8)
+
+    rebuilt_model = _FactorModel()
+    rebuilt = SeedSelectionRuntimeCache(
+        tmp_path / "campaign",
+        pool=None,
+        posterior=_FactorPosterior(rebuilt_model),
+        model_set_sha256="b" * 64,
+        model_manifest_sha256="c" * 64,
+        iteration=3,
+        model_file_sha256_by_atom={"O1": "d" * 64},
+    )
+    assert rebuilt.ensure_model_factors() == {"O1": "published"}
+    assert rebuilt_model.lower_cholesky_calls == 1
+
+
+def test_model_factor_cache_failure_falls_back_to_strict_factor(tmp_path):
+    model = _FactorModel()
+    cache = SeedSelectionRuntimeCache(
+        tmp_path / "campaign",
+        pool=None,
+        posterior=_FactorPosterior(model),
+        model_set_sha256="b" * 64,
+        model_manifest_sha256="c" * 64,
+        iteration=2,
+    )
+
+    assert cache.ensure_model_factors() == {"O1": "fallback"}
+    assert model.lower_cholesky_calls == 1
 
 
 def test_partial_feature_build_resumes_from_last_verified_chunk(tmp_path):
@@ -506,6 +635,49 @@ def test_progress_reporter_throttles_same_stage_journal_updates(tmp_path):
     reporter._last_journal -= 31.0
     reporter.update("variance", force=True, completed=3, total=12)
     assert len(events) == count_after_stage_change + 1
+
+
+def test_progress_reporter_resets_stage_counters_and_stage_elapsed(tmp_path):
+    from ichor.hpc.active_learning.strict_json import strict_json as json
+
+    reporter = SeedSelectionProgressReporter(
+        tmp_path / "campaign",
+        campaign_uid="campaign-1",
+        iteration=2,
+    )
+    reporter.update(
+        "trajectory_coordinates",
+        force=True,
+        completed=12,
+        total=12,
+        cache_status="hit",
+    )
+    reporter.started_monotonic -= 60.0
+    reporter.update(
+        "model_authority",
+        force=True,
+        completed=0,
+        total=6,
+    )
+
+    payload = json.loads(reporter.path.read_text(encoding="utf-8"))
+    assert payload["stage"] == "model_authority"
+    assert payload["completed"] == 0
+    assert payload["total"] == 6
+    assert "cache_status" not in payload
+    assert payload["elapsed_seconds"] >= 60.0
+    assert payload["stage_elapsed_seconds"] < 1.0
+
+
+def test_seed_selection_progress_formatter_covers_every_runtime_stage():
+    from ichor.hpc.active_learning import cli
+    from ichor.hpc.active_learning.daemon.seed_selection_runtime import (
+        SEED_SELECTION_PROGRESS_STAGES,
+    )
+
+    assert cli._SEED_SELECTION_PROGRESS_FORMATTER_STAGES == (
+        SEED_SELECTION_PROGRESS_STAGES
+    )
 
 
 def test_status_uses_current_seed_selection_progress(tmp_path):

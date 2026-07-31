@@ -105,6 +105,25 @@ def test_production_model_cholesky_and_identity_are_stable(tmp_path):
     assert not first.flags.writeable
 
 
+def test_production_model_accepts_only_identity_bound_cholesky_factor(tmp_path):
+    model = Model(_model_dir(tmp_path) / "WATER_iqa_O1.model")
+    expected = np.linalg.cholesky(model.R)
+
+    model.invalidate_numeric_cache()
+    model.install_lower_cholesky(
+        expected,
+        expected_numeric_identity=model.numeric_identity,
+    )
+
+    assert model.lower_cholesky is expected
+    assert not model.lower_cholesky.flags.writeable
+    with pytest.raises(ValueError, match="identity"):
+        model.install_lower_cholesky(
+            expected,
+            expected_numeric_identity="0" * 64,
+        )
+
+
 def test_total_energy_posterior_rejects_non_finite_feature_values(tmp_path):
     posterior = TotalEnergyPosterior(Models(_model_dir(tmp_path)))
     frame = _atoms()

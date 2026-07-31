@@ -308,7 +308,6 @@ class Daemon:
     #internal flags; not part of the public dataclass surface.
     _shutdown_requested: bool = field(default=False, init=False, repr=False)
     _lock_held: Optional[Any] = field(default=None, init=False, repr=False)
-    _provenance_index_repair_attempted: bool = field(default=False, init=False, repr=False)
     _unsubmitted_intent_repair_attempted: bool = field(
         default=False,
         init=False,
@@ -707,31 +706,10 @@ class Daemon:
                 campaign_uid=state.campaign_uid,
                 max_iterations=state.max_iterations,
             )
-            self._repair_provenance_index_best_effort()
             return state
         state = read_state(sp)
         self._set_journal_state(state)
-        self._repair_provenance_index_best_effort()
         return state
-
-    def _repair_provenance_index_best_effort(self) -> None:
-        if self._provenance_index_repair_attempted:
-            return
-        self._provenance_index_repair_attempted = True
-        try:
-            from ..versioning.provenance import repair_index_from_committed_pointdirs
-
-            added = repair_index_from_committed_pointdirs(
-                self.campaign_dir,
-                self.campaign_dir / "QM_REFERENCE_DATA",
-            )
-            if added:
-                self._journal("provenance_index_repaired", records_added=int(added))
-        except Exception as exc:
-            self._journal(
-                "provenance_index_repair_failed",
-                error=type(exc).__name__ + ": " + str(exc)[:180],
-            )
 
     def _set_journal_state(self, state: CampaignState) -> None:
         self._journal_phase_snapshot = state.phase.value
@@ -1354,6 +1332,7 @@ class Daemon:
         state: CampaignState,
         phase: CampaignPhase,
     ) -> Optional[str]:
+        setattr(self.executor, "_committed_artifact_snapshot", None)
         if not bool(getattr(self.executor, "strict_committed_artifact_verification", False)):
             return None
         attempts = max(
@@ -1380,6 +1359,7 @@ class Daemon:
                     verification="authority",
                     snapshot=snapshot,
                 )
+                setattr(self.executor, "_committed_artifact_snapshot", snapshot)
                 return None
             except Exception as exc:
                 reason = (
@@ -1981,6 +1961,7 @@ class Daemon:
                 result.validate(stage="submit", phase_name=phase_name)
             finally:
                 self._bind_executor_progress(None)
+                setattr(self.executor, "_committed_artifact_snapshot", None)
         except SubmissionCancelledBeforeSchedulerAcceptance as exc:
             if phase_reporter is not None:
                 phase_reporter.fail(

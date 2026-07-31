@@ -152,6 +152,31 @@ class Model(ReadFile, WriteFile):
         self._numeric_identity_cache = None
         self._lower_cholesky_cache = None
 
+    def install_lower_cholesky(
+        self,
+        factor: np.ndarray,
+        *,
+        expected_numeric_identity: str,
+    ) -> None:
+        """Install a validated, read-only factor for this exact numeric model."""
+        identity = self.numeric_identity
+        if str(expected_numeric_identity) != identity:
+            raise ValueError("model Cholesky identity does not match the model")
+        values = np.asarray(factor)
+        expected_shape = (int(self.ntrain), int(self.ntrain))
+        if values.dtype != np.dtype(np.float64) or values.shape != expected_shape:
+            raise ValueError("model Cholesky factor shape or dtype is invalid")
+        if not np.all(np.isfinite(values)):
+            raise ValueError("model Cholesky factor must be finite")
+        scale = max(1.0, float(np.max(np.abs(values))))
+        tolerance = np.finfo(np.float64).eps * max(1, int(self.ntrain)) * scale * 16.0
+        if np.any(np.abs(np.triu(values, k=1)) > tolerance):
+            raise ValueError("model Cholesky factor must be lower triangular")
+        if np.any(np.diag(values) <= 0.0):
+            raise ValueError("model Cholesky diagonal must be positive")
+        values.setflags(write=False)
+        self._lower_cholesky_cache = (identity, values)
+
     def _read_file(self, up_to: Optional[str] = None):
         """Read in a FEREBUS output file which contains the optimized
         hyperparameters, mean function, and other information that is needed to make predictions."""

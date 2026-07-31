@@ -3269,7 +3269,20 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             return
         cache = context.get("cache")
         if cache is not None and not bool(context.get("features_ready", False)):
+            reporter = context.get("progress")
+            if reporter is not None:
+                reporter.update(
+                    "features",
+                    completed=0,
+                    total=int(pool.n_frames()),
+                )
             cache.ensure_features()
+            if reporter is not None:
+                reporter.update(
+                    "features",
+                    completed=int(pool.n_frames()),
+                    total=int(pool.n_frames()),
+                )
             context["features_ready"] = True
 
     def _seed_selection_population(self, pool):
@@ -3288,6 +3301,30 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         if isinstance(context, dict) and context.get("model_set") is not None:
             return context["model_set"]
         return super()._seed_selection_model_set(state)
+
+    def _seed_selection_assert_publication_authority(self, state, pool) -> None:
+        context = getattr(self, "_active_seed_selection_context", None)
+        if not isinstance(context, dict) or context.get("pool") is not pool:
+            return
+        snapshot = context.get("artifact_snapshot")
+        if snapshot is not None:
+            snapshot.assert_anchors_unchanged(self.campaign_dir)
+        from ..versioning.manifest import sha256_file
+        from ..versioning.trained_models import (
+            assert_current_model_payloads_unchanged,
+        )
+
+        if sha256_file(pool.canonical_path) != str(pool.sha256):
+            raise BackendSubmissionError(
+                "trajectory pool changed during seed selection"
+            )
+        bindings = context.get("current_model_bindings")
+        if bindings is not None:
+            assert_current_model_payloads_unchanged(
+                self.campaign_dir,
+                context["model_set"],
+                bindings,
+            )
 
     def _seed_selection_finished(self, state, *, selection_published: bool) -> None:
         context = getattr(self, "_active_seed_selection_context", None)
@@ -3356,6 +3393,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         model_manifest_sha256=str(model_set.head_manifest_sha256),
                         iteration=int(state.iteration),
                         progress=context.get("progress"),
+                        model_file_sha256_by_atom=context.get(
+                            "model_file_sha256_by_atom"
+                        ),
                     )
                     context["cache"] = cache
                 indexed = cache.ensure_indexed_posterior(
@@ -3441,7 +3481,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         progress = None
         try:
             from ichor.core.adversarial.posterior import TotalEnergyPosterior
-            from ..versioning.trained_models import load_trained_models
+            from ..versioning.trained_models import (
+                load_trained_models,
+                load_trained_models_from_snapshot,
+            )
             from .seed_selection_runtime import (
                 SeedSelectionProgressReporter,
                 SeedSelectionRuntimeCache,
@@ -3453,17 +3496,50 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 iteration=int(state.iteration),
                 journal_event=self._journal_event,
             )
-            pool = TrajectoryPool.load(self.campaign_dir)
-            model_set, models = load_trained_models(
+            pool = TrajectoryPool.load(
                 self.campaign_dir,
-                int(state.models_version),
-                verification="metadata",
-                reference_verification="metadata",
+                progress_callback=progress.callback,
             )
+            artifact_snapshot = getattr(
+                self, "_committed_artifact_snapshot", None
+            )
+            current_model_bindings = None
+            if artifact_snapshot is None:
+                progress.update("model_authority", completed=0, total=1)
+                model_set, models = load_trained_models(
+                    self.campaign_dir,
+                    int(state.models_version),
+                    verification="metadata",
+                    reference_verification="metadata",
+                )
+                progress.update("model_authority", completed=1, total=1)
+                progress.update("models", completed=1, total=1)
+            else:
+                (
+                    model_set,
+                    models,
+                    current_model_bindings,
+                ) = load_trained_models_from_snapshot(
+                    self.campaign_dir,
+                    int(state.models_version),
+                    snapshot=artifact_snapshot,
+                    expected_campaign_uid=str(state.campaign_uid),
+                    progress_callback=progress.callback,
+                )
             posterior = TotalEnergyPosterior(
                 models,
                 property_name="iqa",
                 scaled=True,
+            )
+            model_file_sha256_by_atom = {
+                str(task.atom): str(task.model.sha256)
+                for task in model_set.tasks
+                if str(task.property) == "iqa"
+            }
+            progress.bind_inputs(
+                trajectory_sha256=str(pool.sha256),
+                model_set_sha256=str(model_set.model_set_sha256),
+                model_manifest_sha256=str(model_set.head_manifest_sha256),
             )
             cache = SeedSelectionRuntimeCache(
                 self.campaign_dir,
@@ -3473,12 +3549,14 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 model_manifest_sha256=str(model_set.head_manifest_sha256),
                 iteration=int(state.iteration),
                 progress=progress,
+                model_file_sha256_by_atom=model_file_sha256_by_atom,
             )
-            progress.bind_inputs(
-                trajectory_sha256=str(pool.sha256),
-                model_set_sha256=str(model_set.model_set_sha256),
-                model_manifest_sha256=str(model_set.head_manifest_sha256),
+            progress.update(
+                "model_factors",
+                completed=0,
+                total=int(len(posterior._property_models)),
             )
+            cache.ensure_model_factors()
         except Exception as exc:
             if progress is not None:
                 progress.update(
@@ -3503,6 +3581,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             "cache": cache,
             "indexed_posterior": None,
             "features_ready": False,
+            "artifact_snapshot": artifact_snapshot,
+            "current_model_bindings": current_model_bindings,
+            "model_file_sha256_by_atom": model_file_sha256_by_atom,
         }
         try:
             return super()._inline_seed_select(state)
@@ -5232,6 +5313,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 self.campaign_dir,
                 self.config,
                 iteration=int(state.iteration),
+                trajectory_pool=pool,
             )
             acquisition_config = resolved_protocol.acquisition_config
         except Exception as exc:
@@ -5803,6 +5885,54 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 ),
             )
 
+        try:
+            from ichor.core.adversarial.posterior import TotalEnergyPosterior
+            from ichor.core.models import Models
+            from .seed_selection_runtime import SeedSelectionRuntimeCache
+
+            factor_models = Models.from_model_files(
+                committed_model_set.root,
+                committed_model_set.model_paths,
+            )
+            factor_posterior = TotalEnergyPosterior(
+                factor_models,
+                property_name="iqa",
+                scaled=True,
+            )
+            factor_cache = SeedSelectionRuntimeCache(
+                self.campaign_dir,
+                pool=None,
+                posterior=factor_posterior,
+                model_set_sha256=str(committed_model_set.model_set_sha256),
+                model_manifest_sha256=str(
+                    committed_model_set.head_manifest_sha256
+                ),
+                iteration=int(next_version) + 1,
+                model_file_sha256_by_atom={
+                    str(task.atom): str(task.model.sha256)
+                    for task in committed_model_set.tasks
+                    if str(task.property) == "iqa"
+                },
+            )
+            factor_statuses = factor_cache.ensure_model_factors()
+            self._journal_event(
+                "seed_selection_cache",
+                phase=phase_name,
+                iteration=int(state.iteration),
+                cache_kind="model_factors",
+                cache_status="prewarmed",
+                n_models=int(len(factor_statuses)),
+            )
+        except Exception as exc:
+            self._journal_event(
+                "seed_selection_cache",
+                phase=phase_name,
+                iteration=int(state.iteration),
+                cache_kind="model_factors",
+                cache_status="prewarm_failed",
+                error=type(exc).__name__ + ": " + str(exc)[:240],
+            )
+
         state_updates = {"models_version": int(next_version), "validation_set_version": int(next_version)}
         if is_initial:
             from ..versioning.sampling_iterations import finalise_bootstrap
@@ -6202,6 +6332,15 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 "accepted": [],
                 "rejected": rejected,
             })
+            try:
+                from ..sampling_history import prewarm_sampling_history_cache
+
+                prewarm_sampling_history_cache(
+                    iter_dir,
+                    iteration=int(state.iteration),
+                )
+            except Exception:
+                pass
             publish_batch_decision(
                 n_accepted=0,
                 n_rejected=len(rejected),
@@ -6936,6 +7075,15 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             "rejected": rejected,
         })
         self.artefact_log.append(str(manifest_path))
+        try:
+            from ..sampling_history import prewarm_sampling_history_cache
+
+            prewarm_sampling_history_cache(
+                iter_dir,
+                iteration=int(state.iteration),
+            )
+        except Exception:
+            pass
         self._report_runtime_progress(
             "audit_publication",
             completed=3,

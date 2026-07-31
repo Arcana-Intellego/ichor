@@ -31,17 +31,19 @@ from __future__ import annotations
 
 from ..strict_json import strict_json as json
 import os
+import platform
 import shutil
+import sys
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
-from ichor.core.atoms import Atoms
-from ichor.core.files.xyz import Trajectory
+from ichor.core.atoms import Atom, Atoms
+from ichor.core.files.xyz.strict_xyz import iter_xyz_frames
 
 from ..daemon.filesystem import campaign_owned_path
 from ..daemon.state import (
@@ -59,6 +61,9 @@ __all__ = [
     "POOL_XYZ_FILENAME",
     "POOL_MANIFEST_FILENAME",
     "POOL_SCHEMA_VERSION",
+    "POOL_COORDINATE_CACHE_SUBDIR",
+    "POOL_COORDINATE_CACHE_FILENAME",
+    "POOL_COORDINATE_CACHE_MANIFEST_FILENAME",
 ]
 
 
@@ -68,12 +73,16 @@ POOL_MANIFEST_FILENAME = "pool.manifest.json"
 POOL_IMPORT_TRANSACTION_FILENAME = "pool.import.transaction.json"
 POOL_SCHEMA_VERSION = 2
 POOL_IMPORT_TRANSACTION_SCHEMA_VERSION = 1
+POOL_COORDINATE_CACHE_SCHEMA_VERSION = 1
+POOL_COORDINATE_ENCODING_VERSION = 1
+POOL_COORDINATE_PARSER_CONTRACT = "strict_xyz_stream_v1"
+POOL_COORDINATE_CACHE_SUBDIR = Path(".DATA") / "CACHE" / "TRAJECTORY_POOL"
+POOL_COORDINATE_CACHE_FILENAME = "coordinates.npy"
+POOL_COORDINATE_CACHE_MANIFEST_FILENAME = "CACHE_MANIFEST.json"
 
 
 def _validated_frames(path: Path, *, source_label: Path) -> tuple:
-    trajectory = Trajectory(path)
-    trajectory.read()
-    frames = [atoms.copy() for atoms in trajectory]
+    frames = [atoms.copy() for atoms in iter_xyz_frames(path)]
     if not frames:
         raise ValueError("trajectory has zero frames: " + str(source_label))
     head = frames[0]
@@ -96,6 +105,282 @@ def _validated_frames(path: Path, *, source_label: Path) -> tuple:
         if not np.all(np.isfinite(coordinates)):
             raise ValueError("frame " + str(index) + " contains non-finite coordinates")
     return frames, atom_types, masses
+
+
+def _coordinates_from_frames(frames: List[Atoms]) -> np.ndarray:
+    coordinates = np.empty((len(frames), len(frames[0]), 3), dtype=np.float64)
+    for frame_id, atoms in enumerate(frames):
+        coordinates[frame_id, :, :] = np.asarray(atoms.coordinates, dtype=np.float64)
+    coordinates.setflags(write=False)
+    return coordinates
+
+
+def _coordinate_cache_identity(manifest: "TrajectoryPoolManifest") -> Dict[str, Any]:
+    return {
+        "pool_sha256": str(manifest.sha256),
+        "n_frames": int(manifest.n_frames),
+        "natoms": int(manifest.natoms),
+        "atom_types": list(manifest.atom_types),
+        "masses": [float(value) for value in manifest.masses],
+        "encoding_version": POOL_COORDINATE_ENCODING_VERSION,
+        "parser_contract": POOL_COORDINATE_PARSER_CONTRACT,
+        "dtype": np.dtype(np.float64).str,
+        "byteorder": sys.byteorder,
+        "platform": platform.system(),
+        "machine": platform.machine(),
+        "numpy_version": str(np.__version__),
+    }
+
+
+def _coordinate_cache_paths(
+    campaign: Path, manifest: "TrajectoryPoolManifest"
+) -> Dict[str, Path]:
+    root = campaign_owned_path(campaign, POOL_COORDINATE_CACHE_SUBDIR)
+    identity_dir = root / str(manifest.sha256)
+    return {
+        "root": root,
+        "directory": identity_dir,
+        "data": identity_dir / POOL_COORDINATE_CACHE_FILENAME,
+        "manifest": identity_dir / POOL_COORDINATE_CACHE_MANIFEST_FILENAME,
+        "lock": root / (str(manifest.sha256) + ".lock"),
+        "building": root / (".building-" + str(manifest.sha256)),
+    }
+
+
+def _read_coordinate_cache(
+    directory: Path, manifest: "TrajectoryPoolManifest"
+) -> np.ndarray:
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("trajectory coordinate cache directory is invalid")
+    manifest_path = directory / POOL_COORDINATE_CACHE_MANIFEST_FILENAME
+    data_path = directory / POOL_COORDINATE_CACHE_FILENAME
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise ValueError("trajectory coordinate cache manifest is missing")
+    if data_path.is_symlink() or not data_path.is_file():
+        raise ValueError("trajectory coordinate cache data is missing")
+    payload = json.loads(
+        manifest_path.read_text(encoding="utf-8"), source=manifest_path
+    )
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema_version",
+        "identity",
+        "data",
+    }:
+        raise ValueError("trajectory coordinate cache manifest fields are invalid")
+    if payload.get("schema_version") != POOL_COORDINATE_CACHE_SCHEMA_VERSION:
+        raise ValueError("trajectory coordinate cache schema is unsupported")
+    if payload.get("identity") != _coordinate_cache_identity(manifest):
+        raise ValueError("trajectory coordinate cache identity mismatch")
+    data = payload.get("data")
+    if not isinstance(data, dict) or set(data) != {
+        "name",
+        "size",
+        "sha256",
+        "shape",
+        "dtype",
+    }:
+        raise ValueError("trajectory coordinate cache data record is invalid")
+    if data.get("name") != POOL_COORDINATE_CACHE_FILENAME:
+        raise ValueError("trajectory coordinate cache filename is invalid")
+    if data_path.stat().st_size != int(data.get("size", -1)):
+        raise ValueError("trajectory coordinate cache size mismatch")
+    if sha256_file(data_path) != str(data.get("sha256") or ""):
+        raise ValueError("trajectory coordinate cache hash mismatch")
+    expected_shape = (int(manifest.n_frames), int(manifest.natoms), 3)
+    if data.get("shape") != list(expected_shape):
+        raise ValueError("trajectory coordinate cache shape record mismatch")
+    if data.get("dtype") != np.dtype(np.float64).str:
+        raise ValueError("trajectory coordinate cache dtype record mismatch")
+    coordinates = np.load(data_path, mmap_mode="r", allow_pickle=False)
+    if coordinates.shape != expected_shape or coordinates.dtype != np.dtype(np.float64):
+        raise ValueError("trajectory coordinate cache array contract mismatch")
+    if not np.all(np.isfinite(coordinates)):
+        raise ValueError("trajectory coordinate cache contains non-finite values")
+    return coordinates
+
+
+def _report_progress(
+    callback: Optional[Callable[[str, Dict[str, Any]], None]],
+    stage: str,
+    **payload: Any,
+) -> None:
+    if callback is None:
+        return
+    try:
+        callback(str(stage), dict(payload))
+    except Exception:
+        pass
+
+
+def _validated_coordinates(
+    path: Path,
+    *,
+    manifest: "TrajectoryPoolManifest",
+    progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+) -> np.ndarray:
+    coordinates = np.empty(
+        (int(manifest.n_frames), int(manifest.natoms), 3), dtype=np.float64
+    )
+    observed_frames = 0
+    for frame_id, atoms in enumerate(iter_xyz_frames(path)):
+        if frame_id >= int(manifest.n_frames):
+            raise RuntimeError("pool manifest metadata does not match canonical pool.xyz")
+        atom_types = tuple(atom.type for atom in atoms)
+        masses = tuple(float(atom.mass) for atom in atoms)
+        if atom_types != manifest.atom_types or masses != manifest.masses:
+            raise RuntimeError("pool manifest metadata does not match canonical pool.xyz")
+        frame_coordinates = np.asarray(atoms.coordinates, dtype=np.float64)
+        if frame_coordinates.shape != (int(manifest.natoms), 3):
+            raise RuntimeError("pool manifest metadata does not match canonical pool.xyz")
+        if not np.all(np.isfinite(frame_coordinates)):
+            raise RuntimeError("canonical pool.xyz contains non-finite coordinates")
+        coordinates[frame_id, :, :] = frame_coordinates
+        observed_frames += 1
+        if observed_frames == 1 or observed_frames % 256 == 0:
+            _report_progress(
+                progress_callback,
+                "trajectory_coordinates",
+                completed=int(observed_frames),
+                total=int(manifest.n_frames),
+                cache_status="building",
+            )
+    if observed_frames != int(manifest.n_frames):
+        raise RuntimeError("pool manifest metadata does not match canonical pool.xyz")
+    coordinates.setflags(write=False)
+    return coordinates
+
+
+def _remove_derived_cache_path(path: Path) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.is_symlink() or not path.is_dir():
+        path.unlink()
+        return
+    retired = path.with_name(".invalid-" + uuid.uuid4().hex[:12])
+    os.replace(path, retired)
+    shutil.rmtree(retired, ignore_errors=True)
+
+
+def _publish_coordinate_cache(
+    campaign: Path,
+    manifest: "TrajectoryPoolManifest",
+    coordinates: np.ndarray,
+) -> np.ndarray:
+    paths = _coordinate_cache_paths(campaign, manifest)
+    paths["root"].mkdir(parents=True, exist_ok=True)
+    _remove_derived_cache_path(paths["building"])
+    paths["building"].mkdir()
+    data_path = paths["building"] / POOL_COORDINATE_CACHE_FILENAME
+    with data_path.open("xb") as handle:
+        np.save(handle, np.asarray(coordinates, dtype=np.float64), allow_pickle=False)
+        handle.flush()
+        _fsync_file_descriptor(handle.fileno())
+    cache_manifest = {
+        "schema_version": POOL_COORDINATE_CACHE_SCHEMA_VERSION,
+        "identity": _coordinate_cache_identity(manifest),
+        "data": {
+            "name": POOL_COORDINATE_CACHE_FILENAME,
+            "size": int(data_path.stat().st_size),
+            "sha256": sha256_file(data_path),
+            "shape": [int(manifest.n_frames), int(manifest.natoms), 3],
+            "dtype": np.dtype(np.float64).str,
+        },
+    }
+    atomic_write_json(
+        paths["building"] / POOL_COORDINATE_CACHE_MANIFEST_FILENAME,
+        cache_manifest,
+    )
+    if paths["directory"].exists() or paths["directory"].is_symlink():
+        _remove_derived_cache_path(paths["directory"])
+    os.replace(paths["building"], paths["directory"])
+    _fsync_parent_dir(paths["directory"])
+    published = _read_coordinate_cache(paths["directory"], manifest)
+    for child in paths["root"].iterdir():
+        if (
+            child != paths["directory"]
+            and child.is_dir()
+            and not child.is_symlink()
+            and not child.name.startswith(".building-")
+        ):
+            _remove_derived_cache_path(child)
+    return published
+
+
+def _load_or_build_coordinate_cache(
+    campaign: Path,
+    canonical_path: Path,
+    manifest: "TrajectoryPoolManifest",
+    *,
+    progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+) -> np.ndarray:
+    try:
+        paths = _coordinate_cache_paths(campaign, manifest)
+        if paths["directory"].exists() or paths["directory"].is_symlink():
+            try:
+                coordinates = _read_coordinate_cache(paths["directory"], manifest)
+                _report_progress(
+                    progress_callback,
+                    "trajectory_coordinates",
+                    completed=int(manifest.n_frames),
+                    total=int(manifest.n_frames),
+                    cache_status="hit",
+                )
+                return coordinates
+            except (OSError, ValueError):
+                pass
+        paths["root"].mkdir(parents=True, exist_ok=True)
+        if paths["lock"].is_symlink():
+            raise ValueError("trajectory coordinate cache lock is symlinked")
+        import portalocker
+
+        try:
+            with portalocker.Lock(str(paths["lock"]), mode="a", timeout=600):
+                if paths["directory"].exists() or paths["directory"].is_symlink():
+                    try:
+                        coordinates = _read_coordinate_cache(
+                            paths["directory"], manifest
+                        )
+                        _report_progress(
+                            progress_callback,
+                            "trajectory_coordinates",
+                            completed=int(manifest.n_frames),
+                            total=int(manifest.n_frames),
+                            cache_status="hit",
+                        )
+                        return coordinates
+                    except (OSError, ValueError):
+                        _remove_derived_cache_path(paths["directory"])
+                coordinates = _validated_coordinates(
+                    canonical_path,
+                    manifest=manifest,
+                    progress_callback=progress_callback,
+                )
+                try:
+                    published = _publish_coordinate_cache(
+                        campaign, manifest, coordinates
+                    )
+                    _report_progress(
+                        progress_callback,
+                        "trajectory_coordinates",
+                        completed=int(manifest.n_frames),
+                        total=int(manifest.n_frames),
+                        cache_status="published",
+                    )
+                    return published
+                except (OSError, ValueError):
+                    return coordinates
+        except portalocker.exceptions.LockException:
+            return _validated_coordinates(
+                canonical_path,
+                manifest=manifest,
+                progress_callback=progress_callback,
+            )
+    except (OSError, ValueError):
+        return _validated_coordinates(
+            canonical_path,
+            manifest=manifest,
+            progress_callback=progress_callback,
+        )
 
 
 def _checked_unlink(path: Path) -> None:
@@ -312,14 +597,27 @@ class TrajectoryPool:
     frame_id in range(n_frames).
     """
 
-    def __init__(self, manifest: TrajectoryPoolManifest, atoms_list: List[Atoms]) -> None:
-        if manifest.n_frames != len(atoms_list):
+    def __init__(
+        self,
+        manifest: TrajectoryPoolManifest,
+        frames: Union[List[Atoms], np.ndarray],
+    ) -> None:
+        if isinstance(frames, np.ndarray):
+            coordinates = frames
+        else:
+            coordinates = _coordinates_from_frames(frames)
+        expected_shape = (int(manifest.n_frames), int(manifest.natoms), 3)
+        if coordinates.shape != expected_shape:
             raise ValueError(
                 "manifest n_frames=" + str(manifest.n_frames)
-                + " disagrees with loaded list length=" + str(len(atoms_list))
+                + " disagrees with coordinate shape=" + repr(coordinates.shape)
             )
+        if coordinates.dtype != np.dtype(np.float64):
+            raise ValueError("trajectory coordinates must use float64 encoding")
+        if not np.all(np.isfinite(coordinates)):
+            raise ValueError("trajectory coordinates contain non-finite values")
         self._manifest = manifest
-        self._atoms: List[Atoms] = atoms_list
+        self._coordinates = coordinates
 
     # --- accessors ----------------------------------------------------
 
@@ -353,7 +651,15 @@ class TrajectoryPool:
         frame_index = int(frame_id)
         if not 0 <= frame_index < self.n_frames():
             raise IndexError("frame_id " + str(frame_id) + " out of range [0, " + str(self.n_frames()) + ")")
-        return self._atoms[frame_index].copy()
+        coordinates = self._coordinates[frame_index]
+        return Atoms(
+            [
+                Atom(atom_type, float(x), float(y), float(z))
+                for atom_type, (x, y, z) in zip(
+                    self._manifest.atom_types, coordinates
+                )
+            ]
+        )
 
     def frame_ids(self) -> range:
         """Return the inclusive range of all stable frame IDs."""
@@ -361,7 +667,7 @@ class TrajectoryPool:
 
     def to_atoms_list(self) -> List[Atoms]:
         """Return detached frame copies that cannot mutate the pool."""
-        return [atoms.copy() for atoms in self._atoms]
+        return [self.frame(frame_id) for frame_id in self.frame_ids()]
 
     # --- import + load -----------------------------------------------
 
@@ -474,15 +780,35 @@ class TrajectoryPool:
             else:
                 _checked_unlink(staged)
             raise
-        return cls(manifest, atoms_list)
+        coordinates = _coordinates_from_frames(atoms_list)
+        try:
+            coordinates = _publish_coordinate_cache(
+                campaign_dir, manifest, coordinates
+            )
+        except (OSError, ValueError):
+            pass
+        return cls(manifest, coordinates)
 
     @classmethod
-    def load(cls, campaign_dir: Union[str, Path]) -> "TrajectoryPool":
+    def load(
+        cls,
+        campaign_dir: Union[str, Path],
+        *,
+        progress_callback: Optional[
+            Callable[[str, Dict[str, Any]], None]
+        ] = None,
+    ) -> "TrajectoryPool":
         """Load ``<campaign_dir>/pool.xyz`` using its daemon manifest.
 
         Re-verifies the SHA-256 of the canonical pool against the manifest and raises
         if drift is detected (someone touched the file under us)."""
         campaign_dir = Path(campaign_dir)
+        _report_progress(
+            progress_callback,
+            "trajectory_authority",
+            completed=0,
+            total=1,
+        )
         _recover_import_transaction(campaign_dir)
         manifest_path = campaign_owned_path(
             campaign_dir, POOL_SUBDIR / POOL_MANIFEST_FILENAME
@@ -511,14 +837,28 @@ class TrajectoryPool:
                 + on_disk_sha + " != manifest " + manifest.sha256
                 + " -- the trajectory was modified out-of-band. Refusing to load."
             )
-        atoms_list, atom_types, masses = _validated_frames(
-            canonical_path, source_label=canonical_path
+        _report_progress(
+            progress_callback,
+            "trajectory_authority",
+            completed=1,
+            total=1,
         )
-        if (
-            len(atoms_list) != manifest.n_frames
-            or len(atoms_list[0]) != manifest.natoms
-            or atom_types != manifest.atom_types
-            or masses != manifest.masses
-        ):
-            raise RuntimeError("pool manifest metadata does not match canonical pool.xyz")
-        return cls(manifest, atoms_list)
+        _report_progress(
+            progress_callback,
+            "trajectory_coordinates",
+            completed=0,
+            total=int(manifest.n_frames),
+        )
+        coordinates = _load_or_build_coordinate_cache(
+            campaign_dir,
+            canonical_path,
+            manifest,
+            progress_callback=progress_callback,
+        )
+        _report_progress(
+            progress_callback,
+            "trajectory_coordinates",
+            completed=int(manifest.n_frames),
+            total=int(manifest.n_frames),
+        )
+        return cls(manifest, coordinates)

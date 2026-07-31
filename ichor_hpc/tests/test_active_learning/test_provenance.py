@@ -746,7 +746,10 @@ def test_append_recent_seeds_rejects_negative_cooldown(tmp_path):
         )
 
 
-def test_load_training_seed_frame_ids_self_heals_from_sidecars(tmp_path):
+def test_load_training_seed_frame_ids_self_heals_from_sidecars(
+    tmp_path,
+    monkeypatch,
+):
     # the flat index can fall short of what's committed if a crash hit between
     # commit() and the index-append loop. passing training_dir should union the
     # committed pointdir sidecars back in so a truncated index can't make
@@ -858,4 +861,17 @@ def test_load_training_seed_frame_ids_self_heals_from_sidecars(tmp_path):
     assert load_training_seed_frame_ids(
         campaign,
         reference_data_dir=training,
+    ) == {11, 22}
+
+    def _unexpected_pointdir_scan(*_args, **_kwargs):
+        raise AssertionError("hot-path exclusion recovery scanned pointdirs")
+
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.versioning.provenance.read_provenance",
+        _unexpected_pointdir_scan,
+    )
+    assert load_training_seed_frame_ids(
+        campaign,
+        reference_data_dir=training,
+        expected_trajectory_sha256="a" * 64,
     ) == {11, 22}

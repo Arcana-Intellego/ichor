@@ -1,5 +1,6 @@
 """Tests for ichor.hpc.active_learning.acquisition.trajectory_pool (M9)."""
 import json
+import gc
 import math
 import os
 from pathlib import Path
@@ -9,6 +10,9 @@ import pytest
 from ichor.core.adversarial.geometry import select_local_neighbours
 from ichor.hpc.active_learning.acquisition.trajectory_pool import (
     POOL_MANIFEST_FILENAME,
+    POOL_COORDINATE_CACHE_FILENAME,
+    POOL_COORDINATE_CACHE_MANIFEST_FILENAME,
+    POOL_COORDINATE_CACHE_SUBDIR,
     POOL_SCHEMA_VERSION,
     POOL_SUBDIR,
     POOL_XYZ_FILENAME,
@@ -100,6 +104,73 @@ def test_load_after_import_matches_imported_state(tmp_path):
         assert tuple(at.type for at in a) == tuple(at.type for at in b)
 
 
+def test_import_prewarms_content_addressed_coordinate_cache(tmp_path):
+    pool = TrajectoryPool.import_from(FIXTURE, tmp_path)
+    cache = tmp_path / POOL_COORDINATE_CACHE_SUBDIR / pool.sha256
+
+    assert (cache / POOL_COORDINATE_CACHE_FILENAME).is_file()
+    assert (cache / POOL_COORDINATE_CACHE_MANIFEST_FILENAME).is_file()
+
+
+def test_load_reports_independent_authority_and_coordinate_stages(tmp_path):
+    TrajectoryPool.import_from(FIXTURE, tmp_path)
+    updates = []
+
+    pool = TrajectoryPool.load(
+        tmp_path,
+        progress_callback=lambda stage, payload: updates.append(
+            (stage, dict(payload))
+        ),
+    )
+
+    assert updates[0] == (
+        "trajectory_authority",
+        {"completed": 0, "total": 1},
+    )
+    assert any(
+        stage == "trajectory_coordinates"
+        and payload.get("cache_status") == "hit"
+        for stage, payload in updates
+    )
+    assert updates[-1][0] == "trajectory_coordinates"
+    assert updates[-1][1]["completed"] == pool.n_frames()
+
+
+def test_coordinate_cache_hit_does_not_reparse_xyz(monkeypatch, tmp_path):
+    import ichor.hpc.active_learning.acquisition.trajectory_pool as module
+
+    imported = TrajectoryPool.import_from(FIXTURE, tmp_path)
+
+    def fail_parse(*args, **kwargs):
+        raise AssertionError("canonical XYZ was reparsed on a cache hit")
+
+    monkeypatch.setattr(module, "iter_xyz_frames", fail_parse)
+    loaded = TrajectoryPool.load(tmp_path)
+
+    assert loaded.sha256 == imported.sha256
+    assert loaded.frame(3).coordinates.tolist() == imported.frame(3).coordinates.tolist()
+
+
+def test_corrupt_coordinate_cache_is_ignored_and_rebuilt(tmp_path):
+    imported = TrajectoryPool.import_from(FIXTURE, tmp_path)
+    expected = imported.frame(7).coordinates.tolist()
+    cache = tmp_path / POOL_COORDINATE_CACHE_SUBDIR / imported.sha256
+    data = cache / POOL_COORDINATE_CACHE_FILENAME
+    del imported
+    gc.collect()
+    data.write_bytes(data.read_bytes()[:-8] + b"corrupt!")
+
+    loaded = TrajectoryPool.load(tmp_path)
+
+    assert loaded.frame(7).coordinates.tolist() == expected
+    payload = json.loads(
+        (cache / POOL_COORDINATE_CACHE_MANIFEST_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert data.stat().st_size == payload["data"]["size"]
+
+
 def test_load_detects_drift_when_canonical_xyz_modified(tmp_path):
     pool = TrajectoryPool.import_from(FIXTURE, tmp_path)
     # Append a stray byte to the canonical file
@@ -176,6 +247,17 @@ def test_pool_load_rejects_manifest_atom_metadata_drift(tmp_path):
     manifest_path = tmp_path / POOL_SUBDIR / POOL_MANIFEST_FILENAME
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     payload["atom_types"][0] = "N"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="metadata"):
+        TrajectoryPool.load(tmp_path)
+
+
+def test_pool_load_rejects_manifest_mass_metadata_drift(tmp_path):
+    TrajectoryPool.import_from(FIXTURE, tmp_path)
+    manifest_path = tmp_path / POOL_SUBDIR / POOL_MANIFEST_FILENAME
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["masses"][0] += 1.0
     manifest_path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="metadata"):

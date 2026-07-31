@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 from .strict_json import strict_json as json
 import math
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -208,11 +209,32 @@ def _local_motion_values(
     campaign_dir: Path,
     iter_dir: Path,
     config: Any,
+    *,
+    trajectory_pool: Any = None,
 ) -> Tuple[List[float], Dict[str, Any]]:
     from .acquisition.trajectory_pool import TrajectoryPool
 
-    pool = TrajectoryPool.load(campaign_dir)
     records = _load_raw_seed_records(iter_dir)
+    if not records:
+        n_pool_frames = (
+            int(trajectory_pool.n_frames()) if trajectory_pool is not None else 0
+        )
+        return [], {
+            "n_seed_records": 0,
+            "n_neighbour_pairs": 0,
+            "neighbour_sources": {},
+            "nearest_pool_rmsd": {
+                "n_pool_frames": n_pool_frames,
+                "n_pool_frames_scanned": 0,
+                "n_finite_positive_nearest_distances": 0,
+                "nearest_k": _neighbour_count_from_config(config),
+            },
+        }
+    pool = (
+        trajectory_pool
+        if trajectory_pool is not None
+        else TrajectoryPool.load(campaign_dir)
+    )
     values: List[float] = []
     n_seed_records = 0
     n_neighbour_pairs = 0
@@ -329,8 +351,7 @@ def _ariadne_movement_history_values(
 ) -> Tuple[List[float], Dict[str, Any]]:
     if int(window) <= 0 or int(iteration) <= 1:
         return [], {"n_history_files": 0}
-    from .historical_ariadne import read_historical_ariadne_records
-    from .layout import active_iteration_dir
+    from .sampling_history import load_or_build_sampling_history
 
     start = max(1, int(iteration) - int(window))
     values: List[float] = []
@@ -340,12 +361,36 @@ def _ariadne_movement_history_values(
     n_skipped_handoff_rejected = 0
     n_skipped_rejected = 0
     n_skipped_nonfinite = 0
-    for previous in range(start, int(iteration)):
-        iter_dir = active_iteration_dir(campaign_dir, previous)
-        source_records = read_historical_ariadne_records(
-            iter_dir,
-            expected_iteration=previous,
+    previous_iterations = list(range(start, int(iteration)))
+
+    def _load_history(previous: int):
+        return load_or_build_sampling_history(
+            campaign_dir,
+            iteration=int(previous),
         )
+
+    with ThreadPoolExecutor(
+        max_workers=max(1, min(4, len(previous_iterations)))
+    ) as executor:
+        loaded_histories = list(
+            executor.map(_load_history, previous_iterations)
+        )
+    for _previous, history_payload in zip(
+        previous_iterations,
+        loaded_histories,
+    ):
+        source_records = [
+            {
+                "seed_id": int(record["seed_id"]),
+                "seed_uid": str(record.get("seed_uid") or ""),
+                "handoff_accepted": True,
+                "landing_safety": {
+                    "accepted": True,
+                    "metrics": dict(record.get("metrics") or {}),
+                },
+            }
+            for record in list(history_payload.get("records") or [])
+        ]
         new_values, diag = _movement_values_from_records(source_records)
         n_audit_files += 1
         n_results_files += 1
@@ -554,6 +599,7 @@ def compute_geometry_novelty_scale(
     config: Any,
     *,
     iteration: int,
+    trajectory_pool: Any = None,
 ) -> Dict[str, Any]:
     """Compute the schema-v1 geometry novelty scale payload.
 
@@ -580,7 +626,12 @@ def compute_geometry_novelty_scale(
 
     if enabled and scale_source in ("local_motion", "hybrid"):
         try:
-            local_values, local_diag = _local_motion_values(campaign, iter_dir, config)
+            local_values, local_diag = _local_motion_values(
+                campaign,
+                iter_dir,
+                config,
+                trajectory_pool=trajectory_pool,
+            )
             diagnostics["local_motion"] = local_diag
         except Exception as exc:
             diagnostics["local_motion"] = {
@@ -828,6 +879,7 @@ def ensure_geometry_novelty_scale(
     config: Any,
     *,
     iteration: int,
+    trajectory_pool: Any = None,
 ) -> Dict[str, Any]:
     """Read or write the per-iteration geometry-novelty scale sidecar.
 
@@ -873,6 +925,7 @@ def ensure_geometry_novelty_scale(
             campaign_dir,
             config,
             iteration=int(iteration),
+            trajectory_pool=trajectory_pool,
         )
     payload = dict(payload)
     if recompute_reason:

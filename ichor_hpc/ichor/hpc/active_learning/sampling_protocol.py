@@ -1043,6 +1043,7 @@ def resolve_sampling_protocol(
     *,
     write_manifest: bool = True,
     _policy_version: Optional[int] = None,
+    trajectory_pool: Any = None,
 ) -> ResolvedSamplingProtocol:
     from .geometry_novelty import (
         apply_geometry_novelty_to_acquisition_config,
@@ -1071,10 +1072,13 @@ def resolve_sampling_protocol(
         int(iteration),
         write_manifest=write_manifest,
     )
+    geometry_kwargs = {"iteration": int(iteration)}
+    if trajectory_pool is not None:
+        geometry_kwargs["trajectory_pool"] = trajectory_pool
     geometry_payload = ensure_geometry_novelty_scale(
         campaign_dir,
         effective,
-        iteration=int(iteration),
+        **geometry_kwargs,
     )
     scale_model_payload = build_sampling_scale_model(
         campaign_dir,
@@ -1424,6 +1428,8 @@ def resolve_or_load_sampling_protocol(
     campaign_dir: Union[str, Path],
     config: CampaignConfig,
     iteration: int,
+    *,
+    trajectory_pool: Any = None,
 ) -> ResolvedSamplingProtocol:
     """Resolve a protocol once, then reuse the immutable snapshot."""
     from .sampling_scale_model import sampling_scale_model_path
@@ -1441,7 +1447,12 @@ def resolve_or_load_sampling_protocol(
                 "sampling protocol snapshot is incomplete; refusing to regenerate it"
             )
         return load_sampling_protocol(campaign_dir, config, int(iteration))
-    return resolve_sampling_protocol(campaign_dir, config, int(iteration))
+    return resolve_sampling_protocol(
+        campaign_dir,
+        config,
+        int(iteration),
+        trajectory_pool=trajectory_pool,
+    )
 
 
 def preview_sampling_protocol(
@@ -1487,6 +1498,7 @@ def preview_sampling_protocol(
         int(iteration),
         geometry_scale_payload=dict(geometry_scale_payload),
         write_manifest=False,
+        history_cache_write=False,
         model_version=SAMPLING_SCALE_MODEL_MODEL_VERSION,
         normalise_history=True,
     )

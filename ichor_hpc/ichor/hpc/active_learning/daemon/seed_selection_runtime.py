@@ -25,6 +25,29 @@ SEED_FEATURE_CACHE_SCHEMA_VERSION = 1
 SEED_VARIANCE_CACHE_SCHEMA_VERSION = 1
 SEED_NEIGHBOUR_CACHE_SCHEMA_VERSION = 1
 SEED_PROJECTION_WORKSPACE_SCHEMA_VERSION = 1
+SEED_MODEL_FACTOR_CACHE_SCHEMA_VERSION = 1
+SEED_SELECTION_PROGRESS_STAGES = frozenset(
+    {
+        "trajectory_authority",
+        "trajectory_coordinates",
+        "model_authority",
+        "models",
+        "model_factors",
+        "features",
+        "seed_exclusions",
+        "sampling_protocol",
+        "reference_neighbours",
+        "reference_scales",
+        "filtering",
+        "random",
+        "variance",
+        "shortlist",
+        "d_optimal",
+        "publishing",
+        "failed",
+        "complete",
+    }
+)
 SEED_PROGRESS_SCHEMA_VERSION = 1
 SEED_FEATURE_ENCODING_VERSION = 1
 SEED_POSTERIOR_PROJECTION_VERSION = 1
@@ -88,6 +111,16 @@ def _write_npy_atomic(path: Path, values: np.ndarray) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
+    try:
+        descriptor = os.open(str(path.parent), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
 
 
 def _invalidate_directory(path: Path) -> None:
@@ -96,9 +129,9 @@ def _invalidate_directory(path: Path) -> None:
     if path.is_symlink() or not path.is_dir():
         path.unlink()
         return
-    invalid = path.with_name(path.name + ".invalid-" + uuid.uuid4().hex[:12])
+    invalid = path.with_name(".invalid-" + uuid.uuid4().hex[:12])
     os.replace(path, invalid)
-    shutil.rmtree(invalid)
+    shutil.rmtree(invalid, ignore_errors=True)
 
 
 def finalise_seed_selection_workspace(
@@ -156,8 +189,8 @@ class SeedSelectionProgressReporter:
         self._last_payload: Dict[str, Any] = {}
         self._stage_started_monotonic = self.started_monotonic
         self._stage_initial_completed = 0
-        self._journal("seed_selection_started", stage="loading")
-        self.update("loading", force=True, completed=0, total=0)
+        self._journal("seed_selection_started", stage="trajectory_authority")
+        self.update("trajectory_authority", force=True, completed=0, total=1)
 
     def bind_inputs(
         self,
@@ -189,13 +222,39 @@ class SeedSelectionProgressReporter:
     def update(self, stage: str, *, force: bool = False, **payload: Any) -> None:
         now = time.monotonic()
         stage_changed = str(stage) != self._last_stage
+        if stage_changed and self._last_stage is not None:
+            previous_elapsed = max(0.0, now - self._stage_started_monotonic)
+            previous = {
+                "schema_version": SEED_PROGRESS_SCHEMA_VERSION,
+                "campaign_uid": self.campaign_uid,
+                "phase": "SEED_SELECT",
+                "iteration": int(self.iteration),
+                "pid": int(self.pid),
+                "daemon_start_identity": self.daemon_start_identity,
+                "stage": str(self._last_stage),
+                "status": "completed",
+                "started_iso": self.started_iso,
+                "updated_iso": datetime.now(timezone.utc).isoformat(),
+                "elapsed_seconds": float(now - self.started_monotonic),
+                "stage_elapsed_seconds": float(previous_elapsed),
+                **self._input_identity,
+                **_normalise_json(self._last_payload),
+            }
+            try:
+                atomic_write_json(self.path, previous)
+            except Exception:
+                pass
         if stage_changed:
             self._stage_started_monotonic = now
             try:
                 self._stage_initial_completed = int(payload.get("completed", 0))
             except (TypeError, ValueError):
                 self._stage_initial_completed = 0
-        merged = {**self._last_payload, **payload}
+        merged = (
+            dict(payload)
+            if stage_changed
+            else {**self._last_payload, **payload}
+        )
         stage_elapsed = max(0.0, now - self._stage_started_monotonic)
         try:
             completed_value = int(merged.get("completed", 0))
@@ -235,6 +294,8 @@ class SeedSelectionProgressReporter:
                 "seed_selection_progress",
                 stage=str(stage),
                 elapsed_seconds=float(record["elapsed_seconds"]),
+                stage_elapsed_seconds=float(record["stage_elapsed_seconds"]),
+                selection_elapsed_seconds=float(record["elapsed_seconds"]),
                 **{
                     key: record[key]
                     for key in (
@@ -249,6 +310,7 @@ class SeedSelectionProgressReporter:
                         "modes",
                         "cache_kind",
                         "cache_status",
+                        "excluded",
                         "throughput_per_second",
                     )
                     if key in record
@@ -877,6 +939,7 @@ class SeedSelectionRuntimeCache:
         model_manifest_sha256: str,
         iteration: int,
         progress: Optional[SeedSelectionProgressReporter] = None,
+        model_file_sha256_by_atom: Optional[Mapping[str, str]] = None,
     ) -> None:
         self.campaign_dir = Path(campaign_dir)
         self.pool = pool
@@ -885,6 +948,10 @@ class SeedSelectionRuntimeCache:
         self.model_manifest_sha256 = str(model_manifest_sha256)
         self.iteration = int(iteration)
         self.progress = progress
+        self.model_file_sha256_by_atom = {
+            str(atom): str(digest)
+            for atom, digest in (model_file_sha256_by_atom or {}).items()
+        }
         self.root = campaign_owned_path(
             self.campaign_dir, Path(".DATA") / "CACHE" / "SEED_SELECT"
         )
@@ -897,6 +964,195 @@ class SeedSelectionRuntimeCache:
         )
         self._active_features: Optional[Tuple[Dict[str, np.ndarray], Dict[str, Any]]] = None
         self.active_neighbour_cache_id: Optional[str] = None
+
+    def _model_factor_identity(self, atom: str, model: Any) -> Dict[str, Any]:
+        file_sha = self.model_file_sha256_by_atom.get(str(atom), "")
+        if len(file_sha) != 64 or any(ch not in "0123456789abcdef" for ch in file_sha):
+            raise ValueError("current model file identity is unavailable for " + str(atom))
+        return {
+            "schema_version": SEED_MODEL_FACTOR_CACHE_SCHEMA_VERSION,
+            "model_set_sha256": self.model_set_sha256,
+            "model_file_sha256": file_sha,
+            "numeric_model_identity": str(model.numeric_identity),
+            "atom": str(atom),
+            "property": str(model.prop),
+            "ntrain": int(model.ntrain),
+            "nfeats": int(model.nfeats),
+            "jitter": float(model.jitter),
+            "factor_algorithm": "numpy.linalg.cholesky:model.R:v1",
+            "dtype": np.dtype(np.float64).str,
+            "numpy_version": str(np.__version__),
+            "scipy_version": str(scipy.__version__),
+            "numpy_build_sha256": _numpy_build_sha256(),
+            "machine": str(platform.machine()),
+            "byteorder": sys.byteorder,
+        }
+
+    @staticmethod
+    def _factor_residual_is_valid(model: Any, factor: np.ndarray) -> bool:
+        ntrain = int(model.ntrain)
+        if ntrain <= 0:
+            return False
+        probes = sorted({0, ntrain // 2, ntrain - 1})
+        x = np.asarray(model.x, dtype=np.float64)
+        for left in probes:
+            for right in probes:
+                stop = min(left, right) + 1
+                observed = float(
+                    np.dot(factor[left, :stop], factor[right, :stop])
+                )
+                expected = float(
+                    np.asarray(
+                        model.prior_covariance(
+                            x[left : left + 1], x[right : right + 1]
+                        ),
+                        dtype=np.float64,
+                    )[0, 0]
+                )
+                if left == right:
+                    expected += float(model.jitter)
+                tolerance = max(1.0e-12, abs(expected) * 5.0e-10)
+                if not np.isfinite(observed) or abs(observed - expected) > tolerance:
+                    return False
+        return True
+
+    def _read_model_factor(
+        self,
+        data_path: Path,
+        manifest_path: Path,
+        *,
+        identity: Mapping[str, Any],
+        model: Any,
+    ) -> np.ndarray:
+        if (
+            data_path.is_symlink()
+            or manifest_path.is_symlink()
+            or not data_path.is_file()
+            or not manifest_path.is_file()
+        ):
+            raise ValueError("model-factor cache files are missing or unsafe")
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if payload.get("schema_version") != SEED_MODEL_FACTOR_CACHE_SCHEMA_VERSION:
+            raise ValueError("model-factor cache schema is unsupported")
+        if payload.get("identity") != dict(identity):
+            raise ValueError("model-factor cache identity mismatch")
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise ValueError("model-factor cache data record is invalid")
+        if int(data.get("size", -1)) != int(data_path.stat().st_size):
+            raise ValueError("model-factor cache size mismatch")
+        if str(data.get("sha256") or "") != _sha256_file(data_path):
+            raise ValueError("model-factor cache hash mismatch")
+        expected_shape = (int(model.ntrain), int(model.ntrain))
+        if data.get("shape") != list(expected_shape):
+            raise ValueError("model-factor cache shape record mismatch")
+        if data.get("dtype") != np.dtype(np.float64).str:
+            raise ValueError("model-factor cache dtype record mismatch")
+        factor = np.load(data_path, mmap_mode="r", allow_pickle=False)
+        if factor.shape != expected_shape or factor.dtype != np.dtype(np.float64):
+            raise ValueError("model-factor cache array contract mismatch")
+        if not np.all(np.isfinite(factor)):
+            raise ValueError("model-factor cache contains non-finite values")
+        if np.any(np.diag(factor) <= 0.0):
+            raise ValueError("model-factor cache diagonal is invalid")
+        scale = max(1.0, float(np.max(np.abs(factor))))
+        tolerance = np.finfo(np.float64).eps * max(1, int(model.ntrain)) * scale * 16.0
+        if np.any(np.abs(np.triu(factor, k=1)) > tolerance):
+            raise ValueError("model-factor cache is not lower triangular")
+        if not self._factor_residual_is_valid(model, factor):
+            raise ValueError("model-factor cache covariance residual is invalid")
+        return factor
+
+    def ensure_model_factors(self) -> Dict[str, str]:
+        """Restore or compute Cholesky factors for the current posterior models."""
+        import portalocker
+
+        namespace_token = self.model_set_sha256[:24]
+        namespace = self.root / "model_factors" / namespace_token
+        namespace_ready = True
+        try:
+            namespace.mkdir(parents=True, exist_ok=True)
+        except (OSError, ValueError):
+            namespace_ready = False
+        statuses: Dict[str, str] = {}
+        models = sorted(self.posterior._property_models.items())
+        total = len(models)
+        for position, (atom, model) in enumerate(models, start=1):
+            status = "computed"
+            try:
+                if not namespace_ready:
+                    raise OSError("model-factor cache directory is unavailable")
+                identity = self._model_factor_identity(str(atom), model)
+                cache_id = _canonical_sha256(identity)
+                path_token = cache_id[:32]
+                data_path = namespace / (path_token + ".npy")
+                manifest_path = namespace / (path_token + ".json")
+                lock_path = namespace / (path_token + ".lock")
+                if lock_path.is_symlink():
+                    raise ValueError("model-factor cache lock is symlinked")
+                with portalocker.Lock(str(lock_path), mode="a", timeout=600):
+                    try:
+                        factor = self._read_model_factor(
+                            data_path,
+                            manifest_path,
+                            identity=identity,
+                            model=model,
+                        )
+                        model.install_lower_cholesky(
+                            factor,
+                            expected_numeric_identity=str(model.numeric_identity),
+                        )
+                        status = "hit"
+                    except Exception:
+                        data_path.unlink(missing_ok=True)
+                        manifest_path.unlink(missing_ok=True)
+                        factor = np.asarray(model.lower_cholesky, dtype=np.float64)
+                        _write_npy_atomic(data_path, factor)
+                        atomic_write_json(
+                            manifest_path,
+                            {
+                                "schema_version": SEED_MODEL_FACTOR_CACHE_SCHEMA_VERSION,
+                                "identity": identity,
+                                "data": {
+                                    "size": int(data_path.stat().st_size),
+                                    "sha256": _sha256_file(data_path),
+                                    "shape": [int(model.ntrain), int(model.ntrain)],
+                                    "dtype": np.dtype(np.float64).str,
+                                },
+                            },
+                        )
+                        restored = self._read_model_factor(
+                            data_path,
+                            manifest_path,
+                            identity=identity,
+                            model=model,
+                        )
+                        model.install_lower_cholesky(
+                            restored,
+                            expected_numeric_identity=str(model.numeric_identity),
+                        )
+                        status = "published"
+            except Exception:
+                # Derived-cache failure must never replace the strict numeric path.
+                _ = model.lower_cholesky
+                status = "fallback"
+            statuses[str(atom)] = status
+            if self.progress is not None:
+                self.progress.update(
+                    "model_factors",
+                    completed=int(position),
+                    total=int(total),
+                    cache_kind="model_factors",
+                    cache_status=status,
+                )
+        if self.progress is not None:
+            aggregate = "hit" if statuses and set(statuses.values()) == {"hit"} else "ready"
+            self.progress.cache(
+                "model_factors",
+                aggregate,
+                n_models=int(total),
+            )
+        return statuses
 
     def _neighbour_identity(
         self,
@@ -1580,11 +1836,35 @@ class SeedSelectionRuntimeCache:
         if workspaces_root.is_dir() and not workspaces_root.is_symlink():
             for child in workspaces_root.iterdir():
                 _invalidate_directory(child)
+        factors_root = self.root / "model_factors"
+        if factors_root.is_dir() and not factors_root.is_symlink():
+            candidates = [
+                child
+                for child in factors_root.iterdir()
+                if child.is_dir() and not child.is_symlink()
+            ]
+            predecessors = sorted(
+                (
+                    child
+                    for child in candidates
+                    if child.name != self.model_set_sha256[:24]
+                ),
+                key=lambda child: child.stat().st_mtime_ns,
+                reverse=True,
+            )
+            keep = {self.model_set_sha256[:24]}
+            if predecessors:
+                keep.add(predecessors[0].name)
+            for child in factors_root.iterdir():
+                if child.name not in keep:
+                    _invalidate_directory(child)
 
 
 __all__ = [
     "CachedPoolPosterior",
     "DeferredCachedPoolPosterior",
+    "SEED_MODEL_FACTOR_CACHE_SCHEMA_VERSION",
+    "SEED_SELECTION_PROGRESS_STAGES",
     "SeedSelectionProgressReporter",
     "SeedSelectionRuntimeCache",
     "finalise_seed_selection_workspace",
