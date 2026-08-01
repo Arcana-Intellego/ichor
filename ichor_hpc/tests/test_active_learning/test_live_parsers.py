@@ -4,6 +4,7 @@ Strategy: drive the parser directly with hand-constructed states + phases,
 overriding _quantum_staging_path to point at the fixture pack rather than
 materialising a campaign filesystem.
 """
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -443,6 +444,37 @@ def _commit_bootstrap_reference_data(campaign):
     return ReferenceDataVersioning(
         Path(campaign) / "QM_REFERENCE_DATA"
     ).resolve(0, verification="deep")
+
+
+def _commit_active_reference_data(campaign, *, iteration=1):
+    live = Path(campaign) / ".DATA" / "STAGING" / ("iter_" + str(iteration))
+    pointdir = live / "POINT_0000.pointdir"
+    pointdir.mkdir(parents=True, exist_ok=True)
+    (pointdir / "input.gjf").write_text("# synthetic\n", encoding="utf-8")
+    stg.write_points_file(live, [pointdir])
+    stg.write_quantum_acceptance_manifest(
+        live,
+        phase_name="AIMALL",
+        iteration=iteration,
+        accepted=[pointdir],
+        rejected=[],
+    )
+    _complete_point_allocation(
+        campaign,
+        live,
+        context="active",
+        iteration=iteration,
+        targets={"train": 1, "int_val": 0, "ext_val": 0, "total": 1},
+    )
+    stg.commit_reference_data_delta(
+        campaign,
+        reference_data_version=iteration,
+        context="active",
+        iteration=iteration,
+    )
+    return ReferenceDataVersioning(
+        Path(campaign) / "QM_REFERENCE_DATA"
+    ).resolve(iteration, verification="deep")
 
 
 def test_ariadne_optional_scale_diagnostics_are_warnings_only():
@@ -1167,7 +1199,12 @@ def test_handlers_dict_dispatches_all_day3_phases(tmp_path):
 # --- FEREBUS parser tests ----------------------------------------
 
 
-def _seed_models_staging(campaign_dir, properties=("iqa",)):
+def _seed_models_staging(
+    campaign_dir,
+    properties=("iqa",),
+    *,
+    reference_version=0,
+):
     """Create manifest-backed pyferebus staging with parseable models."""
     import hashlib
 
@@ -1192,7 +1229,7 @@ def _seed_models_staging(campaign_dir, properties=("iqa",)):
 
     reference_view = ReferenceDataVersioning(
         campaign_dir / "QM_REFERENCE_DATA"
-    ).resolve(0, verification="deep")
+    ).resolve(reference_version, verification="deep")
     target = campaign_dir / "TRAINED_MODELS" / "iteration-staging"
     target.mkdir(parents=True, exist_ok=True)
     row_ids = {
@@ -1221,7 +1258,7 @@ def _seed_models_staging(campaign_dir, properties=("iqa",)):
     row_identity_payload = {
         "schema_version": stg.FEREBUS_ROW_IDENTITIES_SCHEMA_VERSION,
         "campaign_uid": reference_view.campaign_uid,
-        "reference_data_version": 0,
+        "reference_data_version": int(reference_version),
         "reference_data_view_sha256": reference_view.cumulative_view_sha256,
         "source_rows": source_rows,
         "source_rows_sha256": canonical_json_sha256(source_rows),
@@ -1362,7 +1399,7 @@ def _seed_models_staging(campaign_dir, properties=("iqa",)):
         "schema_version": stg.FEREBUS_TASK_SCHEMA_VERSION,
         "campaign_uid": reference_view.campaign_uid,
         "system": "WATER",
-        "reference_data_version": 0,
+        "reference_data_version": int(reference_version),
         "reference_data_head_manifest_sha256": reference_view.head_manifest_sha256,
         "reference_data_view_sha256": reference_view.cumulative_view_sha256,
         "n_reference_points": len(reference_view.entries),
@@ -1575,6 +1612,10 @@ def test_ferebus_task_artefact_layout_supports_properties_and_missing_files(tmp_
 
 
 def test_rejected_ferebus_candidate_is_quarantined_without_model_commit(tmp_path):
+    from ichor.hpc.active_learning.daemon.ferebus_candidate_recovery import (
+        discover_recovery_candidate,
+    )
+
     ex = _make_executor(tmp_path)
     ex.config.quality_gates.ferebus_max_ext_rmse_ha = 0.1
     _commit_bootstrap_reference_data(ex.campaign_dir)
@@ -1586,6 +1627,7 @@ def test_rejected_ferebus_candidate_is_quarantined_without_model_commit(tmp_path
         observations=[],
     )
 
+    result.validate(stage="postprocess", phase_name="FEREBUS")
     assert result.failure_reason.startswith("ferebus_quality_failed:")
     assert not staging.exists(), result.failure_reason
     assert not (
@@ -1600,6 +1642,14 @@ def test_rejected_ferebus_candidate_is_quarantined_without_model_commit(tmp_path
         ).glob("*/FEREBUS_QUALITY.json")
     )
     assert len(quarantined_quality) == 1
+    assert (
+        discover_recovery_candidate(
+            ex.campaign_dir,
+            expected_campaign_uid="m16-test",
+            reference_data_version=0,
+        )
+        is None
+    )
 
 
 def test_incomplete_ferebus_measurement_preserves_raw_staging(tmp_path):
@@ -1634,6 +1684,7 @@ def test_incomplete_ferebus_measurement_preserves_raw_staging(tmp_path):
         observations=[],
     )
 
+    result.validate(stage="postprocess", phase_name="INITIAL_FEREBUS")
     assert result.failure_reason.startswith(
         "ferebus_quality_measurement_incomplete:"
     )
@@ -1765,6 +1816,187 @@ def test_legacy_measurement_quarantine_is_copied_for_inline_recovery(tmp_path):
     }
 
 
+def test_relative_regression_quarantine_reuses_quality_and_commits_without_job(
+    tmp_path,
+):
+    from ichor.hpc.active_learning.daemon.completion_receipts import (
+        canonical_sha256,
+    )
+    from ichor.hpc.active_learning.daemon.ferebus_candidate_recovery import (
+        discover_recovery_candidate,
+        materialise_recovery_candidate,
+        prepare_recovery_request,
+    )
+    from ichor.hpc.active_learning.daemon.ferebus_quality import (
+        FEREBUS_QUALITY_DECISION_POLICY,
+        evaluate_ferebus_quality,
+        evaluate_ferebus_quality_decision,
+        read_ferebus_quality_decision,
+        write_ferebus_quality_manifest,
+    )
+    from ichor.hpc.active_learning.daemon.ferebus_task_runner import (
+        write_preexisting_model_receipts,
+    )
+    from ichor.hpc.active_learning.versioning.manifest import sha256_file
+
+    ex = _make_executor(tmp_path)
+    _commit_bootstrap_reference_data(ex.campaign_dir)
+    _seed_models_staging(ex.campaign_dir)
+    bootstrap_result = ex._parse_ferebus_postprocess(
+        SimpleNamespace(
+            iteration=0,
+            campaign_uid="m16-test",
+            reference_data_version=0,
+        ),
+        CampaignPhase("FEREBUS"),
+        observations=[],
+    )
+    assert bootstrap_result.failure_reason is None
+    bootstrap_staging = ex.campaign_dir / "TRAINED_MODELS" / "iteration-staging"
+    if bootstrap_staging.exists():
+        shutil.rmtree(bootstrap_staging)
+    _commit_active_reference_data(ex.campaign_dir, iteration=1)
+    staging = _seed_models_staging(
+        ex.campaign_dir,
+        reference_version=1,
+    )
+    candidate_model = staging / "iqa" / "O1" / "WATER_iqa_O1.model"
+    model_lines = candidate_model.read_text(encoding="utf-8").splitlines()
+    weights_index = model_lines.index("[weights]")
+    for index in range(weights_index + 1, len(model_lines)):
+        if model_lines[index]:
+            model_lines[index] = "-1000.0"
+    candidate_model.write_text(
+        "\n".join(model_lines) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    write_preexisting_model_receipts(
+        staging,
+        execution_kind="synthetic_dry_run",
+    )
+    quality = evaluate_ferebus_quality(staging, ex.config.quality_gates)
+    advisory = evaluate_ferebus_quality_decision(
+        quality,
+        ex.config.quality_gates,
+    )
+    assert advisory["accepted"] is True
+    assert advisory["warnings"]
+    quality_path = write_ferebus_quality_manifest(staging, quality)
+
+    legacy = dict(advisory)
+    legacy.pop("decision_policy", None)
+    legacy.pop("n_warned", None)
+    legacy.pop("n_warnings", None)
+    legacy["accepted"] = False
+    legacy["reasons"] = list(legacy.pop("warnings"))
+    legacy_tasks = []
+    for task in legacy["tasks"]:
+        old_task = dict(task)
+        old_task["reasons"] = list(old_task.pop("warnings"))
+        old_task["accepted"] = not bool(old_task["reasons"])
+        legacy_tasks.append(old_task)
+    legacy["tasks"] = legacy_tasks
+    legacy["n_accepted"] = sum(
+        1 for task in legacy_tasks if task["accepted"]
+    )
+    legacy["n_rejected"] = len(legacy_tasks) - legacy["n_accepted"]
+    legacy["config_sha256"] = "legacy-config"
+    evaluation_sha = canonical_sha256(legacy)
+    legacy["evaluation_sha256"] = evaluation_sha
+    decision_path = staging / "FEREBUS_QUALITY_DECISION.json"
+    atomic_write_json(
+        decision_path,
+        {
+            "schema_version": 2,
+            "campaign_uid": "m16-test",
+            "reference_data_version": 1,
+            "quality": {
+                "path": "FEREBUS_QUALITY.json",
+                "size": quality_path.stat().st_size,
+                "sha256": sha256_file(quality_path),
+            },
+            "evaluations": [legacy],
+            "current_evaluation_sha256": evaluation_sha,
+        },
+    )
+    candidate_digest = hashlib.sha256(
+        (sha256_file(quality_path) + ":" + evaluation_sha).encode("ascii")
+    ).hexdigest()
+    quarantine = (
+        ex.campaign_dir
+        / "TRAINED_MODELS"
+        / "rejected-candidates"
+        / "reference-000001"
+        / candidate_digest
+    )
+    quarantine.parent.mkdir(parents=True)
+    shutil.move(str(staging), str(quarantine))
+    source_bytes = {
+        path.relative_to(quarantine).as_posix(): path.read_bytes()
+        for path in quarantine.rglob("*")
+        if path.is_file()
+    }
+
+    candidate = discover_recovery_candidate(
+        ex.campaign_dir,
+        expected_campaign_uid="m16-test",
+        reference_data_version=1,
+    )
+    assert candidate is not None
+    assert candidate["candidate_kind"] == "quality_rejected_relative_regression"
+    prepare_recovery_request(
+        ex.campaign_dir,
+        candidate=candidate,
+        campaign_uid="m16-test",
+        phase="FEREBUS",
+        iteration=1,
+        reference_data_version=1,
+    )
+    recovered = materialise_recovery_candidate(
+        ex.campaign_dir,
+        campaign_uid="m16-test",
+        phase="FEREBUS",
+        iteration=1,
+        reference_data_version=1,
+    )
+    assert recovered == staging
+    assert (recovered / "FEREBUS_QUALITY.json").read_bytes() == source_bytes[
+        "FEREBUS_QUALITY.json"
+    ]
+
+    result = ex._parse_ferebus_postprocess(
+        SimpleNamespace(
+            iteration=1,
+            campaign_uid="m16-test",
+            reference_data_version=1,
+        ),
+        CampaignPhase("FEREBUS"),
+        observations=[],
+    )
+
+    result.validate(stage="submit", phase_name="FEREBUS")
+    assert result.failure_reason is None
+    assert result.submitted_job_id is None
+    assert result.state_updates["models_version"] == 1
+    committed = ex.campaign_dir / "TRAINED_MODELS" / "iteration-000001"
+    decision = read_ferebus_quality_decision(
+        committed,
+        require_accepted=True,
+        verify_current_config=False,
+    )
+    assert decision["current_evaluation"]["decision_policy"] == (
+        FEREBUS_QUALITY_DECISION_POLICY
+    )
+    assert decision["current_evaluation"]["warnings"]
+    assert len(decision["evaluations"]) == 2
+    assert source_bytes == {
+        path.relative_to(quarantine).as_posix(): path.read_bytes()
+        for path in quarantine.rglob("*")
+        if path.is_file()
+    }
+
+
 def test_submit_ferebus_reprocesses_active_recovery_without_sbatch(
     tmp_path,
     monkeypatch,
@@ -1812,6 +2044,7 @@ def test_submit_ferebus_reprocesses_active_recovery_without_sbatch(
         "INITIAL_FEREBUS",
     )
 
+    result.validate(stage="submit", phase_name="INITIAL_FEREBUS")
     assert result.failure_reason is None
     assert result.state_updates == {"models_version": 0}
     assert statuses == ["accepted"]

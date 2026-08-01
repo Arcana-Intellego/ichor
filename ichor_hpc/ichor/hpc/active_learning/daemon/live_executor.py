@@ -2722,11 +2722,16 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     reference_data_version=int(tv),
                     candidate_id=str(recovery.get("candidate_id") or ""),
                     staging=str(recovered_staging),
+                    candidate_kind=str(recovery.get("candidate_kind") or ""),
+                    reused_quality_evidence=(
+                        recovery.get("candidate_kind")
+                        == "quality_rejected_relative_regression"
+                    ),
                     scheduler_jobs_submitted=0,
                 )
                 result = self._parse_ferebus_postprocess(state, phase_name, [])
                 quality_disposition = str(
-                    (result.submission_metadata or {}).get(
+                    (result.postprocess_metadata or {}).get(
                         "ferebus_quality_disposition", ""
                     )
                 )
@@ -2754,6 +2759,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     reference_data_version=int(tv),
                     candidate_id=str(recovery.get("candidate_id") or ""),
                     outcome=recovery_status,
+                    candidate_kind=str(recovery.get("candidate_kind") or ""),
+                    n_warned=int(recovery.get("source_n_warned") or 0),
+                    n_warnings=int(recovery.get("source_n_warnings") or 0),
                     scheduler_jobs_submitted=0,
                 )
                 return result
@@ -5625,16 +5633,21 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 FEREBUS_QUALITY_MANIFEST,
                 evaluate_ferebus_quality,
                 read_ferebus_quality_decision,
+                validate_ferebus_quality_evidence,
                 write_ferebus_quality_decision,
                 write_ferebus_quality_manifest,
             )
             from .config_lock import canonical_config, config_fingerprint
 
             self._report_runtime_progress("quality_metrics")
-            quality = evaluate_ferebus_quality(
-                staging,
-                getattr(self.config, "quality_gates", None),
-            )
+            quality_path = staging / FEREBUS_QUALITY_MANIFEST
+            if quality_path.exists() or quality_path.is_symlink():
+                quality = validate_ferebus_quality_evidence(staging)
+            else:
+                quality = evaluate_ferebus_quality(
+                    staging,
+                    getattr(self.config, "quality_gates", None),
+                )
             quality_summary = dict(quality.get("summary") or {})
             measured_models = int(quality_summary.get("n_measured") or 0)
             total_models = int(
@@ -5694,7 +5707,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         "ferebus_quality_measurement_incomplete: "
                         + ";".join(errors)[:300]
                     ),
-                    submission_metadata={
+                    postprocess_metadata={
                         "ferebus_quality_disposition": "measurement_incomplete",
                         "quality_attempt_path": str(attempt_path),
                     },
@@ -5728,6 +5741,18 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 decision_manifest=str(decision_path),
                 accepted=bool(current_decision.get("accepted")),
                 n_total=int(current_decision.get("n_tasks", 0)),
+                n_rejected=int(current_decision.get("n_rejected", 0)),
+                n_warned=int(current_decision.get("n_warned", 0)),
+                n_warnings=int(current_decision.get("n_warnings", 0)),
+                warnings=list(current_decision.get("warnings", [])),
+                reasons=list(current_decision.get("reasons", [])),
+                decision_policy=str(current_decision.get("decision_policy") or ""),
+                candidate_aggregate_iqa_ext_rmse=(
+                    current_decision.get("promotion") or {}
+                ).get("candidate_aggregate_iqa_ext_rmse"),
+                aggregate_rmse_warning_limit=(
+                    current_decision.get("promotion") or {}
+                ).get("aggregate_rmse_limit"),
             )
             if not bool(current_decision.get("accepted")):
                 from ..layout import trained_models_dir
@@ -5773,7 +5798,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     + ";".join(
                         str(r) for r in current_decision.get("reasons", [])
                     )[:300],
-                    submission_metadata={
+                    postprocess_metadata={
                         "ferebus_quality_disposition": "quality_rejected",
                     },
                 )
@@ -5786,7 +5811,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     + ": "
                     + str(exc)
                 ),
-                submission_metadata={
+                postprocess_metadata={
                     "ferebus_quality_disposition": "measurement_failed",
                 },
             )

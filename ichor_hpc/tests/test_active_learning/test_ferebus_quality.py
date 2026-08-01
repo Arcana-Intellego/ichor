@@ -7,6 +7,7 @@ import pytest
 from ichor.hpc.active_learning.daemon import input_staging as stg
 from ichor.hpc.active_learning.daemon.ferebus_quality import (
     FEREBUS_QUALITY_DECISION_MANIFEST,
+    FEREBUS_QUALITY_DECISION_POLICY,
     FEREBUS_QUALITY_MANIFEST,
     FerebusQualityMeasurementIncomplete,
     _parse_perf,
@@ -381,7 +382,7 @@ def test_ferebus_quality_optional_thresholds_are_enforced(tmp_path):
     assert "ferebus_ext_rmse_threshold_exceeded" in decision["reasons"]
 
 
-def test_ferebus_promotion_rejects_aggregate_regression_beyond_five_percent():
+def test_ferebus_promotion_warns_for_aggregate_regression_beyond_five_percent():
     quality = {
         "measurement_complete": True,
         "records": [
@@ -403,12 +404,15 @@ def test_ferebus_promotion_rejects_aggregate_regression_beyond_five_percent():
 
     decision = evaluate_ferebus_quality_decision(quality, _gates())
 
-    assert decision["accepted"] is False
-    assert "ferebus_aggregate_ext_rmse_regressed" in decision["reasons"]
+    assert decision["accepted"] is True
+    assert decision["reasons"] == []
+    assert "ferebus_aggregate_ext_rmse_regressed" in decision["warnings"]
+    assert decision["decision_policy"] == FEREBUS_QUALITY_DECISION_POLICY
+    assert decision["n_warnings"] == 1
     assert decision["promotion"]["aggregate_rmse_limit"] == pytest.approx(1.05)
 
 
-def test_ferebus_promotion_rejects_single_task_regression_beyond_twenty_percent():
+def test_ferebus_promotion_warns_for_single_task_regression_beyond_twenty_percent():
     quality = {
         "measurement_complete": True,
         "records": [
@@ -431,9 +435,52 @@ def test_ferebus_promotion_rejects_single_task_regression_beyond_twenty_percent(
 
     decision = evaluate_ferebus_quality_decision(quality, gates)
 
-    assert decision["accepted"] is False
-    assert "ferebus_task_ext_rmse_regressed" in decision["reasons"]
+    assert decision["accepted"] is True
+    assert decision["reasons"] == []
+    assert "ferebus_task_ext_rmse_regressed" in decision["warnings"]
+    assert decision["tasks"][0]["accepted"] is True
+    assert decision["tasks"][0]["reasons"] == []
+    assert decision["tasks"][0]["warnings"] == [
+        "ferebus_task_ext_rmse_regressed"
+    ]
+    assert decision["n_warned"] == 1
     assert decision["tasks"][0]["relative_rmse_limit"] == pytest.approx(0.12)
+
+
+def test_ferebus_absolute_failure_remains_hard_alongside_relative_warning():
+    quality = {
+        "measurement_complete": True,
+        "records": [
+            {
+                "property": "iqa",
+                "atom": "O1",
+                "row_counts": {"ext_val": 10},
+                "condition_number": 1.0,
+                "metrics": {
+                    "ext_val": {"rmse": 1.06, "mae": 1.0, "r2": 0.0}
+                },
+                "incumbent_ext_metrics": {
+                    "rmse": 1.0,
+                    "mae": 1.0,
+                    "r2": 0.0,
+                },
+                "incumbent_binding": {"bound": True},
+            }
+        ],
+        "summary": {
+            "aggregate_iqa_ext_rmse": 1.06,
+            "incumbent_aggregate_iqa_ext_rmse": 1.0,
+        },
+    }
+
+    decision = evaluate_ferebus_quality_decision(
+        quality,
+        _gates(ferebus_max_ext_rmse_ha=1.01),
+    )
+
+    assert decision["accepted"] is False
+    assert "ferebus_ext_rmse_threshold_exceeded" in decision["reasons"]
+    assert "ferebus_aggregate_ext_rmse_regressed" in decision["warnings"]
 
 
 def test_ferebus_promotion_rejects_non_numeric_thresholds():

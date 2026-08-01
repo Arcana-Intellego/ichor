@@ -1828,6 +1828,33 @@ def test_status_recommendations_use_authoritative_lifecycle_reason(
     ) == [expected_code]
 
 
+def test_status_recognises_historical_ferebus_phase_result_metadata_bug(tmp_path):
+    campaign = _campaign_with_config(tmp_path)
+    recommendations = build_status_recommendations(
+        campaign,
+        {
+            "phase": CampaignPhase.HALTED.value,
+            "lifecycle_context": {
+                "disposition": "halted",
+                "reason_code": "postprocess_exception",
+                "message": (
+                    "ValueError: PhaseResult submission metadata requires a "
+                    "submitted job"
+                ),
+                "from_phase": CampaignPhase.FEREBUS.value,
+                "iteration": 18,
+            },
+        },
+    )
+
+    assert [item.code for item in recommendations] == [
+        "halted_ferebus_quality_failed"
+    ]
+    assert "completed FEREBUS candidate" in recommendations[0].primary
+    assert "retrain" not in recommendations[0].primary
+    assert recommendations[0].command.startswith("ichor-al-daemon reconcile ")
+
+
 def test_status_recommendations_report_scientific_completion_not_stop(tmp_path):
     campaign = _campaign_with_config(tmp_path)
 
@@ -3956,6 +3983,17 @@ def test_cli_stop_when_no_state_returns_4(tmp_path):
                 "n_rejected": 0,
             },
             "OK",
+        ),
+        (
+            {
+                "event": "ferebus_quality_summary",
+                "accepted": True,
+                "n_total": 4,
+                "n_rejected": 0,
+                "n_warned": 1,
+                "n_warnings": 2,
+            },
+            "WARN",
         ),
         ({"event": "sacct_error"}, "WARN"),
         ({"event": "sacct_error_timeout"}, "FAIL"),

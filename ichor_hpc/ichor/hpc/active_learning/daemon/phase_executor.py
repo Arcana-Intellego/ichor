@@ -109,6 +109,7 @@ class PhaseResult:
         PostprocessRetryDisposition.NONE
     )
     submission_metadata: Dict[str, Any] = field(default_factory=dict)
+    postprocess_metadata: Dict[str, Any] = field(default_factory=dict)
     next_phase_override: Optional[str] = None
 
     def validate(self, *, stage: str, phase_name: str) -> "PhaseResult":
@@ -164,6 +165,16 @@ class PhaseResult:
             raise ValueError("PhaseResult.submission_metadata must be an object")
         if self.submitted_job_id is None and self.submission_metadata:
             raise ValueError("PhaseResult submission metadata requires a submitted job")
+        if not isinstance(self.postprocess_metadata, dict):
+            raise ValueError("PhaseResult.postprocess_metadata must be an object")
+        if self.postprocess_metadata and not self.is_complete:
+            raise ValueError(
+                "PhaseResult postprocess metadata requires a completed result"
+            )
+        if self.postprocess_metadata and self.submitted_job_id is not None:
+            raise ValueError(
+                "PhaseResult postprocess metadata requires a jobless result"
+            )
         if not isinstance(self.journal_events, list) or any(
             not isinstance(event, dict) for event in self.journal_events
         ):

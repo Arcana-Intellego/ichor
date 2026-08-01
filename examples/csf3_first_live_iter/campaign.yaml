@@ -89,6 +89,8 @@ quality_gates:
   require_readable_aimall_geometry: true
   require_finite_iqa: true
   require_finite_integration_error: true
+  # Incumbent-relative FEREBUS regressions are advisory warnings. Absolute
+  # RMSE, R2, condition-number, and evidence-validity gates remain hard.
   ferebus_max_aggregate_ext_rmse_increase_fraction: 0.05
   ferebus_max_task_ext_rmse_increase_fraction: 0.20
   ferebus_regression_abs_tolerance_ha: 1.0e-6

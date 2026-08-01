@@ -28,6 +28,8 @@ def test_phase_result_defaults():
     assert r.state_updates == {}
     assert r.journal_events == []
     assert r.failure_reason is None
+    assert r.submission_metadata == {}
+    assert r.postprocess_metadata == {}
 
 
 def test_phase_result_rejects_completion_and_submission_together():
@@ -46,6 +48,35 @@ def test_phase_result_rejects_fractional_expected_tasks():
 
     with pytest.raises(ValueError, match="positive integer"):
         result.validate(stage="submit", phase_name="GAUSSIAN")
+
+
+def test_phase_result_allows_jobless_completed_postprocess_metadata_on_submit():
+    result = PhaseResult(
+        is_complete=True,
+        postprocess_metadata={"ferebus_quality_disposition": "accepted"},
+    )
+
+    assert result.validate(stage="submit", phase_name="FEREBUS") is result
+
+
+def test_phase_result_rejects_postprocess_metadata_for_incomplete_result():
+    result = PhaseResult(
+        submitted_job_id="123",
+        postprocess_metadata={"ferebus_quality_disposition": "accepted"},
+    )
+
+    with pytest.raises(ValueError, match="requires a completed result"):
+        result.validate(stage="submit", phase_name="FEREBUS")
+
+
+def test_phase_result_keeps_submission_metadata_bound_to_submitted_job():
+    result = PhaseResult(
+        is_complete=True,
+        submission_metadata={"ferebus_quality_disposition": "accepted"},
+    )
+
+    with pytest.raises(ValueError, match="requires a submitted job"):
+        result.validate(stage="submit", phase_name="FEREBUS")
 
 
 def test_phase_result_restricts_convergence_to_stop_check():

@@ -16,6 +16,13 @@ FEREBUS_QUALITY_MANIFEST = "FEREBUS_QUALITY.json"
 FEREBUS_QUALITY_SCHEMA_VERSION = 4
 FEREBUS_QUALITY_DECISION_MANIFEST = "FEREBUS_QUALITY_DECISION.json"
 FEREBUS_QUALITY_DECISION_SCHEMA_VERSION = 2
+FEREBUS_QUALITY_DECISION_POLICY = "absolute_hard_relative_advisory_v1"
+FEREBUS_RELATIVE_REGRESSION_WARNINGS = frozenset(
+    {
+        "ferebus_aggregate_ext_rmse_regressed",
+        "ferebus_task_ext_rmse_regressed",
+    }
+)
 
 _PERFORMANCE_METRIC_ALIASES = {
     "weights_l2_nor": "weights_l2_norm",
@@ -895,8 +902,10 @@ def evaluate_ferebus_quality_decision(
         )
     task_decisions: List[Dict[str, Any]] = []
     all_reasons: List[str] = []
+    all_warnings: List[str] = []
     for record in list(quality.get("records") or []):
         reasons: List[str] = []
+        warnings: List[str] = []
         metrics = record.get("metrics") if isinstance(record, Mapping) else None
         if not isinstance(metrics, Mapping):
             reason = record.get("measurement_error")
@@ -939,14 +948,16 @@ def evaluate_ferebus_quality_decision(
                         regression_abs,
                     )
                     if ext_rmse > relative_limit:
-                        reasons.append("ferebus_task_ext_rmse_regressed")
+                        warnings.append("ferebus_task_ext_rmse_regressed")
         all_reasons.extend(reasons)
+        all_warnings.extend(warnings)
         task_decisions.append(
             {
                 "property": str(record.get("property") or ""),
                 "atom": str(record.get("atom") or ""),
                 "accepted": not reasons,
                 "reasons": reasons,
+                "warnings": warnings,
                 "candidate_ext_rmse": (
                     None if not isinstance(metrics, Mapping) else ext_rmse
                 ),
@@ -983,10 +994,11 @@ def evaluate_ferebus_quality_decision(
             regression_abs,
         )
         if candidate_aggregate is not None and candidate_aggregate > aggregate_limit:
-            all_reasons.append("ferebus_aggregate_ext_rmse_regressed")
+            all_warnings.append("ferebus_aggregate_ext_rmse_regressed")
     else:
         incumbent_aggregate = None
     return {
+        "decision_policy": FEREBUS_QUALITY_DECISION_POLICY,
         "thresholds": {
             "ferebus_min_ext_r2": min_ext_r2,
             "ferebus_max_ext_rmse_ha": max_ext_rmse,
@@ -1004,8 +1016,11 @@ def evaluate_ferebus_quality_decision(
         "n_tasks": len(task_decisions),
         "n_accepted": sum(1 for item in task_decisions if item["accepted"]),
         "n_rejected": sum(1 for item in task_decisions if not item["accepted"]),
+        "n_warned": sum(1 for item in task_decisions if item["warnings"]),
+        "n_warnings": len(all_warnings),
         "accepted": not all_reasons,
         "reasons": sorted(set(all_reasons)),
+        "warnings": sorted(set(all_warnings)),
         "tasks": task_decisions,
     }
 
@@ -1124,8 +1139,10 @@ def read_ferebus_quality_decision(
 
 __all__ = [
     "FEREBUS_QUALITY_DECISION_MANIFEST",
+    "FEREBUS_QUALITY_DECISION_POLICY",
     "FEREBUS_QUALITY_DECISION_SCHEMA_VERSION",
     "FEREBUS_QUALITY_MANIFEST",
+    "FEREBUS_RELATIVE_REGRESSION_WARNINGS",
     "FEREBUS_QUALITY_SCHEMA_VERSION",
     "FerebusQualityMeasurementIncomplete",
     "FerebusQualityDecisionError",

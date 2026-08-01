@@ -1245,10 +1245,23 @@ def _ferebus_quality_can_be_reevaluated(
             return False
         staging = trained_models_dir(campaign_dir) / "iteration-staging"
         ok, _ = validate_ferebus_completed(staging)
-        if not ok:
-            return False
-        validate_ferebus_quality_evidence(staging)
-        return True
+        if ok:
+            validate_ferebus_quality_evidence(staging)
+            return True
+        from .ferebus_candidate_recovery import discover_recovery_candidate
+
+        candidate = discover_recovery_candidate(
+            Path(campaign_dir),
+            expected_campaign_uid=str(proposed_state.campaign_uid),
+            reference_data_version=int(
+                getattr(proposed_state, "reference_data_version", -1)
+            ),
+        )
+        return bool(
+            isinstance(candidate, Mapping)
+            and candidate.get("candidate_kind")
+            == "quality_rejected_relative_regression"
+        )
     except Exception:
         return False
 

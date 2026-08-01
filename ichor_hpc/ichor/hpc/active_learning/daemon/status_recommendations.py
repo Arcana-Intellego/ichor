@@ -755,6 +755,21 @@ def _halt_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecom
         else ""
     )
     upper = reason.upper()
+    if "PHASERESULT SUBMISSION METADATA REQUIRES A SUBMITTED JOB" in upper:
+        return StatusRecommendation(
+            code="halted_ferebus_quality_failed",
+            severity="required",
+            primary="preview recovery of the completed FEREBUS candidate",
+            why=(
+                "local FEREBUS quality postprocessing completed, but an internal "
+                "result-metadata validation error prevented model publication"
+            ),
+            command=_reconcile_cmd(campaign),
+            details=[
+                "reconcile can reuse authenticated model and quality evidence without submitting a scheduler job",
+                "the campaign remains fail-closed if the candidate has any absolute quality failure",
+            ],
+        )
     if reason_code == "mandatory_custom_bootstrap_failed":
         return StatusRecommendation(
             code="halted_mandatory_custom_bootstrap_failed",
@@ -808,13 +823,14 @@ def _halt_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecom
             code="halted_ferebus_quality_failed",
             severity="required",
             primary=(
-                "inspect FEREBUS quality evidence, then either re-evaluate "
-                "justified thresholds or explicitly retrain"
+                "inspect the hard FEREBUS quality failure before deciding whether "
+                "to change an absolute threshold or explicitly retrain"
             ),
             why=_short_error(reason),
             command=_reconcile_cmd(campaign),
             details=[
-                "threshold-only edits reuse hash-bound model evidence",
+                "incumbent-relative RMSE changes are advisory and do not halt the campaign",
+                "threshold-only edits can reuse hash-bound model evidence",
                 "after a safe preview, reconcile --retrain-ferebus --apply archives the rejected candidate before retraining",
             ],
         )

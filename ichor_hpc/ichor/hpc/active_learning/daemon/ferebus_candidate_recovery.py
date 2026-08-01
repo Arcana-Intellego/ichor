@@ -7,6 +7,7 @@ import shutil
 import stat
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Mapping, Optional
 
 from ..strict_json import strict_json as json
@@ -118,6 +119,30 @@ def read_recovery_request(
         raise FerebusCandidateRecoveryError(
             "FEREBUS postprocess recovery status is invalid"
         )
+    candidate_kind = payload.get("candidate_kind")
+    if candidate_kind is not None and candidate_kind not in {
+        "measurement_incomplete",
+        "quality_rejected_relative_regression",
+    }:
+        raise FerebusCandidateRecoveryError(
+            "FEREBUS postprocess recovery candidate kind is invalid"
+        )
+    source_warnings = payload.get("source_warnings")
+    if source_warnings is not None and (
+        not isinstance(source_warnings, list)
+        or any(not isinstance(value, str) or not value for value in source_warnings)
+    ):
+        raise FerebusCandidateRecoveryError(
+            "FEREBUS postprocess recovery warnings are invalid"
+        )
+    for field in ("source_n_warned", "source_n_warnings"):
+        value = payload.get(field)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+        ):
+            raise FerebusCandidateRecoveryError(
+                "FEREBUS postprocess recovery " + field + " is invalid"
+            )
     source_text = str(payload.get("source_path") or "")
     if not source_text:
         raise FerebusCandidateRecoveryError(
@@ -157,20 +182,8 @@ def _legacy_candidate_summary(
     quality = _read_object(quality_path, "legacy FEREBUS quality evidence")
     if (
         quality.get("schema_version") != 4
-        or quality.get("measurement_complete") is not False
         or str(quality.get("campaign_uid") or "") != str(expected_campaign_uid)
         or quality.get("reference_data_version") != int(reference_data_version)
-    ):
-        return None
-    errors = quality.get("measurement_errors")
-    if (
-        not isinstance(errors, list)
-        or not errors
-        or any(
-            not isinstance(reason, str)
-            or not reason.startswith("ferebus_quality_metric_failed:")
-            for reason in errors
-        )
     ):
         return None
     decision = _read_object(decision_path, "legacy FEREBUS quality decision")
@@ -206,16 +219,7 @@ def _legacy_candidate_summary(
         current = validated.get(current_digest)
     if not isinstance(current, dict) or current.get("accepted") is not False:
         return None
-    allowed_reasons = set(str(value) for value in errors)
-    allowed_reasons.add("ferebus_aggregate_metric_missing")
-    reasons = current.get("reasons")
-    if (
-        not isinstance(reasons, list)
-        or not reasons
-        or any(str(reason) not in allowed_reasons for reason in reasons)
-    ):
-        return None
-    return {
+    summary = {
         "status": "recoverable_legacy_candidate",
         "candidate_id": candidate.name,
         "source_path": _relative_campaign_path(campaign_dir, candidate),
@@ -224,8 +228,97 @@ def _legacy_candidate_summary(
         "decision_sha256": sha256_file(decision_path),
         "task_manifest_sha256": sha256_file(task_manifest_path),
         "task_map_file_sha256": sha256_file(task_map_path),
-        "measurement_errors": list(errors),
     }
+    errors = quality.get("measurement_errors")
+    if quality.get("measurement_complete") is False:
+        if (
+            not isinstance(errors, list)
+            or not errors
+            or any(
+                not isinstance(reason, str)
+                or not reason.startswith("ferebus_quality_metric_failed:")
+                for reason in errors
+            )
+        ):
+            return None
+        allowed_reasons = set(str(value) for value in errors)
+        allowed_reasons.add("ferebus_aggregate_metric_missing")
+        reasons = current.get("reasons")
+        if (
+            not isinstance(reasons, list)
+            or not reasons
+            or any(str(reason) not in allowed_reasons for reason in reasons)
+        ):
+            return None
+        summary.update(
+            {
+                "candidate_kind": "measurement_incomplete",
+                "measurement_errors": list(errors),
+            }
+        )
+        return summary
+
+    if quality.get("measurement_complete") is not True or errors not in (None, []):
+        return None
+    from .ferebus_quality import (
+        FEREBUS_RELATIVE_REGRESSION_WARNINGS,
+        evaluate_ferebus_quality_decision,
+    )
+
+    reasons = current.get("reasons")
+    if not isinstance(reasons, list) or not reasons:
+        return None
+    observed_reasons = {str(reason) for reason in reasons}
+    tasks = current.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        return None
+    for task in tasks:
+        if not isinstance(task, dict):
+            return None
+        task_reasons = task.get("reasons")
+        if not isinstance(task_reasons, list):
+            return None
+        observed_reasons.update(str(reason) for reason in task_reasons)
+    if (
+        not observed_reasons
+        or not observed_reasons.issubset(FEREBUS_RELATIVE_REGRESSION_WARNINGS)
+    ):
+        return None
+    thresholds = current.get("thresholds")
+    if not isinstance(thresholds, dict):
+        return None
+    advisory_decision = evaluate_ferebus_quality_decision(
+        quality,
+        SimpleNamespace(**thresholds),
+    )
+    if (
+        advisory_decision.get("accepted") is not True
+        or list(advisory_decision.get("reasons") or [])
+        or set(advisory_decision.get("warnings") or []) != observed_reasons
+    ):
+        return None
+    expected_candidate_id = hashlib.sha256(
+        (observed_quality_sha256 + ":" + current_digest).encode("ascii")
+    ).hexdigest()
+    if candidate.name != expected_candidate_id:
+        return None
+    summary.update(
+        {
+            "status": "recoverable_relative_regression_candidate",
+            "candidate_kind": "quality_rejected_relative_regression",
+            "measurement_errors": [],
+            "warnings": sorted(observed_reasons),
+            "n_warned": sum(
+                1 for task in tasks if list(task.get("reasons") or [])
+            ),
+            "n_warnings": sum(
+                len(list(task.get("reasons") or [])) for task in tasks
+            )
+            + int("ferebus_aggregate_ext_rmse_regressed" in reasons),
+            "promotion": dict(current.get("promotion") or {}),
+        }
+    )
+    return summary
 
 
 def discover_recovery_candidate(
@@ -248,6 +341,24 @@ def discover_recovery_candidate(
                 )
             out = dict(existing)
             out["status"] = "active_recovery_request"
+            source = campaign_owned_path(campaign, str(existing["source_path"]))
+            source_summary = _legacy_candidate_summary(
+                campaign,
+                source,
+                expected_campaign_uid=expected_campaign_uid,
+                reference_data_version=reference_data_version,
+            )
+            if isinstance(source_summary, dict):
+                for key in (
+                    "candidate_kind",
+                    "measurement_errors",
+                    "warnings",
+                    "n_warned",
+                    "n_warnings",
+                    "promotion",
+                ):
+                    if key in source_summary:
+                        out[key] = source_summary[key]
             return out
         return None
     root = campaign / "TRAINED_MODELS" / "rejected-candidates" / (
@@ -323,6 +434,10 @@ def prepare_recovery_request(
         "source_decision_sha256": candidate.get("decision_sha256"),
         "source_task_manifest_sha256": candidate.get("task_manifest_sha256"),
         "source_task_map_file_sha256": candidate.get("task_map_file_sha256"),
+        "candidate_kind": candidate.get("candidate_kind"),
+        "source_warnings": list(candidate.get("warnings") or []),
+        "source_n_warned": int(candidate.get("n_warned") or 0),
+        "source_n_warnings": int(candidate.get("n_warnings") or 0),
         "status": "prepared",
         "created_at_iso": now,
         "updated_at_iso": now,
@@ -457,11 +572,19 @@ def write_quality_attempt(
     return path
 
 
-def _copy_regular_tree(source: Path, destination: Path) -> None:
+def _copy_regular_tree(
+    source: Path,
+    destination: Path,
+    *,
+    preserve_quality_evidence: bool = False,
+) -> None:
     destination.mkdir(mode=0o700, parents=False, exist_ok=False)
     with os.scandir(source) as entries:
         for entry in entries:
-            if entry.name in _CANONICAL_QUALITY_FILES:
+            if (
+                entry.name in _CANONICAL_QUALITY_FILES
+                and not preserve_quality_evidence
+            ):
                 continue
             source_path = Path(entry.path)
             destination_path = destination / entry.name
@@ -471,7 +594,11 @@ def _copy_regular_tree(source: Path, destination: Path) -> None:
                     "FEREBUS recovery source contains a symlink: " + str(source_path)
                 )
             if stat.S_ISDIR(info.st_mode):
-                _copy_regular_tree(source_path, destination_path)
+                _copy_regular_tree(
+                    source_path,
+                    destination_path,
+                    preserve_quality_evidence=preserve_quality_evidence,
+                )
             elif stat.S_ISREG(info.st_mode):
                 shutil.copy2(source_path, destination_path, follow_symlinks=False)
             else:
@@ -519,6 +646,56 @@ def _validate_raw_candidate(
         )
 
 
+def _preserves_quality_evidence(
+    campaign_dir: Path,
+    source: Path,
+    request: Mapping[str, Any],
+) -> bool:
+    """Recognise a legacy candidate rejected only by advisory comparisons."""
+    expected_quality_sha = request.get("source_quality_sha256")
+    expected_decision_sha = request.get("source_decision_sha256")
+    if expected_quality_sha is None or expected_decision_sha is None:
+        return False
+    quality_path = source / "FEREBUS_QUALITY.json"
+    quality = _read_object(quality_path, "FEREBUS recovery quality evidence")
+    summary = _legacy_candidate_summary(
+        campaign_dir,
+        source,
+        expected_campaign_uid=str(request.get("campaign_uid") or ""),
+        reference_data_version=int(request.get("reference_data_version", -1)),
+    )
+    if (
+        not isinstance(summary, dict)
+        or summary.get("candidate_kind")
+        != "quality_rejected_relative_regression"
+        or str(summary.get("quality_sha256") or "")
+        != str(expected_quality_sha)
+        or str(summary.get("decision_sha256") or "")
+        != str(expected_decision_sha)
+    ):
+        if quality.get("measurement_complete") is True:
+            raise FerebusCandidateRecoveryError(
+                "complete FEREBUS recovery evidence is not an authenticated "
+                "relative-regression-only candidate"
+            )
+        return False
+    return True
+
+
+def _validate_preserved_quality_evidence(staging: Path) -> None:
+    from .ferebus_quality import (
+        read_ferebus_quality_decision,
+        validate_ferebus_quality_evidence,
+    )
+
+    validate_ferebus_quality_evidence(staging)
+    read_ferebus_quality_decision(
+        staging,
+        require_accepted=False,
+        verify_current_config=False,
+    )
+
+
 def materialise_recovery_candidate(
     campaign_dir: Path,
     *,
@@ -546,7 +723,14 @@ def materialise_recovery_candidate(
     source = campaign_owned_path(campaign, str(request["source_path"]))
     staging = campaign / "TRAINED_MODELS" / "iteration-staging"
     _validate_raw_candidate(campaign, source, request)
+    preserve_quality_evidence = _preserves_quality_evidence(
+        campaign,
+        source,
+        request,
+    )
     if source.absolute() == staging.absolute():
+        if preserve_quality_evidence:
+            _validate_preserved_quality_evidence(staging)
         update_recovery_status(
             campaign,
             campaign_uid=campaign_uid,
@@ -560,6 +744,8 @@ def materialise_recovery_candidate(
             marker_payload = _read_object(marker, "FEREBUS recovery staging marker")
             if marker_payload.get("request_sha256") == request.get("request_sha256"):
                 _validate_raw_candidate(campaign, staging, request)
+                if bool(marker_payload.get("reused_quality_evidence", False)):
+                    _validate_preserved_quality_evidence(staging)
                 return staging
         raise FerebusCandidateRecoveryError(
             "FEREBUS iteration-staging is not empty for candidate recovery"
@@ -573,13 +759,28 @@ def materialise_recovery_candidate(
                 "invalid stale FEREBUS recovery staging path"
             )
         shutil.rmtree(temporary)
-    _copy_regular_tree(source, temporary)
-    for filename in _CANONICAL_QUALITY_FILES:
-        path = temporary / filename
-        if path.exists() or path.is_symlink():
+    _copy_regular_tree(
+        source,
+        temporary,
+        preserve_quality_evidence=preserve_quality_evidence,
+    )
+    if preserve_quality_evidence:
+        if sha256_file(temporary / "FEREBUS_QUALITY.json") != str(
+            request.get("source_quality_sha256")
+        ) or sha256_file(temporary / "FEREBUS_QUALITY_DECISION.json") != str(
+            request.get("source_decision_sha256")
+        ):
             raise FerebusCandidateRecoveryError(
-                "legacy FEREBUS quality evidence leaked into recovery staging"
+                "preserved FEREBUS quality evidence changed during recovery"
             )
+        _validate_preserved_quality_evidence(temporary)
+    else:
+        for filename in _CANONICAL_QUALITY_FILES:
+            path = temporary / filename
+            if path.exists() or path.is_symlink():
+                raise FerebusCandidateRecoveryError(
+                    "legacy FEREBUS quality evidence leaked into recovery staging"
+                )
     _validate_raw_candidate(campaign, temporary, request)
     atomic_write_json(
         temporary / FEREBUS_RECOVERY_MARKER_FILENAME,
@@ -588,6 +789,7 @@ def materialise_recovery_candidate(
             "request_sha256": str(request["request_sha256"]),
             "source_path": str(request["source_path"]),
             "candidate_id": str(request["candidate_id"]),
+            "reused_quality_evidence": bool(preserve_quality_evidence),
             "materialised_at_iso": _now_iso(),
         },
     )

@@ -4530,7 +4530,11 @@ def _journal_event_severity(event: Dict[str, Any]) -> str:
     if raw == "ferebus_candidate_reprocessed":
         outcome = str(event.get("outcome") or "")
         if outcome == "accepted":
-            return "OK"
+            return (
+                "WARN"
+                if (_event_int(event, "n_warnings") or 0) > 0
+                else "OK"
+            )
         if outcome == "measurement_incomplete":
             return "WARN"
         if outcome in {"rejected", "failed"}:
@@ -4598,6 +4602,11 @@ def _journal_event_severity(event: Dict[str, Any]) -> str:
         ):
             return "FAIL"
         if rejected is not None and rejected > 0:
+            return "WARN"
+        if raw == "ferebus_quality_summary" and (
+            (_event_int(event, "n_warned") or 0) > 0
+            or (_event_int(event, "n_warnings") or 0) > 0
+        ):
             return "WARN"
         return "OK"
     if raw in _JOURNAL_FAIL_EVENTS:
@@ -5023,6 +5032,8 @@ def _compact_event_details(event: Dict[str, Any]) -> str:
         ("n_tasks", "tasks"),
         ("n_kept", "kept"),
         ("n_rejected", "rejected"),
+        ("n_warned", "warned"),
+        ("n_warnings", "warnings"),
         ("n_frames", "frames"),
         ("moved_points", "moved"),
         ("total_points", "total"),
@@ -5084,6 +5095,8 @@ def _verbose_event_details(event: Dict[str, Any]) -> str:
         "n_tasks",
         "n_kept",
         "n_rejected",
+        "n_warned",
+        "n_warnings",
         "n_frames",
         "pool_n_frames",
         "required_pool_frames",
@@ -12202,8 +12215,28 @@ def _reconcile_presentation(
 
     candidate = getattr(report, "ferebus_candidate_recovery", None)
     if isinstance(candidate, Mapping) and candidate:
-        planned.append(("FEREBUS", "prepare the validated existing model candidate for recovery"))
-        reason_parts.append("a completed FEREBUS candidate can be recovered")
+        if (
+            candidate.get("candidate_kind")
+            == "quality_rejected_relative_regression"
+        ):
+            planned.append(
+                (
+                    "FEREBUS",
+                    "reuse the fully measured model candidate; record its "
+                    "incumbent-relative RMSE regression as an advisory warning",
+                )
+            )
+            reason_parts.append(
+                "a fully measured FEREBUS candidate was rejected only by the old relative-regression policy"
+            )
+        else:
+            planned.append(
+                (
+                    "FEREBUS",
+                    "prepare the validated existing model candidate for recovery",
+                )
+            )
+            reason_parts.append("a completed FEREBUS candidate can be recovered")
 
     state_differs = _reconcile_state_differs(current, proposed)
     if (
@@ -15289,7 +15322,11 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
 
     ferebus_recovery_request = None
     candidate_recovery = getattr(report, "ferebus_candidate_recovery", None)
-    if isinstance(candidate_recovery, dict) and candidate_recovery:
+    if (
+        isinstance(candidate_recovery, dict)
+        and candidate_recovery
+        and not retrain_ferebus
+    ):
         try:
             from .daemon.ferebus_candidate_recovery import (
                 prepare_recovery_request,
@@ -15582,6 +15619,11 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 ),
             )
         if isinstance(ferebus_recovery_request, dict):
+            recovery_candidate = getattr(
+                original_report,
+                "ferebus_candidate_recovery",
+                None,
+            )
             append_event(
                 campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
                 "ferebus_candidate_recovery_prepared",
@@ -15598,6 +15640,21 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 ),
                 request_sha256=str(
                     ferebus_recovery_request.get("request_sha256") or ""
+                ),
+                candidate_kind=(
+                    str(recovery_candidate.get("candidate_kind") or "")
+                    if isinstance(recovery_candidate, Mapping)
+                    else ""
+                ),
+                n_warned=(
+                    int(recovery_candidate.get("n_warned") or 0)
+                    if isinstance(recovery_candidate, Mapping)
+                    else 0
+                ),
+                n_warnings=(
+                    int(recovery_candidate.get("n_warnings") or 0)
+                    if isinstance(recovery_candidate, Mapping)
+                    else 0
                 ),
             )
         if archived_ariadne_publication:
