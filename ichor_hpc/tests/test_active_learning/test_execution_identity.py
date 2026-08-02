@@ -21,6 +21,7 @@ from ichor.hpc.active_learning.execution_identity import (
     environment_current_path,
     environment_generations_dir,
     execution_identity_path,
+    inspect_environment_generation_launch,
     legacy_intent_config_generation_split_is_proven,
     read_active_environment_generation,
     rebind_environment,
@@ -94,8 +95,103 @@ def test_first_start_requires_explicit_mode(tmp_path):
             config=CampaignConfig(),
             requested_mode=None,
         )
-
     assert not execution_identity_path(tmp_path).exists()
+
+
+def test_environment_launch_inspection_distinguishes_fresh_and_missing_identity(
+    tmp_path,
+):
+    config = CampaignConfig(max_iterations=2)
+    state = fresh_campaign_state(max_iterations=2)
+
+    fresh = inspect_environment_generation_launch(
+        tmp_path,
+        state=state,
+        config=config,
+        scheduler_ownership_clear=True,
+    )
+    state.phase = CampaignPhase.SEED_SELECT
+    progressed = inspect_environment_generation_launch(
+        tmp_path,
+        state=state,
+        config=config,
+        scheduler_ownership_clear=True,
+    )
+
+    assert fresh["disposition"] == "unbound_first_start"
+    assert fresh["launchable"] is True
+    assert progressed["disposition"] == "invalid"
+    assert progressed["launchable"] is False
+
+
+def test_environment_launch_inspection_allows_safe_stale_binding(
+    tmp_path,
+    monkeypatch,
+):
+    config = CampaignConfig(max_iterations=2)
+    state = fresh_campaign_state(max_iterations=2)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _fake_generation,
+    )
+    ensure_execution_identity(
+        tmp_path,
+        campaign_uid=str(state.campaign_uid),
+        config=config,
+        requested_mode="dry_run",
+    )
+    changed = CampaignConfig(max_iterations=3)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "_inspect_environment_transition_boundary",
+        lambda *_args, **_kwargs: {"transition_kind": "idle_boundary"},
+    )
+
+    result = inspect_environment_generation_launch(
+        tmp_path,
+        state=state,
+        config=changed,
+        scheduler_ownership_clear=True,
+    )
+
+    assert result["disposition"] == "rebindable_on_resume"
+    assert result["launchable"] is True
+    assert result["config_matches"] is False
+
+
+def test_environment_launch_inspection_blocks_invalid_active_pointer(
+    tmp_path,
+    monkeypatch,
+):
+    config = CampaignConfig(max_iterations=2)
+    state = fresh_campaign_state(max_iterations=2)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _fake_generation,
+    )
+    ensure_execution_identity(
+        tmp_path,
+        campaign_uid=str(state.campaign_uid),
+        config=config,
+        requested_mode="dry_run",
+    )
+    current_path = environment_current_path(tmp_path)
+    current = json.loads(current_path.read_text(encoding="utf-8"))
+    current["generation_digest_sha256"] = "f" * 64
+    current_path.write_text(json.dumps(current), encoding="utf-8")
+
+    result = inspect_environment_generation_launch(
+        tmp_path,
+        state=state,
+        config=config,
+        scheduler_ownership_clear=True,
+    )
+
+    assert result["disposition"] == "invalid"
+    assert result["launchable"] is False
+    assert "digest mismatch" in result["reason"]
 
 
 def test_package_identity_never_uses_recursive_filesystem_walkers(
@@ -115,6 +211,94 @@ def test_package_identity_never_uses_recursive_filesystem_walkers(
     observed = execution_identity_module._tree_hash([package_root])
 
     assert len(observed) == 64
+
+
+def test_package_identity_v2_hashes_nested_code_and_package_data(tmp_path):
+    package_root = tmp_path / "installed-ichor"
+    nested = package_root / "hpc" / "active_learning"
+    nested.mkdir(parents=True)
+    source = nested / "worker.py"
+    data = nested / "defaults.json"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    data.write_text('{"value":1}\n', encoding="utf-8")
+    logical_roots = {package_root.resolve(): "ichor.hpc"}
+
+    baseline = execution_identity_module._tree_hash(
+        [package_root],
+        logical_roots=logical_roots,
+    )
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+    source_changed = execution_identity_module._tree_hash(
+        [package_root],
+        logical_roots=logical_roots,
+    )
+    data.write_text('{"value":2}\n', encoding="utf-8")
+    data_changed = execution_identity_module._tree_hash(
+        [package_root],
+        logical_roots=logical_roots,
+    )
+
+    assert source_changed != baseline
+    assert data_changed != source_changed
+
+
+def test_package_identity_v2_is_independent_of_install_path(tmp_path):
+    left = tmp_path / "left" / "ichor"
+    right = tmp_path / "right" / "ichor"
+    for root in (left, right):
+        (root / "core").mkdir(parents=True)
+        (root / "core" / "module.py").write_text(
+            "VALUE = 1\n",
+            encoding="utf-8",
+        )
+
+    left_digest = execution_identity_module._tree_hash(
+        [left],
+        logical_roots={left.resolve(): "ichor.core"},
+    )
+    right_digest = execution_identity_module._tree_hash(
+        [right],
+        logical_roots={right.resolve(): "ichor.core"},
+    )
+
+    assert left_digest == right_digest
+
+
+def test_ariadne_identity_includes_native_extension_bytes(tmp_path, monkeypatch):
+    python_module = tmp_path / "ariadne.py"
+    native_module = tmp_path / "_ariadne.so"
+    python_module.write_text("ABI = 1\n", encoding="utf-8")
+    native_module.write_bytes(b"native-extension-v1")
+
+    def find_spec(name):
+        origins = {
+            "ariadne": python_module,
+            "_ariadne": native_module,
+        }
+        return SimpleNamespace(
+            origin=str(origins[name]),
+            submodule_search_locations=None,
+        )
+
+    monkeypatch.setattr(execution_identity_module.importlib.util, "find_spec", find_spec)
+    monkeypatch.setattr(
+        execution_identity_module.importlib,
+        "import_module",
+        lambda _name: (_ for _ in ()).throw(ImportError("fixture")),
+    )
+    monkeypatch.setattr(
+        execution_identity_module,
+        "_distribution_version",
+        lambda _name: None,
+    )
+
+    identity = execution_identity_module._ariadne_identity()
+
+    assert identity["native_extension"]["path"] == str(native_module.resolve())
+    assert identity["native_extension"]["size"] == len(b"native-extension-v1")
+    assert identity["native_extension"]["sha256"] == hashlib.sha256(
+        b"native-extension-v1"
+    ).hexdigest()
 
 
 def test_first_start_binds_mode_seed_and_environment_generation(
@@ -2662,6 +2846,70 @@ class _SubmittedExecutor:
         raise AssertionError
 
 
+def _unbound_direct_daemon_campaign(tmp_path, executor):
+    campaign = tmp_path / "unbound-direct-daemon"
+    campaign.mkdir()
+    state = fresh_campaign_state(campaign_uid="uid-unbound-direct")
+    state.phase = CampaignPhase.FEREBUS
+    state.iteration = 1
+    state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json"
+    state_path.parent.mkdir(parents=True)
+    write_state(state_path, state)
+    daemon = Daemon(
+        campaign_dir=campaign,
+        config=CampaignConfig(),
+        executor=executor,
+    )
+    return campaign, state, daemon
+
+
+def test_direct_daemon_submission_remains_intentionally_unbound(tmp_path):
+    executor = _SubmittedExecutor()
+    campaign, state, daemon = _unbound_direct_daemon_campaign(tmp_path, executor)
+
+    assert daemon._on_phase_entry(state, state.phase) == TickStatus.SUBMITTED
+
+    intent = load_intent(campaign, state.phase.value, state.iteration)
+    assert intent.get("environment_generation") is None
+    assert intent.get("environment_generation_digest_sha256") is None
+    assert executor.submissions == 1
+
+
+@pytest.mark.parametrize("mutation", ["identity_appeared", "intent_bound"])
+def test_direct_daemon_rejects_binding_mutation_during_staging(
+    tmp_path,
+    mutation,
+):
+    campaign_holder = {}
+
+    class MutatingExecutor(_SubmittedExecutor):
+        def submit_or_run(self, bound_state, bound_phase):
+            campaign = campaign_holder["campaign"]
+            intent = load_intent(
+                campaign,
+                bound_phase.value,
+                bound_state.iteration,
+            )
+            if mutation == "identity_appeared":
+                path = execution_identity_path(campaign)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}\n", encoding="utf-8")
+            else:
+                intent = dict(intent)
+                intent["environment_generation"] = 1
+            self._submission_environment_guard(intent)
+            self.submissions += 1
+            raise AssertionError("scheduler acceptance must not be reached")
+
+    executor = MutatingExecutor()
+    campaign, state, daemon = _unbound_direct_daemon_campaign(tmp_path, executor)
+    campaign_holder["campaign"] = campaign
+
+    assert daemon._on_phase_entry(state, state.phase) == TickStatus.HALTED
+    assert executor.submissions == 0
+    assert read_state(daemon.state_path()).phase is CampaignPhase.HALTED
+
+
 def _daemon_environment_campaign(tmp_path, monkeypatch):
     campaign = tmp_path / "daemon-campaign"
     campaign.mkdir()
@@ -2721,6 +2969,43 @@ def test_submission_intent_snapshots_active_environment(tmp_path, monkeypatch):
         intent["environment_generation_digest_sha256"]
         == active["digest_sha256"]
     )
+
+
+def test_bound_daemon_rejects_execution_identity_content_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, config, state, _version = _daemon_environment_campaign(
+        tmp_path,
+        monkeypatch,
+    )
+    daemon = Daemon(
+        campaign_dir=campaign,
+        config=config,
+        executor=_SubmittedExecutor(),
+    )
+    assert daemon._verify_environment_boundary(
+        state,
+        state.phase,
+        boundary="submission",
+    ) is None
+    path = execution_identity_path(campaign)
+    replacement = json.loads(path.read_text(encoding="utf-8"))
+    replacement["created_at_iso"] = "2026-01-02T00:00:00+00:00"
+    replacement["digest_sha256"] = _canonical_digest(replacement)
+    path.write_text(
+        json.dumps(replacement, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    status = daemon._verify_environment_boundary(
+        state,
+        state.phase,
+        boundary="submission",
+    )
+
+    assert status == TickStatus.HALTED
+    assert read_state(daemon.state_path()).phase is CampaignPhase.HALTED
 
 
 def test_initial_submission_refuses_stale_environment_config_binding(

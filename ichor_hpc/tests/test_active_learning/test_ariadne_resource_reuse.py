@@ -352,20 +352,27 @@ def test_fresh_ariadne_evidence_reports_each_dimension(
     model_root = campaign / "TRAINED_MODELS" / "iteration-000014"
     model_root.mkdir(parents=True)
 
-    class Seed(list):
-        def __init__(self, dimension):
-            super().__init__([object()] * 6)
-            self.dimension = dimension
-
-    seeds = [Seed(3), Seed(5)]
-    pool = SimpleNamespace(
-        sha256="p" * 64,
-        manifest=SimpleNamespace(n_frames=10_000),
-        canonical_path=pool_file,
-        frame=lambda index: seeds[index],
+    pool_sha256 = sha256_file(pool_file)
+    pool_manifest = campaign / ".DATA" / "TRAJECTORY" / "pool.manifest.json"
+    pool_manifest.parent.mkdir(parents=True)
+    pool_manifest.write_text(
+        json.dumps(
+            {
+                "source_path": str(pool_file),
+                "canonical_path": str(pool_file),
+                "sha256": pool_sha256,
+                "n_frames": 10_000,
+                "natoms": 6,
+                "atom_types": ["H"] * 6,
+                "masses": [1.0] * 6,
+                "imported_iso": "2026-07-28T00:00:00+00:00",
+                "schema_version": 2,
+            }
+        ),
+        encoding="utf-8",
     )
     task_map = {
-        "trajectory_sha256": "p" * 64,
+        "trajectory_sha256": pool_sha256,
         "models_version": 14,
         "model_manifest_sha256": "a" * 64,
         "model_set_sha256": "b" * 64,
@@ -378,7 +385,9 @@ def test_fresh_ariadne_evidence_reports_each_dimension(
     monkeypatch.setattr(
         trajectory_pool.TrajectoryPool,
         "load",
-        lambda _campaign: pool,
+        lambda _campaign: pytest.fail(
+            "ARIADNE resource sizing must not materialise the trajectory pool"
+        ),
     )
     monkeypatch.setattr(
         handoff_manifests,
@@ -402,13 +411,15 @@ def test_fresh_ariadne_evidence_reports_each_dimension(
     monkeypatch.setattr(
         geometry,
         "select_local_neighbours",
-        lambda seed, *_args, **_kwargs: [seed],
+        lambda *_args, **_kwargs: pytest.fail(
+            "ARIADNE resource sizing must not select neighbours"
+        ),
     )
     monkeypatch.setattr(
         subspace,
         "build_local_subspace",
-        lambda seed, *_args, **_kwargs: SimpleNamespace(
-            dimension=seed.dimension
+        lambda *_args, **_kwargs: pytest.fail(
+            "ARIADNE resource sizing must not build local subspaces"
         ),
     )
     progress = []
@@ -422,7 +433,9 @@ def test_fresh_ariadne_evidence_reports_each_dimension(
         ),
     )
 
-    assert evidence["gradient_dimensions"] == [3, 5]
+    assert evidence["gradient_dimensions"] == [6, 6]
+    assert evidence["gradient_dimension"] == 6
+    assert evidence["gradient_dimension_source"] == "configured_safe_upper_bound"
     assert [
         (stage, payload["completed"], payload["total"])
         for stage, payload in progress
@@ -430,9 +443,8 @@ def test_fresh_ariadne_evidence_reports_each_dimension(
         ("ariadne_resource_validation", 1, 3),
         ("ariadne_resource_validation", 2, 3),
         ("ariadne_resource_validation", 3, 3),
-        ("ariadne_resource_dimensions", 0, 2),
-        ("ariadne_resource_dimensions", 1, 2),
-        ("ariadne_resource_dimensions", 2, 2),
+        ("ariadne_resource_bound", 0, 2),
+        ("ariadne_resource_bound", 2, 2),
     ]
 
 

@@ -9,6 +9,7 @@ import ichor.hpc.active_learning.daemon.status_recommendations as recommendation
 from ichor.hpc.active_learning.daemon import phase_progress
 from ichor.hpc.active_learning.daemon.presentation_assessment import (
     assess_campaign_presentation,
+    classify_operator_failure,
 )
 
 from ichor.hpc.active_learning.daemon.state import (
@@ -233,6 +234,158 @@ def test_status_recommends_direct_resume_when_reconcile_has_nothing_to_apply():
     assert result[0].code == "scheduler_terminal_recovery_resume"
     assert str(result[0].command).startswith("ichor-al-daemon resume")
     assert "validate 4 scheduler-completed outputs" in result[0].primary
+
+
+def test_status_blocks_resume_when_environment_generation_is_invalid():
+    payload = {
+        "phase": CampaignPhase.SEED_SELECT.value,
+        "iteration": 8,
+        "pending_jobs": {},
+        "active_submission_intents": [],
+        "state_artifact_contract_status": {"ok": True},
+        "artifact_manifest_status": {"ok": True},
+        "_presentation_config_review": {
+            "state": "unchanged",
+            "n_allowed": 0,
+            "n_blocked": 0,
+        },
+        "_presentation_environment_generation": {
+            "disposition": "invalid",
+            "launchable": False,
+            "generation": -1,
+            "reason": "environment generation digest mismatch",
+        },
+        "_presentation_execution_identity_checked": True,
+        "_presentation_execution_mode": "live",
+    }
+
+    result = recommendations.build_status_recommendations(
+        Path("campaign"),
+        payload,
+    )
+
+    assert result[0].code == "execution_identity_unavailable"
+    assert result[0].severity == "blocked"
+    assert "reconcile" in str(result[0].command)
+    assert "resume" not in str(result[0].command)
+
+
+def test_status_allows_safe_environment_rebind_on_resume():
+    payload = {
+        "phase": CampaignPhase.SEED_SELECT.value,
+        "iteration": 8,
+        "pending_jobs": {},
+        "active_submission_intents": [],
+        "state_artifact_contract_status": {"ok": True},
+        "artifact_manifest_status": {"ok": True},
+        "_presentation_config_review": {
+            "state": "unchanged",
+            "n_allowed": 0,
+            "n_blocked": 0,
+        },
+        "_presentation_environment_generation": {
+            "disposition": "rebindable_on_resume",
+            "launchable": True,
+            "generation": 20,
+            "reason": "startup will create a correctly bound generation",
+        },
+        "_presentation_execution_identity_checked": True,
+        "_presentation_execution_mode": "live",
+    }
+
+    result = recommendations.build_status_recommendations(
+        Path("campaign"),
+        payload,
+    )
+
+    assert result[0].code == "phase_seed_select_ready"
+    assert "resume" in str(result[0].command)
+    assert any("correctly bound" in detail for detail in result[0].details)
+
+
+@pytest.mark.parametrize(
+    ("reason", "family"),
+    [
+        (
+            "resource implementation ICHOR package tree has drifted",
+            "ichor_source_drift",
+        ),
+        (
+            "resource implementation ARIADNE native code has drifted",
+            "ariadne_native_drift",
+        ),
+        (
+            "resource implementation dependency environment has drifted",
+            "dependency_environment_drift",
+        ),
+        (
+            "resource implementation ICHOR package-tree identity kind is unsupported",
+            "legacy_identity_insufficient",
+        ),
+    ],
+)
+def test_operator_failure_classifier_distinguishes_identity_failures(
+    reason,
+    family,
+):
+    assert classify_operator_failure(reason).family == family
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_action"),
+    [
+        (
+            "resource implementation ICHOR package tree has drifted",
+            "reinstall the current ICHOR checkout",
+        ),
+        (
+            "resource implementation ARIADNE native code has drifted",
+            "rebuild and reinstall ARIADNE",
+        ),
+        (
+            "resource implementation dependency environment has drifted",
+            "restore or reinstall the configured Python environment",
+        ),
+        (
+            "resource implementation ICHOR package-tree identity kind is unsupported",
+            "affected tasks may need retry",
+        ),
+    ],
+)
+def test_halted_status_uses_failure_specific_recovery_guidance(
+    reason,
+    expected_action,
+):
+    payload = {
+        "phase": CampaignPhase.HALTED.value,
+        "iteration": 8,
+        "pending_jobs": {},
+        "active_submission_intents": [],
+        "state_artifact_contract_status": {"ok": True},
+        "artifact_manifest_status": {"ok": True},
+        "latest_halt_event": {
+            "event": "halt",
+            "reason": "backend_submission_failed: ValueError: " + reason,
+        },
+        "_presentation_config_review": {
+            "state": "unchanged",
+            "n_allowed": 0,
+            "n_blocked": 0,
+        },
+        "_presentation_environment_generation": {
+            "disposition": "current",
+            "launchable": True,
+            "generation": 3,
+        },
+    }
+
+    result = recommendations.build_status_recommendations(
+        Path("campaign"),
+        payload,
+    )
+
+    assert expected_action in result[0].primary
+    assert "profile problem" not in result[0].primary
 
 
 def test_running_daemon_reports_on_disk_config_change_as_deferred():

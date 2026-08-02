@@ -333,6 +333,12 @@ class Daemon:
     _last_environment_binding: Optional[Dict[str, Any]] = field(
         default=None, init=False, repr=False
     )
+    _environment_binding_mode: Optional[str] = field(
+        default=None, init=False, repr=False
+    )
+    _execution_identity_digest: Optional[str] = field(
+        default=None, init=False, repr=False
+    )
     _journal_phase_snapshot: Optional[str] = field(
         default=None, init=False, repr=False
     )
@@ -1412,6 +1418,44 @@ class Daemon:
                 return self._halt(state, phase, reason)
         return None
 
+    def _verify_execution_identity_binding(self, state: CampaignState) -> str:
+        """Latch and authenticate bound versus intentional direct API use."""
+        from ..execution_identity import (
+            ExecutionIdentityError,
+            execution_identity_path,
+            read_execution_identity,
+        )
+
+        identity_path = execution_identity_path(self.campaign_dir)
+        if not identity_path.exists() and not identity_path.is_symlink():
+            observed_mode = "unbound"
+            observed_digest = None
+        else:
+            identity = read_execution_identity(
+                self.campaign_dir,
+                expected_campaign_uid=str(state.campaign_uid),
+            )
+            observed_mode = "bound"
+            observed_digest = str(identity["digest_sha256"])
+        if self._environment_binding_mode is None:
+            self._environment_binding_mode = observed_mode
+            self._execution_identity_digest = observed_digest
+        elif self._environment_binding_mode != observed_mode:
+            raise ExecutionIdentityError(
+                "campaign execution identity changed while the daemon was running"
+            )
+        elif observed_mode == "bound" and (
+            self._execution_identity_digest != observed_digest
+        ):
+            raise ExecutionIdentityError(
+                "campaign execution identity content changed while the daemon was running"
+            )
+        elif observed_mode == "unbound" and self._execution_identity_digest is not None:
+            raise ExecutionIdentityError(
+                "unbound daemon unexpectedly retained an execution identity"
+            )
+        return observed_mode
+
     def _verify_environment_boundary(
         self,
         state: CampaignState,
@@ -1422,12 +1466,18 @@ class Daemon:
         """Require the active generation pointer captured at daemon startup."""
         from ..execution_identity import (
             ExecutionIdentityError,
-            execution_identity_path,
             read_active_environment_generation,
         )
 
-        identity_path = execution_identity_path(self.campaign_dir)
-        if not identity_path.exists() and not identity_path.is_symlink():
+        try:
+            observed_mode = self._verify_execution_identity_binding(state)
+        except (ExecutionIdentityError, OSError, ValueError) as exc:
+            return self._halt_environment_drift(
+                state,
+                phase,
+                type(exc).__name__ + ": " + str(exc)[:200],
+            )
+        if observed_mode == "unbound":
             # Direct unit-level daemon construction remains supported.  The
             # public start path always creates the identity before execution.
             return None
@@ -1472,12 +1522,10 @@ class Daemon:
         """Capture once and automatically advance drift at a safe boundary."""
         from ..execution_identity import (
             advance_environment_generation,
-            execution_identity_path,
             read_active_environment_generation,
         )
 
-        identity_path = execution_identity_path(self.campaign_dir)
-        if not identity_path.exists() and not identity_path.is_symlink():
+        if self._verify_execution_identity_binding(state) == "unbound":
             return
         advance_environment_generation(
             self.campaign_dir,
@@ -1504,13 +1552,18 @@ class Daemon:
         intent: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """Require submitted work to remain bound to its exact generation."""
-        from ..execution_identity import execution_identity_path
+        from ..execution_identity import ExecutionIdentityError
 
         if phase.value not in SBATCH_PHASES:
             return None
-        identity_path = execution_identity_path(self.campaign_dir)
-        if not identity_path.exists() and not identity_path.is_symlink():
-            return None
+        try:
+            observed_mode = self._verify_execution_identity_binding(state)
+        except (ExecutionIdentityError, OSError, ValueError) as exc:
+            return self._halt_environment_drift(
+                state,
+                phase,
+                type(exc).__name__ + ": " + str(exc)[:200],
+            )
         try:
             bound_intent = intent or _submission_intent.load_intent(
                 self.campaign_dir,
@@ -1518,6 +1571,22 @@ class Daemon:
                 int(state.iteration),
                 expected_campaign_uid=str(state.campaign_uid),
             )
+            if observed_mode == "unbound":
+                if bound_intent is None:
+                    return None
+                if (
+                    bound_intent.get("environment_generation") is not None
+                    or bound_intent.get(
+                        "environment_generation_digest_sha256"
+                    )
+                    is not None
+                ):
+                    raise ValueError(
+                        "unbound submission intent acquired an environment binding"
+                    )
+                return None
+            if bound_intent is None:
+                raise ValueError("submission intent is missing")
             if self._last_environment_binding is None:
                 raise ValueError("active environment binding is unavailable")
             intent_generation = bound_intent.get("environment_generation")
@@ -1557,7 +1626,6 @@ class Daemon:
         """Prove config, generation and decision identities before submission."""
         from ..execution_identity import (
             ExecutionIdentityError,
-            execution_identity_path,
             read_active_environment_generation,
         )
         from .config_lock import (
@@ -1566,10 +1634,14 @@ class Daemon:
             read_config_lock,
         )
 
-        identity_path = execution_identity_path(self.campaign_dir)
-        if not identity_path.exists() and not identity_path.is_symlink():
+        observed_mode = self._verify_execution_identity_binding(state)
+        if observed_mode == "unbound":
             # Preserve direct executor unit tests that intentionally have no
             # bound campaign execution identity.
+            if self._last_environment_binding is not None:
+                raise ExecutionIdentityError(
+                    "unbound daemon unexpectedly acquired an environment generation"
+                )
             return
         active = read_active_environment_generation(
             self.campaign_dir,
@@ -2130,7 +2202,16 @@ class Daemon:
                 intent_generation_digest = bound_intent.get(
                     "environment_generation_digest_sha256"
                 )
-                if (
+                if self._environment_binding_mode == "unbound":
+                    if (
+                        intent_generation is not None
+                        or intent_generation_digest is not None
+                    ):
+                        raise ValueError(
+                            "unbound submission intent environment binding changed "
+                            "during pre-submit staging"
+                        )
+                elif (
                     self._last_environment_binding is None
                     or intent_generation
                     != self._last_environment_binding["generation"]
@@ -5532,6 +5613,13 @@ class Daemon:
                 idle_streak += 1
             else:
                 idle_streak = 0
+            try:
+                state = read_state(self.state_path())
+                self._write_lease_heartbeat(state)
+            except Exception:
+                self._write_lease_heartbeat()
+            if max_ticks is not None and ticks >= max_ticks:
+                return 0
             poll = (
                 self.config.runtime.poll_interval_idle_seconds
                 if idle_streak >= 3
@@ -5541,9 +5629,4 @@ class Daemon:
                     else self.config.runtime.poll_interval_seconds
                 )
             )
-            try:
-                state = read_state(self.state_path())
-                self._write_lease_heartbeat(state)
-            except Exception:
-                self._write_lease_heartbeat()
             self.sleep_fn(float(poll))

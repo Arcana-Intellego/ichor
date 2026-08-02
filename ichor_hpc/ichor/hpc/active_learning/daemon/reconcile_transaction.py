@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ..strict_json import strict_json as json
 from .filesystem import campaign_owned_path, operational_path
-from .state import _fsync_parent_dir, atomic_write_json
+from .state import _fsync_file_descriptor, _fsync_parent_dir, atomic_write_json
 from ..versioning.versioned_directory import VersionedDirectory
 
 
@@ -883,6 +883,132 @@ def _commit_plan_states(campaign: Path, plan: Mapping[str, Any]) -> List[str]:
     return states
 
 
+def _reconcile_state_backup_contract(
+    campaign: Path,
+    transaction_payload: Mapping[str, Any],
+) -> Dict[str, Any]:
+    if int(transaction_payload.get("schema_version", 1)) != 2:
+        raise ValueError("exact reconcile state backups require transaction schema 2")
+    transaction_id = _required_text(
+        transaction_payload.get("transaction_id"), "reconcile transaction ID"
+    )
+    plan = transaction_payload.get("commit_plan")
+    if not isinstance(plan, Mapping):
+        raise ValueError("reconcile transaction commit plan is missing")
+    _verify_stable_authority(campaign, plan)
+    states = _commit_plan_states(campaign, plan)
+    if not states or any(state not in {"before", "after"} for state in states):
+        raise ValueError("reconcile authority matches neither recorded state")
+    state_record = plan.get("state")
+    if not isinstance(state_record, Mapping):
+        raise ValueError("reconcile commit state plan is missing")
+    before = state_record.get("before")
+    if not isinstance(before, Mapping):
+        raise ValueError("reconcile source-state evidence is missing")
+    if not bool(before.get("exists", False)):
+        return {"status": "not_required", "path": None, "bytes": None}
+    before_payload = before.get("payload")
+    if not isinstance(before_payload, Mapping):
+        raise ValueError("reconcile source-state payload is unavailable")
+    expected_bytes = _canonical_json_bytes(before_payload)
+    expected_sha = _required_text(
+        before.get("sha256"), "reconcile source-state SHA-256"
+    )
+    if hashlib.sha256(expected_bytes).hexdigest() != expected_sha:
+        raise ValueError("reconcile source-state payload digest is invalid")
+    if int(before.get("size", -1)) != len(expected_bytes):
+        raise ValueError("reconcile source-state payload size is invalid")
+    state_relative = _required_text(state_record.get("path"), "reconcile state path")
+    expected_relative = state_relative + ".before-reconcile-" + transaction_id
+    if str(state_record.get("backup_path") or "") != expected_relative:
+        raise ValueError("reconcile state backup path is not transaction-scoped")
+    target = campaign_owned_path(campaign, campaign / Path(expected_relative))
+    temporary = campaign_owned_path(
+        campaign,
+        target.with_name("." + target.name + ".publishing"),
+    )
+    for candidate, label in ((target, "backup"), (temporary, "backup temporary file")):
+        if candidate.is_symlink():
+            raise ValueError("reconcile state " + label + " is a symlink")
+        if candidate.exists() and not candidate.is_file():
+            raise ValueError("reconcile state " + label + " is not a regular file")
+    if target.is_file() and _file_sha256(target) == expected_sha:
+        status = "valid"
+    elif target.is_file():
+        status = "repairable_partial"
+    else:
+        status = "absent"
+    return {
+        "status": status,
+        "path": target,
+        "temporary_path": temporary,
+        "bytes": expected_bytes,
+        "sha256": expected_sha,
+    }
+
+
+def inspect_reconcile_state_backup(
+    campaign_dir: Path,
+    transaction_payload: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Classify the deterministic v2 state backup without changing it."""
+    campaign = Path(campaign_dir).resolve()
+    contract = _reconcile_state_backup_contract(campaign, transaction_payload)
+    return {
+        key: value
+        for key, value in contract.items()
+        if key not in {"bytes", "temporary_path"}
+    }
+
+
+def publish_reconcile_state_backup(
+    campaign_dir: Path,
+    transaction: "ReconcileTransaction",
+) -> Optional[Path]:
+    """Publish or repair one exact schema-v2 state backup atomically."""
+    campaign = Path(campaign_dir).resolve()
+    contract = _reconcile_state_backup_contract(campaign, transaction.payload)
+    if contract["status"] == "not_required":
+        return None
+    target = Path(contract["path"])
+    if contract["status"] == "valid":
+        return target
+    temporary = Path(contract["temporary_path"])
+    if temporary.exists():
+        temporary.unlink()
+        _fsync_parent_dir(temporary)
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(bytes(contract["bytes"]))
+            handle.flush()
+            _fsync_file_descriptor(handle.fileno())
+        if _file_sha256(temporary) != str(contract["sha256"]):
+            raise ValueError("reconcile state backup temporary digest mismatch")
+        os.replace(temporary, target)
+        _fsync_parent_dir(target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+            _fsync_parent_dir(temporary)
+    if _file_sha256(target) != str(contract["sha256"]):
+        raise ValueError("reconcile state backup publication did not converge")
+    return target
+
+
+def _discard_reconcile_state_backup_temporary(
+    campaign: Path,
+    transaction_payload: Mapping[str, Any],
+) -> None:
+    """Remove only the authenticated transaction's interrupted temp file."""
+    contract = _reconcile_state_backup_contract(campaign, transaction_payload)
+    if contract["status"] == "not_required":
+        return
+    temporary = Path(contract["temporary_path"])
+    if temporary.exists():
+        temporary.unlink()
+        _fsync_parent_dir(temporary)
+
+
 def _read_current_state(campaign: Path) -> Optional[Any]:
     from .state import read_state
 
@@ -1303,6 +1429,15 @@ def inspect_reconcile_transaction_recovery(
             "reason": "commit evidence is inconsistent: " + str(exc),
         }
     if all(value == "after" for value in states):
+        try:
+            backup = inspect_reconcile_state_backup(campaign, payload)
+        except Exception as exc:
+            return {
+                **common,
+                "state": "blocked",
+                "recoverable": False,
+                "reason": "state backup evidence is unsafe: " + str(exc),
+            }
         valid, reason = _v2_target_contract_is_valid(campaign, payload)
         if not valid:
             return {
@@ -1315,16 +1450,43 @@ def inspect_reconcile_transaction_recovery(
             **common,
             "action": "adopt",
             "disposition": "adopted_committed_state",
-            "reason": "all recorded campaign changes were published",
+            "reason": (
+                "all recorded campaign changes were published"
+                + (
+                    "; its interrupted state backup will be repaired"
+                    if backup.get("status") in {"absent", "repairable_partial"}
+                    else ""
+                )
+            ),
+            "state_backup_status": str(backup.get("status") or ""),
         }
     if all(value == "before" for value in states):
+        try:
+            backup = inspect_reconcile_state_backup(campaign, payload)
+        except Exception as exc:
+            return {
+                **common,
+                "state": "blocked",
+                "recoverable": False,
+                "reason": "state backup evidence is unsafe: " + str(exc),
+            }
         return {
             **common,
             "action": "abandon",
             "disposition": "rolled_back_exactly",
             "reason": "no recorded authoritative campaign change was published",
+            "state_backup_status": str(backup.get("status") or ""),
         }
     if all(value in {"before", "after"} for value in states):
+        try:
+            backup = inspect_reconcile_state_backup(campaign, payload)
+        except Exception as exc:
+            return {
+                **common,
+                "state": "blocked",
+                "recoverable": False,
+                "reason": "state backup evidence is unsafe: " + str(exc),
+            }
         valid, reason = _v2_target_contract_is_valid(campaign, payload)
         if not valid:
             return {
@@ -1337,7 +1499,16 @@ def inspect_reconcile_transaction_recovery(
             **common,
             "action": "roll_forward",
             "disposition": "rolled_forward",
-            "reason": "a partially published recovery can be completed from exact transaction evidence",
+            "reason": (
+                "a partially published recovery can be completed from exact "
+                "transaction evidence"
+                + (
+                    "; its interrupted state backup will be repaired"
+                    if backup.get("status") == "repairable_partial"
+                    else ""
+                )
+            ),
+            "state_backup_status": str(backup.get("status") or ""),
         }
     return {
         **common,
@@ -1348,6 +1519,10 @@ def inspect_reconcile_transaction_recovery(
 
 
 def _archive_orphan_temp(campaign: Path, source: Path, transaction_id: str) -> Path:
+    payload = _read_atomic_transaction_temp(source)
+    full_transaction_id = str(payload["transaction_id"])
+    if str(transaction_id) != full_transaction_id:
+        raise ValueError("reconcile transaction orphan identity changed")
     root = operational_path(campaign, "reconcile_transaction_orphans")
     root.mkdir(parents=True, exist_ok=True)
     if root.is_symlink() or not root.is_dir():
@@ -1357,12 +1532,49 @@ def _archive_orphan_temp(campaign: Path, source: Path, transaction_id: str) -> P
     except OSError as exc:
         raise OSError("could not secure reconcile transaction orphan archive") from exc
     digest = _file_sha256(source)
+
+    def _matching_archive(candidate: Path) -> bool:
+        if candidate.is_symlink() or not candidate.is_file():
+            return False
+        if _file_sha256(candidate) != digest:
+            return False
+        try:
+            archived_payload = json.loads(
+                candidate.read_text(encoding="utf-8"),
+                source=candidate,
+            )
+            _validate_transaction_payload(archived_payload)
+        except (OSError, ValueError):
+            return False
+        return str(archived_payload.get("transaction_id") or "") == full_transaction_id
+
+    # The legacy name may itself exceed the Windows path limit.  ``root`` is
+    # already campaign-owned and both identity components are validated hex.
+    legacy_target = root / (full_transaction_id + "-" + digest + ".json.part")
+    try:
+        legacy_exists = legacy_target.exists() or legacy_target.is_symlink()
+    except OSError:
+        legacy_exists = False
+    if legacy_exists:
+        if not _matching_archive(legacy_target):
+            raise ValueError("legacy reconcile transaction orphan archive conflicts")
+        source.unlink()
+        _fsync_parent_dir(source)
+        return legacy_target
+
     target = campaign_owned_path(
         campaign,
-        root / (str(transaction_id) + "-" + digest + ".json.part"),
+        root
+        / (
+            "o-"
+            + full_transaction_id[:12]
+            + "-"
+            + digest[:16]
+            + ".json.part"
+        ),
     )
-    if target.exists():
-        if target.is_symlink() or not target.is_file() or _file_sha256(target) != digest:
+    if target.exists() or target.is_symlink():
+        if not _matching_archive(target):
             raise ValueError("reconcile transaction orphan archive conflicts")
         source.unlink()
         _fsync_parent_dir(source)
@@ -1475,26 +1687,15 @@ def _roll_forward_v2_commit(
         campaign,
         campaign / Path(str(state_record["path"])),
     )
+    before = state_record.get("before")
+    if not isinstance(before, Mapping):
+        raise ValueError("reconcile source-state evidence is missing")
+    if bool(before.get("exists", False)):
+        publish_reconcile_state_backup(campaign, transaction)
     observed_state = snapshot_small_file(campaign, state_path)
     if observed_state.get("sha256") != state_record.get("after_sha256"):
-        before = state_record.get("before")
-        if not isinstance(before, Mapping) or not _snapshot_matches(campaign, before):
+        if not _snapshot_matches(campaign, before):
             raise ValueError("campaign state matches neither recorded before nor after state")
-        backup = campaign_owned_path(
-            campaign,
-            campaign / Path(str(state_record["backup_path"])),
-        )
-        if bool(before.get("exists", False)):
-            before_payload = before.get("payload")
-            if not isinstance(before_payload, dict):
-                raise ValueError("reconcile source-state payload is unavailable")
-            if backup.exists():
-                if backup.is_symlink() or not backup.is_file():
-                    raise ValueError("reconcile state backup is unsafe")
-                if _file_sha256(backup) != str(before.get("sha256") or ""):
-                    raise ValueError("reconcile state backup digest mismatch")
-            else:
-                atomic_write_json(backup, before_payload)
         after_payload = state_record.get("after_payload")
         if not isinstance(after_payload, dict):
             raise ValueError("reconcile target-state payload is unavailable")
@@ -1638,12 +1839,19 @@ def apply_reconcile_transaction_recovery(
             reason=reason,
         )
     elif action == "adopt":
+        if int(payload.get("schema_version", 1)) == 2:
+            publish_reconcile_state_backup(campaign, transaction)
         transaction.resolve(
             status="COMMITTED",
             disposition=disposition,
             reason=reason,
         )
     elif action == "abandon":
+        if (
+            int(payload.get("schema_version", 1)) == 2
+            and isinstance(payload.get("commit_plan"), Mapping)
+        ):
+            _discard_reconcile_state_backup_temporary(campaign, payload)
         transaction.resolve(
             status="FAILED",
             disposition=disposition,
@@ -1660,6 +1868,9 @@ def apply_reconcile_transaction_recovery(
         "reason": reason,
         "phase": str(payload["proposed_phase"]),
         "iteration": int(payload["proposed_iteration"]),
+        "state_backup_status": str(
+            inspection.get("state_backup_status") or ""
+        ),
         "requires_reinspection": True,
     }
 
@@ -1729,9 +1940,11 @@ __all__ = [
     "begin_reconcile_transaction",
     "build_reconcile_commit_plan",
     "inspect_reconcile_transaction_recovery",
+    "inspect_reconcile_state_backup",
     "inventory_reconcile_transactions",
     "publish_reconcile_config_target",
     "publish_reconcile_intent_target",
+    "publish_reconcile_state_backup",
     "read_reconcile_transaction",
     "restore_version_pointer",
     "snapshot_small_file",

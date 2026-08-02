@@ -16,6 +16,161 @@ _TERMINAL_RECOVERY_STATES = frozenset(
 _CONFIG_REVIEW_STATES = frozenset(
     {"unchanged", "allowed", "blocked", "invalid", "unavailable"}
 )
+_ENVIRONMENT_DISPOSITIONS = frozenset(
+    {
+        "unbound_first_start",
+        "current",
+        "rebindable_on_resume",
+        "reconcile_required",
+        "invalid",
+        "ownership_blocked",
+    }
+)
+
+
+@dataclass(frozen=True)
+class EnvironmentLaunchAssessment:
+    """Authenticated environment-generation evidence used for launch advice."""
+
+    disposition: str
+    reason: str
+    generation: int
+
+    @property
+    def launchable(self) -> bool:
+        return self.disposition in {
+            "unbound_first_start",
+            "current",
+            "rebindable_on_resume",
+        }
+
+    @property
+    def advances_on_resume(self) -> bool:
+        return self.disposition == "rebindable_on_resume"
+
+    @property
+    def requires_reconcile(self) -> bool:
+        return self.disposition == "reconcile_required"
+
+
+@dataclass(frozen=True)
+class ReconcileLaunchAssessment:
+    """Whether interrupted reconcile evidence permits campaign launch."""
+
+    disposition: str
+    reason: str
+    state_backup_status: str
+
+    @property
+    def launchable(self) -> bool:
+        return self.disposition == "none"
+
+    @property
+    def requires_reconcile(self) -> bool:
+        return self.disposition == "recoverable"
+
+
+@dataclass(frozen=True)
+class OperatorFailureAssessment:
+    """Plain-language classification of an internal operator-facing failure."""
+
+    family: str
+    summary: str
+    action: str
+
+
+def classify_operator_failure(value: Any) -> OperatorFailureAssessment:
+    """Classify implementation and backend failures without exposing internals."""
+    text = " ".join(str(value or "").split())
+    upper = text.upper()
+    if any(
+        token in upper
+        for token in (
+            "ICHOR PACKAGE TREE HAS DRIFTED",
+            "ICHOR PACKAGE-TREE HAS DRIFTED",
+            "ICHOR SOURCE",
+            "SOURCE TREE HAS DRIFTED",
+        )
+    ):
+        return OperatorFailureAssessment(
+            family="ichor_source_drift",
+            summary="the installed ICHOR code differs from the recorded producer code",
+            action=(
+                "stop active work, reinstall the current ICHOR checkout, then "
+                "preview reconcile"
+            ),
+        )
+    if "ARIADNE" in upper and any(
+        token in upper
+        for token in ("NATIVE CODE HAS DRIFTED", "NATIVE MODULE", "ABI")
+    ):
+        return OperatorFailureAssessment(
+            family="ariadne_native_drift",
+            summary="the installed ARIADNE native module differs from the recorded producer",
+            action=(
+                "rebuild and reinstall ARIADNE in the configured environment, "
+                "then preview reconcile"
+            ),
+        )
+    if any(
+        token in upper
+        for token in (
+            "DEPENDENCY ENVIRONMENT HAS DRIFTED",
+            "DEPENDENCY_ENVIRONMENT_CHANGED",
+            "PYTHON DEPENDENC",
+            "PYTHON ENVIRONMENT HAS DRIFTED",
+        )
+    ):
+        return OperatorFailureAssessment(
+            family="dependency_environment_drift",
+            summary="the configured Python dependency environment differs from the recorded producer",
+            action=(
+                "restore or reinstall the configured Python environment, then "
+                "preview reconcile"
+            ),
+        )
+    if any(
+        token in upper
+        for token in (
+            "IDENTITY KIND IS UNSUPPORTED",
+            "IDENTITY KIND IS INVALID",
+            "LEGACY IDENTITY",
+            "LEGACY EVIDENCE",
+            "PRODUCER EQUIVALENCE",
+            "IMPLEMENTATION IDENTITY IS INCOMPLETE",
+        )
+    ):
+        return OperatorFailureAssessment(
+            family="legacy_identity_insufficient",
+            summary="the historical implementation evidence is insufficient to prove output reuse",
+            action=(
+                "preview reconcile; affected tasks may need retry, but the "
+                "campaign is not corrupted"
+            ),
+        )
+    if any(
+        token in upper
+        for token in (
+            "BACKEND",
+            "EXECUTABLE IS NOT",
+            "EXECUTABLE WAS NOT",
+            "EXECUTABLE MISSING",
+            "MACHINE PROFILE",
+            "CLUSTER PROFILE",
+            "MODULE STACK",
+            "MODULE SETUP",
+        )
+    ):
+        return OperatorFailureAssessment(
+            family="backend_profile_failure",
+            summary="the configured backend or machine profile could not be used",
+            action="fix the configured backend or profile problem, then preview reconcile",
+        )
+    return OperatorFailureAssessment(
+        family="unknown",
+        summary="the campaign stopped because an operation could not be completed safely",
+        action="preview reconcile and inspect the technical evidence",
+    )
 
 
 def config_review_evidence(
@@ -104,6 +259,8 @@ class CampaignPresentationAssessment:
     """Normalised facts shared by status, preflight and reconcile wording."""
 
     scheduler: SchedulerWorkAssessment
+    environment: EnvironmentLaunchAssessment
+    reconcile: ReconcileLaunchAssessment
     config_state: str
     config_allowed_count: int
     config_blocked_count: int
@@ -116,6 +273,82 @@ class CampaignPresentationAssessment:
     @property
     def config_blocks_progress(self) -> bool:
         return self.config_state in {"blocked", "invalid"}
+
+    @property
+    def launch_evidence_ready(self) -> bool:
+        return self.environment.launchable and self.reconcile.launchable
+
+
+def _environment_launch_assessment(
+    payload: Mapping[str, Any],
+) -> EnvironmentLaunchAssessment:
+    evidence = payload.get("_presentation_environment_generation")
+    if not isinstance(evidence, Mapping):
+        return EnvironmentLaunchAssessment(
+            disposition="invalid",
+            reason="execution environment evidence is unavailable",
+            generation=-1,
+        )
+    disposition = str(evidence.get("disposition") or "")
+    if not disposition:
+        if evidence.get("error"):
+            disposition = "invalid"
+        elif evidence.get("config_matches") is True:
+            disposition = "current"
+        elif evidence.get("config_matches") is False:
+            disposition = "reconcile_required"
+        else:
+            disposition = "invalid"
+    if disposition not in _ENVIRONMENT_DISPOSITIONS:
+        disposition = "invalid"
+    try:
+        generation = int(evidence.get("generation", -1))
+    except (TypeError, ValueError):
+        generation = -1
+        disposition = "invalid"
+    reason = str(
+        evidence.get("reason")
+        or evidence.get("error")
+        or {
+            "unbound_first_start": "the fresh campaign will create its first execution identity",
+            "current": "the active environment generation matches the campaign configuration",
+            "rebindable_on_resume": (
+                "startup can safely create a generation bound to the current configuration"
+            ),
+            "reconcile_required": "campaign recovery is required before the environment can advance",
+            "invalid": "execution environment evidence is invalid",
+            "ownership_blocked": "active or uncertain ownership prevents an environment transition",
+        }[disposition]
+    )
+    return EnvironmentLaunchAssessment(
+        disposition=disposition,
+        reason=reason,
+        generation=generation,
+    )
+
+
+def _reconcile_launch_assessment(
+    payload: Mapping[str, Any],
+) -> ReconcileLaunchAssessment:
+    evidence = payload.get("_presentation_reconcile_transaction_recovery")
+    if not isinstance(evidence, Mapping):
+        return ReconcileLaunchAssessment(
+            disposition="none",
+            reason="",
+            state_backup_status="",
+        )
+    state = str(evidence.get("state") or "")
+    if state in {"", "none", "recovered"}:
+        disposition = "none"
+    elif state == "recoverable" and bool(evidence.get("recoverable", False)):
+        disposition = "recoverable"
+    else:
+        disposition = "blocked"
+    return ReconcileLaunchAssessment(
+        disposition=disposition,
+        reason=str(evidence.get("reason") or ""),
+        state_backup_status=str(evidence.get("state_backup_status") or ""),
+    )
 
 
 def _matches_current_state(
@@ -259,6 +492,8 @@ def assess_campaign_presentation(
             retry_tasks=retry_tasks,
             reusable_outputs=reusable_outputs,
         ),
+        environment=_environment_launch_assessment(payload),
+        reconcile=_reconcile_launch_assessment(payload),
         config_state=config_state,
         config_allowed_count=config_allowed_count,
         config_blocked_count=config_blocked_count,
@@ -268,8 +503,12 @@ def assess_campaign_presentation(
 
 __all__ = [
     "CampaignPresentationAssessment",
+    "EnvironmentLaunchAssessment",
+    "OperatorFailureAssessment",
+    "ReconcileLaunchAssessment",
     "SchedulerWorkAssessment",
     "assess_campaign_presentation",
+    "classify_operator_failure",
     "config_review_evidence",
     "invalid_config_review_evidence",
 ]

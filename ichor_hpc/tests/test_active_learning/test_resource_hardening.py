@@ -660,6 +660,36 @@ def test_resource_package_identity_ignores_editable_namespace_hooks(monkeypatch)
     assert _ichor_package_tree_sha256() == baseline
 
 
+def test_ariadne_resource_identity_detects_native_backend_drift(
+    tmp_path,
+    monkeypatch,
+):
+    import ichor.hpc.active_learning.execution_identity as identity_module
+
+    native_identity = {
+        "module": "_ariadne",
+        "path": None,
+        "size": None,
+        "sha256": "a" * 64,
+    }
+    monkeypatch.setattr(
+        identity_module,
+        "_ariadne_identity",
+        lambda: dict(native_identity),
+    )
+    identity = capture_implementation_identity(tmp_path, backend="ariadne")
+
+    verify_implementation_identity(identity)
+    monkeypatch.setattr(
+        identity_module,
+        "_ariadne_identity",
+        lambda: {**native_identity, "sha256": "b" * 64},
+    )
+
+    with pytest.raises(ValueError, match="ARIADNE native code has drifted"):
+        verify_implementation_identity(identity)
+
+
 def test_legacy_resource_identity_uses_authenticated_generation_fallback(
     tmp_path,
 ):

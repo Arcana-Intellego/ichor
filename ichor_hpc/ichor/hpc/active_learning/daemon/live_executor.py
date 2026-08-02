@@ -4223,6 +4223,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             resource_resolution_path=str(resolution_binding["path"]),
             resource_resolution_sha256=str(resolution_binding["sha256"]),
             resource_evidence_mode=resource_evidence_mode,
+            gradient_dimension_source=resolution_evidence.get(
+                "gradient_dimension_source"
+            ),
+            gradient_dimension=resolution_evidence.get("gradient_dimension"),
             resource_evidence_source_submission_identity=(
                 None
                 if resource_evidence_source is None

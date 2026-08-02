@@ -22,6 +22,10 @@ def test_ariadne_resource_progress_stages_have_explicit_human_labels():
         == "Computing ARIADNE local subspace dimensions"
     )
     assert (
+        format_progress_stage("ariadne_resource_bound")
+        == "Applying configured ARIADNE resource bound"
+    )
+    assert (
         format_progress_stage("ariadne_resource_reuse")
         == "Reusing validated ARIADNE resource evidence"
     )

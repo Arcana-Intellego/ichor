@@ -15,7 +15,10 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from .state import CampaignPhase
 from .lease import evaluate_lease_liveness
-from .presentation_assessment import assess_campaign_presentation
+from .presentation_assessment import (
+    assess_campaign_presentation,
+    classify_operator_failure,
+)
 
 
 @dataclass
@@ -406,6 +409,40 @@ def _reconcile_transaction_recommendation(
             command=_reconcile_cmd(campaign),
         )
     return None
+
+
+def _environment_launch_recommendation(
+    campaign: Path,
+    payload: Dict[str, Any],
+) -> Optional[StatusRecommendation]:
+    if "_presentation_environment_generation" not in payload:
+        return None
+    if _daemon_is_active(payload):
+        return None
+    environment = assess_campaign_presentation(payload).environment
+    if environment.disposition in {
+        "current",
+        "unbound_first_start",
+        "rebindable_on_resume",
+        "ownership_blocked",
+    }:
+        return None
+    if environment.disposition == "reconcile_required":
+        return StatusRecommendation(
+            code="execution_identity_unavailable",
+            severity="required",
+            primary="preview recovery before restarting the campaign",
+            why=environment.reason,
+            command=_reconcile_cmd(campaign),
+        )
+    return StatusRecommendation(
+        code="execution_identity_unavailable",
+        severity="blocked",
+        primary="preview recovery before restarting; the execution environment evidence is invalid",
+        why=environment.reason,
+        command=_reconcile_cmd(campaign),
+        details=[_cmd(campaign, "status") + " --verbose"],
+    )
 
 
 def _config_review_recommendation(
@@ -866,19 +903,18 @@ def _halt_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecom
                 ),
                 command=_reconcile_cmd(campaign),
             )
-        if "RESOURCE IMPLEMENTATION ICHOR PACKAGE TREE HAS DRIFTED" in upper:
+        failure = classify_operator_failure(reason)
+        if failure.family in {
+            "ichor_source_drift",
+            "ariadne_native_drift",
+            "dependency_environment_drift",
+            "legacy_identity_insufficient",
+        }:
             return StatusRecommendation(
                 code="halted_backend_submission_failed",
                 severity="required",
-                primary=(
-                    "ensure all daemon and "
-                    + _scheduler_name(payload)
-                    + " work is stopped, reinstall the "
-                    "current ICHOR checkout, then preview recovery"
-                ),
-                why=(
-                    "the editable ICHOR installation changed after this work was prepared"
-                ),
+                primary=failure.action,
+                why=failure.summary,
                 command=_reconcile_cmd(campaign),
             )
         if "RESOURCE EVIDENCE" in upper or "HANDOFF" in upper:
@@ -1184,20 +1220,27 @@ def _phase_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusReco
             )
         if mode is not None:
             primary = primary.replace("start the daemon", "resume the daemon")
+        environment = assess_campaign_presentation(payload).environment
+        details = (
+            [
+                _cmd(campaign, "start") + " --mode dry_run",
+                "choose live only after preflight passes",
+            ]
+            if phase == CampaignPhase.INIT.value and mode is None
+            else []
+        )
+        if environment.advances_on_resume:
+            details.append(
+                "startup will create a correctly bound environment generation "
+                "before scientific work begins"
+            )
         return StatusRecommendation(
             code="phase_" + phase.lower() + "_ready",
             severity="info",
             primary=primary,
             why=why,
             command=_phase_command(campaign, payload),
-            details=(
-                [
-                    _cmd(campaign, "start") + " --mode dry_run",
-                    "choose live only after preflight passes",
-                ]
-                if phase == CampaignPhase.INIT.value and mode is None
-                else []
-            ),
+            details=details,
         )
     return StatusRecommendation(
         code="phase_unknown",
@@ -1410,9 +1453,6 @@ def build_status_recommendations(
     if scheduler_uncertain is not None:
         return [scheduler_uncertain] + stale_pid
 
-    if _phase(payload) == CampaignPhase.HALTED.value:
-        return [_halt_recommendation(campaign, payload)] + stale_pid
-
     stop_disposition = payload.get("_presentation_stop_disposition")
     if (
         isinstance(stop_disposition, Mapping)
@@ -1438,6 +1478,15 @@ def build_status_recommendations(
     if allocation_transition is not None:
         return [allocation_transition] + stale_pid
 
+    if _phase(payload) == CampaignPhase.HALTED.value:
+        environment_recommendation = _environment_launch_recommendation(
+            campaign,
+            payload,
+        )
+        if environment_recommendation is not None:
+            return [environment_recommendation] + stale_pid
+        return [_halt_recommendation(campaign, payload)] + stale_pid
+
     if _state_contract_problem(payload):
         return [_contract_recommendation(campaign, payload)] + stale_pid
 
@@ -1447,6 +1496,13 @@ def build_status_recommendations(
     config_review = _config_review_recommendation(campaign, payload)
     if config_review is not None:
         return [config_review] + stale_pid
+
+    environment_recommendation = _environment_launch_recommendation(
+        campaign,
+        payload,
+    )
+    if environment_recommendation is not None:
+        return [environment_recommendation] + stale_pid
 
     scheduler_recovery = _scheduler_recovery_recommendation(campaign, payload)
     if scheduler_recovery is not None:

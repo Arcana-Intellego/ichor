@@ -30,6 +30,8 @@ EXECUTION_IDENTITY_SCHEMA_VERSION = 1
 ENVIRONMENT_GENERATION_SCHEMA_VERSION = 1
 ENVIRONMENT_CURRENT_SCHEMA_VERSION = 1
 VALID_EXECUTION_MODES = frozenset({"live", "dry_run"})
+ICHOR_PACKAGE_TREE_IDENTITY_KIND_V1 = "explicit_import_origins_v1"
+ICHOR_PACKAGE_TREE_IDENTITY_KIND = "explicit_import_origins_v2"
 
 _REBINDABLE_REFERENCE_COMMIT_STATES = frozenset(
     {
@@ -1035,7 +1037,7 @@ _ENVIRONMENT_FINGERPRINT_KEYS = (
     "native_library_paths",
     "campaign_schema_version",
 )
-_ENVIRONMENT_GENERATION_KEYS = frozenset({
+_ENVIRONMENT_GENERATION_LEGACY_KEYS = frozenset({
     "schema_version",
     "generation",
     "campaign_uid",
@@ -1060,6 +1062,9 @@ _ENVIRONMENT_GENERATION_KEYS = frozenset({
     "environment_fingerprint_sha256",
     "digest_sha256",
 })
+_ENVIRONMENT_GENERATION_KEYS = frozenset(
+    {*_ENVIRONMENT_GENERATION_LEGACY_KEYS, "ichor_package_tree_identity_kind"}
+)
 _EXECUTION_IDENTITY_KEYS = frozenset({
     "schema_version",
     "campaign_uid",
@@ -1111,7 +1116,14 @@ def _environment_fingerprint_payload(payload: Mapping[str, Any]) -> Dict[str, An
     than execution identity, so they must not make a login-node restart look
     like software drift.
     """
-    return {key: payload.get(key) for key in _ENVIRONMENT_FINGERPRINT_KEYS}
+    value = {key: payload.get(key) for key in _ENVIRONMENT_FINGERPRINT_KEYS}
+    # The marker is additive to schema 1.  Omitting it from historical payloads
+    # preserves their already-published fingerprint and generation digest.
+    if "ichor_package_tree_identity_kind" in payload:
+        value["ichor_package_tree_identity_kind"] = payload.get(
+            "ichor_package_tree_identity_kind"
+        )
+    return value
 
 
 def _environment_fingerprint(payload: Mapping[str, Any]) -> str:
@@ -1162,6 +1174,10 @@ def _generation_changed_fields(
         "campaign_config_sha256"
     ):
         fields.append("campaign_config_sha256")
+    if expected.get("ichor_package_tree_identity_kind") != observed.get(
+        "ichor_package_tree_identity_kind"
+    ):
+        fields.append("ichor_package_tree_identity_kind")
     return fields
 
 
@@ -1225,7 +1241,7 @@ def _sha256_file(path: Path) -> Optional[str]:
     return digest.hexdigest()
 
 
-def _tree_hash(roots: Iterable[Path]) -> str:
+def _tree_hash_v1(roots: Iterable[Path]) -> str:
     """Return a bounded source identity without traversing package trees."""
     resolved_roots = sorted(
         {path.resolve() for path in roots if path.exists()},
@@ -1283,6 +1299,137 @@ def _tree_hash(roots: Iterable[Path]) -> str:
     return hashlib.sha256(
         json.dumps(
             payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+_IDENTITY_CACHE_DIRECTORY_NAMES = frozenset(
+    {
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+    }
+)
+_IDENTITY_CACHE_FILE_SUFFIXES = frozenset({".pyc", ".pyo"})
+
+
+def _package_file_closure(root: Path) -> List[Dict[str, Any]]:
+    """Hash every installed package payload without following links."""
+    source_root = Path(root)
+    if source_root.is_symlink():
+        raise ExecutionIdentityError(
+            "package identity root must not be a symlink: " + str(source_root)
+        )
+    resolved_root = source_root.resolve()
+    if not resolved_root.is_dir():
+        raise ExecutionIdentityError(
+            "package identity root is not a directory: " + str(resolved_root)
+        )
+    records: List[Dict[str, Any]] = []
+    pending = [resolved_root]
+    while pending:
+        directory = pending.pop()
+        try:
+            children = sorted(directory.iterdir(), key=lambda item: item.name)
+        except OSError as exc:
+            raise ExecutionIdentityError(
+                "package identity directory is unreadable: " + str(directory)
+            ) from exc
+        for child in children:
+            if child.is_symlink():
+                raise ExecutionIdentityError(
+                    "package identity contains a symlink: " + str(child)
+                )
+            relative = child.relative_to(resolved_root)
+            if child.is_dir():
+                if child.name not in _IDENTITY_CACHE_DIRECTORY_NAMES:
+                    pending.append(child)
+                continue
+            if not child.is_file():
+                raise ExecutionIdentityError(
+                    "package identity contains a special file: " + str(child)
+                )
+            if child.suffix.casefold() in _IDENTITY_CACHE_FILE_SUFFIXES:
+                continue
+            resolved_child = child.resolve()
+            try:
+                resolved_child.relative_to(resolved_root)
+            except ValueError as exc:
+                raise ExecutionIdentityError(
+                    "package identity file escapes its import root: " + str(child)
+                ) from exc
+            digest = _sha256_file(child)
+            if digest is None:
+                raise ExecutionIdentityError(
+                    "package identity file cannot be hashed: " + str(child)
+                )
+            records.append(
+                {
+                    "path": relative.as_posix(),
+                    "size": int(child.stat().st_size),
+                    "sha256": digest,
+                }
+            )
+    return sorted(records, key=lambda record: str(record["path"]))
+
+
+def _tree_hash(
+    roots: Iterable[Path],
+    *,
+    logical_roots: Optional[Mapping[Path, str]] = None,
+) -> str:
+    """Return a path-stable byte closure for explicit package import roots."""
+    resolved_root_set = set()
+    for raw_root in roots:
+        root = Path(raw_root)
+        if not root.exists():
+            continue
+        if root.is_symlink():
+            raise ExecutionIdentityError(
+                "package identity root must not be a symlink: " + str(root)
+            )
+        resolved_root_set.add(root.resolve())
+    resolved_roots = sorted(resolved_root_set, key=lambda item: str(item))
+    root_records = []
+    observed_logical_roots = set()
+    for root in resolved_roots:
+        raw_logical_root = (
+            logical_roots.get(root) if logical_roots is not None else root.name
+        )
+        if not isinstance(raw_logical_root, str) or not raw_logical_root:
+            raise ExecutionIdentityError(
+                "package identity logical root is missing for " + str(root)
+            )
+        logical_root = raw_logical_root
+        if logical_root in observed_logical_roots:
+            raise ExecutionIdentityError(
+                "package identity contains a duplicate logical root: "
+                + repr(logical_root)
+            )
+        observed_logical_roots.add(logical_root)
+        root_records.append(
+            {
+                "logical_root": logical_root,
+                "files": _package_file_closure(root),
+            }
+        )
+    root_records.sort(
+        key=lambda record: json.dumps(
+            record,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+    )
+    return hashlib.sha256(
+        json.dumps(
+            {"identity_kind": ICHOR_PACKAGE_TREE_IDENTITY_KIND, "roots": root_records},
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=True,
@@ -1358,25 +1505,45 @@ def _git_repository_root(path: Path) -> Optional[Path]:
 
 def _ichor_package_roots() -> List[Path]:
     """Locate installed package roots without assuming an editable checkout."""
-    roots = set()
+    return sorted(_ichor_package_import_origins(), key=lambda value: str(value))
+
+
+def _ichor_package_import_origins() -> Dict[Path, str]:
+    """Map each physical ICHOR import root to stable logical namespaces."""
+    roots: Dict[Path, List[str]] = {}
     for import_name in ("ichor.core", "ichor.hpc", "ichor.cli"):
         spec = importlib.util.find_spec(import_name)
         if spec is None or spec.origin is None:
             continue
         origin = Path(spec.origin).resolve()
         if origin.name == "__init__.py" and len(origin.parents) >= 2:
-            roots.add(origin.parents[1])
+            root = origin.parents[1]
         else:
-            roots.add(origin.parent)
-    return sorted(roots, key=lambda value: str(value))
+            root = origin.parent
+        roots.setdefault(root, []).append(import_name)
+    return {
+        root: "+".join(sorted(import_names))
+        for root, import_names in roots.items()
+    }
 
 
-def ichor_package_tree_sha256() -> str:
+def ichor_package_tree_sha256(
+    *, identity_kind: str = ICHOR_PACKAGE_TREE_IDENTITY_KIND
+) -> str:
     """Return a process-stable identity for the installed ICHOR packages."""
     roots = _ichor_package_roots()
     if not roots:
         raise ExecutionIdentityError("ICHOR package roots cannot be inspected")
-    return _tree_hash(roots)
+    if identity_kind == ICHOR_PACKAGE_TREE_IDENTITY_KIND:
+        return _tree_hash(
+            roots,
+            logical_roots=_ichor_package_import_origins(),
+        )
+    if identity_kind == ICHOR_PACKAGE_TREE_IDENTITY_KIND_V1:
+        return _tree_hash_v1(roots)
+    raise ExecutionIdentityError(
+        "unsupported ICHOR package-tree identity kind: " + str(identity_kind)
+    )
 
 
 def _distribution_version(name: str) -> Optional[str]:
@@ -1402,6 +1569,11 @@ def _module_identity(name: str) -> Dict[str, Any]:
     return {
         "module": name,
         "path": None if file_path is None else str(file_path),
+        "size": (
+            None
+            if file_path is None or not file_path.is_file() or file_path.is_symlink()
+            else int(file_path.stat().st_size)
+        ),
         "sha256": None if file_path is None else _sha256_file(file_path),
         "package_tree_sha256": (
             None if not package_roots else _tree_hash(package_roots)
@@ -1420,6 +1592,7 @@ def _json_safe_probe(value: Any) -> Any:
 
 def _ariadne_identity() -> Dict[str, Any]:
     identity = _module_identity("ariadne")
+    identity["native_extension"] = _module_identity("_ariadne")
     identity["import_ok"] = False
     identity["abi_probe"] = None
     identity["abi_probe_error"] = None
@@ -1542,6 +1715,7 @@ def capture_environment_generation(
         "python_version": platform.python_version(),
         "ichor_git": git_identity,
         "ichor_package_tree_sha256": ichor_package_tree_sha256(),
+        "ichor_package_tree_identity_kind": ICHOR_PACKAGE_TREE_IDENTITY_KIND,
         "dependencies": _installed_dependencies(),
         "pyferebus": _module_identity("pyferebus"),
         "ariadne": _ariadne_identity(),
@@ -1585,11 +1759,12 @@ def _validate_generation_payload(
     expected_campaign_uid: str,
     path: Path,
 ) -> Dict[str, Any]:
-    _require_exact_keys(
-        payload,
-        _ENVIRONMENT_GENERATION_KEYS,
-        "environment generation",
+    expected_keys = (
+        _ENVIRONMENT_GENERATION_KEYS
+        if "ichor_package_tree_identity_kind" in payload
+        else _ENVIRONMENT_GENERATION_LEGACY_KEYS
     )
+    _require_exact_keys(payload, expected_keys, "environment generation")
     if payload.get("schema_version") != ENVIRONMENT_GENERATION_SCHEMA_VERSION:
         raise ExecutionIdentityError(
             "unsupported environment generation schema: " + str(path)
@@ -1632,6 +1807,14 @@ def _validate_generation_payload(
         payload.get("ichor_package_tree_sha256"),
         "ICHOR package-tree digest",
     )
+    identity_kind = payload.get("ichor_package_tree_identity_kind")
+    if identity_kind is not None and identity_kind not in {
+        ICHOR_PACKAGE_TREE_IDENTITY_KIND_V1,
+        ICHOR_PACKAGE_TREE_IDENTITY_KIND,
+    }:
+        raise ExecutionIdentityError(
+            "environment generation ICHOR package-tree identity kind is unsupported"
+        )
     for key in (
         "ichor_git",
         "pyferebus",
@@ -2044,6 +2227,326 @@ def ensure_execution_identity(
     return str(requested_mode), payload
 
 
+def _inspect_environment_transition_boundary(
+    campaign: Path,
+    state: Any,
+    config: CampaignConfig,
+    *,
+    scheduler_ownership_clear: bool,
+) -> Dict[str, Any]:
+    """Prove that a generation may advance without mutating campaign state."""
+    transition_context: Dict[str, Any] = {"transition_kind": "idle_boundary"}
+    diversity_transition_pending = False
+    aimall_transition_pending = False
+    gaussian_transition_pending = False
+    allocation_check_transition_pending = False
+    scheduler_cancel_transition = _scheduler_cancellation_transition_boundary(
+        campaign,
+        state,
+    )
+    if scheduler_cancel_transition is not None:
+        transition_context = scheduler_cancel_transition
+    elif state.phase is CampaignPhase.REFERENCE_COMMIT:
+        from .daemon.reference_commit import classify_reference_commit
+
+        context = "bootstrap" if int(state.iteration) == 0 else "active"
+        reference_commit_recovery = classify_reference_commit(
+            campaign,
+            context=context,
+            iteration=int(state.iteration),
+            verification="authority",
+        )
+        recovery_state = str(reference_commit_recovery.get("state") or "")
+        if recovery_state not in _REBINDABLE_REFERENCE_COMMIT_STATES:
+            detail = str(reference_commit_recovery.get("reason") or recovery_state)
+            raise ExecutionIdentityError(
+                "environment transition at REFERENCE_COMMIT requires a valid "
+                "unpublished recovery transaction; observed " + detail
+            )
+        ledger = reference_commit_recovery.get("ledger")
+        if not isinstance(ledger, Mapping):
+            raise ExecutionIdentityError(
+                "environment transition at REFERENCE_COMMIT lacks a valid transaction ledger"
+            )
+        observed_identity = (
+            str(ledger.get("campaign_uid") or ""),
+            int(ledger.get("iteration", -1)),
+            int(ledger.get("reference_data_version", -1)),
+            str(ledger.get("context") or ""),
+            int(state.reference_data_version),
+        )
+        expected_identity = (
+            str(state.campaign_uid),
+            int(state.iteration),
+            int(state.iteration),
+            context,
+            int(state.iteration) - 1,
+        )
+        if observed_identity != expected_identity:
+            raise ExecutionIdentityError(
+                "environment transition at REFERENCE_COMMIT found inconsistent "
+                "campaign, iteration, or reference-version identity"
+            )
+        transition_context = {"transition_kind": "reference_commit_recovery"}
+    elif state.phase in {CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS}:
+        _validate_ferebus_transition_boundary(campaign, state)
+        transition_context = {"transition_kind": "ferebus_retry"}
+    elif state.phase is CampaignPhase.ARIADNE_ARRAY:
+        transition_context = _validate_ariadne_retry_transition_boundary(
+            campaign,
+            state,
+        )
+    elif state.phase in {
+        CampaignPhase.INITIAL_ALLOCATION_CHECK,
+        CampaignPhase.ALLOCATION_CHECK,
+    }:
+        allocation_check_transition_pending = True
+    elif state.phase in {
+        CampaignPhase.INITIAL_GAUSSIAN,
+        CampaignPhase.GAUSSIAN,
+        CampaignPhase.INITIAL_REPLACEMENT_GAUSSIAN,
+        CampaignPhase.REPLACEMENT_GAUSSIAN,
+    }:
+        from .daemon.submission_intent import (
+            gaussian_intent_claims_completed_array,
+            load_intent,
+        )
+
+        gaussian_intent = load_intent(
+            campaign,
+            state.phase.value,
+            int(state.iteration),
+        )
+        if not (
+            isinstance(gaussian_intent, Mapping)
+            and gaussian_intent_claims_completed_array(gaussian_intent)
+        ):
+            raise ExecutionIdentityError(
+                "environment transition requires an idle SEED_SELECT, "
+                "STOP_CHECK or DONE boundary"
+            )
+        gaussian_transition_pending = True
+    elif state.phase in {
+        CampaignPhase.INITIAL_AIMALL,
+        CampaignPhase.AIMALL,
+        CampaignPhase.INITIAL_REPLACEMENT_AIMALL,
+        CampaignPhase.REPLACEMENT_AIMALL,
+    }:
+        from .daemon.submission_intent import (
+            aimall_intent_claims_completed_array,
+            load_intent,
+        )
+
+        aimall_intent = load_intent(
+            campaign,
+            state.phase.value,
+            int(state.iteration),
+        )
+        if not (
+            isinstance(aimall_intent, Mapping)
+            and aimall_intent_claims_completed_array(aimall_intent)
+        ):
+            raise ExecutionIdentityError(
+                "environment transition requires an idle SEED_SELECT, "
+                "STOP_CHECK or DONE boundary"
+            )
+        aimall_transition_pending = True
+    elif state.phase in {
+        CampaignPhase.PHASE_A_DIVERSITY,
+        CampaignPhase.PHASE_B_DIVERSITY,
+    }:
+        diversity_transition_pending = True
+    elif state.phase not in {
+        CampaignPhase.INIT,
+        CampaignPhase.SEED_SELECT,
+        CampaignPhase.STOP_CHECK,
+        CampaignPhase.DONE,
+    }:
+        raise ExecutionIdentityError(
+            "environment transition requires a verified safe phase boundary"
+        )
+
+    if any(value is not None for value in state.pending_jobs.values()):
+        raise ExecutionIdentityError(
+            "environment transition is blocked by pending scheduler ownership"
+        )
+    if not bool(scheduler_ownership_clear):
+        raise ExecutionIdentityError(
+            "environment transition requires a conclusive scheduler ownership check"
+        )
+
+    from .daemon.artifact_contracts import verify_state_referenced_artifacts
+    from .daemon.config_lock import review_config_changes
+    from .daemon.submission_intent import ACTIVE_STATUSES, inventory_intents
+    from .daemon.reconcile_transaction import inspect_reconcile_transaction_recovery
+
+    review = review_config_changes(
+        campaign,
+        config,
+        state,
+        initialise_missing=False,
+    )
+    if review.changed:
+        raise ExecutionIdentityError(
+            "campaign configuration differs from its lock; reconcile it before restart"
+        )
+    inventory = inventory_intents(
+        campaign,
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+    if inventory["errors"]:
+        raise ExecutionIdentityError(
+            "environment transition is blocked by malformed submission intents"
+        )
+    if any(
+        str(record.get("status")) in ACTIVE_STATUSES
+        for record in inventory["records"]
+    ):
+        raise ExecutionIdentityError(
+            "environment transition is blocked by active submission intents"
+        )
+
+    from .daemon.artifact_snapshot import build_committed_artifact_snapshot
+
+    snapshot = build_committed_artifact_snapshot(
+        campaign,
+        verification_level="authority",
+    )
+    transaction_recovery = inspect_reconcile_transaction_recovery(
+        campaign,
+        artifact_snapshot=snapshot,
+    )
+    if str(transaction_recovery.get("state") or "") != "none":
+        if bool(transaction_recovery.get("recoverable", False)):
+            raise ExecutionIdentityError(
+                "environment transition is waiting for ordinary reconcile to recover "
+                "an interrupted transaction"
+            )
+        raise ExecutionIdentityError(
+            "environment transition is blocked by ambiguous reconcile transaction evidence"
+        )
+    verify_state_referenced_artifacts(
+        campaign,
+        state,
+        strict_models=True,
+        verification="authority",
+        snapshot=snapshot,
+    )
+    if diversity_transition_pending:
+        transition_context = _validate_scalar_diversity_transition_boundary(
+            campaign,
+            state,
+            intent_records=inventory["records"],
+        )
+    if aimall_transition_pending:
+        transition_context = _validate_aimall_postprocess_transition_boundary(
+            campaign,
+            state,
+        )
+    if gaussian_transition_pending:
+        transition_context = _validate_gaussian_postprocess_transition_boundary(
+            campaign,
+            state,
+        )
+    if allocation_check_transition_pending:
+        transition_context = _validate_allocation_check_transition_boundary(
+            campaign,
+            state,
+        )
+    return transition_context
+
+
+def inspect_environment_generation_launch(
+    campaign_dir: Union[str, Path],
+    *,
+    state: Any,
+    config: CampaignConfig,
+    scheduler_ownership_clear: bool,
+) -> Dict[str, Any]:
+    """Classify launch binding without hashing the installed implementation."""
+    campaign = Path(campaign_dir).resolve()
+    identity_path = execution_identity_path(campaign)
+    if not identity_path.exists() and not identity_path.is_symlink():
+        if state.phase is CampaignPhase.INIT:
+            return {
+                "disposition": "unbound_first_start",
+                "launchable": True,
+                "generation": -1,
+                "reason": "the fresh campaign will create its first execution identity",
+            }
+        return {
+            "disposition": "invalid",
+            "launchable": False,
+            "generation": -1,
+            "reason": "the progressed campaign has no execution identity",
+        }
+    try:
+        read_execution_identity(
+            campaign,
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        active = read_active_environment_generation(
+            campaign,
+            expected_campaign_uid=str(state.campaign_uid),
+        )["generation"]
+    except Exception as exc:
+        return {
+            "disposition": "invalid",
+            "launchable": False,
+            "generation": -1,
+            "reason": "execution environment evidence is invalid: " + str(exc),
+            "error": type(exc).__name__ + ": " + str(exc),
+        }
+    generation = int(active["generation"])
+    current_config_sha256 = config_fingerprint(config.to_dict())
+    if str(active.get("campaign_config_sha256") or "") == current_config_sha256:
+        return {
+            "disposition": "current",
+            "launchable": True,
+            "generation": generation,
+            "config_matches": True,
+            "reason": "the active environment generation matches the campaign configuration",
+        }
+    try:
+        context = _inspect_environment_transition_boundary(
+            campaign,
+            state,
+            config,
+            scheduler_ownership_clear=scheduler_ownership_clear,
+        )
+    except Exception as exc:
+        reason = str(exc)
+        upper = reason.upper()
+        ownership = any(
+            token in upper
+            for token in (
+                "SCHEDULER OWNERSHIP",
+                "ACTIVE SUBMISSION INTENT",
+                "CONCLUSIVE SCHEDULER",
+            )
+        )
+        disposition = "ownership_blocked" if ownership else "reconcile_required"
+        return {
+            "disposition": disposition,
+            "launchable": False,
+            "generation": generation,
+            "config_matches": False,
+            "reason": reason,
+            "error": type(exc).__name__ + ": " + reason,
+        }
+    return {
+        "disposition": "rebindable_on_resume",
+        "launchable": True,
+        "generation": generation,
+        "config_matches": False,
+        "reason": (
+            "startup will create a correctly bound environment generation before "
+            "scientific work begins"
+        ),
+        "transition_context": context,
+    }
+
+
 def advance_environment_generation(
     campaign_dir: Union[str, Path],
     *,
@@ -2217,6 +2720,7 @@ def advance_environment_generation(
     }:
         diversity_transition_pending = True
     elif state.phase not in {
+        CampaignPhase.INIT,
         CampaignPhase.SEED_SELECT,
         CampaignPhase.STOP_CHECK,
         CampaignPhase.DONE,
@@ -2406,6 +2910,12 @@ def advance_environment_generation(
             campaign,
             state,
         )
+    transition_context = _inspect_environment_transition_boundary(
+        campaign,
+        state,
+        config,
+        scheduler_ownership_clear=scheduler_ownership_clear,
+    )
     while True:
         generation_path = generations_root / (
             "generation-" + str(generation_number).zfill(6) + ".json"
@@ -2518,6 +3028,7 @@ __all__ = [
     "execution_identity_path",
     "ichor_package_tree_sha256",
     "inspect_allocation_check_transition_boundary",
+    "inspect_environment_generation_launch",
     "inspect_scalar_diversity_transition_boundary",
     "read_active_environment_generation",
     "read_execution_identity",

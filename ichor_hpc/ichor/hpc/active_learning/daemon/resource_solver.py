@@ -1039,7 +1039,12 @@ def _ariadne_evidence(
     *,
     progress_callback: Optional[Callable[..., None]] = None,
 ) -> Dict[str, Any]:
-    from ..acquisition.trajectory_pool import TrajectoryPool
+    from ..acquisition.trajectory_pool import (
+        POOL_MANIFEST_FILENAME,
+        POOL_SUBDIR,
+        POOL_XYZ_FILENAME,
+        TrajectoryPoolManifest,
+    )
     from ..layout import active_iteration_dir
     from ..seed_identity import read_ariadne_task_map
     from ..versioning.trained_models import resolve_trained_model_set
@@ -1063,8 +1068,30 @@ def _ariadne_evidence(
         total=3,
         unit="checks",
     )
-    pool = TrajectoryPool.load(campaign_dir)
-    if str(task_map["trajectory_sha256"]) != str(pool.sha256):
+    manifest_path = campaign_owned_path(
+        campaign_dir,
+        POOL_SUBDIR / POOL_MANIFEST_FILENAME,
+    )
+    pool_path = campaign_owned_path(campaign_dir, POOL_XYZ_FILENAME)
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise FileNotFoundError(
+            "trajectory pool manifest is not a regular file: "
+            + str(manifest_path)
+        )
+    if pool_path.is_symlink() or not pool_path.is_file():
+        raise FileNotFoundError(
+            "canonical trajectory pool is not a regular file: " + str(pool_path)
+        )
+    with open(manifest_path, "r", encoding="utf-8") as handle:
+        pool_manifest = TrajectoryPoolManifest.from_dict(json.load(handle))
+    if Path(pool_manifest.canonical_path).resolve() != pool_path.resolve():
+        raise ValueError(
+            "trajectory pool manifest canonical path does not identify pool.xyz"
+        )
+    pool_sha256 = sha256_file(pool_path)
+    if pool_sha256 != str(pool_manifest.sha256):
+        raise ValueError("trajectory pool SHA does not match its manifest")
+    if str(task_map["trajectory_sha256"]) != pool_sha256:
         raise ValueError("ARIADNE task map trajectory SHA does not match the pool")
     _report_resource_progress(
         progress_callback,
@@ -1089,68 +1116,43 @@ def _ariadne_evidence(
         total=3,
         unit="checks",
     )
-    selected = [
-        pool.frame(int(task["pool_row_index_zero_based"]))
-        for task in task_map["tasks"]
-    ]
-    if not selected:
+    tasks = list(task_map["tasks"])
+    if not tasks:
         raise ValueError("ARIADNE task map contains no tasks")
-    n_atoms = len(selected[0])
-    if any(len(frame) != n_atoms for frame in selected):
-        raise ValueError("ARIADNE selected geometries disagree on atom count")
+    n_pool_frames = int(pool_manifest.n_frames)
+    for task in tasks:
+        raw_index = task.get("pool_row_index_zero_based")
+        if isinstance(raw_index, bool) or not isinstance(raw_index, int):
+            raise ValueError("ARIADNE task-map pool row must be an exact integer")
+        if raw_index < 0 or raw_index >= n_pool_frames:
+            raise ValueError("ARIADNE task-map pool row is outside the pool")
+    n_atoms = int(pool_manifest.natoms)
     mode = str(getattr(config.acquisition.gradient, "mode", "active_fd"))
     if mode == "active_fd":
-        from ichor.core.adversarial.geometry import select_local_neighbours
-        from ichor.core.adversarial.subspace import build_local_subspace
-
-        acquisition_config = config.to_acquisition_config()
-        dimensions = []
+        configured_max = int(config.acquisition.subspace.max_subspace_dim)
+        dimension = max(1, min(configured_max, 3 * n_atoms))
+        dimensions = [dimension for _task in tasks]
         _report_resource_progress(
             progress_callback,
-            "ariadne_resource_dimensions",
+            "ariadne_resource_bound",
             completed=0,
-            total=len(selected),
-            unit="seeds",
-            pool_frames=int(pool.manifest.n_frames),
+            total=len(tasks),
+            unit="tasks",
+            gradient_dimension=int(dimension),
         )
-        for position, seed in enumerate(selected, start=1):
-            neighbours = select_local_neighbours(
-                seed,
-                pool,
-                max_neighbours=acquisition_config.subspace.neighbour_count,
-                deduplicate_rmsd=(
-                    acquisition_config.subspace.neighbour_deduplicate_rmsd
-                ),
-            )
-            if not neighbours:
-                raise ValueError(
-                    "ARIADNE resource evidence could not select local neighbours"
-                )
-            dimensions.append(
-                int(
-                    build_local_subspace(
-                        seed,
-                        neighbours,
-                        acquisition_config.subspace,
-                    ).dimension
-                )
-            )
-            _report_resource_progress(
-                progress_callback,
-                "ariadne_resource_dimensions",
-                completed=int(position),
-                total=len(selected),
-                unit="seeds",
-                pool_frames=int(pool.manifest.n_frames),
-            )
-        dimension = max(dimensions)
-        dimension_source = "exact_seed_local_subspaces"
+        _report_resource_progress(
+            progress_callback,
+            "ariadne_resource_bound",
+            completed=len(tasks),
+            total=len(tasks),
+            unit="tasks",
+            gradient_dimension=int(dimension),
+        )
+        dimension_source = "configured_safe_upper_bound"
     else:
-        dimensions = [int(3 * n_atoms) for _seed in selected]
+        dimensions = [int(3 * n_atoms) for _task in tasks]
         dimension = int(3 * n_atoms)
         dimension_source = "exact_cartesian_dimension"
-    pool_path = campaign_owned_path(campaign_dir, pool.canonical_path)
-    n_pool_frames = int(pool.manifest.n_frames)
     decoded_coordinate_bytes = int(n_pool_frames * n_atoms * 3 * 8)
     # The current runner eagerly creates Python Atoms/Atom objects for the
     # complete pool in every array member.  This conservative object allowance
@@ -1164,6 +1166,7 @@ def _ariadne_evidence(
         "source": "ariadne_task_map_and_model_set",
         "task_map": _file_evidence(task_map_file),
         "pool": _file_evidence(pool_path),
+        "pool_manifest": _file_evidence(manifest_path),
         "pool_n_frames": n_pool_frames,
         "pool_file_bytes": int(pool_path.stat().st_size),
         "decoded_coordinate_bytes": decoded_coordinate_bytes,

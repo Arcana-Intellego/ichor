@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import uuid
 from pathlib import Path
@@ -548,10 +549,87 @@ def test_redundant_atomic_temp_is_archived_before_canonical_recovery(tmp_path):
     assert first["action"] == "archive_redundant_orphan"
     result = apply_reconcile_transaction_recovery(campaign, first)
 
-    assert Path(result["archived_path"]).is_file()
+    archived = Path(result["archived_path"])
+    assert archived.is_file()
+    assert archived.name.startswith(
+        "o-" + transaction.payload["transaction_id"][:12] + "-"
+    )
+    assert len(archived.name) < 64
     assert transaction.path.is_file()
     second = inspect_reconcile_transaction_recovery(campaign)
     assert second["action"] == "abandon"
+
+
+def test_redundant_atomic_temp_recognises_valid_legacy_archive(tmp_path):
+    campaign = tmp_path.parent / ("l-" + uuid.uuid4().hex[:4])
+    transaction = begin_reconcile_transaction(
+        campaign,
+        proposed_phase="INIT",
+        proposed_iteration=0,
+        planned_operations=["write_recovered_state"],
+        intent_transitions=[],
+    )
+    temp = transaction.path.parent / ".t-feedfacecafe"
+    content = transaction.path.read_bytes()
+    temp.write_bytes(content)
+    digest = hashlib.sha256(content).hexdigest()
+    archive_root = (
+        campaign
+        / ".DATA"
+        / "ACTIVE_LEARNING"
+        / "reconcile_transaction_orphans"
+    )
+    archive_root.mkdir(parents=True)
+    legacy = archive_root / (
+        transaction.payload["transaction_id"]
+        + "-"
+        + digest
+        + ".json.part"
+    )
+    legacy.write_bytes(content)
+
+    inspection = inspect_reconcile_transaction_recovery(campaign)
+    result = apply_reconcile_transaction_recovery(campaign, inspection)
+
+    assert Path(result["archived_path"]) == legacy
+    assert legacy.read_bytes() == content
+    assert not temp.exists()
+
+
+def test_redundant_atomic_temp_short_archive_collision_fails_closed(tmp_path):
+    campaign = tmp_path / "campaign"
+    transaction = begin_reconcile_transaction(
+        campaign,
+        proposed_phase="INIT",
+        proposed_iteration=0,
+        planned_operations=["write_recovered_state"],
+        intent_transitions=[],
+    )
+    temp = transaction.path.parent / ".t-feedfacecafe"
+    content = transaction.path.read_bytes()
+    temp.write_bytes(content)
+    digest = hashlib.sha256(content).hexdigest()
+    archive_root = (
+        campaign
+        / ".DATA"
+        / "ACTIVE_LEARNING"
+        / "reconcile_transaction_orphans"
+    )
+    archive_root.mkdir(parents=True)
+    collision = archive_root / (
+        "o-"
+        + transaction.payload["transaction_id"][:12]
+        + "-"
+        + digest[:16]
+        + ".json.part"
+    )
+    collision.write_text("conflict", encoding="utf-8")
+
+    inspection = inspect_reconcile_transaction_recovery(campaign)
+    with pytest.raises(ValueError, match="archive conflicts"):
+        apply_reconcile_transaction_recovery(campaign, inspection)
+
+    assert temp.read_bytes() == content
 
 
 def test_malformed_atomic_temp_remains_a_manual_review_blocker(tmp_path):
@@ -763,6 +841,139 @@ def test_schema_v2_partial_authority_commit_rolls_forward(tmp_path):
 
     assert versions.current_version() == 1
     assert read_reconcile_transaction(transaction.path)["status"] == "COMMITTED"
+
+
+def test_schema_v2_roll_forward_repairs_partial_state_backup(tmp_path):
+    campaign = tmp_path / "campaign"
+    state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json"
+    state_path.parent.mkdir(parents=True)
+    before = CampaignState()
+    write_state(state_path, before)
+    after = CampaignState.from_dict(before.to_dict())
+    after.max_iterations += 1
+    versions = VersionedDirectory(campaign / "QM_REFERENCE_DATA")
+    versions.iteration_path(0).mkdir(parents=True)
+    versions.iteration_path(1).mkdir()
+    versions.update_current(0)
+    transaction = begin_reconcile_transaction(
+        campaign,
+        proposed_phase=after.phase.value,
+        proposed_iteration=after.iteration,
+        planned_operations=["write_recovered_state"],
+        intent_transitions=[],
+        campaign_uid=after.campaign_uid,
+    )
+    transaction.set_status("MUTATING")
+    plan = build_reconcile_commit_plan(
+        campaign,
+        transaction_id=transaction.payload["transaction_id"],
+        proposed_state=after,
+        config=None,
+        intent_transitions=[],
+        artifact_snapshot=SimpleNamespace(anchor_records=(), anchor_sha256=None),
+    )
+    plan["pointers"] = [
+        {
+            "label": "test_reference_data",
+            "parent": "QM_REFERENCE_DATA",
+            "prefix": "iteration",
+            "name_width": 6,
+            "before_version": 0,
+            "after_version": 1,
+        }
+    ]
+    transaction.prepare_commit(plan)
+    backup = campaign / plan["state"]["backup_path"]
+    backup.write_bytes(b'{"partial":')
+    versions.update_current(1)
+
+    inspection = inspect_reconcile_transaction_recovery(campaign)
+
+    assert inspection["action"] == "roll_forward"
+    assert inspection["state_backup_status"] == "repairable_partial"
+    apply_reconcile_transaction_recovery(campaign, inspection)
+    assert json.loads(backup.read_text(encoding="utf-8")) == before.to_dict()
+    assert CampaignState.from_dict(
+        json.loads(state_path.read_text(encoding="utf-8"))
+    ).to_dict() == after.to_dict()
+    assert read_reconcile_transaction(transaction.path)["status"] == "COMMITTED"
+
+
+def test_schema_v2_adoption_repairs_partial_state_backup(tmp_path):
+    campaign = tmp_path / "campaign"
+    state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json"
+    state_path.parent.mkdir(parents=True)
+    before = CampaignState()
+    write_state(state_path, before)
+    after = CampaignState.from_dict(before.to_dict())
+    after.max_iterations += 1
+    transaction = begin_reconcile_transaction(
+        campaign,
+        proposed_phase=after.phase.value,
+        proposed_iteration=after.iteration,
+        planned_operations=["write_recovered_state"],
+        intent_transitions=[],
+        campaign_uid=after.campaign_uid,
+    )
+    transaction.set_status("MUTATING")
+    plan = build_reconcile_commit_plan(
+        campaign,
+        transaction_id=transaction.payload["transaction_id"],
+        proposed_state=after,
+        config=None,
+        intent_transitions=[],
+        artifact_snapshot=SimpleNamespace(anchor_records=(), anchor_sha256=None),
+    )
+    transaction.prepare_commit(plan)
+    backup = campaign / plan["state"]["backup_path"]
+    backup.write_bytes(b'{"partial":')
+    write_state(state_path, after)
+
+    inspection = inspect_reconcile_transaction_recovery(campaign)
+
+    assert inspection["action"] == "adopt"
+    assert inspection["state_backup_status"] == "repairable_partial"
+    apply_reconcile_transaction_recovery(campaign, inspection)
+    assert json.loads(backup.read_text(encoding="utf-8")) == before.to_dict()
+    assert read_reconcile_transaction(transaction.path)["status"] == "COMMITTED"
+
+
+def test_schema_v2_abandon_removes_interrupted_backup_temporary(tmp_path):
+    campaign = tmp_path / "campaign"
+    state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json"
+    state_path.parent.mkdir(parents=True)
+    state = CampaignState()
+    write_state(state_path, state)
+    proposed = CampaignState.from_dict(state.to_dict())
+    proposed.max_iterations += 1
+    transaction = begin_reconcile_transaction(
+        campaign,
+        proposed_phase=proposed.phase.value,
+        proposed_iteration=proposed.iteration,
+        planned_operations=["write_recovered_state"],
+        intent_transitions=[],
+        campaign_uid=proposed.campaign_uid,
+    )
+    transaction.set_status("MUTATING")
+    plan = build_reconcile_commit_plan(
+        campaign,
+        transaction_id=transaction.payload["transaction_id"],
+        proposed_state=proposed,
+        config=None,
+        intent_transitions=[],
+        artifact_snapshot=SimpleNamespace(anchor_records=(), anchor_sha256=None),
+    )
+    transaction.prepare_commit(plan)
+    backup = campaign / plan["state"]["backup_path"]
+    temporary = backup.with_name("." + backup.name + ".publishing")
+    temporary.write_bytes(b"partial")
+
+    inspection = inspect_reconcile_transaction_recovery(campaign)
+
+    assert inspection["action"] == "abandon"
+    apply_reconcile_transaction_recovery(campaign, inspection)
+    assert not temporary.exists()
+    assert read_reconcile_transaction(transaction.path)["status"] == "FAILED"
 
 
 def test_schema_v2_partial_config_history_commit_rolls_forward_exact_payloads(tmp_path):

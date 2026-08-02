@@ -27,7 +27,8 @@ from ..versioning.manifest import sha256_file
 RESOURCE_RESOLUTION_SCHEMA_VERSION = 2
 RESOURCE_FORMULA_VERSION = "2"
 IMPLEMENTATION_IDENTITY_SCHEMA_VERSION = 1
-ICHOR_PACKAGE_TREE_IDENTITY_KIND = "explicit_import_origins_v1"
+ICHOR_PACKAGE_TREE_IDENTITY_KIND_V1 = "explicit_import_origins_v1"
+ICHOR_PACKAGE_TREE_IDENTITY_KIND = "explicit_import_origins_v2"
 
 
 _BACKEND_SOURCE_FILES = {
@@ -92,7 +93,7 @@ def _dependency_lock_sha256() -> str:
 
 
 def _legacy_ichor_package_tree_sha256() -> str:
-    from ..execution_identity import _tree_hash
+    from ..execution_identity import _tree_hash_v1
 
     roots = []
     try:
@@ -103,7 +104,16 @@ def _legacy_ichor_package_tree_sha256() -> str:
         raise ValueError("ICHOR package roots cannot be inspected") from exc
     if not roots:
         raise ValueError("ICHOR package roots cannot be inspected")
-    return _tree_hash(roots)
+    return _tree_hash_v1(roots)
+
+
+def _v1_ichor_package_tree_sha256() -> str:
+    from ..execution_identity import (
+        ICHOR_PACKAGE_TREE_IDENTITY_KIND_V1 as EXECUTION_IDENTITY_KIND_V1,
+        ichor_package_tree_sha256,
+    )
+
+    return ichor_package_tree_sha256(identity_kind=EXECUTION_IDENTITY_KIND_V1)
 
 
 def _ichor_package_tree_sha256() -> str:
@@ -171,6 +181,11 @@ def capture_implementation_identity(
                 "resolved_file": _file_record(expanded),
             }
 
+    native_backend_identity = None
+    if backend_name == "ariadne":
+        from ..execution_identity import _ariadne_identity
+
+        native_backend_identity = _ariadne_identity()
     return {
         "schema_version": IMPLEMENTATION_IDENTITY_SCHEMA_VERSION,
         "captured_at_iso": datetime.now(timezone.utc).isoformat(),
@@ -185,6 +200,7 @@ def capture_implementation_identity(
         "environment_generation": generation_record,
         "environment_generation_digest_sha256": generation_digest,
         "backend_executable": executable_record,
+        "native_backend_identity": native_backend_identity,
     }
 
 
@@ -270,7 +286,7 @@ def _verify_bound_environment_generation(
     *,
     campaign_dir: Path,
     expected_campaign_uid: str,
-    current_package_digest: str,
+    current_package_digests: Mapping[str, str],
 ) -> None:
     generation_record = identity.get("environment_generation")
     generation_digest = identity.get("environment_generation_digest_sha256")
@@ -327,9 +343,18 @@ def _verify_bound_environment_generation(
         raise ValueError(
             "resource implementation environment-generation digest mismatch"
         )
-    if (
-        str(generation.get("ichor_package_tree_sha256") or "")
-        != str(current_package_digest)
+    generation_kind = str(
+        generation.get("ichor_package_tree_identity_kind")
+        or ICHOR_PACKAGE_TREE_IDENTITY_KIND_V1
+    )
+    current_package_digest = current_package_digests.get(generation_kind)
+    if current_package_digest is None:
+        raise ValueError(
+            "resource implementation environment package-tree identity kind "
+            "is unsupported"
+        )
+    if str(generation.get("ichor_package_tree_sha256") or "") != str(
+        current_package_digest
     ):
         raise ValueError("resource implementation ICHOR package tree has drifted")
 
@@ -363,16 +388,20 @@ def verify_implementation_identity(
         _verify_file_record(record, campaign_dir=None, label="backend executable")
 
     recorded_digest = str(identity.get("ichor_package_tree_sha256") or "")
-    current_digest = _ichor_package_tree_sha256()
+    current_digests = {
+        ICHOR_PACKAGE_TREE_IDENTITY_KIND: _ichor_package_tree_sha256(),
+        ICHOR_PACKAGE_TREE_IDENTITY_KIND_V1: _v1_ichor_package_tree_sha256(),
+    }
+    current_digest = current_digests[ICHOR_PACKAGE_TREE_IDENTITY_KIND]
     identity_kind = identity.get("ichor_package_tree_identity_kind")
     bound_generation_present = identity.get("environment_generation") is not None
     legacy_direct_match = False
     if identity_kind is not None:
-        if identity_kind != ICHOR_PACKAGE_TREE_IDENTITY_KIND:
+        if identity_kind not in current_digests:
             raise ValueError(
                 "resource implementation ICHOR package-tree identity kind is unsupported"
             )
-        if recorded_digest != current_digest:
+        if recorded_digest != current_digests[str(identity_kind)]:
             raise ValueError("resource implementation ICHOR package tree has drifted")
     else:
         try:
@@ -395,10 +424,23 @@ def verify_implementation_identity(
                 identity,
                 campaign_dir=Path(campaign_dir).resolve(),
                 expected_campaign_uid=str(expected_campaign_uid),
-                current_package_digest=current_digest,
+                current_package_digests=current_digests,
             )
     elif recorded_digest != current_digest and identity_kind is not None:
         raise ValueError("resource implementation ICHOR package tree has drifted")
+
+    backend = str(identity.get("backend") or "").strip().casefold()
+    native_backend_identity = identity.get("native_backend_identity")
+    if backend == "ariadne" and identity_kind == ICHOR_PACKAGE_TREE_IDENTITY_KIND:
+        if not isinstance(native_backend_identity, Mapping):
+            raise ValueError("resource implementation ARIADNE identity is missing")
+        from ..execution_identity import _ariadne_identity
+
+        if dict(native_backend_identity) != _ariadne_identity():
+            raise ValueError("resource implementation ARIADNE native code has drifted")
+    elif native_backend_identity is not None:
+        if not isinstance(native_backend_identity, Mapping):
+            raise ValueError("resource implementation native backend identity is invalid")
 
 
 def resolution_path(
@@ -500,7 +542,7 @@ def write_resolution(
                 existing_without_identity == proposed_without_identity
                 and isinstance(legacy_identity, Mapping)
                 and legacy_identity.get("ichor_package_tree_identity_kind")
-                is None
+                in {None, ICHOR_PACKAGE_TREE_IDENTITY_KIND_V1}
             )
             if not legacy_replay:
                 raise ValueError(

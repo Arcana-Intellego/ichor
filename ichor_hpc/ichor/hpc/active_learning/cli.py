@@ -124,6 +124,7 @@ from .daemon.live_executor import (
 from .daemon.preflight import check_backends, missing_backend_message
 from .daemon.presentation_assessment import (
     assess_campaign_presentation,
+    classify_operator_failure,
     config_review_evidence,
     invalid_config_review_evidence,
 )
@@ -169,6 +170,7 @@ from .daemon.reconcile_transaction import (
     inspect_reconcile_transaction_recovery,
     publish_reconcile_config_target,
     publish_reconcile_intent_target,
+    publish_reconcile_state_backup,
     restore_version_pointer,
     snapshot_version_pointer,
 )
@@ -1091,52 +1093,6 @@ def _copy_existing_timestamped(path: Path, marker: str) -> Optional[Path]:
 
     target = _timestamped_sibling(path, marker)
     shutil.copy2(path, target)
-    return target
-
-
-def _copy_existing_reconcile_backup(
-    campaign: Path,
-    path: Path,
-    transaction: ReconcileTransaction,
-) -> Optional[Path]:
-    if not path.exists():
-        return None
-    import hashlib
-    import shutil
-
-    commit_plan = transaction.payload.get("commit_plan")
-    state_plan = (
-        commit_plan.get("state") if isinstance(commit_plan, Mapping) else None
-    )
-    if not isinstance(state_plan, Mapping):
-        raise ValueError("reconcile transaction state backup plan is missing")
-    target = campaign_owned_path(
-        campaign,
-        campaign / Path(str(state_plan.get("backup_path") or "")),
-    )
-    expected = state_plan.get("before")
-    expected_sha = (
-        str(expected.get("sha256") or "")
-        if isinstance(expected, Mapping)
-        else ""
-    )
-
-    def digest(candidate: Path) -> str:
-        value = hashlib.sha256()
-        with candidate.open("rb") as handle:
-            for block in iter(lambda: handle.read(1024 * 1024), b""):
-                value.update(block)
-        return value.hexdigest()
-
-    if target.exists():
-        if target.is_symlink() or not target.is_file():
-            raise ValueError("reconcile state backup is unsafe: " + str(target))
-        if not expected_sha or digest(target) != expected_sha:
-            raise ValueError("reconcile state backup digest mismatch")
-        return target
-    shutil.copy2(path, target)
-    if expected_sha and digest(target) != expected_sha:
-        raise ValueError("reconcile state backup did not preserve source bytes")
     return target
 
 
@@ -2537,10 +2493,10 @@ def _round_journal_seconds(value: Any) -> Optional[int]:
 
 
 def _format_journal_detail_value(key: str, value: Any) -> str:
-    if str(key) in {"reason", "error"} and (
-        "resource implementation ICHOR package tree has drifted" in str(value)
-    ):
-        return "ICHOR installation changed after this scheduler work was prepared"
+    if str(key) in {"reason", "error"}:
+        failure = classify_operator_failure(value)
+        if failure.family != "unknown":
+            return failure.summary
     if str(key).endswith("_seconds"):
         rounded = _round_journal_seconds(value)
         if rounded is not None:
@@ -3099,6 +3055,8 @@ def _format_runtime_status(payload: Dict[str, Any], *, verbose: bool) -> List[st
                 ),
             ]
         )
+    elif verbose and isinstance(environment, dict) and environment.get("error"):
+        rows.append(("environment generation error", environment.get("error")))
     ferebus_recovery = payload.get("ferebus_candidate_recovery")
     if isinstance(ferebus_recovery, dict):
         rows.extend(
@@ -4704,6 +4662,31 @@ def _journal_array_progress(event: Dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+_JOURNAL_ARRAY_PROGRESS_EVENTS = frozenset(
+    {
+        "sbatch",
+        "phase_pre_submit_intent",
+        "phase_submitted",
+        "adopted_accounted_job",
+        "adopted_inflight_job",
+        "queue_lifecycle_update",
+        "phase_succeeded",
+        "phase_succeeded_live",
+        "scheduler_progress",
+        "user_cancelled_jobs",
+        "reconcile_resolved_terminal_intent",
+        "partial_array_recovery_postprocess_only",
+        "partial_array_recovery_prepared",
+        "sacct_empty_timeout",
+        "sacct_unknown_timeout",
+        "sacct_missing_timeout",
+        "sacct_empty_but_squeue_active",
+        "sacct_rows_missing_but_squeue_active",
+        "squeue_liveness_inconclusive",
+    }
+)
+
+
 def _journal_scheduler_name(event: Dict[str, Any]) -> str:
     return (
         "Sun Grid Engine"
@@ -4781,6 +4764,41 @@ def _journal_operator_summary(
             + " cache "
             + str(event.get("cache_status") or "updated").replace("_", " ")
         )
+    if raw == "resolved_phase_resources":
+        n_tasks = (
+            _event_int(event, "n_tasks")
+            or _event_int(event, "expected_tasks")
+        )
+        task_text = (
+            ""
+            if n_tasks is None
+            else " for " + str(n_tasks) + " task" + ("" if n_tasks == 1 else "s")
+        )
+        evidence_mode = str(event.get("resource_evidence_mode") or "")
+        dimension_source = str(event.get("gradient_dimension_source") or "")
+        if evidence_mode == "reused":
+            source = str(
+                event.get("resource_evidence_source_attempt_id")
+                or event.get("resource_evidence_source_submission_identity")
+                or "an authenticated prior attempt"
+            )
+            return (
+                "resources resolved"
+                + task_text.replace(" task", " retry task")
+                + " using validated ARIADNE evidence from "
+                + source
+            )
+        if dimension_source == "configured_safe_upper_bound":
+            dimension = _event_int(event, "gradient_dimension")
+            return (
+                "resources resolved"
+                + task_text
+                + " using configured ARIADNE dimension bound "
+                + ("unknown" if dimension is None else str(dimension))
+            )
+        if dimension_source:
+            return "resources resolved" + task_text + " using exact ARIADNE dimensions"
+        return "resources resolved" + task_text
     if raw == "user_cancelled_jobs":
         completed = _event_int(event, "n_scheduler_completed_tasks")
         retry = _event_int(event, "n_retry_tasks")
@@ -4983,7 +5001,10 @@ def _journal_operator_summary(
     if raw in {"phase_succeeded", "phase_succeeded_live"}:
         return "array complete" if _journal_array_progress(event) else "phase succeeded"
     if raw == "halt":
-        return "halt"
+        failure = classify_operator_failure(
+            event.get("reason") or event.get("error")
+        )
+        return "campaign halted; " + failure.summary
     if raw == "sacct_rows_missing_but_squeue_active":
         return "waiting for accounting"
     if raw == "sacct_empty_but_squeue_active":
@@ -5055,6 +5076,10 @@ def _compact_event_details(event: Dict[str, Any]) -> str:
     for key, label in detail_keys:
         if raw == "seed_selection_progress" and key == "elapsed_seconds":
             continue
+        if raw == "resolved_phase_resources" and key == "n_tasks":
+            continue
+        if raw == "halt" and key in {"reason", "error"}:
+            continue
         if key in event and event.get(key) is not None:
             if label in seen_labels:
                 continue
@@ -5067,7 +5092,11 @@ def _compact_event_details(event: Dict[str, Any]) -> str:
             seen_labels.add(label)
     if _event_int(event, "_aggregated_count") not in {None, 1}:
         parts.insert(0, "events=" + str(_event_int(event, "_aggregated_count")))
-    progress = _journal_array_progress(event)
+    progress = (
+        _journal_array_progress(event)
+        if raw in _JOURNAL_ARRAY_PROGRESS_EVENTS
+        else ""
+    )
     if progress:
         insert_at = 1 if parts and parts[0].startswith("job=") else 0
         parts.insert(insert_at, progress)
@@ -5113,6 +5142,12 @@ def _verbose_event_details(event: Dict[str, Any]) -> str:
         "squeue_state_counts",
     }
     parts = ["raw=" + raw]
+    if raw == "halt":
+        for key in ("reason", "error"):
+            if event.get(key) is not None:
+                parts.append(
+                    "raw_" + key + "=" + _format_value(event.get(key))
+                )
     for key in sorted(event):
         if key in skip or key in _JOURNAL_THROUGHPUT_FIELDS:
             continue
@@ -8415,6 +8450,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
         payload.pop("partial_array_recovery_error", None)
     config_review_status: Dict[str, Any]
+    cfg: Optional[CampaignConfig] = None
     try:
         cfg = CampaignConfig.from_yaml(campaign / "campaign.yaml")
         payload["campaign_config_status"] = {"ok": True}
@@ -8559,6 +8595,23 @@ def cmd_status(args: argparse.Namespace) -> int:
     ) != "none":
         presentation_payload["_presentation_reconcile_transaction_recovery"] = (
             dict(status_transaction_recovery)
+        )
+    scheduler_assessment = assess_campaign_presentation(
+        presentation_payload
+    ).scheduler
+    environment_evidence = _preflight_environment_generation_evidence(
+        campaign,
+        state,
+        cfg,
+        scheduler_ownership_clear=(
+            not _status_daemon_active(presentation_payload)
+            and not scheduler_assessment.has_unresolved_scheduler_work
+            and not payload.get("submission_intent_errors")
+        ),
+    )
+    if isinstance(environment_evidence, Mapping):
+        presentation_payload["_presentation_environment_generation"] = dict(
+            environment_evidence
         )
     presentation_payload["_presentation_execution_identity_checked"] = True
     try:
@@ -11645,6 +11698,9 @@ def _reconcile_plain_text(value: Any) -> str:
     """Remove implementation exception names from concise human output."""
 
     text = str(value or "").strip()
+    failure = classify_operator_failure(text)
+    if failure.family != "unknown":
+        return failure.summary
     text = re.sub(
         r"(^|[;:])\s*[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception):\s*",
         r"\1 ",
@@ -11872,41 +11928,49 @@ def _reconcile_cleanup_rows(
     return rows, reasons, warnings, preserved
 
 
+def _reconcile_environment_launch_assessment(
+    campaign: Path,
+    state: Optional[CampaignState],
+    *,
+    scheduler_ownership_clear: bool,
+) -> Optional[Dict[str, Any]]:
+    """Use the shared launch classifier for a proposed reconcile state."""
+    if state is None:
+        return None
+    if not (campaign / "campaign.yaml").is_file():
+        return None
+    try:
+        from .execution_identity import inspect_environment_generation_launch
+
+        config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+        return inspect_environment_generation_launch(
+            campaign,
+            state=state,
+            config=config,
+            scheduler_ownership_clear=scheduler_ownership_clear,
+        )
+    except Exception as exc:
+        return {
+            "disposition": "invalid",
+            "launchable": False,
+            "generation": -1,
+            "reason": "execution environment evidence is invalid: " + str(exc),
+            "error": type(exc).__name__ + ": " + str(exc),
+        }
+
+
 def _reconcile_environment_config_binding_repair(
     campaign: Path,
     state: Optional[CampaignState],
+    *,
+    scheduler_ownership_clear: bool = True,
 ) -> Optional[Dict[str, Any]]:
-    """Describe a bounded config-only generation repair for presentation."""
-    if state is None:
-        return None
-    try:
-        from .execution_identity import (
-            execution_identity_path,
-            read_active_environment_generation,
-        )
-
-        identity_path = execution_identity_path(campaign)
-        if not identity_path.exists() and not identity_path.is_symlink():
-            return None
-        config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
-        current_sha256 = config_fingerprint(canonical_config(config))
-        active = read_active_environment_generation(
-            campaign,
-            expected_campaign_uid=str(state.campaign_uid),
-        )["generation"]
-        bound_sha256 = str(active.get("campaign_config_sha256") or "")
-        if bound_sha256 == current_sha256:
-            return None
-        return {
-            "kind": "campaign_config_generation_binding_advanced",
-            "generation": int(active["generation"]),
-            "bound_config_sha256": bound_sha256,
-            "current_config_sha256": current_sha256,
-        }
-    except Exception:
-        # Contract and technical views retain malformed identity details.  The
-        # concise presentation must not invent a repair from untrusted input.
-        return None
+    """Compatibility hook for the former private presentation helper."""
+    return _reconcile_environment_launch_assessment(
+        campaign,
+        state,
+        scheduler_ownership_clear=scheduler_ownership_clear,
+    )
 
 
 def _reconcile_presentation(
@@ -12036,6 +12100,31 @@ def _reconcile_presentation(
                     transaction_recovery.get("reason")
                 )
             planned.insert(0, ("interrupted reconcile", description))
+            backup_status = str(
+                transaction_recovery.get("state_backup_status") or ""
+            )
+            action = str(transaction_recovery.get("action") or "")
+            if backup_status == "repairable_partial":
+                planned.insert(
+                    1,
+                    (
+                        "state backup",
+                        "replace the interrupted partial backup from the "
+                        "transaction's authenticated before-state",
+                    ),
+                )
+            elif backup_status == "absent" and action in {
+                "adopt",
+                "roll_forward",
+            }:
+                planned.insert(
+                    1,
+                    (
+                        "state backup",
+                        "create the missing authenticated backup from the "
+                        "transaction's recorded before-state",
+                    ),
+                )
             reason_parts.insert(0, "a previous reconcile was interrupted")
         elif str(transaction_recovery.get("state") or "") == "blocked":
             blocker = _reconcile_plain_text(transaction_recovery.get("reason"))
@@ -12054,6 +12143,26 @@ def _reconcile_presentation(
                 _reconcile_plain_text(transaction_recovery.get("reason")),
             )
             planned.insert(0, ("interrupted reconcile", description))
+            backup_status = str(
+                transaction_recovery.get("state_backup_status") or ""
+            )
+            if backup_status == "repairable_partial":
+                planned.insert(
+                    1,
+                    (
+                        "state backup",
+                        "replaced the interrupted partial backup from "
+                        "authenticated transaction evidence",
+                    ),
+                )
+            elif backup_status == "absent":
+                planned.insert(
+                    1,
+                    (
+                        "state backup",
+                        "created the missing authenticated state backup",
+                    ),
+                )
             reason_parts.insert(0, "an interrupted reconcile was recovered")
     allowed_changes = list(getattr(config_review, "allowed_changes", []) or [])
     grouped_config_changes: Dict[str, List[str]] = {}
@@ -12101,22 +12210,45 @@ def _reconcile_presentation(
                 )
             )
 
-    environment_binding_repair = _reconcile_environment_config_binding_repair(
+    scheduler_assessment = _reconcile_campaign_assessment(
+        current,
+        report,
+    ).scheduler
+    environment_assessment = _reconcile_environment_config_binding_repair(
         campaign,
         proposed,
+        scheduler_ownership_clear=(
+            not (runtime_status or {}).get("reconcile_apply_blockers")
+            and not scheduler_assessment.has_unresolved_scheduler_work
+        ),
     )
-    if environment_binding_repair is not None:
-        planned.append(
-            (
-                "environment configuration",
-                "advance the environment generation so it is bound to the "
-                "current campaign configuration",
+    environment_disposition = str(
+        (environment_assessment or {}).get("disposition")
+        or (
+            "reconcile_required"
+            if (environment_assessment or {}).get("kind")
+            else "current"
+        )
+    )
+    environment_reason = _reconcile_plain_text(
+        (environment_assessment or {}).get("reason") or ""
+    )
+    if environment_disposition in {"invalid", "ownership_blocked"}:
+        if environment_reason not in blockers:
+            blockers.append(environment_reason)
+    elif environment_disposition == "reconcile_required":
+        if planned or _reconcile_state_differs(current, proposed):
+            planned.append(
+                (
+                    "environment configuration",
+                    "advance the environment generation so it is bound to the "
+                    "current campaign configuration after the listed recovery "
+                    "makes the transition boundary safe",
+                )
             )
-        )
-        reason_parts.append(
-            "the active environment generation is bound to an older "
-            "campaign configuration"
-        )
+            reason_parts.append("environment recovery is required before launch")
+        else:
+            blockers.append(environment_reason)
 
     scheduler_cancellation = [
         dict(item)
@@ -12344,7 +12476,11 @@ def _reconcile_presentation(
         and not isinstance(ariadne, Mapping)
         and not ordinary_repairs
         and not isinstance(candidate, Mapping)
-        and environment_binding_repair is None
+        and environment_disposition in {
+            "current",
+            "unbound_first_start",
+            "rebindable_on_resume",
+        }
     )
     has_changes = bool(planned)
     if blockers:
@@ -12448,6 +12584,17 @@ def _reconcile_presentation(
             after.append(
                 ("stop request", retained_stop + "; remains active")
             )
+        if environment_disposition in {
+            "rebindable_on_resume",
+            "reconcile_required",
+        }:
+            after.append(
+                (
+                    "software environment",
+                    "resume will record a correctly bound generation before "
+                    "scientific work begins",
+                )
+            )
 
     if result == "ready to apply":
         next_label = "run"
@@ -12498,6 +12645,11 @@ def _reconcile_presentation(
                 target_iteration,
                 replacement_round=target_round,
             )
+            if environment_disposition == "rebindable_on_resume":
+                next_effect += (
+                    "; startup first records a correctly bound environment "
+                    "generation"
+                )
     elif result == "no recovery needed":
         next_label = "review"
         next_command = _campaign_command(campaign, "status")
@@ -13414,6 +13566,33 @@ def _print_reconcile_applied_operator_report(
     print("")
     print("Applied changes")
     applied_rows: List[Tuple[str, str]] = [("campaign state", "written and verified")]
+    transaction_recovery = getattr(
+        report,
+        "reconcile_transaction_recovery",
+        None,
+    )
+    if (
+        isinstance(transaction_recovery, Mapping)
+        and str(transaction_recovery.get("state") or "") == "recovered"
+    ):
+        backup_status = str(
+            transaction_recovery.get("state_backup_status") or ""
+        )
+        if backup_status == "repairable_partial":
+            applied_rows.append(
+                (
+                    "state backup",
+                    "replaced the interrupted partial backup from authenticated "
+                    "transaction evidence",
+                )
+            )
+        elif backup_status == "absent":
+            applied_rows.append(
+                (
+                    "state backup",
+                    "created the missing authenticated state backup",
+                )
+            )
     applied_rows.extend(("stale artefact", "removed " + _reconcile_relative_path(campaign, item)) for item in removed)
     applied_rows.extend(("model staging", "removed " + _reconcile_relative_path(campaign, item)) for item in removed_model_staging)
     applied_rows.extend(("submission scripts", "archived " + _reconcile_relative_path(campaign, item)) for item in archived_scripts)
@@ -13705,7 +13884,9 @@ def _advance_environment_after_reconcile(
             config=config,
             avail=availability,
         )
-        live_preflight_ok = bool(preflight.get("ready", False))
+        live_preflight_ok = bool(
+            preflight.get("_presentation_base_environment_ready", False)
+        )
         if not live_preflight_ok:
             details = _preflight_failure_details(preflight)
             raise ValueError(
@@ -14636,6 +14817,10 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             "reason": str(
                 transaction_recovery_results[-1].get("reason") or ""
             ),
+            "state_backup_status": str(
+                transaction_recovery_results[-1].get("state_backup_status")
+                or ""
+            ),
         }
     else:
         report.reconcile_transaction_recovery = (
@@ -15519,11 +15704,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     try:
         if transaction is None:
             raise RuntimeError("reconcile transaction was not created")
-        backup_path = _copy_existing_reconcile_backup(
-            campaign,
-            target_canonical,
-            transaction,
-        )
+        backup_path = publish_reconcile_state_backup(campaign, transaction)
     except Exception as exc:
         pointer_errors = _restore_reconcile_pointer_snapshots(campaign, pointer_snapshots)
         reason = "state backup failed: " + type(exc).__name__ + ": " + str(exc)
@@ -15824,6 +16005,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             _reconcile_environment_config_binding_repair(
                 campaign,
                 report.proposed_state,
+                scheduler_ownership_clear=True,
             )
         )
         append_event(
@@ -15868,8 +16050,10 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             recovery_reason=str(report.decision or ""),
             environment_binding_repair_kind=(
                 None
-                if environment_binding_repair is None
-                else str(environment_binding_repair["kind"])
+                if not isinstance(environment_binding_repair, Mapping)
+                or str(environment_binding_repair.get("disposition") or "")
+                in {"current", "unbound_first_start"}
+                else "campaign_config_generation_binding_advanced"
             ),
             **ariadne_event_fields,
             **aimall_event_fields,
@@ -16829,33 +17013,27 @@ def _preflight_environment_generation_evidence(
     campaign: Path,
     state: Optional[CampaignState],
     config: Optional[CampaignConfig],
+    *,
+    scheduler_ownership_clear: bool,
 ) -> Optional[Dict[str, Any]]:
-    """Return bounded, read-only generation/config evidence for human output."""
+    """Return the shared read-only environment launch disposition."""
     if state is None or config is None:
         return None
     try:
-        from .execution_identity import (
-            execution_identity_path,
-            read_active_environment_generation,
-        )
+        from .execution_identity import inspect_environment_generation_launch
 
-        identity_path = execution_identity_path(campaign)
-        if not identity_path.exists() and not identity_path.is_symlink():
-            return None
-        active = read_active_environment_generation(
+        return inspect_environment_generation_launch(
             campaign,
-            expected_campaign_uid=str(state.campaign_uid),
-        )["generation"]
-        current_config_sha256 = config_fingerprint(canonical_config(config))
-        bound_config_sha256 = str(
-            active.get("campaign_config_sha256") or ""
+            state=state,
+            config=config,
+            scheduler_ownership_clear=scheduler_ownership_clear,
         )
-        return {
-            "generation": int(active["generation"]),
-            "config_matches": bound_config_sha256 == current_config_sha256,
-        }
     except Exception as exc:
         return {
+            "disposition": "invalid",
+            "launchable": False,
+            "generation": -1,
+            "reason": "execution environment evidence is invalid: " + str(exc),
             "error": type(exc).__name__ + ": " + str(exc),
         }
 
@@ -16872,7 +17050,10 @@ def _preflight_payload(
     feasibility_ok = bool(feasibility_summary.get("ok", False))
     state_payload = dict(state_summary or {"ok": True})
     state_ok = bool(state_payload.get("ok", False))
-    ready = bool(avail.all_present and config_ok and feasibility_ok and state_ok)
+    base_environment_ready = bool(
+        avail.all_present and config_ok and feasibility_ok
+    )
+    ready = bool(base_environment_ready and state_ok)
     payload: Dict[str, Any] = dict(backend_payload)
     payload.update(
         {
@@ -16891,6 +17072,7 @@ def _preflight_payload(
             "next_action": (
                 "start live campaign" if ready else "fix failed checks before live start"
             ),
+            "_presentation_base_environment_ready": base_environment_ready,
         }
     )
     return payload
@@ -16993,14 +17175,27 @@ def _preflight_failure_details(payload: Dict[str, Any]) -> List[str]:
                 )
             )
         elif condition in {"paused", "reconcile_required", "complete"}:
-            details.extend(issues)
+            details.extend(
+                (
+                    classify_operator_failure(issue).summary
+                    if classify_operator_failure(issue).family != "unknown"
+                    else issue
+                )
+                for issue in issues
+            )
         else:
+            state_error = str(
+                state.get("error")
+                or state.get("phase")
+                or "state is not runnable"
+            )
+            failure = classify_operator_failure(state_error)
             details.append(
                 "campaign launch state: "
-                + str(
-                    state.get("error")
-                    or state.get("phase")
-                    or "state is not runnable"
+                + (
+                    failure.summary
+                    if failure.family != "unknown"
+                    else state_error
                 )
             )
     submitted_smoke = payload.get("submitted_environment_smoke")
@@ -17247,34 +17442,47 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
     environment_generation = payload.get(
         "_presentation_environment_generation"
     )
-    if (
-        isinstance(environment_generation, Mapping)
-        and environment_generation.get("generation") is not None
-    ):
-        config_matches = bool(
-            environment_generation.get("config_matches", False)
-        )
+    if isinstance(environment_generation, Mapping):
+        disposition = str(environment_generation.get("disposition") or "")
+        if not disposition:
+            disposition = (
+                "current"
+                if environment_generation.get("config_matches") is True
+                else "reconcile_required"
+                if environment_generation.get("config_matches") is False
+                else "invalid"
+            )
+        launchable = disposition in {
+            "current",
+            "unbound_first_start",
+            "rebindable_on_resume",
+        }
+        generation = int(environment_generation.get("generation", -1))
+        detail = str(environment_generation.get("reason") or disposition)
+        if disposition == "current":
+            detail = (
+                str(generation)
+                + "; bound to the current campaign configuration"
+            )
         lines.append(
             _preflight_check_line(
                 "environment generation",
-                config_matches,
-                str(environment_generation["generation"])
-                + (
-                    "; bound to the current campaign configuration"
-                    if config_matches
-                    else "; configuration binding requires reconcile"
-                ),
-                warn=not config_matches,
+                launchable,
+                detail,
+                warn=disposition in {
+                    "unbound_first_start",
+                    "rebindable_on_resume",
+                },
             )
         )
-    elif (
+    if (
         verbose
         and isinstance(environment_generation, Mapping)
         and environment_generation.get("error")
     ):
         lines.append(
-            "  environment generation: "
-            + _reconcile_plain_text(environment_generation["error"])
+            "  technical environment error: "
+            + str(environment_generation["error"])
         )
     issues = [
         str(item)
@@ -17475,6 +17683,11 @@ def _preflight_launch_advice(
     if isinstance(diversity_transition, Mapping):
         status_payload["_presentation_diversity_transition"] = dict(
             diversity_transition
+        )
+    environment = payload.get("_presentation_environment_generation")
+    if isinstance(environment, Mapping):
+        status_payload["_presentation_environment_generation"] = dict(
+            environment
         )
 
     lock = _probe_daemon_lock(paths["lock"])
@@ -17711,6 +17924,9 @@ def evaluate_campaign_preflight(
     presentation_contract: Optional[Dict[str, Any]] = None
     presentation_stop: Dict[str, Any] = {}
     presentation_diversity_transition: Optional[Dict[str, Any]] = None
+    presentation_environment: Optional[Dict[str, Any]] = None
+    presentation_transaction: Optional[Dict[str, Any]] = None
+    preflight_snapshot: Optional[Any] = None
     presentation_config_review: Dict[str, Any] = {
         "state": "unavailable",
         "n_allowed": 0,
@@ -17925,6 +18141,115 @@ def evaluate_campaign_preflight(
                             + str(exc)
                         )
 
+            ownership_payload = state.to_dict()
+            paths = _campaign_paths(campaign)
+            ownership_payload.update(_probe_daemon_lock(paths["lock"]))
+            stale_seconds, clock_skew = _runtime_liveness_policy(campaign)
+            ownership_payload.update(
+                _probe_daemon_lease(
+                    paths["lease"],
+                    stale_seconds=stale_seconds,
+                    clock_skew_tolerance_seconds=clock_skew,
+                )
+            )
+            ownership_payload.update(
+                _probe_background_daemon(
+                    paths["background_pid"],
+                    paths["background_log"],
+                    paths["background_startup"],
+                )
+            )
+            intent_errors: List[Dict[str, str]] = []
+            ownership_payload["active_submission_intents"] = (
+                _load_active_submission_intents(
+                    campaign,
+                    errors=intent_errors,
+                    expected_campaign_uid=str(state.campaign_uid),
+                    state=state,
+                )
+            )
+            if intent_errors:
+                ownership_payload["submission_intent_errors"] = intent_errors
+            scheduler_recovery = _load_scheduler_recovery_status(campaign, state)
+            if scheduler_recovery is not None:
+                ownership_payload["_presentation_scheduler_recovery"] = (
+                    scheduler_recovery
+                )
+            ownership = assess_campaign_presentation(
+                ownership_payload
+            ).scheduler
+            daemon_active = _status_daemon_active(ownership_payload)
+            scheduler_clear = bool(
+                not daemon_active
+                and not ownership.has_unresolved_scheduler_work
+                and not intent_errors
+            )
+            if daemon_active:
+                condition = "blocked"
+                issues.append("another daemon currently owns this campaign")
+            elif ownership.has_unresolved_scheduler_work or intent_errors:
+                condition = "blocked"
+                issues.append(
+                    "scheduler ownership is active or cannot be established safely"
+                )
+
+            try:
+                presentation_transaction = inspect_reconcile_transaction_recovery(
+                    campaign,
+                    artifact_snapshot=preflight_snapshot,
+                )
+            except Exception as exc:
+                presentation_transaction = {
+                    "state": "blocked",
+                    "recoverable": False,
+                    "reason": type(exc).__name__ + ": " + str(exc),
+                }
+            transaction_state = str(
+                (presentation_transaction or {}).get("state") or "none"
+            )
+            if transaction_state == "recoverable" and bool(
+                (presentation_transaction or {}).get("recoverable", False)
+            ):
+                if condition != "blocked":
+                    condition = "reconcile_required"
+                issues.append(
+                    "an interrupted reconcile must be recovered before launch"
+                )
+            elif transaction_state not in {"none", "recovered"}:
+                condition = "blocked"
+                issues.append(
+                    "interrupted reconcile evidence requires manual review"
+                )
+
+            presentation_environment = (
+                _preflight_environment_generation_evidence(
+                    campaign,
+                    state,
+                    loaded_config,
+                    scheduler_ownership_clear=scheduler_clear,
+                )
+            )
+            environment_disposition = str(
+                (presentation_environment or {}).get("disposition") or "invalid"
+            )
+            if environment_disposition == "reconcile_required":
+                if condition != "blocked":
+                    condition = "reconcile_required"
+                issues.append(
+                    str(
+                        (presentation_environment or {}).get("reason")
+                        or "environment recovery is required before launch"
+                    )
+                )
+            elif environment_disposition in {"invalid", "ownership_blocked"}:
+                condition = "blocked"
+                issues.append(
+                    str(
+                        (presentation_environment or {}).get("reason")
+                        or "execution environment evidence is invalid"
+                    )
+                )
+
             if state.phase in {
                 CampaignPhase.PHASE_A_DIVERSITY,
                 CampaignPhase.PHASE_B_DIVERSITY,
@@ -17972,13 +18297,13 @@ def evaluate_campaign_preflight(
     payload["_presentation_diversity_transition"] = (
         presentation_diversity_transition
     )
-    payload["_presentation_environment_generation"] = (
-        _preflight_environment_generation_evidence(
-            campaign,
-            presentation_state,
-            loaded_config,
+    payload["_presentation_environment_generation"] = presentation_environment
+    if isinstance(presentation_transaction, Mapping) and str(
+        presentation_transaction.get("state") or ""
+    ) != "none":
+        payload["_presentation_reconcile_transaction_recovery"] = dict(
+            presentation_transaction
         )
-    )
     return payload
 
 

@@ -35,6 +35,7 @@ _STAGE_LABELS = {
     "resource_resolution": "Resolving resources",
     "ariadne_resource_validation": "Validating ARIADNE resource inputs",
     "ariadne_resource_dimensions": "Computing ARIADNE local subspace dimensions",
+    "ariadne_resource_bound": "Applying configured ARIADNE resource bound",
     "ariadne_resource_reuse": "Reusing validated ARIADNE resource evidence",
     "resource_rules": "Applying scheduler resource rules",
     "input_staging": "Staging inputs",

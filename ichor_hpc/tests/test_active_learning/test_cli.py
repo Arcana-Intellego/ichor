@@ -662,6 +662,83 @@ def test_campaign_preflight_allows_and_reports_pending_boundary_stop(
     assert "retain and honour this request" in output
 
 
+def test_campaign_preflight_is_not_ready_for_recoverable_transaction(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    _write_locked_state(campaign, fresh_campaign_state(max_iterations=2))
+    monkeypatch.setattr(
+        cli_mod,
+        "_pool_feasibility_summary",
+        lambda _campaign, _config: _pool_feasibility_payload(),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "inspect_reconcile_transaction_recovery",
+        lambda *_args, **_kwargs: {
+            "state": "recoverable",
+            "recoverable": True,
+            "action": "adopt",
+            "disposition": "adopted_committed_state",
+            "state_backup_status": "repairable_partial",
+            "reason": "all campaign changes were published",
+        },
+    )
+
+    payload = cli_mod.evaluate_campaign_preflight(
+        campaign,
+        avail=_backend_availability(),
+    )
+
+    assert payload["ready"] is False
+    assert payload["campaign_state"]["condition"] == "reconcile_required"
+    assert "interrupted reconcile" in payload["campaign_state"]["error"]
+    action, command = cli_mod._preflight_launch_advice(campaign, payload)
+    assert "reconcile" in action
+    assert command == cli_mod._campaign_command(campaign, "reconcile")
+
+
+def test_campaign_preflight_blocks_an_invalid_environment_pointer(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning import execution_identity
+
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=2)
+    _write_locked_state(campaign, state)
+    config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+    execution_identity.ensure_execution_identity(
+        campaign,
+        campaign_uid=str(state.campaign_uid),
+        config=config,
+        requested_mode="dry_run",
+    )
+    current_path = execution_identity.environment_current_path(campaign)
+    current = json.loads(current_path.read_text(encoding="utf-8"))
+    current["generation_digest_sha256"] = "f" * 64
+    current_path.write_text(json.dumps(current), encoding="utf-8")
+    monkeypatch.setattr(
+        cli_mod,
+        "_pool_feasibility_summary",
+        lambda _campaign, _config: _pool_feasibility_payload(),
+    )
+
+    payload = cli_mod.evaluate_campaign_preflight(
+        campaign,
+        avail=_backend_availability(),
+    )
+
+    assert payload["ready"] is False
+    assert payload["campaign_state"]["condition"] == "blocked"
+    environment = payload["_presentation_environment_generation"]
+    assert environment["disposition"] == "invalid"
+    action, command = cli_mod._preflight_launch_advice(campaign, payload)
+    assert "recovery" in action
+    assert command == cli_mod._campaign_command(campaign, "reconcile")
+
+
 def test_preflight_reports_proven_terminal_scalar_retry_boundary():
     payload = {
         "ready": True,
@@ -989,7 +1066,7 @@ def test_cli_preflight_marks_missing_submitted_python_as_failed_and_actionable(
     assert "configure an absolute submitted Python path" in out
 
 
-def test_cli_preflight_ready_campaign_with_active_daemon_recommends_monitoring(
+def test_cli_preflight_active_daemon_is_not_launch_ready_and_recommends_monitoring(
     tmp_path,
     capsys,
     monkeypatch,
@@ -1010,8 +1087,10 @@ def test_cli_preflight_ready_campaign_with_active_daemon_recommends_monitoring(
 
     rc = main(["preflight", "--campaign-dir", str(campaign)])
 
-    assert rc == 0
+    assert rc == 12
     out = capsys.readouterr().out
+    assert "result: blocked" in out
+    assert "campaign launch: blocked" in out
     assert "the daemon is running; monitor it instead of starting another" in out
     assert "ichor-al-daemon journal --campaign-dir" in out
     assert "start --campaign-dir" not in out
@@ -1377,7 +1456,11 @@ def test_cli_status_reports_initial_ferebus_bootstrap_contract_problem(tmp_path,
     assert "being produced" not in out
 
 
-def test_cli_status_backend_submission_failure_recommends_reconcile_apply(tmp_path, capsys):
+def test_cli_status_backend_submission_failure_recommends_reconcile_apply(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
     campaign = _campaign_with_config(tmp_path)
     data = campaign / DEFAULT_DATA_SUBDIR
     data.mkdir(parents=True, exist_ok=True)
@@ -1390,6 +1473,15 @@ def test_cli_status_backend_submission_failure_recommends_reconcile_apply(tmp_pa
         from_phase=CampaignPhase.PHASE_A_DIVERSITY.value,
         iteration=0,
         reason="backend_submission_failed: partition 'multicore_small' is not present",
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_preflight_environment_generation_evidence",
+        lambda *_args, **_kwargs: {
+            "disposition": "current",
+            "launchable": True,
+            "generation": 0,
+        },
     )
 
     rc = main(["status", "--campaign-dir", str(campaign)])
@@ -4759,6 +4851,104 @@ def test_reconcile_preview_describes_rebuildable_allocation_sample(
     assert "--apply" not in output
 
 
+def test_reconcile_preview_discloses_repairable_state_backup(
+    tmp_path,
+):
+    state = fresh_campaign_state(campaign_uid="backup-repair")
+    data = tmp_path / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True)
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    report = SimpleNamespace(
+        proposed_state=CampaignState.from_dict(state.to_dict()),
+        unsafe_reasons=[],
+        blocking_artifacts=[],
+        active_submission_intents=[],
+        decision="INIT: coherent campaign authority",
+        reconcile_transaction_recovery={
+            "state": "recoverable",
+            "recoverable": True,
+            "action": "adopt",
+            "disposition": "adopted_committed_state",
+            "state_backup_status": "repairable_partial",
+            "reason": "all recorded campaign changes were published",
+        },
+    )
+
+    presentation = cli_mod._reconcile_presentation(
+        tmp_path,
+        report,
+        {
+            "contract_ok": True,
+            "missing_or_invalid_inputs": [],
+            "protected_artifacts": [],
+        },
+        config_review=SimpleNamespace(
+            allowed_changes=[],
+            blocked_changes=[],
+        ),
+        runtime_status={},
+    )
+
+    assert presentation.result == "ready to apply"
+    rows = list(presentation.planned_changes)
+    assert rows.count(
+        (
+            "state backup",
+            "replace the interrupted partial backup from the transaction's "
+            "authenticated before-state",
+        )
+    ) == 1
+
+
+def test_reconcile_safe_stale_binding_requires_resume_not_apply(
+    tmp_path,
+    monkeypatch,
+):
+    state = fresh_campaign_state(campaign_uid="safe-rebind")
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 3
+    data = tmp_path / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True)
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    report = SimpleNamespace(
+        proposed_state=CampaignState.from_dict(state.to_dict()),
+        unsafe_reasons=[],
+        blocking_artifacts=[],
+        active_submission_intents=[],
+        decision="SEED_SELECT: campaign authority is coherent",
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_reconcile_environment_config_binding_repair",
+        lambda *_args, **_kwargs: {
+            "disposition": "rebindable_on_resume",
+            "launchable": True,
+            "generation": 7,
+            "reason": "startup will create a correctly bound generation",
+        },
+    )
+
+    presentation = cli_mod._reconcile_presentation(
+        tmp_path,
+        report,
+        {
+            "contract_ok": True,
+            "missing_or_invalid_inputs": [],
+            "protected_artifacts": [],
+        },
+        config_review=SimpleNamespace(
+            allowed_changes=[],
+            blocked_changes=[],
+        ),
+        runtime_status={},
+    )
+
+    assert presentation.result == "no reconcile changes needed"
+    assert "resume" in presentation.next_command
+    assert "correctly bound environment generation" in presentation.next_effect
+    assert "--apply" not in presentation.next_command
+
+
 def test_preflight_describes_completed_stop_as_pause_not_backend_failure(tmp_path):
     payload = {
         "ready": False,
@@ -4995,6 +5185,65 @@ def test_journal_rounds_time_details_and_hides_all_throughput():
     assert event["elapsed_seconds"] == 59.6
     assert event["stage_elapsed_seconds"] == 12.5
     assert event["throughput"] == 0.5
+
+
+def test_journal_resource_resolution_uses_evidence_specific_summary():
+    configured = {
+        "event": "resolved_phase_resources",
+        "phase": CampaignPhase.ARIADNE_ARRAY.value,
+        "iteration": 18,
+        "n_tasks": 200,
+        "resource_evidence_mode": "computed",
+        "gradient_dimension_source": "configured_safe_upper_bound",
+        "gradient_dimension": 6,
+    }
+    reused = {
+        **configured,
+        "n_tasks": 196,
+        "resource_evidence_mode": "reused",
+        "resource_evidence_source_attempt_id": "attempt-1",
+    }
+
+    configured_output = cli_mod._format_journal_events(
+        [configured],
+        verbose=False,
+    )
+    reused_output = cli_mod._format_journal_events([reused], verbose=False)
+
+    assert (
+        "resources resolved for 200 tasks using configured ARIADNE "
+        "dimension bound 6"
+    ) in configured_output
+    assert (
+        "resources resolved for 196 retry tasks using validated ARIADNE "
+        "evidence from attempt-1"
+    ) in reused_output
+    for output in (configured_output, reused_output):
+        assert "completed=-" not in output
+        assert "running=-" not in output
+        assert "pending=-" not in output
+        assert "tasks=" not in output
+
+
+def test_journal_halt_is_plain_by_default_and_raw_when_verbose():
+    reason = (
+        "backend_submission_failed: ValueError: resource implementation "
+        "ARIADNE native code has drifted"
+    )
+    event = {
+        "event": "halt",
+        "phase": CampaignPhase.HALTED.value,
+        "iteration": 18,
+        "reason": reason,
+    }
+
+    default = cli_mod._format_journal_events([event], verbose=False)
+    verbose = cli_mod._format_journal_events([event], verbose=True)
+
+    assert "installed ARIADNE native module differs" in default
+    assert "backend_submission_failed" not in default
+    assert "ValueError" not in default
+    assert "raw_reason=" + reason in verbose
 
 
 def test_journal_malformed_seconds_remain_safely_renderable():
@@ -5407,6 +5656,15 @@ def test_cli_reconcile_cleanable_scripts_reports_candidate_without_manual_mv(
     scripts.mkdir(parents=True)
     (scripts / "PHASE_B_DIVERSITY-1.sh").write_text("#!/bin/bash\n", encoding="utf-8")
     monkeypatch.setattr(cli_mod, "_reconcile_runtime_status", lambda campaign: {})
+    monkeypatch.setattr(
+        cli_mod,
+        "_reconcile_environment_config_binding_repair",
+        lambda *_args, **_kwargs: {
+            "disposition": "current",
+            "launchable": True,
+            "generation": 0,
+        },
+    )
 
     rc = main(["reconcile", "--campaign-dir", str(campaign)])
 
@@ -6443,6 +6701,15 @@ def test_cli_reconcile_reselects_after_terminal_intent_before_proposal(
             "trusted_inputs": [],
         },
     )
+    monkeypatch.setattr(
+        cli_mod,
+        "_reconcile_environment_config_binding_repair",
+        lambda *_args, **_kwargs: {
+            "disposition": "current",
+            "launchable": True,
+            "generation": 0,
+        },
+    )
 
     rc = main(["reconcile", "--campaign-dir", str(campaign)])
 
@@ -6462,6 +6729,7 @@ def test_cli_reconcile_reselects_after_terminal_intent_before_proposal(
 
 def test_reconcile_terminal_scheduler_recovery_without_changes_uses_resume(
     tmp_path,
+    monkeypatch,
 ):
     from ichor.hpc.active_learning.daemon.reconcile import (
         ReconciliationReport,
@@ -6518,6 +6786,15 @@ def test_reconcile_terminal_scheduler_recovery_without_changes_uses_resume(
             "n_retry": 196,
         }
     ]
+    monkeypatch.setattr(
+        cli_mod,
+        "_reconcile_environment_config_binding_repair",
+        lambda *_args, **_kwargs: {
+            "disposition": "current",
+            "launchable": True,
+            "generation": 0,
+        },
+    )
     presentation = cli_mod._reconcile_presentation(
         campaign,
         report,

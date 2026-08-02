@@ -1206,6 +1206,7 @@ def test_ariadne_postprocess_intent_copies_original_decision_contract(
         "generation": 7,
         "generation_digest_sha256": "7" * 64,
     }
+    d._environment_binding_mode = "bound"
     source = {
         "decision_contract": {
             "failure_threshold_fraction": 0.125,
@@ -1224,6 +1225,11 @@ def test_ariadne_postprocess_intent_copies_original_decision_contract(
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(d, "_verify_environment_boundary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        d,
+        "_validate_submission_environment_binding",
+        lambda *_args, **_kwargs: None,
+    )
     monkeypatch.setattr(
         d,
         "_verify_committed_artifacts_if_enabled",
@@ -1566,6 +1572,32 @@ def test_run_loop_returns_nonzero_for_preexisting_halted_state(tmp_path):
     write_state(d.state_path(), state)
 
     assert d._run_loop(max_ticks=1) == 20
+
+
+@pytest.mark.parametrize(
+    ("max_ticks", "expected_ticks", "expected_heartbeats", "expected_sleeps"),
+    ((0, 0, 0, 0), (1, 1, 1, 0), (2, 2, 2, 1)),
+)
+def test_bounded_run_never_sleeps_after_its_final_tick(
+    tmp_path,
+    max_ticks,
+    expected_ticks,
+    expected_heartbeats,
+    expected_sleeps,
+):
+    daemon = _make_daemon(tmp_path)
+    write_state(daemon.state_path(), fresh_campaign_state(max_iterations=2))
+    ticks = []
+    heartbeats = []
+    sleeps = []
+    daemon.tick = lambda: ticks.append(True) or TickStatus.POLLING
+    daemon._write_lease_heartbeat = lambda *_args, **_kwargs: heartbeats.append(True)
+    daemon.sleep_fn = lambda seconds: sleeps.append(seconds)
+
+    assert daemon._run_loop(max_ticks=max_ticks) == 0
+    assert len(ticks) == expected_ticks
+    assert len(heartbeats) == expected_heartbeats
+    assert len(sleeps) == expected_sleeps
 
 
 def test_generic_tick_exception_writes_last_exception_sidecar_and_halts(tmp_path):
