@@ -2860,6 +2860,146 @@ class _FakeSbatch:
         return SimpleNamespace(returncode=0, stdout="12345\n", stderr="")
 
 
+@pytest.mark.parametrize("scheduler_kind", ["slurm", "sge"])
+def test_submission_environment_guard_runs_before_scheduler_acceptance(
+    tmp_path,
+    monkeypatch,
+    scheduler_kind,
+):
+    cfg = CampaignConfig()
+    runner = _FakeSbatch()
+    campaign = tmp_path / "campaign"
+    ex = LiveBackendsPhaseExecutor(
+        campaign_dir=campaign,
+        config=cfg,
+        backend_check=False,
+        sbatch_runner=runner,
+    )
+    ex.scheduler_identity_kind = scheduler_kind
+    ex._scheduler_backend = live_executor_mod.get_scheduler_backend(
+        scheduler_kind
+    )
+    submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid="binding-guard-test",
+        phase_name="GAUSSIAN",
+        iteration=4,
+        expected_tasks=1,
+        scheduler_identity_kind=scheduler_kind,
+    )
+    monkeypatch.setattr(ex, "_array_size_after_staging", lambda *_args: 1)
+
+    def write_bound_fixture_script(
+        phase,
+        state,
+        array_size,
+        array_task_map=None,
+    ):
+        phase_name = phase.value if isinstance(phase, CampaignPhase) else str(phase)
+        intent = submission_intent.load_active_intent(
+            campaign,
+            phase_name,
+            state.iteration,
+        )
+        bundle = prepare_attempt_bundle(
+            campaign,
+            phase_name,
+            state.iteration,
+            str(intent["submission_identity"]),
+            array_size=array_size,
+            max_log_files_per_directory=5000,
+            source_array_task_map=array_task_map,
+        )
+        script = write_attempt_script(bundle, "#!/bin/bash\ntrue\n")
+        binding = write_script_binding(bundle)
+        submission_intent.bind_submission_script(
+            campaign,
+            phase_name,
+            state.iteration,
+            script_path=str(script.resolve()),
+            script_sha256=str(binding["script_sha256"]),
+            binding_path=str(binding["path"]),
+            binding_sha256=str(binding["sha256"]),
+        )
+        return script
+
+    monkeypatch.setattr(ex, "_write_real_script", write_bound_fixture_script)
+    monkeypatch.setattr(
+        live_executor_mod,
+        "prepare_retry_submission",
+        lambda *_args, **_kwargs: {
+            "phase": "GAUSSIAN",
+            "iteration": 4,
+            "logical_total": 1,
+            "n_complete": 0,
+            "n_reuse": 0,
+            "n_retry": 1,
+            "force_resubmit": False,
+            "retry_task_ids": [0],
+            "path": str(campaign / "ledger.json"),
+            "retry_task_file": None,
+        },
+    )
+    ex._submission_environment_guard = lambda _intent: (_ for _ in ()).throw(
+        ValueError("stale campaign configuration")
+    )
+
+    with pytest.raises(
+        BackendSubmissionError,
+        match="submission environment binding failed",
+    ):
+        ex.submit_or_run(
+            SimpleNamespace(iteration=4, campaign_uid="binding-guard-test"),
+            CampaignPhase.GAUSSIAN,
+        )
+
+    assert runner.calls == []
+
+
+def test_phase_b_resource_contract_failure_has_precise_pre_submit_message(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = tmp_path / "campaign"
+    ex = LiveBackendsPhaseExecutor(
+        campaign_dir=campaign,
+        config=CampaignConfig(),
+        backend_check=False,
+        sbatch_runner=_FakeSbatch(),
+    )
+    submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid="phase-b-resource-message",
+        phase_name="PHASE_B_DIVERSITY",
+        iteration=19,
+        expected_tasks=1,
+    )
+    monkeypatch.setattr(
+        live_executor_mod,
+        "resolve_phase_resources",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            live_executor_mod.ResourceEvidenceInvalid(
+                "PHASE_B_DIVERSITY",
+                "ARIADNE decision contract is not bound to a producer environment",
+            )
+        ),
+    )
+
+    with pytest.raises(
+        BackendSubmissionError,
+        match="Phase B resource evidence validation failed",
+    ):
+        ex._write_real_script(
+            "PHASE_B_DIVERSITY",
+            SimpleNamespace(
+                iteration=19,
+                campaign_uid="phase-b-resource-message",
+                replacement_round=0,
+                models_version=18,
+            ),
+        )
+
+
 def test_partial_array_recovery_journal_payload_does_not_duplicate_phase(
     tmp_path,
     monkeypatch,

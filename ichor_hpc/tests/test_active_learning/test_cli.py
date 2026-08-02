@@ -1,4 +1,5 @@
 """Tests for ichor.hpc.active_learning.cli."""
+import copy
 import json
 import re
 import subprocess
@@ -692,6 +693,37 @@ def test_preflight_reports_proven_terminal_scalar_retry_boundary():
     assert "[OK] diversity retry boundary" in output
     assert "job 17997698" in output
     assert "permits a clean scalar retry" in output
+
+
+def test_preflight_reports_environment_generation_config_binding():
+    payload = {
+        "ready": True,
+        "all_backends_present": True,
+        "campaign_config": {"ok": True},
+        "pool_feasibility": {
+            "ok": True,
+            "pool_n_frames": 10000,
+            "required_pool_frames": 7340,
+        },
+        "campaign_state": {
+            "ok": True,
+            "condition": "ready",
+            "phase": CampaignPhase.PHASE_B_DIVERSITY.value,
+            "iteration": 19,
+            "issues": [],
+        },
+        "_presentation_environment_generation": {
+            "generation": 21,
+            "config_matches": True,
+        },
+        "next_action": "resume the daemon",
+    }
+
+    output = cli_mod._format_preflight(payload)
+
+    assert "[OK] environment generation: 21" in output
+    assert "bound to the current campaign configuration" in output
+    assert "PHASE_B_DIVERSITY iteration 19" in output
 
 
 def test_campaign_preflight_validates_every_slurm_phase_resource_contract(
@@ -4602,6 +4634,76 @@ def test_reconcile_preview_uses_scalar_transition_verdict_before_resume(
         assert "--apply" not in output
     else:
         assert "ichor-al-daemon resume" not in output
+
+
+def test_reconcile_preview_reports_config_binding_repair_and_ariadne_reuse(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    current = fresh_campaign_state(
+        max_iterations=40,
+        campaign_uid="config-binding-recovery",
+    )
+    current.phase = CampaignPhase.HALTED
+    current.iteration = 19
+    current.reference_data_version = 18
+    current.models_version = 18
+    proposed = copy.deepcopy(current)
+    proposed.phase = CampaignPhase.PHASE_B_DIVERSITY
+    data = tmp_path / DEFAULT_DATA_SUBDIR
+    data.mkdir(parents=True)
+    write_state(data / DEFAULT_STATE_FILENAME, current)
+    report = SimpleNamespace(
+        proposed_state=proposed,
+        unsafe_reasons=[],
+        blocking_artifacts=[],
+        active_submission_intents=[],
+        decision="PHASE_B_DIVERSITY: authoritative ARIADNE results are ready",
+        ariadne_results_recovery={
+            "expected_tasks": 200,
+            "accepted_tasks": 200,
+            "rejected_tasks": 0,
+            "missing_rejected_outputs": 0,
+            "tasks_resubmitted": 0,
+        },
+    )
+    contract = {
+        "contract_ok": True,
+        "selected_phase": CampaignPhase.PHASE_B_DIVERSITY.value,
+        "missing_or_invalid_inputs": [],
+        "protected_artifacts": [],
+    }
+    monkeypatch.setattr(
+        cli_mod,
+        "_reconcile_environment_config_binding_repair",
+        lambda *_args, **_kwargs: {
+            "kind": "campaign_config_generation_binding_advanced",
+            "generation": 20,
+        },
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.execution_identity."
+        "inspect_scalar_diversity_transition_boundary",
+        lambda *_args, **_kwargs: {"safe": True},
+    )
+
+    cli_mod._print_reconcile_operator_report(
+        tmp_path,
+        report,
+        contract,
+        mode="dry_run",
+        proposed_state_path=data / "state.json.proposed",
+    )
+    output = capsys.readouterr().out
+
+    assert "Preview result: ready to apply" in output
+    assert "phase B diversity selection, iteration 19" in output
+    assert "reuse 200 accepted results" in output
+    assert "exclude 0 rejected tasks" in output
+    assert "resubmit no ARIADNE tasks" in output
+    assert "environment configuration" in output
+    assert "bound to the current campaign configuration" in output
 
 
 def test_reconcile_preview_describes_rebuildable_allocation_sample(

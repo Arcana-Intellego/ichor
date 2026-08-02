@@ -71,6 +71,8 @@ from .phase_executor import (
     SubmissionCancelledBeforeSchedulerAcceptance,
 )
 from .resource_solver import (
+    ResourceEvidenceInvalid,
+    ResourceEvidenceUnavailable,
     ResolvedPhaseResources,
     gaussian_mdef,
     resolve_phase_resources,
@@ -3930,8 +3932,23 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             total=(int(array_size) if array_size is not None else 1),
             unit="tasks",
         )
+        self._raise_if_immediate_cancel_before_submission(state)
+        environment_guard = getattr(
+            self,
+            "_submission_environment_guard",
+            None,
+        )
+        if callable(environment_guard):
+            try:
+                environment_guard(bound_intent or {})
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                raise BackendSubmissionError(
+                    "submission environment binding failed for "
+                    + phase_name
+                    + ": "
+                    + str(exc)
+                ) from exc
         try:
-            self._raise_if_immediate_cancel_before_submission(state)
             submission = self._scheduler_backend.submit(
                 script,
                 binding_sha256=binding_sha,
@@ -4089,29 +4106,37 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 self._report_runtime_progress("resource_resolution")
         else:
             self._report_runtime_progress("resource_resolution")
-        resolved = resolve_phase_resources(
-            phase_name=phase_name,
-            config=self.config,
-            partition=effective_partition,
-            campaign_dir=self.campaign_dir,
-            iteration=int(state.iteration),
-            array_size=array_size,
-            replacement_round=int(getattr(state, "replacement_round", 0)),
-            staging_dir=(
-                self._quantum_staging_path(state, phase_name)
-                if "GAUSSIAN" in phase_name or "AIMALL" in phase_name
-                else None
-            ),
-            expected_models_version=(
-                int(state.models_version)
-                if phase_name == "ARIADNE_ARRAY"
-                else None
-            ),
-            submitted_task_ids=resource_task_ids,
-            evidence_override=evidence_override,
-            require_evidence=True,
-            progress_callback=self._report_runtime_progress,
-        )
+        try:
+            resolved = resolve_phase_resources(
+                phase_name=phase_name,
+                config=self.config,
+                partition=effective_partition,
+                campaign_dir=self.campaign_dir,
+                iteration=int(state.iteration),
+                array_size=array_size,
+                replacement_round=int(getattr(state, "replacement_round", 0)),
+                staging_dir=(
+                    self._quantum_staging_path(state, phase_name)
+                    if "GAUSSIAN" in phase_name or "AIMALL" in phase_name
+                    else None
+                ),
+                expected_models_version=(
+                    int(state.models_version)
+                    if phase_name == "ARIADNE_ARRAY"
+                    else None
+                ),
+                submitted_task_ids=resource_task_ids,
+                evidence_override=evidence_override,
+                require_evidence=True,
+                progress_callback=self._report_runtime_progress,
+            )
+        except (ResourceEvidenceInvalid, ResourceEvidenceUnavailable) as exc:
+            if phase_name == "PHASE_B_DIVERSITY":
+                raise BackendSubmissionError(
+                    "Phase B resource evidence validation failed: "
+                    + str(exc)
+                ) from exc
+            raise
         self._report_runtime_progress("script_rendering")
         try:
             bundle = prepare_attempt_bundle(

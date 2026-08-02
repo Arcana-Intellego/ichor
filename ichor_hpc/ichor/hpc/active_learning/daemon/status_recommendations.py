@@ -847,6 +847,25 @@ def _halt_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecom
             ],
         )
     if "BACKEND_SUBMISSION_FAILED" in upper:
+        if (
+            "DECISION CONTRACT IS NOT BOUND TO A PRODUCER ENVIRONMENT" in upper
+            or "STALE CAMPAIGN CONFIGURATION" in upper
+            or "STALE CAMPAIGN CONFIG" in upper
+        ):
+            return StatusRecommendation(
+                code="halted_backend_submission_failed",
+                severity="required",
+                primary=(
+                    "preview recovery of the stale configuration-to-environment "
+                    "binding"
+                ),
+                why=(
+                    "the completed ARIADNE work used the approved campaign "
+                    "configuration, but its historical environment generation "
+                    "was recorded against the preceding configuration"
+                ),
+                command=_reconcile_cmd(campaign),
+            )
         if "RESOURCE IMPLEMENTATION ICHOR PACKAGE TREE HAS DRIFTED" in upper:
             return StatusRecommendation(
                 code="halted_backend_submission_failed",

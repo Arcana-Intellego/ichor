@@ -788,6 +788,32 @@ def test_terminal_phase_b_retry_overrides_stale_startup_failure(tmp_path):
     assert "ready for one Phase B retry" in cli._status_current_activity(payload)
 
 
+def test_halted_legacy_config_generation_split_recommends_reconcile(tmp_path):
+    campaign = tmp_path / "campaign"
+    payload = {
+        "phase": CampaignPhase.HALTED.value,
+        "iteration": 19,
+        "lifecycle_context": {
+            "message": (
+                "backend_submission_failed: Phase B resource evidence "
+                "validation failed: ARIADNE decision contract is not bound "
+                "to a producer environment"
+            ),
+        },
+    }
+
+    result = recommendations.build_status_recommendations(campaign, payload)
+    selected = next(
+        item
+        for item in result
+        if item.code == "halted_backend_submission_failed"
+    )
+
+    assert "stale configuration-to-environment binding" in selected.primary
+    assert "approved campaign configuration" in selected.why
+    assert str(selected.command).startswith("ichor-al-daemon reconcile")
+
+
 def test_unsafe_diversity_transition_reports_actual_startup_failure(tmp_path):
     campaign = tmp_path / "campaign"
     payload = {

@@ -305,6 +305,7 @@ class Daemon:
     resource_usage_collector: Optional[Callable[..., Dict[str, Any]]] = None
     scheduler_identity_kind: Optional[str] = None
     environment_preflight_ok: bool = False
+    poll_interval_override_seconds: Optional[int] = None
 
     #internal flags; not part of the public dataclass surface.
     _shutdown_requested: bool = field(default=False, init=False, repr=False)
@@ -1451,6 +1452,9 @@ class Daemon:
             "generation_digest_sha256": str(
                 active["generation"]["digest_sha256"]
             ),
+            "campaign_config_sha256": str(
+                active["generation"]["campaign_config_sha256"]
+            ),
         }
         if (
             self._last_environment_binding is not None
@@ -1488,6 +1492,9 @@ class Daemon:
         self._last_environment_binding = {
             "generation": int(active["generation"]),
             "generation_digest_sha256": str(active["digest_sha256"]),
+            "campaign_config_sha256": str(
+                active["campaign_config_sha256"]
+            ),
         }
 
     def _verify_intent_environment_binding(
@@ -1538,6 +1545,87 @@ class Daemon:
                 + str(exc)[:200],
             )
         return None
+
+    def _validate_submission_environment_binding(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+        decision_contract: Mapping[str, Any],
+        *,
+        allow_frozen_recovery_contract: bool,
+    ) -> None:
+        """Prove config, generation and decision identities before submission."""
+        from ..execution_identity import (
+            ExecutionIdentityError,
+            execution_identity_path,
+            read_active_environment_generation,
+        )
+        from .config_lock import (
+            canonical_config,
+            config_fingerprint,
+            read_config_lock,
+        )
+
+        identity_path = execution_identity_path(self.campaign_dir)
+        if not identity_path.exists() and not identity_path.is_symlink():
+            # Preserve direct executor unit tests that intentionally have no
+            # bound campaign execution identity.
+            return
+        active = read_active_environment_generation(
+            self.campaign_dir,
+            expected_campaign_uid=str(state.campaign_uid),
+        )["generation"]
+        observed = {
+            "generation": int(active["generation"]),
+            "generation_digest_sha256": str(active["digest_sha256"]),
+            "campaign_config_sha256": str(active["campaign_config_sha256"]),
+        }
+        if self._last_environment_binding is None:
+            raise ExecutionIdentityError(
+                "daemon startup environment binding is unavailable"
+            )
+        if observed != self._last_environment_binding:
+            raise ExecutionIdentityError(
+                "active environment generation changed before submission"
+            )
+        current_config_sha256 = config_fingerprint(
+            canonical_config(self.config)
+        )
+        lock = read_config_lock(
+            self.campaign_dir,
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        lock_config_sha256 = str(lock.get("fingerprint_sha256") or "")
+        if lock_config_sha256 != current_config_sha256:
+            raise ExecutionIdentityError(
+                "config lock does not match the daemon's canonical configuration"
+            )
+        if observed["campaign_config_sha256"] != current_config_sha256:
+            raise ExecutionIdentityError(
+                "active environment generation is bound to a stale campaign "
+                "configuration"
+            )
+        decision_config_sha256 = str(
+            decision_contract.get("config_sha256") or ""
+        )
+        if (
+            len(decision_config_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in decision_config_sha256
+            )
+        ):
+            raise ExecutionIdentityError(
+                "submission decision contract has an invalid config digest"
+            )
+        if (
+            decision_config_sha256 != current_config_sha256
+            and not allow_frozen_recovery_contract
+        ):
+            raise ExecutionIdentityError(
+                "submission decision contract is not bound to the active "
+                "environment configuration"
+            )
 
     def _strict_artifact_checks_enabled(self) -> bool:
         return bool(getattr(self.executor, "strict_committed_artifact_verification", False))
@@ -1932,7 +2020,11 @@ class Daemon:
                     + type(exc).__name__ + ": " + str(exc)[:160],
                 )
         intent_written = False
+        submission_decision_contract: Optional[Dict[str, Any]] = None
+        allow_frozen_recovery_contract = False
         if phase_name in SBATCH_PHASES:
+            from ..execution_identity import ExecutionIdentityError
+
             try:
                 if not local_postprocess_intent:
                     planned_expected_tasks = self._infer_expected_tasks_from_artifacts(
@@ -1945,6 +2037,27 @@ class Daemon:
                             phase,
                         )
                     )
+                    submission_decision_contract = (
+                        dict(postprocess_source["decision_contract"])
+                        if postprocess_source is not None
+                        else (
+                            recovery_decision_contract
+                            if recovery_decision_contract is not None
+                            else self._submission_decision_contract()
+                        )
+                    )
+                    allow_frozen_recovery_contract = bool(
+                        postprocess_source is not None
+                        or recovery_decision_contract is not None
+                    )
+                    self._validate_submission_environment_binding(
+                        state,
+                        phase,
+                        submission_decision_contract,
+                        allow_frozen_recovery_contract=(
+                            allow_frozen_recovery_contract
+                        ),
+                    )
                     _submission_intent.write_pre_submit_intent(
                         self.campaign_dir,
                         campaign_uid=str(getattr(state, "campaign_uid", "")),
@@ -1954,15 +2067,7 @@ class Daemon:
                             getattr(state, "replacement_round", 0)
                         ),
                         expected_tasks=planned_expected_tasks,
-                        decision_contract=(
-                            dict(postprocess_source["decision_contract"])
-                            if postprocess_source is not None
-                            else (
-                                recovery_decision_contract
-                                if recovery_decision_contract is not None
-                                else self._submission_decision_contract()
-                            )
-                        ),
+                        decision_contract=submission_decision_contract,
                         postprocess_source=(
                             dict(postprocess_source)
                             if postprocess_source is not None
@@ -1985,6 +2090,12 @@ class Daemon:
                         ),
                     )
                 intent_written = True
+            except ExecutionIdentityError as exc:
+                return self._halt_environment_drift(
+                    state,
+                    phase,
+                    "submission_environment_binding_invalid: " + str(exc)[:200],
+                )
             except Exception as exc:
                 return self._halt(
                     state,
@@ -1999,6 +2110,53 @@ class Daemon:
                 "input_staging" if phase_name in SBATCH_PHASES else "phase_entry"
             )
         self._bind_executor_progress(phase_reporter)
+        if submission_decision_contract is not None:
+            def _submission_environment_guard(
+                bound_intent: Mapping[str, Any],
+            ) -> None:
+                contract = bound_intent.get("decision_contract")
+                if not isinstance(contract, Mapping):
+                    raise ValueError(
+                        "submission intent has no decision contract"
+                    )
+                if dict(contract) != submission_decision_contract:
+                    raise ValueError(
+                        "submission intent decision contract changed during "
+                        "pre-submit staging"
+                    )
+                intent_generation = bound_intent.get(
+                    "environment_generation"
+                )
+                intent_generation_digest = bound_intent.get(
+                    "environment_generation_digest_sha256"
+                )
+                if (
+                    self._last_environment_binding is None
+                    or intent_generation
+                    != self._last_environment_binding["generation"]
+                    or intent_generation_digest
+                    != self._last_environment_binding[
+                        "generation_digest_sha256"
+                    ]
+                ):
+                    raise ValueError(
+                        "submission intent environment binding changed during "
+                        "pre-submit staging"
+                    )
+                self._validate_submission_environment_binding(
+                    state,
+                    phase,
+                    contract,
+                    allow_frozen_recovery_contract=(
+                        allow_frozen_recovery_contract
+                    ),
+                )
+
+            setattr(
+                self.executor,
+                "_submission_environment_guard",
+                _submission_environment_guard,
+            )
         try:
             try:
                 result = self.executor.submit_or_run(state, phase)
@@ -2006,6 +2164,7 @@ class Daemon:
             finally:
                 self._bind_executor_progress(None)
                 setattr(self.executor, "_committed_artifact_snapshot", None)
+                setattr(self.executor, "_submission_environment_guard", None)
         except SubmissionCancelledBeforeSchedulerAcceptance as exc:
             if phase_reporter is not None:
                 phase_reporter.fail(
@@ -2874,6 +3033,11 @@ class Daemon:
         phase: CampaignPhase,
     ) -> Optional[Dict[str, Any]]:
         """Retain the first attempt's decision controls across retry arrays."""
+        from ..execution_identity import (
+            execution_identity_path,
+            legacy_intent_config_generation_split_is_proven,
+            read_environment_generation,
+        )
         from .scheduler_recovery import scheduler_terminal_recoveries
 
         recoveries = scheduler_terminal_recoveries(
@@ -2885,7 +3049,12 @@ class Daemon:
         )
         if not recoveries:
             return None
+        identity_path = execution_identity_path(self.campaign_dir)
+        require_environment_proof = (
+            identity_path.exists() or identity_path.is_symlink()
+        )
         contracts: List[Dict[str, Any]] = []
+        producer_binding_proven = False
         for recovery in recoveries:
             intent = recovery.get("intent")
             contract = (
@@ -2897,11 +3066,70 @@ class Daemon:
                 raise ValueError(
                     "scheduler recovery producer has no decision contract"
                 )
-            contracts.append(dict(contract))
+            contract_payload = dict(contract)
+            if require_environment_proof:
+                generation = intent.get("environment_generation")
+                generation_digest = intent.get(
+                    "environment_generation_digest_sha256"
+                )
+                if (
+                    isinstance(generation, bool)
+                    or not isinstance(generation, int)
+                    or generation < 0
+                    or not isinstance(generation_digest, str)
+                    or len(generation_digest) != 64
+                ):
+                    raise ValueError(
+                        "scheduler recovery producer has no valid environment "
+                        "binding"
+                    )
+                environment = read_environment_generation(
+                    self.campaign_dir,
+                    generation=int(generation),
+                    expected_campaign_uid=str(state.campaign_uid),
+                )
+                if str(environment.get("digest_sha256") or "") != str(
+                    generation_digest
+                ):
+                    raise ValueError(
+                        "scheduler recovery producer environment digest mismatch"
+                    )
+                decision_config_sha256 = str(
+                    contract_payload.get("config_sha256") or ""
+                )
+                exact_binding = str(
+                    environment.get("campaign_config_sha256") or ""
+                ) == decision_config_sha256
+                legacy_binding = (
+                    not exact_binding
+                    and legacy_intent_config_generation_split_is_proven(
+                        self.campaign_dir,
+                        campaign_uid=str(state.campaign_uid),
+                        intent=intent,
+                        environment=environment,
+                        decision_config_sha256=decision_config_sha256,
+                        allowed_statuses=(
+                            "COMPLETED",
+                            "FAILED",
+                            "SUPERSEDED",
+                        ),
+                    )
+                )
+                producer_binding_proven = bool(
+                    producer_binding_proven
+                    or exact_binding
+                    or legacy_binding
+                )
+            contracts.append(contract_payload)
         original = contracts[0]
         if any(contract != original for contract in contracts[1:]):
             raise ValueError(
                 "scheduler recovery attempts have contradictory decision contracts"
+            )
+        if require_environment_proof and not producer_binding_proven:
+            raise ValueError(
+                "scheduler recovery decision contract is not bound to an "
+                "authenticated source environment"
             )
         return original
 
@@ -5307,7 +5535,11 @@ class Daemon:
             poll = (
                 self.config.runtime.poll_interval_idle_seconds
                 if idle_streak >= 3
-                else self.config.runtime.poll_interval_seconds
+                else (
+                    self.poll_interval_override_seconds
+                    if self.poll_interval_override_seconds is not None
+                    else self.config.runtime.poll_interval_seconds
+                )
             )
             try:
                 state = read_state(self.state_path())

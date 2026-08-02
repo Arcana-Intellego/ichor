@@ -227,6 +227,21 @@ def read_historical_config_by_fingerprint(
     expected_campaign_uid: str,
 ) -> CampaignConfig:
     """Read one authenticated config snapshot from the current history chain."""
+    return read_historical_config_binding_by_fingerprint(
+        campaign_dir,
+        fingerprint_sha256,
+        expected_campaign_uid=expected_campaign_uid,
+    )["config"]
+
+
+def read_historical_config_binding_by_fingerprint(
+    campaign_dir: Union[str, Path],
+    fingerprint_sha256: str,
+    *,
+    expected_campaign_uid: str,
+    head_at_iso: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return a config snapshot and the interval in which it was the lock head."""
     fingerprint = str(fingerprint_sha256)
     if (
         len(fingerprint) != 64
@@ -238,10 +253,27 @@ def read_historical_config_by_fingerprint(
         expected_campaign_uid=str(expected_campaign_uid),
     )
     current_canonical = current.get("canonical_config")
-    if isinstance(current_canonical, dict):
+    if isinstance(current_canonical, dict) and head_at_iso is None:
         current_fingerprint = config_fingerprint(current_canonical)
         if current_fingerprint == fingerprint:
-            return CampaignConfig.from_dict(current_canonical)
+            raw_current_sequence = current.get("history_sequence")
+            current_sequence = (
+                int(raw_current_sequence)
+                if isinstance(raw_current_sequence, int)
+                and not isinstance(raw_current_sequence, bool)
+                and raw_current_sequence >= 0
+                else -1
+            )
+            return {
+                "config": CampaignConfig.from_dict(current_canonical),
+                "fingerprint_sha256": current_fingerprint,
+                "sequence": current_sequence,
+                "entry_sha256": current.get("history_entry_sha256"),
+                "created_at_iso": str(current.get("created_at_iso") or ""),
+                "successor_created_at_iso": None,
+                "is_current": True,
+                "legacy_current_without_history": current_sequence < 0,
+            }
     raw_sequence = current.get("history_sequence")
     raw_digest = current.get("history_entry_sha256")
     if (
@@ -259,6 +291,15 @@ def read_historical_config_by_fingerprint(
     expected_sequence = int(raw_sequence)
     digest = raw_digest
     seen = set()
+    successor: Optional[Dict[str, Any]] = None
+    head_at: Optional[datetime] = None
+    if head_at_iso is not None:
+        try:
+            head_at = datetime.fromisoformat(str(head_at_iso))
+        except ValueError as exc:
+            raise ValueError("config binding timestamp must be ISO-8601") from exc
+        if head_at.tzinfo is None or head_at.utcoffset() is None:
+            raise ValueError("config binding timestamp must include a timezone")
     while digest:
         if digest in seen:
             raise ValueError("config lock history contains a cycle")
@@ -286,7 +327,49 @@ def read_historical_config_by_fingerprint(
         if str(entry.get("fingerprint_sha256") or "") != observed_fingerprint:
             raise ValueError("config lock history canonical fingerprint mismatch")
         if observed_fingerprint == fingerprint:
-            return CampaignConfig.from_dict(canonical)
+            created_iso = str(entry.get("created_at_iso") or "")
+            successor_iso = (
+                None
+                if successor is None
+                else str(successor.get("created_at_iso") or "")
+            )
+            in_requested_window = head_at is None
+            if head_at is not None:
+                try:
+                    created_at = datetime.fromisoformat(created_iso)
+                    successor_at = (
+                        None
+                        if successor_iso is None
+                        else datetime.fromisoformat(successor_iso)
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        "config lock history timestamp is invalid"
+                    ) from exc
+                if created_at.tzinfo is None or created_at.utcoffset() is None:
+                    raise ValueError(
+                        "config lock history timestamp has no timezone"
+                    )
+                if successor_at is not None and (
+                    successor_at.tzinfo is None
+                    or successor_at.utcoffset() is None
+                ):
+                    raise ValueError(
+                        "config lock history successor timestamp has no timezone"
+                    )
+                in_requested_window = created_at <= head_at and (
+                    successor_at is None or head_at < successor_at
+                )
+            if in_requested_window:
+                return {
+                    "config": CampaignConfig.from_dict(canonical),
+                    "fingerprint_sha256": observed_fingerprint,
+                    "sequence": int(entry["sequence"]),
+                    "entry_sha256": str(entry["entry_sha256"]),
+                    "created_at_iso": created_iso,
+                    "successor_created_at_iso": successor_iso,
+                    "is_current": successor is None,
+                }
         previous = entry.get("previous_entry_sha256")
         if previous in (None, ""):
             if expected_sequence != 0:
@@ -294,6 +377,7 @@ def read_historical_config_by_fingerprint(
             break
         if expected_sequence <= 0:
             raise ValueError("config lock history root has a predecessor")
+        successor = entry
         digest = str(previous)
         expected_sequence -= 1
     raise FileNotFoundError(

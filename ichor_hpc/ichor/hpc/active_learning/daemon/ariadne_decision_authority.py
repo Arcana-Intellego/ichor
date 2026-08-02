@@ -5,7 +5,10 @@ import math
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Union
 
-from ..execution_identity import read_environment_generation
+from ..execution_identity import (
+    legacy_intent_config_generation_split_is_proven,
+    read_environment_generation,
+)
 from .config_lock import (
     canonical_config,
     config_fingerprint,
@@ -274,6 +277,7 @@ def resolve_ariadne_handoff_decision_contract(
 
     contract_bound_to_environment = False
     authenticated_unbound_contract = False
+    legacy_config_generation_split = False
     scheduler_kinds = set()
     producer_attempt_ids = []
     producer_submission_identities = []
@@ -304,6 +308,14 @@ def resolve_ariadne_handoff_decision_contract(
             selected_contract["config_sha256"]
         ):
             contract_bound_to_environment = True
+        elif legacy_intent_config_generation_split_is_proven(
+            campaign,
+            campaign_uid=str(campaign_uid),
+            intent=producer,
+            environment=environment,
+            decision_config_sha256=str(selected_contract["config_sha256"]),
+        ):
+            legacy_config_generation_split = True
         scheduler_kind = producer.get("scheduler_identity_kind")
         if scheduler_kind is not None:
             scheduler_kinds.add(str(scheduler_kind))
@@ -325,6 +337,7 @@ def resolve_ariadne_handoff_decision_contract(
     if (
         not contract_bound_to_environment
         and not authenticated_unbound_contract
+        and not legacy_config_generation_split
     ):
         raise ValueError(
             "ARIADNE decision contract is not bound to a producer environment"
@@ -340,7 +353,11 @@ def resolve_ariadne_handoff_decision_contract(
         "authority_kind": (
             "submission_intent"
             if contract_bound_to_environment
-            else "submission_intent_legacy_unbound"
+            else (
+                "submission_intent_legacy_config_generation_split"
+                if legacy_config_generation_split
+                else "submission_intent_legacy_unbound"
+            )
         ),
     }
 

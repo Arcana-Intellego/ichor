@@ -1125,6 +1125,46 @@ def _environment_fingerprint(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _generation_binding_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return the immutable runtime/config identity carried by a generation.
+
+    The historical environment fingerprint deliberately excludes campaign
+    configuration.  Keep that digest stable for existing generations and pair
+    it with the canonical config digest whenever generation equality matters.
+    """
+    return {
+        "environment_fingerprint_sha256": payload.get(
+            "environment_fingerprint_sha256"
+        ),
+        "campaign_config_sha256": payload.get("campaign_config_sha256"),
+    }
+
+
+def _generation_binding_matches(
+    expected: Mapping[str, Any],
+    observed: Mapping[str, Any],
+) -> bool:
+    return _generation_binding_payload(expected) == _generation_binding_payload(
+        observed
+    )
+
+
+def _generation_changed_fields(
+    expected: Mapping[str, Any],
+    observed: Mapping[str, Any],
+) -> List[str]:
+    fields = [
+        key
+        for key in _ENVIRONMENT_FINGERPRINT_KEYS
+        if expected.get(key) != observed.get(key)
+    ]
+    if expected.get("campaign_config_sha256") != observed.get(
+        "campaign_config_sha256"
+    ):
+        fields.append("campaign_config_sha256")
+    return fields
+
+
 def _sha256_digest(value: Any, label: str) -> str:
     if (
         not isinstance(value, str)
@@ -1746,6 +1786,71 @@ def read_environment_generation(
     )
 
 
+def legacy_intent_config_generation_split_is_proven(
+    campaign_dir: Union[str, Path],
+    *,
+    campaign_uid: str,
+    intent: Mapping[str, Any],
+    environment: Mapping[str, Any],
+    decision_config_sha256: str,
+    allowed_statuses: Sequence[str] = ("COMPLETED",),
+) -> bool:
+    """Recognise intents written during the historical config-only drift bug."""
+    from .daemon.config_lock import (
+        read_historical_config_binding_by_fingerprint,
+    )
+
+    if str(intent.get("status") or "") not in {
+        str(value) for value in allowed_statuses
+    }:
+        return False
+    if not str(intent.get("job_id") or ""):
+        return False
+    intent_created_iso = str(intent.get("created_iso") or "")
+    environment_created_iso = str(environment.get("created_at_iso") or "")
+    if not intent_created_iso or not environment_created_iso:
+        return False
+    try:
+        intent_created = datetime.fromisoformat(intent_created_iso)
+        environment_created = datetime.fromisoformat(environment_created_iso)
+    except ValueError:
+        return False
+    if (
+        intent_created.tzinfo is None
+        or intent_created.utcoffset() is None
+        or environment_created.tzinfo is None
+        or environment_created.utcoffset() is None
+        or environment_created >= intent_created
+    ):
+        return False
+    environment_config_sha256 = str(
+        environment.get("campaign_config_sha256") or ""
+    )
+    if (
+        not environment_config_sha256
+        or environment_config_sha256 == str(decision_config_sha256)
+    ):
+        return False
+    try:
+        environment_binding = read_historical_config_binding_by_fingerprint(
+            campaign_dir,
+            environment_config_sha256,
+            expected_campaign_uid=str(campaign_uid),
+            head_at_iso=environment_created_iso,
+        )
+        decision_binding = read_historical_config_binding_by_fingerprint(
+            campaign_dir,
+            str(decision_config_sha256),
+            expected_campaign_uid=str(campaign_uid),
+            head_at_iso=intent_created_iso,
+        )
+    except (FileNotFoundError, ValueError):
+        return False
+    return int(decision_binding["sequence"]) >= int(
+        environment_binding["sequence"]
+    )
+
+
 def environment_status(
     campaign_dir: Union[str, Path],
     *,
@@ -1764,17 +1869,8 @@ def environment_status(
         config=config,
         generation=int(generation["generation"]),
     )
-    expected_fields = _environment_fingerprint_payload(generation)
-    observed_fields = _environment_fingerprint_payload(observed)
-    changed_fields: List[str] = [
-        key
-        for key in _ENVIRONMENT_FINGERPRINT_KEYS
-        if expected_fields.get(key) != observed_fields.get(key)
-    ]
-    matches = (
-        generation["environment_fingerprint_sha256"]
-        == observed["environment_fingerprint_sha256"]
-    )
+    changed_fields = _generation_changed_fields(generation, observed)
+    matches = _generation_binding_matches(generation, observed)
     return {
         "schema_version": 1,
         "campaign_uid": str(campaign_uid),
@@ -1983,10 +2079,7 @@ def advance_environment_generation(
         config=config,
         generation=int(active_generation["generation"]) + 1,
     )
-    if (
-        candidate["environment_fingerprint_sha256"]
-        == active_generation["environment_fingerprint_sha256"]
-    ):
+    if _generation_binding_matches(active_generation, candidate):
         return {
             "schema_version": 1,
             "changed": False,
@@ -2326,10 +2419,7 @@ def advance_environment_generation(
             expected_campaign_uid=str(state.campaign_uid),
             path=generation_path,
         )
-        if (
-            existing["environment_fingerprint_sha256"]
-            == candidate["environment_fingerprint_sha256"]
-        ):
+        if _generation_binding_matches(existing, candidate):
             candidate = existing
             break
         generation_number += 1
@@ -2353,6 +2443,12 @@ def advance_environment_generation(
         "generation_digest_sha256": str(candidate["digest_sha256"]),
     }
     atomic_write_json(environment_current_path(campaign), current)
+    changed_fields = _generation_changed_fields(active_generation, candidate)
+    binding_repair_kind = (
+        "campaign_config_generation_binding_advanced"
+        if "campaign_config_sha256" in changed_fields
+        else None
+    )
     try:
         from .daemon.journal import append_event
 
@@ -2373,11 +2469,8 @@ def advance_environment_generation(
             generation_digest_sha256=str(candidate["digest_sha256"]),
             phase=state.phase.value,
             iteration=int(state.iteration),
-            changed_fields=[
-                key
-                for key in _ENVIRONMENT_FINGERPRINT_KEYS
-                if active_generation.get(key) != candidate.get(key)
-            ],
+            changed_fields=changed_fields,
+            environment_binding_repair_kind=binding_repair_kind,
             **journal_transition_context,
         )
     except Exception:
@@ -2389,6 +2482,8 @@ def advance_environment_generation(
         "generation": generation_number,
         "generation_digest_sha256": str(candidate["digest_sha256"]),
         "generation_path": str(generation_path),
+        "changed_fields": changed_fields,
+        "environment_binding_repair_kind": binding_repair_kind,
         **transition_context,
     }
 

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 import ichor.hpc.active_learning.execution_identity as execution_identity_module
+import ichor.hpc.active_learning.daemon.config_lock as config_lock_module
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.execution_identity import (
     ExecutionIdentityError,
@@ -20,10 +21,15 @@ from ichor.hpc.active_learning.execution_identity import (
     environment_current_path,
     environment_generations_dir,
     execution_identity_path,
+    legacy_intent_config_generation_split_is_proven,
     read_active_environment_generation,
     rebind_environment,
 )
-from ichor.hpc.active_learning.daemon.config_lock import ensure_config_lock
+from ichor.hpc.active_learning.daemon.config_lock import (
+    config_fingerprint,
+    ensure_config_lock,
+    write_config_lock,
+)
 from ichor.hpc.active_learning.daemon.state import (
     CampaignPhase,
     fresh_campaign_state,
@@ -71,7 +77,7 @@ def _fake_generation(*args, campaign_uid, config, generation=0, **kwargs):
             "LD_LIBRARY_PATH": "",
             "LIBRARY_PATH": "",
         },
-        "campaign_config_sha256": "1" * 64,
+        "campaign_config_sha256": config_fingerprint(config.to_dict()),
         "config_lock_sha256": None,
         "campaign_dir": str(campaign),
     }
@@ -254,6 +260,35 @@ def test_environment_status_detects_execution_field_drift(tmp_path, monkeypatch)
             campaign_uid="uid-drift",
             config=config,
         )
+
+
+def test_environment_status_detects_config_only_binding_drift(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _fake_generation,
+    )
+    config = CampaignConfig()
+    ensure_execution_identity(
+        tmp_path,
+        campaign_uid="uid-config-drift",
+        config=config,
+        requested_mode="dry_run",
+    )
+    changed = CampaignConfig.from_dict(config.to_dict())
+    changed.campaign.sampling_aggressiveness += 1
+
+    status = environment_status(
+        tmp_path,
+        campaign_uid="uid-config-drift",
+        config=changed,
+    )
+
+    assert status["matches"] is False
+    assert status["changed_fields"] == ["campaign_config_sha256"]
 
 
 def test_ferebus_identity_uses_profile_executable_when_environment_is_unset(
@@ -2208,6 +2243,163 @@ def test_rebind_advances_generation_clears_scales_and_is_idempotent(
     assert state.reference_scales_model_manifest_sha256 is None
 
 
+def test_config_only_change_advances_generation_but_lock_refresh_does_not(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    original = read_active_environment_generation(
+        campaign,
+        expected_campaign_uid=state.campaign_uid,
+    )["generation"]
+    changed = CampaignConfig.from_dict(config.to_dict())
+    changed.campaign.sampling_aggressiveness += 1
+    write_config_lock(
+        campaign,
+        changed,
+        campaign_uid=state.campaign_uid,
+        reason="test_config_only_change",
+    )
+
+    result = rebind_environment(
+        campaign,
+        config=changed,
+        scheduler_ownership_clear=True,
+    )
+    write_config_lock(
+        campaign,
+        changed,
+        campaign_uid=state.campaign_uid,
+        reason="timestamp_only_refresh",
+    )
+    repeated = rebind_environment(
+        campaign,
+        config=changed,
+        scheduler_ownership_clear=True,
+    )
+    active = read_active_environment_generation(
+        campaign,
+        expected_campaign_uid=state.campaign_uid,
+    )["generation"]
+
+    assert result["changed"] is True
+    assert result["generation"] == 1
+    assert repeated["changed"] is False
+    assert active["campaign_config_sha256"] == config_fingerprint(
+        changed.to_dict()
+    )
+    assert (
+        active["environment_fingerprint_sha256"]
+        == original["environment_fingerprint_sha256"]
+    )
+
+
+def test_config_only_generation_collision_allocates_next_free_number(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    collision = _fake_generation(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        config=config,
+        generation=1,
+    )
+    collision_path = environment_generations_dir(campaign) / (
+        "generation-000001.json"
+    )
+    collision_path.write_text(
+        json.dumps(collision, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    changed = CampaignConfig.from_dict(config.to_dict())
+    changed.campaign.sampling_aggressiveness += 1
+    write_config_lock(
+        campaign,
+        changed,
+        campaign_uid=state.campaign_uid,
+        reason="test_config_collision",
+    )
+
+    result = rebind_environment(
+        campaign,
+        config=changed,
+        scheduler_ownership_clear=True,
+    )
+
+    assert result["changed"] is True
+    assert result["generation"] == 2
+
+
+def test_legacy_config_generation_split_requires_authoritative_chronology(
+    tmp_path,
+    monkeypatch,
+):
+    clock = {"value": "2026-07-29T10:00:00+00:00"}
+    monkeypatch.setattr(
+        config_lock_module,
+        "_now_iso",
+        lambda: clock["value"],
+    )
+    old_config = CampaignConfig()
+    write_config_lock(
+        tmp_path,
+        old_config,
+        campaign_uid="uid-legacy-split",
+        reason="initial",
+    )
+    old_sha256 = config_fingerprint(old_config.to_dict())
+    environment = {
+        "created_at_iso": "2026-07-29T10:05:00+00:00",
+        "campaign_config_sha256": old_sha256,
+    }
+    new_config = CampaignConfig.from_dict(old_config.to_dict())
+    new_config.campaign.sampling_aggressiveness += 1
+    new_sha256 = config_fingerprint(new_config.to_dict())
+    clock["value"] = "2026-07-29T10:10:00+00:00"
+    write_config_lock(
+        tmp_path,
+        new_config,
+        campaign_uid="uid-legacy-split",
+        reason="approved_config_change",
+    )
+    intent = {
+        "status": "COMPLETED",
+        "job_id": "18116090",
+        "created_iso": "2026-07-29T10:15:00+00:00",
+    }
+
+    assert legacy_intent_config_generation_split_is_proven(
+        tmp_path,
+        campaign_uid="uid-legacy-split",
+        intent=intent,
+        environment=environment,
+        decision_config_sha256=new_sha256,
+    )
+    intent_at_generation_creation = {
+        **intent,
+        "created_iso": environment["created_at_iso"],
+    }
+    assert not legacy_intent_config_generation_split_is_proven(
+        tmp_path,
+        campaign_uid="uid-legacy-split",
+        intent=intent_at_generation_creation,
+        environment=environment,
+        decision_config_sha256=new_sha256,
+    )
+    intent_before_config_change = {
+        **intent,
+        "created_iso": "2026-07-29T10:07:00+00:00",
+    }
+    assert not legacy_intent_config_generation_split_is_proven(
+        tmp_path,
+        campaign_uid="uid-legacy-split",
+        intent=intent_before_config_change,
+        environment=environment,
+        decision_config_sha256=new_sha256,
+    )
+
+
 def _changed_generation(*args, campaign_uid, config, generation=0, **kwargs):
     payload = _fake_generation(
         campaign_uid=campaign_uid,
@@ -2502,6 +2694,11 @@ def _daemon_environment_campaign(tmp_path, monkeypatch):
         config=config,
         requested_mode="dry_run",
     )
+    ensure_config_lock(
+        campaign,
+        config,
+        campaign_uid=state.campaign_uid,
+    )
     return campaign, config, state, current_version
 
 
@@ -2523,6 +2720,108 @@ def test_submission_intent_snapshots_active_environment(tmp_path, monkeypatch):
     assert (
         intent["environment_generation_digest_sha256"]
         == active["digest_sha256"]
+    )
+
+
+def test_initial_submission_refuses_stale_environment_config_binding(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, config, state, _version = _daemon_environment_campaign(
+        tmp_path,
+        monkeypatch,
+    )
+    changed = CampaignConfig.from_dict(config.to_dict())
+    changed.campaign.sampling_aggressiveness += 1
+    write_config_lock(
+        campaign,
+        changed,
+        campaign_uid=state.campaign_uid,
+        reason="approved_config_change",
+    )
+    executor = _SubmittedExecutor()
+    daemon = Daemon(campaign_dir=campaign, config=changed, executor=executor)
+
+    result = daemon._on_phase_entry(state, state.phase)
+
+    assert result == TickStatus.HALTED
+    assert executor.submissions == 0
+    assert not intent_path(campaign, CampaignPhase.FEREBUS.value, 1).exists()
+    halted = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
+    assert "stale campaign configuration" in str(
+        halted.lifecycle_context.get("message")
+    )
+
+
+def test_submission_refuses_decision_contract_change_during_staging(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, config, state, _version = _daemon_environment_campaign(
+        tmp_path,
+        monkeypatch,
+    )
+
+    class _MutatingExecutor(_SubmittedExecutor):
+        def submit_or_run(self, bound_state, bound_phase):
+            intent = load_intent(
+                campaign,
+                bound_phase.value,
+                bound_state.iteration,
+            )
+            altered = dict(intent)
+            altered_contract = dict(altered["decision_contract"])
+            altered_contract["config_sha256"] = "0" * 64
+            altered["decision_contract"] = altered_contract
+            self._submission_environment_guard(altered)
+            self.submissions += 1
+            raise AssertionError("scheduler acceptance must not be reached")
+
+    executor = _MutatingExecutor()
+    daemon = Daemon(campaign_dir=campaign, config=config, executor=executor)
+
+    result = daemon._on_phase_entry(state, state.phase)
+
+    assert result == TickStatus.HALTED
+    assert executor.submissions == 0
+    halted = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
+    assert "decision contract changed during pre-submit staging" in str(
+        halted.lifecycle_context.get("message")
+    )
+
+
+def test_submission_refuses_environment_binding_change_during_staging(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, config, state, _version = _daemon_environment_campaign(
+        tmp_path,
+        monkeypatch,
+    )
+
+    class _MutatingExecutor(_SubmittedExecutor):
+        def submit_or_run(self, bound_state, bound_phase):
+            intent = load_intent(
+                campaign,
+                bound_phase.value,
+                bound_state.iteration,
+            )
+            altered = dict(intent)
+            altered["environment_generation_digest_sha256"] = "0" * 64
+            self._submission_environment_guard(altered)
+            self.submissions += 1
+            raise AssertionError("scheduler acceptance must not be reached")
+
+    executor = _MutatingExecutor()
+    daemon = Daemon(campaign_dir=campaign, config=config, executor=executor)
+
+    result = daemon._on_phase_entry(state, state.phase)
+
+    assert result == TickStatus.HALTED
+    assert executor.submissions == 0
+    halted = read_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json")
+    assert "environment binding changed during pre-submit staging" in str(
+        halted.lifecycle_context.get("message")
     )
 
 

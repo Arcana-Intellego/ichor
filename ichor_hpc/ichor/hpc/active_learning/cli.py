@@ -92,6 +92,8 @@ from .daemon.config_lock import (
     assert_config_unchanged_for_start,
     clean_model_iteration_staging_for_reconcile,
     clean_reentry_staging,
+    canonical_config,
+    config_fingerprint,
     config_lock_path,
     ensure_config_lock,
     read_config_lock,
@@ -5562,6 +5564,11 @@ def cmd_start(args: argparse.Namespace) -> int:
             else "synthetic"
         ),
         "environment_preflight_ok": True,
+        "poll_interval_override_seconds": (
+            None
+            if args.poll_interval is None
+            else int(args.poll_interval)
+        ),
     }
     if sacct_poller is not None:
         daemon_kwargs["sacct_poller"] = sacct_poller
@@ -5574,9 +5581,6 @@ def cmd_start(args: argparse.Namespace) -> int:
     if resource_usage_collector is not None:
         daemon_kwargs["resource_usage_collector"] = resource_usage_collector
     d = Daemon(**daemon_kwargs)
-    if args.poll_interval is not None:
-        #override config-loaded poll interval per-invocation.
-        d.config.runtime.poll_interval_seconds = int(args.poll_interval)
     startup_callback = None
     if startup_path_from_environment() is not None:
 
@@ -11868,6 +11872,43 @@ def _reconcile_cleanup_rows(
     return rows, reasons, warnings, preserved
 
 
+def _reconcile_environment_config_binding_repair(
+    campaign: Path,
+    state: Optional[CampaignState],
+) -> Optional[Dict[str, Any]]:
+    """Describe a bounded config-only generation repair for presentation."""
+    if state is None:
+        return None
+    try:
+        from .execution_identity import (
+            execution_identity_path,
+            read_active_environment_generation,
+        )
+
+        identity_path = execution_identity_path(campaign)
+        if not identity_path.exists() and not identity_path.is_symlink():
+            return None
+        config = CampaignConfig.from_yaml(campaign / "campaign.yaml")
+        current_sha256 = config_fingerprint(canonical_config(config))
+        active = read_active_environment_generation(
+            campaign,
+            expected_campaign_uid=str(state.campaign_uid),
+        )["generation"]
+        bound_sha256 = str(active.get("campaign_config_sha256") or "")
+        if bound_sha256 == current_sha256:
+            return None
+        return {
+            "kind": "campaign_config_generation_binding_advanced",
+            "generation": int(active["generation"]),
+            "bound_config_sha256": bound_sha256,
+            "current_config_sha256": current_sha256,
+        }
+    except Exception:
+        # Contract and technical views retain malformed identity details.  The
+        # concise presentation must not invent a repair from untrusted input.
+        return None
+
+
 def _reconcile_presentation(
     campaign: Path,
     report: Any,
@@ -12060,6 +12101,23 @@ def _reconcile_presentation(
                 )
             )
 
+    environment_binding_repair = _reconcile_environment_config_binding_repair(
+        campaign,
+        proposed,
+    )
+    if environment_binding_repair is not None:
+        planned.append(
+            (
+                "environment configuration",
+                "advance the environment generation so it is bound to the "
+                "current campaign configuration",
+            )
+        )
+        reason_parts.append(
+            "the active environment generation is bound to an older "
+            "campaign configuration"
+        )
+
     scheduler_cancellation = [
         dict(item)
         for item in (
@@ -12178,7 +12236,14 @@ def _reconcile_presentation(
             (
                 "ARIADNE results",
                 "reuse " + str(accepted) + " accepted result" + ("" if accepted == 1 else "s")
-                + "; exclude " + str(rejected) + " rejected task" + ("" if rejected == 1 else "s"),
+                + "; exclude " + str(rejected) + " rejected task" + ("" if rejected == 1 else "s")
+                + (
+                    "; resubmit no ARIADNE tasks"
+                    if int(ariadne.get("tasks_resubmitted") or 0) == 0
+                    else "; prepare "
+                    + str(int(ariadne.get("tasks_resubmitted") or 0))
+                    + " ARIADNE tasks for retry"
+                ),
             )
         )
 
@@ -12279,6 +12344,7 @@ def _reconcile_presentation(
         and not isinstance(ariadne, Mapping)
         and not ordinary_repairs
         and not isinstance(candidate, Mapping)
+        and environment_binding_repair is None
     )
     has_changes = bool(planned)
     if blockers:
@@ -13421,10 +13487,23 @@ def _print_reconcile_applied_operator_report(
             )
         )
     if isinstance(environment_transition, Mapping) and environment_transition.get("changed"):
+        binding_repair = str(
+            environment_transition.get("environment_binding_repair_kind") or ""
+        )
         applied_rows.append(
             (
-                "software environment",
-                "recorded generation " + str(environment_transition.get("generation")),
+                (
+                    "environment configuration"
+                    if binding_repair
+                    else "software environment"
+                ),
+                "recorded generation "
+                + str(environment_transition.get("generation"))
+                + (
+                    " bound to the current campaign configuration"
+                    if binding_repair
+                    else ""
+                ),
             )
         )
     _print_reconcile_key_values(applied_rows)
@@ -15741,6 +15820,12 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             if scheduler_recoveries
             else {}
         )
+        environment_binding_repair = (
+            _reconcile_environment_config_binding_repair(
+                campaign,
+                report.proposed_state,
+            )
+        )
         append_event(
             campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
             "reconcile_applied",
@@ -15781,6 +15866,11 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             ),
             recovery_selected_phase=report.proposed_state.phase.value,
             recovery_reason=str(report.decision or ""),
+            environment_binding_repair_kind=(
+                None
+                if environment_binding_repair is None
+                else str(environment_binding_repair["kind"])
+            ),
             **ariadne_event_fields,
             **aimall_event_fields,
             **scheduler_event_fields,
@@ -16735,6 +16825,41 @@ def _preflight_check_line(
     return "  " + _preflight_mark(ok, warn=warn) + " " + label + ": " + _format_value(detail)
 
 
+def _preflight_environment_generation_evidence(
+    campaign: Path,
+    state: Optional[CampaignState],
+    config: Optional[CampaignConfig],
+) -> Optional[Dict[str, Any]]:
+    """Return bounded, read-only generation/config evidence for human output."""
+    if state is None or config is None:
+        return None
+    try:
+        from .execution_identity import (
+            execution_identity_path,
+            read_active_environment_generation,
+        )
+
+        identity_path = execution_identity_path(campaign)
+        if not identity_path.exists() and not identity_path.is_symlink():
+            return None
+        active = read_active_environment_generation(
+            campaign,
+            expected_campaign_uid=str(state.campaign_uid),
+        )["generation"]
+        current_config_sha256 = config_fingerprint(canonical_config(config))
+        bound_config_sha256 = str(
+            active.get("campaign_config_sha256") or ""
+        )
+        return {
+            "generation": int(active["generation"]),
+            "config_matches": bound_config_sha256 == current_config_sha256,
+        }
+    except Exception as exc:
+        return {
+            "error": type(exc).__name__ + ": " + str(exc),
+        }
+
+
 def _preflight_payload(
     campaign: Path,
     avail: Any,
@@ -17119,6 +17244,38 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
             warn=state_warn,
         )
     )
+    environment_generation = payload.get(
+        "_presentation_environment_generation"
+    )
+    if (
+        isinstance(environment_generation, Mapping)
+        and environment_generation.get("generation") is not None
+    ):
+        config_matches = bool(
+            environment_generation.get("config_matches", False)
+        )
+        lines.append(
+            _preflight_check_line(
+                "environment generation",
+                config_matches,
+                str(environment_generation["generation"])
+                + (
+                    "; bound to the current campaign configuration"
+                    if config_matches
+                    else "; configuration binding requires reconcile"
+                ),
+                warn=not config_matches,
+            )
+        )
+    elif (
+        verbose
+        and isinstance(environment_generation, Mapping)
+        and environment_generation.get("error")
+    ):
+        lines.append(
+            "  environment generation: "
+            + _reconcile_plain_text(environment_generation["error"])
+        )
     issues = [
         str(item)
         for item in (state.get("issues") or [])
@@ -17814,6 +17971,13 @@ def evaluate_campaign_preflight(
     payload["_presentation_config_review"] = presentation_config_review
     payload["_presentation_diversity_transition"] = (
         presentation_diversity_transition
+    )
+    payload["_presentation_environment_generation"] = (
+        _preflight_environment_generation_evidence(
+            campaign,
+            presentation_state,
+            loaded_config,
+        )
     )
     return payload
 

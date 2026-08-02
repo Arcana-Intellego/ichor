@@ -334,3 +334,39 @@ def test_decision_contract_must_match_a_producer_environment(
             iteration=15,
             logical_total=200,
         )
+
+
+def test_proven_legacy_config_generation_split_is_accepted(
+    tmp_path,
+    monkeypatch,
+):
+    producer = _intent(
+        submission_identity="r0000-a0001-source",
+        attempt_sequence=1,
+        generation=1,
+    )
+    _install_common_fakes(
+        monkeypatch,
+        tmp_path,
+        records=[producer],
+        current=producer,
+        configs={1: CURRENT_CONFIG_SHA},
+    )
+    monkeypatch.setattr(
+        authority,
+        "legacy_intent_config_generation_split_is_proven",
+        lambda *_args, **_kwargs: True,
+    )
+
+    resolved = authority.resolve_ariadne_handoff_decision_contract(
+        tmp_path,
+        campaign_uid=CAMPAIGN_UID,
+        iteration=15,
+        logical_total=200,
+    )
+
+    assert resolved["decision_contract"] == CONTRACT
+    assert (
+        resolved["authority_kind"]
+        == "submission_intent_legacy_config_generation_split"
+    )
