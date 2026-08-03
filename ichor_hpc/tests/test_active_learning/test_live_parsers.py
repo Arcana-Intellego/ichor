@@ -1587,6 +1587,110 @@ def test_ferebus_parser_happy_path_commits_models_version(tmp_path):
     assert any(e.get("event") == "models_committed" for e in events)
 
 
+def test_ferebus_postprocess_snapshot_avoids_historical_chain_resolution(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon.artifact_snapshot import (
+        build_committed_artifact_snapshot,
+    )
+    from ichor.hpc.active_learning.daemon.ferebus_quality import (
+        enrich_task_receipt_with_quality,
+    )
+    import ichor.hpc.active_learning.daemon.ferebus_quality as quality_module
+    import ichor.hpc.active_learning.versioning.trained_models as models_module
+    from ichor.hpc.active_learning.versioning.reference_data import (
+        ReferenceDataVersioning,
+    )
+    from ichor.hpc.active_learning.versioning.trained_models import (
+        TrainedModelVersioning,
+    )
+    from contextlib import contextmanager
+
+    ex = _make_executor(tmp_path)
+    _commit_bootstrap_reference_data(ex.campaign_dir)
+    _seed_models_staging(ex.campaign_dir)
+    bootstrap = ex._parse_ferebus_postprocess(
+        SimpleNamespace(
+            iteration=0,
+            campaign_uid="m16-test",
+            reference_data_version=0,
+        ),
+        CampaignPhase("FEREBUS"),
+        observations=[],
+    )
+    assert bootstrap.failure_reason is None
+    staging = ex.campaign_dir / "TRAINED_MODELS" / "iteration-staging"
+    if staging.exists():
+        shutil.rmtree(staging)
+    _commit_active_reference_data(ex.campaign_dir, iteration=1)
+    staging = _seed_models_staging(
+        ex.campaign_dir,
+        reference_version=1,
+    )
+    enrich_task_receipt_with_quality(staging, 0)
+    ex._committed_artifact_snapshot = build_committed_artifact_snapshot(
+        ex.campaign_dir,
+        verification_level="authority",
+    )
+
+    def forbidden_resolve(*args, **kwargs):
+        raise AssertionError("FEREBUS hot path must not replay authority chains")
+
+    def forbidden_incumbent_prediction(*args, **kwargs):
+        raise AssertionError(
+            "FEREBUS hot path must reuse authenticated incumbent metrics"
+        )
+
+    lock_state = {"held": False}
+    real_evaluate = quality_module.evaluate_ferebus_quality
+    real_lock = models_module.trained_models_commit_lock
+
+    def checked_evaluate(*args, **kwargs):
+        assert lock_state["held"] is False
+        return real_evaluate(*args, **kwargs)
+
+    @contextmanager
+    def observed_lock(*args, **kwargs):
+        with real_lock(*args, **kwargs):
+            lock_state["held"] = True
+            try:
+                yield
+            finally:
+                lock_state["held"] = False
+
+    monkeypatch.setattr(TrainedModelVersioning, "resolve", forbidden_resolve)
+    monkeypatch.setattr(ReferenceDataVersioning, "resolve", forbidden_resolve)
+    monkeypatch.setattr(
+        quality_module,
+        "_local_incumbent_metric",
+        forbidden_incumbent_prediction,
+    )
+    monkeypatch.setattr(quality_module, "evaluate_ferebus_quality", checked_evaluate)
+    monkeypatch.setattr(models_module, "trained_models_commit_lock", observed_lock)
+    result = ex._parse_ferebus_postprocess(
+        SimpleNamespace(
+            iteration=1,
+            campaign_uid="m16-test",
+            reference_data_version=1,
+        ),
+        CampaignPhase("FEREBUS"),
+        observations=[],
+    )
+
+    assert result.failure_reason is None
+    assert result.state_updates["models_version"] == 1
+    summary = next(
+        event
+        for event in reversed(_read_journal_events(ex.campaign_dir))
+        if event.get("event") == "ferebus_quality_summary"
+        and event.get("iteration") == 1
+    )
+    assert summary["n_inline_quality_measurements"] == 1
+    assert summary["n_incumbent_metrics_reused"] == 1
+    assert summary["n_incumbent_metrics_computed"] == 0
+
+
 def test_ferebus_task_artefact_layout_supports_properties_and_missing_files(tmp_path):
     ex = _make_executor(tmp_path)
     _commit_bootstrap_reference_data(ex.campaign_dir)

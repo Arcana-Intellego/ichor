@@ -1,6 +1,7 @@
 """Tests for ichor.hpc.active_learning.cli."""
 import copy
 import json
+import os
 import re
 import subprocess
 import sys
@@ -660,6 +661,136 @@ def test_campaign_preflight_allows_and_reports_pending_boundary_stop(
     assert "[WARN] stop boundary" in output
     assert "stop requested after iteration 0" in output
     assert "retain and honour this request" in output
+
+
+def test_campaign_preflight_does_not_treat_its_background_child_as_an_owner(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    _write_locked_state(campaign, fresh_campaign_state(max_iterations=2))
+    monkeypatch.setattr(
+        cli_mod,
+        "_pool_feasibility_summary",
+        lambda _campaign, _config: _pool_feasibility_payload(),
+    )
+    paths = cli_mod._campaign_paths(campaign)
+    launch_id = "a" * 32
+    monkeypatch.setenv(cli_mod.BACKGROUND_CHILD_ENV, "1")
+    monkeypatch.setenv(cli_mod.BACKGROUND_LAUNCH_ID_ENV, launch_id)
+    monkeypatch.setenv(
+        cli_mod.BACKGROUND_STARTUP_PATH_ENV,
+        str(paths["background_startup"]),
+    )
+    cli_mod.initialise_background_startup(
+        paths["background_startup"],
+        {
+            "schema_version": cli_mod.BACKGROUND_STARTUP_SCHEMA_VERSION,
+            "launch_id": launch_id,
+            "state": "starting",
+            "stage": "backend_preflight",
+            "campaign_dir": str(campaign),
+            "pid": os.getpid(),
+        },
+    )
+
+    payload = cli_mod.evaluate_campaign_preflight(
+        campaign,
+        avail=_backend_availability(),
+    )
+
+    assert payload["ready"] is True, json.dumps(payload, default=str, indent=2)
+    assert "another daemon currently owns this campaign" not in payload[
+        "campaign_state"
+    ]["issues"]
+
+
+def test_campaign_preflight_does_not_ignore_a_different_background_launch(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    _write_locked_state(campaign, fresh_campaign_state(max_iterations=2))
+    monkeypatch.setattr(
+        cli_mod,
+        "_pool_feasibility_summary",
+        lambda _campaign, _config: _pool_feasibility_payload(),
+    )
+    paths = cli_mod._campaign_paths(campaign)
+    monkeypatch.setenv(cli_mod.BACKGROUND_CHILD_ENV, "1")
+    monkeypatch.setenv(cli_mod.BACKGROUND_LAUNCH_ID_ENV, "b" * 32)
+    monkeypatch.setenv(
+        cli_mod.BACKGROUND_STARTUP_PATH_ENV,
+        str(paths["background_startup"]),
+    )
+    cli_mod.initialise_background_startup(
+        paths["background_startup"],
+        {
+            "schema_version": cli_mod.BACKGROUND_STARTUP_SCHEMA_VERSION,
+            "launch_id": "a" * 32,
+            "state": "starting",
+            "stage": "backend_preflight",
+            "campaign_dir": str(campaign),
+            "pid": os.getpid(),
+        },
+    )
+
+    payload = cli_mod.evaluate_campaign_preflight(
+        campaign,
+        avail=_backend_availability(),
+    )
+
+    assert payload["ready"] is False
+    assert "another daemon currently owns this campaign" in payload[
+        "campaign_state"
+    ]["issues"]
+
+
+def test_background_child_preflight_still_blocks_a_real_daemon_lock(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    _write_locked_state(campaign, fresh_campaign_state(max_iterations=2))
+    monkeypatch.setattr(
+        cli_mod,
+        "_pool_feasibility_summary",
+        lambda _campaign, _config: _pool_feasibility_payload(),
+    )
+    paths = cli_mod._campaign_paths(campaign)
+    launch_id = "a" * 32
+    monkeypatch.setenv(cli_mod.BACKGROUND_CHILD_ENV, "1")
+    monkeypatch.setenv(cli_mod.BACKGROUND_LAUNCH_ID_ENV, launch_id)
+    monkeypatch.setenv(
+        cli_mod.BACKGROUND_STARTUP_PATH_ENV,
+        str(paths["background_startup"]),
+    )
+    cli_mod.initialise_background_startup(
+        paths["background_startup"],
+        {
+            "schema_version": cli_mod.BACKGROUND_STARTUP_SCHEMA_VERSION,
+            "launch_id": launch_id,
+            "state": "starting",
+            "stage": "backend_preflight",
+            "campaign_dir": str(campaign),
+            "pid": os.getpid(),
+        },
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_probe_daemon_lock",
+        lambda _path: {"lock_held": True},
+    )
+
+    payload = cli_mod.evaluate_campaign_preflight(
+        campaign,
+        avail=_backend_availability(),
+    )
+
+    assert payload["ready"] is False
+    assert "another daemon currently owns this campaign" in payload[
+        "campaign_state"
+    ]["issues"]
 
 
 def test_campaign_preflight_is_not_ready_for_recoverable_transaction(

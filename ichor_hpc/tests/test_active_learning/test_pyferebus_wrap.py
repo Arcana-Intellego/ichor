@@ -569,6 +569,59 @@ def test_ferebus_runner_maps_dense_retry_index_to_original_task(
     }
 
 
+def test_ferebus_runner_keeps_success_when_optional_quality_fails(
+    tmp_path,
+    monkeypatch,
+):
+    import ichor.hpc.active_learning.daemon.ferebus_quality as quality_module
+
+    captured: List[_StubModel] = []
+    job_details = tmp_path / "job.json"
+    job_details.write_text("{}")
+    submit_ferebus(
+        job_details,
+        tmp_path,
+        model_class=_make_model_class(captured),
+        submit_runner=_StubRunner(),
+    )
+    model = tmp_path / "iqa" / "O1" / "WATER_iqa_O1.model"
+    performance = model.with_suffix(".perf")
+    model.write_bytes(b"trained-model")
+    performance.write_text(
+        "RMSE 0.0\nMAE 0.0\ncovariance_condition_number 1.0\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    monkeypatch.setattr(
+        task_runner.subprocess,
+        "run",
+        lambda *args, **kwargs: _StubCompletedProcess(returncode=0),
+    )
+    monkeypatch.setattr(
+        quality_module,
+        "enrich_task_receipt_with_quality",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("injected optional measurement failure")
+        ),
+    )
+
+    exit_code = task_runner.execute_task(
+        tmp_path / "FEREBUS_TASK_MAP.json",
+        0,
+    )
+
+    assert exit_code == 0
+    receipt = json.loads(
+        (tmp_path / "iqa" / "O1" / "FEREBUS_TASK_RECEIPT.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert receipt["success"] is True
+    assert receipt["exit_code"] == 0
+    assert "quality_measurement" not in receipt
+    assert validate_task_receipts(tmp_path)["n_tasks"] == 1
+
+
 def test_submit_ferebus_keeps_sbatch_directives_before_shell_commands(tmp_path):
     captured: List[_StubModel] = []
     model_class = _make_model_class(

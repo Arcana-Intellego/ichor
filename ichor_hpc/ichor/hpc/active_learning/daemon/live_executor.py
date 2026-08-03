@@ -30,7 +30,6 @@ import sys
 import math
 import re
 from dataclasses import dataclass, field
-from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
@@ -488,17 +487,6 @@ def _write_ferebus_task_artefact_layout(
     manifest_path = committed_dir / FEREBUS_TASK_ARTEFACTS_MANIFEST
     atomic_write_json(manifest_path, payload)
     return manifest_path
-
-
-def _with_trained_models_commit_lock(method):
-    @wraps(method)
-    def locked(self, *args, **kwargs):
-        from ..versioning.trained_models import trained_models_commit_lock
-
-        with trained_models_commit_lock(self.campaign_dir):
-            return method(self, *args, **kwargs)
-
-    return locked
 
 
 def _without_keys(payload: Any, *keys: str) -> Dict[str, Any]:
@@ -5535,7 +5523,6 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
     # --- FEREBUS parser body -------------------------------------------
 
-    @_with_trained_models_commit_lock
     def _parse_ferebus_postprocess(self, state, phase, observations):
         """Parse FEREBUS output, validate the .model file, commit
         a new TRAINED_MODELS/iteration-NNNNNN/ via VersionedDirectory.
@@ -5547,10 +5534,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         from .phase_executor import PhaseResult
 
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
-        self._report_runtime_progress("model_parsing")
+        self._report_runtime_progress("ferebus_authority")
         staging = self._models_staging_path()
         v_models = self._versioning("models")
         committed = v_models.list_committed_versions()
+        artifact_snapshot = getattr(self, "_committed_artifact_snapshot", None)
         is_initial = phase_name == "INITIAL_FEREBUS"
         if is_initial:
             expected_next = 0
@@ -5577,10 +5565,14 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             try:
                 from .model_contract import validate_ferebus_model_contract
 
-                resolved_model_set = v_models.resolve(
-                    next_version,
-                    verification="metadata",
-                )
+                if artifact_snapshot is None:
+                    resolved_model_set = v_models.resolve(
+                        next_version,
+                        verification="metadata",
+                    )
+                else:
+                    artifact_snapshot.assert_anchors_unchanged(self.campaign_dir)
+                    resolved_model_set = artifact_snapshot.model_set(next_version)
                 validate_ferebus_model_contract(
                     committed_dir,
                     committed=True,
@@ -5588,7 +5580,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     trained_model_set=resolved_model_set,
                 )
                 newest_version = max(committed)
-                if newest_version != next_version:
+                if newest_version != next_version and artifact_snapshot is None:
                     v_models.resolve(
                         newest_version,
                         verification="metadata",
@@ -5657,6 +5649,63 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 ),
             )
 
+        quality_context = None
+        reference_view = None
+        parent_model_set = None
+        try:
+            from .ferebus_quality import build_ferebus_quality_context
+
+            if artifact_snapshot is not None:
+                from ..versioning.reference_data import ReferenceDataVersioning
+
+                artifact_snapshot.assert_anchors_unchanged(self.campaign_dir)
+                reference_view = artifact_snapshot.reference_view(expected_next)
+                reference_versioning = ReferenceDataVersioning(
+                    Path(self.campaign_dir) / self.reference_data_dir_name
+                )
+                if reference_versioning.current_version() != int(expected_next):
+                    raise ValueError(
+                        "FEREBUS reference pointer does not match the candidate version"
+                    )
+                if is_initial:
+                    if artifact_snapshot.committed_model_versions:
+                        raise ValueError(
+                            "initial FEREBUS unexpectedly has committed models"
+                        )
+                    if v_models.current_version() is not None:
+                        raise ValueError(
+                            "initial FEREBUS model pointer must be absent"
+                        )
+                else:
+                    parent_model_set = artifact_snapshot.model_set(expected_next - 1)
+                    if v_models.current_version() != int(expected_next - 1):
+                        raise ValueError(
+                            "FEREBUS incumbent pointer does not match the authority snapshot"
+                        )
+                quality_context = build_ferebus_quality_context(
+                    staging,
+                    incumbent_set=parent_model_set,
+                )
+            else:
+                quality_context = build_ferebus_quality_context(staging)
+                parent_model_set = quality_context.incumbent_set
+            self._report_runtime_progress(
+                "ferebus_authority",
+                completed=1,
+                total=1,
+                unit="contracts",
+            )
+        except Exception as exc:
+            return PhaseResult(
+                is_complete=True,
+                failure_reason=(
+                    "ferebus_authority_invalid: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                ),
+            )
+
         try:
             from .ferebus_quality import (
                 FEREBUS_QUALITY_MANIFEST,
@@ -5668,14 +5717,33 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             )
             from .config_lock import canonical_config, config_fingerprint
 
-            self._report_runtime_progress("quality_metrics")
+            measurement_stats = {
+                "inline": 0,
+                "cached": 0,
+                "local": 0,
+                "incumbent_reused": 0,
+                "incumbent_local": 0,
+            }
+
+            def quality_progress(stage, fields):
+                self._report_runtime_progress(str(stage), **dict(fields))
+
             quality_path = staging / FEREBUS_QUALITY_MANIFEST
+            validated_quality = None
             if quality_path.exists() or quality_path.is_symlink():
-                quality = validate_ferebus_quality_evidence(staging)
+                self._report_runtime_progress("ferebus_quality_validation")
+                validated_quality = validate_ferebus_quality_evidence(
+                    staging,
+                    context=quality_context,
+                )
+                quality = validated_quality
             else:
                 quality = evaluate_ferebus_quality(
                     staging,
                     getattr(self.config, "quality_gates", None),
+                    context=quality_context,
+                    progress_callback=quality_progress,
+                    measurement_stats=measurement_stats,
                 )
             quality_summary = dict(quality.get("summary") or {})
             measured_models = int(quality_summary.get("n_measured") or 0)
@@ -5683,12 +5751,6 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 quality_summary.get("n_total")
                 or quality_summary.get("n_tasks")
                 or measured_models
-            )
-            self._report_runtime_progress(
-                "quality_metrics",
-                completed=measured_models,
-                total=total_models,
-                unit="models",
             )
             if quality.get("measurement_complete") is not True:
                 from .ferebus_candidate_recovery import (
@@ -5741,18 +5803,36 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         "quality_attempt_path": str(attempt_path),
                     },
                 )
+            if artifact_snapshot is not None:
+                artifact_snapshot.assert_anchors_unchanged(self.campaign_dir)
             quality_path = write_ferebus_quality_manifest(staging, quality)
+            self._report_runtime_progress(
+                "ferebus_quality_validation",
+                completed=measured_models,
+                total=total_models,
+                unit="models",
+            )
+            if validated_quality is None:
+                validated_quality = validate_ferebus_quality_evidence(
+                    staging,
+                    context=quality_context,
+                )
             config_sha = config_fingerprint(canonical_config(self.config))
-            self._report_runtime_progress("incumbent_comparison")
+            if artifact_snapshot is not None:
+                artifact_snapshot.assert_anchors_unchanged(self.campaign_dir)
             decision_path = write_ferebus_quality_decision(
                 staging,
                 config_sha256=config_sha,
                 gates=getattr(self.config, "quality_gates", None),
+                context=quality_context,
+                validated_quality=validated_quality,
             )
             decision = read_ferebus_quality_decision(
                 staging,
                 expected_config_sha256=config_sha,
                 require_accepted=False,
+                context=quality_context,
+                validated_quality=validated_quality,
             )
             current_decision = dict(decision.get("current_evaluation") or {})
             self._report_runtime_progress(
@@ -5782,6 +5862,15 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 aggregate_rmse_warning_limit=(
                     current_decision.get("promotion") or {}
                 ).get("aggregate_rmse_limit"),
+                n_inline_quality_measurements=int(measurement_stats["inline"]),
+                n_cached_quality_measurements=int(measurement_stats["cached"]),
+                n_local_quality_measurements=int(measurement_stats["local"]),
+                n_incumbent_metrics_reused=int(
+                    measurement_stats["incumbent_reused"]
+                ),
+                n_incumbent_metrics_computed=int(
+                    measurement_stats["incumbent_local"]
+                ),
             )
             if not bool(current_decision.get("accepted")):
                 from ..layout import trained_models_dir
@@ -5846,134 +5935,178 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             )
 
         self._report_runtime_progress("model_commit")
-        v_models.recover_dangling_staging()
         next_version = int(expected_next)
-        try:
-            if next_version == 0:
-                if committed:
-                    raise ValueError("bootstrap model snapshot is not the first commit")
-                parent_model_set = None
-            else:
-                if committed != list(range(next_version)):
-                    raise ValueError(
-                        "committed model versions are not contiguous before "
-                        + str(next_version)
-                    )
-                parent_model_set = v_models.resolve(
-                    next_version - 1,
-                    verification="metadata",
-                )
-            staged = v_models.stage(
-                source_version=None,
-                target_version=next_version,
-            )
-            if int(staged.stat().st_dev) != int(Path(v_models.parent).stat().st_dev):
-                raise OSError("trained-model staging and final root are on different filesystems")
-        except Exception as exc:
-            return PhaseResult(
-                is_complete=True,
-                failure_reason=(
-                    "trained_model_staging_failed: "
-                    + type(exc).__name__
-                    + ": "
-                    + str(exc)
-                ),
-            )
         from . import input_staging as _stg
-        manifest = _stg.read_ferebus_manifest(staging)
-        try:
-            _write_ferebus_task_artefact_layout(
-                staging,
-                staged,
-                manifest,
-                models_version=next_version,
-                parent_model_set=parent_model_set,
-            )
-        except Exception as exc:
-            return PhaseResult(
-                is_complete=True,
-                failure_reason=(
-                    "ferebus_model_snapshot_build_failed: "
-                    + type(exc).__name__
-                    + ": "
-                    + str(exc)
-                ),
-            )
-        try:
-            from .model_contract import validate_ferebus_model_contract
-            from ..versioning.trained_models import (
-                validate_trained_model_snapshot,
-            )
-            from ..versioning.reference_data import ReferenceDataVersioning
+        from .model_contract import validate_ferebus_model_contract
+        from ..versioning.trained_models import (
+            trained_models_commit_lock,
+            validate_trained_model_snapshot,
+        )
 
-            reference_view = ReferenceDataVersioning(
-                Path(self.campaign_dir) / self.reference_data_dir_name
-            ).resolve(next_version, verification="metadata")
-
-            staged_model_set = validate_trained_model_snapshot(
-                self.campaign_dir,
-                staged,
-                next_version,
-                parent=parent_model_set,
-                verification="deep",
-                reference_view=reference_view,
-            )
-            validate_ferebus_model_contract(
-                staged,
-                committed=True,
-                expected_version=next_version,
-                trained_model_set=staged_model_set,
-            )
-        except Exception as exc:
-            self._journal_event(
-                "quantum_output_rejected",
-                phase=phase_name,
-                iteration=int(state.iteration),
-                pointdir=str(staged),
-                reason="staged_model_contract_invalid: " + str(exc)[:160],
-            )
-            return PhaseResult(
-                is_complete=True,
-                failure_reason=(
-                    "staged_model_contract_invalid: "
-                    + type(exc).__name__
-                    + ": "
-                    + str(exc)
-                ),
-            )
-        v_models.commit(next_version)
-        committed_dir = v_models.iteration_path(next_version)
         try:
-            committed_model_set = v_models.resolve(
-                next_version,
-                verification="deep",
-                reference_verification="metadata",
-            )
-            validate_ferebus_model_contract(
-                committed_dir,
-                committed=True,
-                expected_version=next_version,
-                trained_model_set=committed_model_set,
-            )
-            v_models.update_current(next_version)
-            self._report_runtime_progress(
-                "model_commit",
-                completed=int(len(manifest.get("tasks") or [])),
-                total=int(len(manifest.get("tasks") or [])),
-                unit="models",
-            )
+            with trained_models_commit_lock(self.campaign_dir):
+                if artifact_snapshot is not None:
+                    from ..versioning.reference_data import (
+                        ReferenceDataVersioning,
+                    )
+
+                    artifact_snapshot.assert_anchors_unchanged(self.campaign_dir)
+                    reference_versioning = ReferenceDataVersioning(
+                        Path(self.campaign_dir) / self.reference_data_dir_name
+                    )
+                    if reference_versioning.current_version() != next_version:
+                        raise ValueError(
+                            "FEREBUS reference pointer changed before model commit"
+                        )
+                    expected_model_pointer = None if is_initial else next_version - 1
+                    if v_models.current_version() != expected_model_pointer:
+                        raise ValueError(
+                            "FEREBUS model pointer changed before model commit"
+                        )
+                v_models.recover_dangling_staging()
+                current_committed = v_models.list_committed_versions()
+                try:
+                    if next_version == 0:
+                        if current_committed:
+                            raise ValueError(
+                                "bootstrap model snapshot is not the first commit"
+                            )
+                        parent_model_set = None
+                    else:
+                        if current_committed != list(range(next_version)):
+                            raise ValueError(
+                                "committed model versions are not contiguous before "
+                                + str(next_version)
+                            )
+                        if parent_model_set is None:
+                            parent_model_set = v_models.resolve(
+                                next_version - 1,
+                                verification="metadata",
+                            )
+                    staged = v_models.stage(
+                        source_version=None,
+                        target_version=next_version,
+                    )
+                    if int(staged.stat().st_dev) != int(
+                        Path(v_models.parent).stat().st_dev
+                    ):
+                        raise OSError(
+                            "trained-model staging and final root are on different filesystems"
+                        )
+                except Exception as exc:
+                    return PhaseResult(
+                        is_complete=True,
+                        failure_reason=(
+                            "trained_model_staging_failed: "
+                            + type(exc).__name__
+                            + ": "
+                            + str(exc)
+                        ),
+                    )
+                manifest = _stg.read_ferebus_manifest(staging)
+                try:
+                    _write_ferebus_task_artefact_layout(
+                        staging,
+                        staged,
+                        manifest,
+                        models_version=next_version,
+                        parent_model_set=parent_model_set,
+                    )
+                except Exception as exc:
+                    return PhaseResult(
+                        is_complete=True,
+                        failure_reason=(
+                            "ferebus_model_snapshot_build_failed: "
+                            + type(exc).__name__
+                            + ": "
+                            + str(exc)
+                        ),
+                    )
+                try:
+                    if reference_view is None:
+                        from ..versioning.reference_data import ReferenceDataVersioning
+
+                        reference_view = ReferenceDataVersioning(
+                            Path(self.campaign_dir) / self.reference_data_dir_name
+                        ).resolve(next_version, verification="metadata")
+                    staged_model_set = validate_trained_model_snapshot(
+                        self.campaign_dir,
+                        staged,
+                        next_version,
+                        parent=parent_model_set,
+                        verification="deep",
+                        reference_view=reference_view,
+                    )
+                    validate_ferebus_model_contract(
+                        staged,
+                        committed=True,
+                        expected_version=next_version,
+                        trained_model_set=staged_model_set,
+                    )
+                except Exception as exc:
+                    self._journal_event(
+                        "quantum_output_rejected",
+                        phase=phase_name,
+                        iteration=int(state.iteration),
+                        pointdir=str(staged),
+                        reason="staged_model_contract_invalid: " + str(exc)[:160],
+                    )
+                    return PhaseResult(
+                        is_complete=True,
+                        failure_reason=(
+                            "staged_model_contract_invalid: "
+                            + type(exc).__name__
+                            + ": "
+                            + str(exc)
+                        ),
+                    )
+                v_models.commit(next_version)
+                committed_dir = v_models.iteration_path(next_version)
+                try:
+                    committed_model_set = validate_trained_model_snapshot(
+                        self.campaign_dir,
+                        committed_dir,
+                        next_version,
+                        parent=parent_model_set,
+                        verification="deep",
+                        reference_view=reference_view,
+                        require_directory_manifest=True,
+                    )
+                    validate_ferebus_model_contract(
+                        committed_dir,
+                        committed=True,
+                        expected_version=next_version,
+                        trained_model_set=committed_model_set,
+                    )
+                    v_models.update_current(next_version)
+                    self._report_runtime_progress(
+                        "model_commit",
+                        completed=int(len(manifest.get("tasks") or [])),
+                        total=int(len(manifest.get("tasks") or [])),
+                        unit="models",
+                    )
+                except Exception as exc:
+                    self._journal_event(
+                        "quantum_output_rejected",
+                        phase=phase_name,
+                        iteration=int(state.iteration),
+                        pointdir=str(committed_dir),
+                        reason="committed_model_contract_invalid: " + str(exc)[:160],
+                    )
+                    return PhaseResult(
+                        is_complete=True,
+                        failure_reason=(
+                            "committed_model_contract_invalid: "
+                            + type(exc).__name__
+                            + ": "
+                            + str(exc)
+                        ),
+                    )
         except Exception as exc:
-            self._journal_event(
-                "quantum_output_rejected",
-                phase=phase_name,
-                iteration=int(state.iteration),
-                pointdir=str(committed_dir),
-                reason="committed_model_contract_invalid: " + str(exc)[:160],
-            )
             return PhaseResult(
                 is_complete=True,
                 failure_reason=(
-                    "committed_model_contract_invalid: "
+                    "trained_model_commit_lock_failed: "
                     + type(exc).__name__
                     + ": "
                     + str(exc)

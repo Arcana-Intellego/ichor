@@ -781,6 +781,60 @@ def _probe_background_daemon(
     return out
 
 
+def _background_probe_is_current_startup_child(
+    campaign: Path,
+    probe: Mapping[str, Any],
+) -> bool:
+    """Recognise only this process's authenticated launcher handshake."""
+    if os.environ.get(BACKGROUND_CHILD_ENV) != "1":
+        return False
+    launch_id = launch_id_from_environment()
+    if (
+        len(launch_id) != 32
+        or any(character not in "0123456789abcdef" for character in launch_id)
+    ):
+        return False
+    startup_path = startup_path_from_environment()
+    expected_path = _campaign_paths(Path(campaign).resolve())["background_startup"]
+    if startup_path is None:
+        return False
+    try:
+        if Path(startup_path).resolve() != expected_path.resolve():
+            return False
+    except OSError:
+        return False
+    startup = probe.get("background_startup_payload")
+    if not isinstance(startup, Mapping):
+        return False
+    try:
+        recorded_pid = int(startup.get("pid"))
+        observed_pid = int(probe.get("background_pid"))
+    except (TypeError, ValueError):
+        return False
+    recorded_campaign_raw = startup.get("campaign_dir")
+    if (
+        not isinstance(recorded_campaign_raw, str)
+        or not recorded_campaign_raw.strip()
+        or not Path(recorded_campaign_raw).is_absolute()
+    ):
+        return False
+    try:
+        recorded_campaign = Path(recorded_campaign_raw).resolve()
+    except (OSError, ValueError):
+        return False
+    return bool(
+        isinstance(startup.get("schema_version"), int)
+        and not isinstance(startup.get("schema_version"), bool)
+        and startup.get("schema_version") == BACKGROUND_STARTUP_SCHEMA_VERSION
+        and str(startup.get("launch_id") or "") == launch_id
+        and str(startup.get("state") or "") in BACKGROUND_STARTUP_ACTIVE_STATES
+        and recorded_pid == int(os.getpid())
+        and observed_pid == int(os.getpid())
+        and probe.get("background_pid_alive") is True
+        and recorded_campaign == Path(campaign).resolve()
+    )
+
+
 def _lease_is_fresh(
     heartbeat: Any,
     *,
@@ -18152,13 +18206,12 @@ def evaluate_campaign_preflight(
                     clock_skew_tolerance_seconds=clock_skew,
                 )
             )
-            ownership_payload.update(
-                _probe_background_daemon(
-                    paths["background_pid"],
-                    paths["background_log"],
-                    paths["background_startup"],
-                )
+            background_probe = _probe_background_daemon(
+                paths["background_pid"],
+                paths["background_log"],
+                paths["background_startup"],
             )
+            ownership_payload.update(background_probe)
             intent_errors: List[Dict[str, str]] = []
             ownership_payload["active_submission_intents"] = (
                 _load_active_submission_intents(
@@ -18178,7 +18231,17 @@ def evaluate_campaign_preflight(
             ownership = assess_campaign_presentation(
                 ownership_payload
             ).scheduler
-            daemon_active = _status_daemon_active(ownership_payload)
+            launch_ownership_payload = dict(ownership_payload)
+            if _background_probe_is_current_startup_child(
+                campaign,
+                background_probe,
+            ):
+                # The launcher publishes the child PID before the child can
+                # acquire the daemon lock.  Ignore only that exact self-PID;
+                # lock and lease probes remain authoritative for races with a
+                # different daemon.
+                launch_ownership_payload["background_pid_alive"] = False
+            daemon_active = _status_daemon_active(launch_ownership_payload)
             scheduler_clear = bool(
                 not daemon_active
                 and not ownership.has_unresolved_scheduler_work

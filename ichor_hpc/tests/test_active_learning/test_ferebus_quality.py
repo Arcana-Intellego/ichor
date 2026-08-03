@@ -12,6 +12,8 @@ from ichor.hpc.active_learning.daemon.ferebus_quality import (
     FerebusQualityMeasurementIncomplete,
     _parse_perf,
     evaluate_ferebus_quality,
+    enrich_task_receipt_with_quality,
+    validate_ferebus_task_measurement,
     evaluate_ferebus_quality_decision,
     read_ferebus_quality_decision,
     _stream_model_metrics,
@@ -19,6 +21,7 @@ from ichor.hpc.active_learning.daemon.ferebus_quality import (
     write_ferebus_quality_decision,
     write_ferebus_quality_manifest,
 )
+import ichor.hpc.active_learning.daemon.ferebus_quality as ferebus_quality_module
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.ferebus_prior import (
     backend_kernel_token,
@@ -329,6 +332,71 @@ def test_ferebus_quality_computes_metrics_and_condition_number(tmp_path):
     record = payload["records"][0]
     assert record["row_counts"] == {"train": 3, "int_val": 2, "ext_val": 2}
     assert record["metrics"]["ext_val"] == {"rmse": 0.0, "mae": 0.0, "r2": 1.0}
+
+
+def test_task_quality_enrichment_is_reused_without_local_prediction(
+    tmp_path,
+    monkeypatch,
+):
+    staging = _seed_quality_staging(tmp_path)
+    measurement = enrich_task_receipt_with_quality(staging, 0)
+    validated = validate_ferebus_task_measurement(staging, 0, measurement)
+    stats = {}
+
+    def forbidden_subprocess(*args, **kwargs):
+        raise AssertionError("inline task measurement must avoid local prediction")
+
+    monkeypatch.setattr(
+        ferebus_quality_module,
+        "_run_measurement_subprocess",
+        forbidden_subprocess,
+    )
+    quality = evaluate_ferebus_quality(staging, measurement_stats=stats)
+
+    assert quality["measurement_complete"] is True
+    assert quality["records"][0]["metrics"] == validated["metrics"]
+    assert stats == {
+        "inline": 1,
+        "cached": 0,
+        "local": 0,
+        "incumbent_reused": 0,
+        "incumbent_local": 0,
+    }
+
+
+def test_invalid_optional_task_quality_falls_back_and_warms_cache(
+    tmp_path,
+    monkeypatch,
+):
+    staging = _seed_quality_staging(tmp_path)
+    receipt_path = staging / "iqa" / "O1" / "FEREBUS_TASK_RECEIPT.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["quality_measurement"] = {"kind": "tampered"}
+    atomic_write_json(receipt_path, receipt)
+
+    monkeypatch.setattr(
+        ferebus_quality_module,
+        "_run_measurement_subprocess",
+        lambda root, task_id: ferebus_quality_module._measure_task_cache_worker(
+            root, task_id
+        ),
+    )
+    first_stats = {}
+    first = evaluate_ferebus_quality(staging, measurement_stats=first_stats)
+    assert first["measurement_complete"] is True
+    assert first_stats["local"] == 1
+
+    monkeypatch.setattr(
+        ferebus_quality_module,
+        "_run_measurement_subprocess",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("warm cache must avoid recomputation")
+        ),
+    )
+    second_stats = {}
+    second = evaluate_ferebus_quality(staging, measurement_stats=second_stats)
+    assert second["records"] == first["records"]
+    assert second_stats["cached"] == 1
 
 
 def test_ferebus_quality_streams_large_csv_in_bounded_chunks(tmp_path):

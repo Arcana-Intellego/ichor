@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
 
@@ -221,6 +222,34 @@ def execute_task(task_map_path: Path, task_index: int) -> int:
                     "sha256": sha256_file(performance_path),
                 }
                 receipt["success"] = True
+                # Training success is authoritative independently of optional
+                # quality measurement.  Publish it first so an interruption in
+                # the metric tail can never cause scientifically valid training
+                # to be submitted again.
+                receipt_path.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_json(receipt_path, receipt)
+                for variable in (
+                    "OMP_NUM_THREADS",
+                    "OPENBLAS_NUM_THREADS",
+                    "MKL_NUM_THREADS",
+                    "NUMEXPR_NUM_THREADS",
+                    "VECLIB_MAXIMUM_THREADS",
+                ):
+                    os.environ[variable] = "1"
+                try:
+                    from .ferebus_quality import enrich_task_receipt_with_quality
+
+                    enrich_task_receipt_with_quality(root, index)
+                except Exception as exc:
+                    print(
+                        "WARNING: FEREBUS training succeeded but optional quality "
+                        "measurement was not published: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc),
+                        file=sys.stderr,
+                        flush=True,
+                    )
         else:
             receipt["failure_reason"] = "ferebus_nonzero_exit"
     except OSError as exc:
@@ -228,7 +257,8 @@ def execute_task(task_map_path: Path, task_index: int) -> int:
         receipt["exit_code"] = exit_code
         receipt["failure_reason"] = type(exc).__name__ + ": " + str(exc)
     receipt_path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(receipt_path, receipt)
+    if not receipt.get("success") or not receipt_path.is_file():
+        atomic_write_json(receipt_path, receipt)
     return int(exit_code)
 
 
