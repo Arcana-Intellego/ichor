@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
-from ..strict_json import strict_json as json
+import stat
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 from ..daemon.state import atomic_write_json
+from ..strict_json import strict_json as json
 from ..handoff_manifests import (
     ariadne_landing_audit_path,
     ariadne_results_path,
@@ -97,17 +100,87 @@ def _remove_completed_lock_files(root: Path) -> None:
         path.unlink()
 
 
-def _inventory(root: Path, manifest_name: str) -> Tuple[list, list]:
+@dataclass(frozen=True)
+class _InventoryCapture:
+    root: Path
+    manifest_name: str
+    files: list
+    directories: list
+    root_entries: Tuple[str, ...]
+    fingerprints: Mapping[str, Tuple[int, int, int, int, int, int]]
+    bytes_hashed: int
+
+    def recheck(self) -> None:
+        observed_entries = tuple(
+            sorted(
+                path.name
+                for path in self.root.iterdir()
+                if path.name != self.manifest_name
+            )
+        )
+        if observed_entries != self.root_entries:
+            raise SamplingIterationError(
+                "sampling iteration root entries changed after inventory"
+            )
+        for relative, expected in self.fingerprints.items():
+            path = self.root.joinpath(*PurePosixPath(relative).parts)
+            try:
+                observed = _lstat_fingerprint(path)
+            except OSError as exc:
+                raise SamplingIterationError(
+                    "sampling iteration changed after inventory: " + relative
+                ) from exc
+            if observed != expected:
+                raise SamplingIterationError(
+                    "sampling iteration changed after inventory: " + relative
+                )
+
+
+def _lstat_fingerprint(path: Path) -> Tuple[int, int, int, int, int, int]:
+    value = path.lstat()
+    return (
+        int(value.st_mode),
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+    )
+
+
+def _inventory_capture(
+    root: Path,
+    manifest_name: str,
+    *,
+    remove_completed_locks: bool = False,
+    progress_callback: Optional[Callable[..., None]] = None,
+) -> _InventoryCapture:
     if root.is_symlink() or not root.is_dir():
         raise SamplingIterationError("sampling root is not a regular directory: " + str(root))
-    files = []
+    file_paths = []
     directories = []
+    fingerprints: Dict[str, Tuple[int, int, int, int, int, int]] = {}
     for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
         relative = path.relative_to(root).as_posix()
         if relative == manifest_name:
             continue
-        if path.is_symlink():
+        try:
+            fingerprint = _lstat_fingerprint(path)
+        except OSError as exc:
+            raise SamplingIterationError(
+                "sampling iteration entry became unreadable: " + relative
+            ) from exc
+        mode = fingerprint[0]
+        if stat.S_ISLNK(mode):
             raise SamplingIterationError("sampling iteration contains a symlink: " + relative)
+        if remove_completed_locks and path.name in _LOCK_FILENAMES:
+            if not stat.S_ISREG(mode):
+                raise SamplingIterationError(
+                    "completed iteration contains an invalid lock entry: "
+                    + relative
+                )
+            path.unlink()
+            continue
         if (
             path.name.startswith(".tmp-")
             or ".partial-" in path.name
@@ -116,20 +189,86 @@ def _inventory(root: Path, manifest_name: str) -> Tuple[list, list]:
             raise SamplingIterationError(
                 "sampling iteration contains an incomplete artefact: " + relative
             )
-        if path.is_dir():
+        if stat.S_ISDIR(mode):
             directories.append(relative)
-        elif path.is_file():
-            files.append({
-                "path": relative,
-                "size": int(path.stat().st_size),
-                "sha256": sha256_file(path),
-                "role": _role(relative),
-            })
+        elif stat.S_ISREG(mode):
+            file_paths.append((relative, path, fingerprint))
         else:
             raise SamplingIterationError(
                 "sampling iteration contains a special filesystem entry: " + relative
             )
-    return files, directories
+    # Lock cleanup changes parent-directory timestamps. Capture directories
+    # only after the complete cleanup/discovery traversal has finished.
+    for relative in directories:
+        directory = root.joinpath(*PurePosixPath(relative).parts)
+        fingerprint = _lstat_fingerprint(directory)
+        if not stat.S_ISDIR(fingerprint[0]):
+            raise SamplingIterationError(
+                "sampling iteration directory changed during discovery: "
+                + relative
+            )
+        fingerprints[relative] = fingerprint
+    root_entries = tuple(
+        sorted(
+            path.name
+            for path in root.iterdir()
+            if path.name != manifest_name
+        )
+    )
+    total_bytes = sum(int(item[2][3]) for item in file_paths)
+    completed_bytes = 0
+    files_by_path: Dict[str, Dict[str, Any]] = {}
+
+    def digest_one(item: Tuple[str, Path, Tuple[int, int, int, int, int, int]]):
+        relative, path, before = item
+        digest = sha256_file(path)
+        after = _lstat_fingerprint(path)
+        if after != before or not stat.S_ISREG(after[0]):
+            raise SamplingIterationError(
+                "sampling iteration file changed while hashing: " + relative
+            )
+        return relative, digest, before
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        future_by_relative = {
+            executor.submit(digest_one, item): item[0] for item in file_paths
+        }
+        completed_files = 0
+        for future in concurrent.futures.as_completed(future_by_relative):
+            relative, digest, fingerprint = future.result()
+            completed_files += 1
+            completed_bytes += int(fingerprint[3])
+            fingerprints[relative] = fingerprint
+            files_by_path[relative] = {
+                "path": relative,
+                "size": int(fingerprint[3]),
+                "sha256": digest,
+                "role": _role(relative),
+            }
+            if progress_callback is not None:
+                progress_callback(
+                    completed=int(completed_files),
+                    total=int(len(file_paths)),
+                    bytes_completed=int(completed_bytes),
+                    bytes_total=int(total_bytes),
+                )
+    files = [files_by_path[key] for key in sorted(files_by_path)]
+    capture = _InventoryCapture(
+        root=Path(root),
+        manifest_name=str(manifest_name),
+        files=files,
+        directories=directories,
+        root_entries=root_entries,
+        fingerprints=fingerprints,
+        bytes_hashed=int(total_bytes),
+    )
+    capture.recheck()
+    return capture
+
+
+def _inventory(root: Path, manifest_name: str) -> Tuple[list, list]:
+    capture = _inventory_capture(root, manifest_name)
+    return capture.files, capture.directories
 
 
 def _required_paths(root: Path, relative_paths: Iterable[str]) -> None:
@@ -541,10 +680,265 @@ def verify_bootstrap(
     return payload
 
 
+_ACTIVE_FINALISATION_RECEIPT_PHASES = (
+    "ARIADNE_ARRAY",
+    "PHASE_B_DIVERSITY",
+    "SPLIT",
+    "ALLOCATION_CHECK",
+    "REFERENCE_COMMIT",
+    "FEREBUS",
+)
+
+
+def _report_finalisation_progress(
+    callback: Optional[Callable[..., None]],
+    stage: str,
+    **fields: Any,
+) -> None:
+    if callback is not None:
+        callback(str(stage), **fields)
+
+
+def _snapshot_supports_iteration(snapshot: Any, iteration: int) -> bool:
+    if snapshot is None:
+        return False
+    value = int(iteration)
+    expected = tuple(range(value + 1))
+    try:
+        return (
+            tuple(int(item.version) for item in snapshot.reference_views)
+            == expected
+            and tuple(int(item.version) for item in snapshot.model_sets)
+            == expected
+            and not snapshot.reference_errors
+            and not snapshot.model_errors
+            and not snapshot.completion_receipt_errors
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _snapshot_iteration_context(
+    campaign: Path,
+    iteration: int,
+    campaign_uid: str,
+    snapshot: Any,
+) -> Tuple[Dict[str, Any], Dict[str, Any], Path, Dict[str, Any]]:
+    from ..daemon.completion_receipts import validate_completion_reference
+
+    value = int(iteration)
+    snapshot.assert_anchors_unchanged(campaign)
+    if str(campaign_uid) not in set(str(uid) for uid in snapshot.campaign_uids):
+        raise SamplingIterationError("sampling snapshot campaign UID mismatch")
+    input_head = _authority_head_binding(
+        snapshot.reference_view(value - 1),
+        snapshot.model_set(value - 1),
+    )
+    output_head = _authority_head_binding(
+        snapshot.reference_view(value),
+        snapshot.model_set(value),
+    )
+    resolve_sampling_iteration_authority_chain(
+        campaign,
+        value - 1,
+        expected_campaign_uid=campaign_uid,
+        reference_views=tuple(snapshot.reference_views[:value]),
+        model_sets=tuple(snapshot.model_sets[:value]),
+    )
+    parent_path = (
+        bootstrap_manifest_path(campaign)
+        if value == 1
+        else active_iteration_manifest_path(campaign, value - 1)
+    )
+    parent = {
+        "path": parent_path.resolve().relative_to(campaign.resolve()).as_posix(),
+        "sha256": sha256_file(parent_path),
+    }
+
+    receipts_by_phase: Dict[str, list] = {
+        phase: [] for phase in _ACTIVE_FINALISATION_RECEIPT_PHASES
+    }
+    for record in snapshot.completion_receipts:
+        payload = record.get("payload") if isinstance(record, Mapping) else None
+        if (
+            not isinstance(payload, Mapping)
+            or str(payload.get("campaign_uid") or "") != str(campaign_uid)
+            or int(payload.get("iteration", -1)) != value
+        ):
+            continue
+        phase = str(payload.get("phase") or "")
+        if phase in receipts_by_phase:
+            receipts_by_phase[phase].append(record)
+    for phase, records in receipts_by_phase.items():
+        if not records:
+            raise SamplingIterationError(
+                "sampling snapshot lacks " + phase + " completion authority"
+            )
+        validated = []
+        for record in records:
+            reference = record.get("reference")
+            if not isinstance(reference, Mapping):
+                raise SamplingIterationError(
+                    "sampling completion receipt reference is invalid for " + phase
+                )
+            validated.append(
+                validate_completion_reference(
+                    campaign,
+                    reference,
+                    expected_campaign_uid=campaign_uid,
+                )
+            )
+        if len({str(item.get("config_sha256") or "") for item in validated}) != 1:
+            raise SamplingIterationError(
+                "sampling completion receipts conflict for " + phase
+            )
+    return input_head, output_head, parent_path, parent
+
+
+def _validate_capture_against_payload(
+    capture: _InventoryCapture,
+    payload: Mapping[str, Any],
+) -> None:
+    if payload.get("files") != capture.files or payload.get(
+        "directories"
+    ) != capture.directories:
+        raise SamplingIterationError("sampling iteration exact inventory mismatch")
+    if str(payload.get("inventory_sha256") or "") != _canonical_sha256(
+        {"files": capture.files, "directories": capture.directories}
+    ):
+        raise SamplingIterationError("sampling iteration inventory SHA mismatch")
+
+
+def _finalise_active_iteration_from_snapshot(
+    campaign: Path,
+    iteration: int,
+    campaign_uid: str,
+    snapshot: Any,
+    *,
+    progress_callback: Optional[Callable[..., None]],
+) -> Path:
+    value = int(iteration)
+    root = active_iteration_dir(campaign, value)
+    path = active_iteration_manifest_path(campaign, value)
+    _report_finalisation_progress(progress_callback, "iteration_authority")
+    input_head, output_head, unused_parent_path, parent = (
+        _snapshot_iteration_context(
+            campaign,
+            value,
+            campaign_uid,
+            snapshot,
+        )
+    )
+    del unused_parent_path
+    allocation = read_point_allocation(
+        point_allocation_path(campaign, context="active", iteration=value),
+        expected_campaign_uid=campaign_uid,
+        expected_context="active",
+        expected_iteration=value,
+    )
+    if not bool((allocation.get("summary") or {}).get("complete", False)):
+        raise SamplingIterationError("active point allocation is incomplete")
+    _required_paths(root, (
+        "protocol/SAMPLING_PROTOCOL_RESOLVED.json",
+        "protocol/SAMPLING_PROTOCOL_AUDIT.json",
+        "protocol/SAMPLING_SCALE_MODEL.json",
+        "seed_selection/SELECTION.json",
+        "seed_selection/seeds.xyz",
+        "ariadne/TASK_MAP.json",
+        "ariadne/RESULTS.json",
+        "ariadne/AUDIT.json",
+        "phase_b/SELECTION.json",
+        "phase_b/selected.xyz",
+        "allocation/POINT_ALLOCATION.json",
+        "allocation/SPLIT_RECEIPT.json",
+    ))
+    _validate_top_level(
+        root,
+        manifest_name=ITERATION_MANIFEST_FILENAME,
+        allowed_directories=_ACTIVE_TOP_LEVEL_DIRECTORIES,
+    )
+    _report_finalisation_progress(progress_callback, "iteration_inventory")
+
+    def inventory_progress(**fields: Any) -> None:
+        _report_finalisation_progress(
+            progress_callback,
+            "iteration_inventory",
+            **fields,
+        )
+
+    capture = _inventory_capture(
+        root,
+        ITERATION_MANIFEST_FILENAME,
+        remove_completed_locks=True,
+        progress_callback=inventory_progress,
+    )
+    snapshot.assert_anchors_unchanged(campaign)
+    if path.is_file():
+        payload = _read_manifest(
+            path,
+            kind="active_iteration",
+            iteration=value,
+        )
+        if str(payload.get("campaign_uid") or "") != str(campaign_uid):
+            raise SamplingIterationError("active iteration campaign UID mismatch")
+        if payload.get("input_head") != input_head or payload.get(
+            "output_head"
+        ) != output_head or payload.get("parent") != parent:
+            raise SamplingIterationError(
+                "active iteration authority binding mismatch"
+            )
+        _validate_capture_against_payload(capture, payload)
+        capture.recheck()
+        snapshot.assert_anchors_unchanged(campaign)
+        return path
+
+    payload = _manifest_payload(
+        campaign_uid=campaign_uid,
+        kind="active_iteration",
+        iteration=value,
+        parent=parent,
+        input_head=input_head,
+        output_head=output_head,
+        files=capture.files,
+        directories=capture.directories,
+    )
+    _report_finalisation_progress(
+        progress_callback,
+        "iteration_manifest_publication",
+        completed=0,
+        total=1,
+        unit="manifest",
+    )
+    capture.recheck()
+    snapshot.assert_anchors_unchanged(campaign)
+    atomic_write_json(path, payload)
+    published = _read_manifest(
+        path,
+        kind="active_iteration",
+        iteration=value,
+    )
+    if published != payload:
+        raise SamplingIterationError("published sampling manifest changed")
+    _validate_capture_against_payload(capture, published)
+    capture.recheck()
+    snapshot.assert_anchors_unchanged(campaign)
+    _report_finalisation_progress(
+        progress_callback,
+        "iteration_manifest_publication",
+        completed=1,
+        total=1,
+        unit="manifest",
+    )
+    return path
+
+
 def finalise_active_iteration(
     campaign_dir: Path,
     iteration: int,
     campaign_uid: str,
+    *,
+    artifact_snapshot: Any = None,
+    progress_callback: Optional[Callable[..., None]] = None,
 ) -> Path:
     campaign = Path(campaign_dir)
     value = int(iteration)
@@ -552,6 +946,14 @@ def finalise_active_iteration(
         raise SamplingIterationError("active iteration must be >= 1")
     root = active_iteration_dir(campaign, value)
     path = active_iteration_manifest_path(campaign, value)
+    if _snapshot_supports_iteration(artifact_snapshot, value):
+        return _finalise_active_iteration_from_snapshot(
+            campaign,
+            value,
+            campaign_uid,
+            artifact_snapshot,
+            progress_callback=progress_callback,
+        )
     if path.is_file():
         verify_active_iteration(campaign, value, expected_campaign_uid=campaign_uid)
         return path

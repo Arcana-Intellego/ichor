@@ -21,6 +21,11 @@ from ichor.hpc.active_learning.daemon.ferebus_quality import (
     write_ferebus_quality_decision,
     write_ferebus_quality_manifest,
 )
+from ichor.hpc.active_learning.daemon.ferebus_model_factors import (
+    FerebusModelFactorError,
+    publish_task_factor,
+    read_task_factor,
+)
 import ichor.hpc.active_learning.daemon.ferebus_quality as ferebus_quality_module
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.ferebus_prior import (
@@ -115,10 +120,19 @@ def _dataset_identity(path, rows, root):
     }
 
 
-def _seed_quality_staging(tmp_path, *, ext_targets=None):
+def _seed_quality_staging(
+    tmp_path,
+    *,
+    ext_targets=None,
+    campaign_layout=False,
+):
     if ext_targets is None:
         ext_targets = (OXYGEN_PRIOR, OXYGEN_PRIOR)
-    staging = tmp_path / "iteration-staging"
+    staging = (
+        tmp_path / "campaign" / "TRAINED_MODELS" / "iteration-staging"
+        if campaign_layout
+        else tmp_path / "iteration-staging"
+    )
     task_dir = staging / "iqa" / "O1"
     datasets_dir = task_dir / "datasets"
     datasets_dir.mkdir(parents=True)
@@ -332,6 +346,42 @@ def test_ferebus_quality_computes_metrics_and_condition_number(tmp_path):
     record = payload["records"][0]
     assert record["row_counts"] == {"train": 3, "int_val": 2, "ext_val": 2}
     assert record["metrics"]["ext_val"] == {"rmse": 0.0, "mae": 0.0, "r2": 1.0}
+
+
+def test_task_factor_cache_publishes_and_validates_without_receipt_change(tmp_path):
+    from ichor.core.models import Model
+
+    staging = _seed_quality_staging(tmp_path, campaign_layout=True)
+    receipt = staging / "iqa" / "O1" / "FEREBUS_TASK_RECEIPT.json"
+    before = receipt.read_bytes()
+    model = Model(staging / "iqa" / "O1" / "WATER_iqa_O1.model")
+
+    manifest = publish_task_factor(staging, 0, model=model)
+    factor = read_task_factor(staging, 0, model=model)
+
+    assert manifest.is_file()
+    assert factor.shape == (model.ntrain, model.ntrain)
+    assert receipt.read_bytes() == before
+
+
+def test_task_factor_cache_rebuilds_corrupt_optional_evidence(tmp_path):
+    from ichor.core.models import Model
+
+    staging = _seed_quality_staging(tmp_path, campaign_layout=True)
+    model = Model(staging / "iqa" / "O1" / "WATER_iqa_O1.model")
+    manifest = publish_task_factor(staging, 0, model=model)
+    factor_path = manifest.parent / "factor.npy"
+    with factor_path.open("r+b") as handle:
+        handle.seek(-8, 2)
+        handle.write(b"\xff" * 8)
+
+    with pytest.raises(FerebusModelFactorError):
+        read_task_factor(staging, 0, model=model)
+    publish_task_factor(staging, 0, model=model)
+    assert read_task_factor(staging, 0, model=model).shape == (
+        model.ntrain,
+        model.ntrain,
+    )
 
 
 def test_task_quality_enrichment_is_reused_without_local_prediction(

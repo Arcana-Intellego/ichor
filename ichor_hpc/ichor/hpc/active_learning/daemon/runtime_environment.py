@@ -26,6 +26,10 @@ SUBMITTED_PYTHON_IMPORTS = {
     "ichor_hpc": ("ichor.hpc",),
     "ariadne": ("ariadne",),
     "pyferebus": (
+        "typing_extensions",
+        "ichor.hpc.active_learning.daemon.ferebus_task_runner",
+        "ichor.hpc.active_learning.daemon.ferebus_quality",
+        "ichor.hpc.active_learning.daemon.ferebus_model_factors",
         "pyferebus.executors.trainer",
         "pyferebus.writers.config_file",
         "pyferebus.writers.commands_file",

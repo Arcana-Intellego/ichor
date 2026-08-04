@@ -486,6 +486,36 @@ def _validate_configured_executable(path_to_executable: Union[str, Path]) -> str
     return exe
 
 
+def _validate_python_executable(python_executable: Union[str, Path]) -> str:
+    """Return the lexical interpreter path used by the submitted script."""
+    executable = str(python_executable)
+    _reject_control_chars("configured Python executable", executable)
+    if not executable.strip():
+        raise FerebusSubmissionError(
+            "configured Python executable must be a non-empty path"
+        )
+    path = Path(executable).expanduser()
+    if not path.is_absolute():
+        raise FerebusSubmissionError(
+            "configured Python executable must be absolute: " + executable
+        )
+    if os.name != "nt":
+        if path.is_symlink() and not path.exists():
+            raise FerebusSubmissionError(
+                "configured Python executable is a dangling symlink: "
+                + executable
+            )
+        if not path.is_file():
+            raise FerebusSubmissionError(
+                "configured Python executable does not exist: " + executable
+            )
+        if not os.access(str(path), os.X_OK):
+            raise FerebusSubmissionError(
+                "configured Python executable is not executable: " + executable
+            )
+    return executable
+
+
 def _resolve_model_kwargs(
     transfer_learning: bool,
     walltime_hours,
@@ -1020,6 +1050,7 @@ def _replace_with_structured_task_script(
     *,
     task_map: Path,
     scheduler_kind: str,
+    python_executable: Union[str, Path],
     scheduler_task_map: Optional[Path] = None,
 ) -> None:
     """Discard backend-owned shell commands and invoke the structured runner."""
@@ -1045,7 +1076,7 @@ def _replace_with_structured_task_script(
         except OSError:
             pass
     command = (
-        shlex.quote(str(Path(sys.executable).resolve()))
+        shlex.quote(_validate_python_executable(python_executable))
         + " -m ichor.hpc.active_learning.daemon.ferebus_task_runner"
         + " --task-map "
         + shlex.quote(str(task_map.resolve()))
@@ -1094,6 +1125,7 @@ def submit_ferebus(
     overwrite_workdir: bool = False,
     move_dataset_files: bool = True,
     path_to_executable: Optional[Union[str, Path]] = None,
+    python_executable: Optional[Union[str, Path]] = None,
     expected_tasks: Optional[int] = None,
     submitted_tasks: Optional[int] = None,
     scheduler_task_map: Optional[Union[str, Path]] = None,
@@ -1350,6 +1382,9 @@ def submit_ferebus(
         script,
         task_map=task_map,
         scheduler_kind=scheduler_kind,
+        python_executable=(
+            sys.executable if python_executable is None else python_executable
+        ),
         scheduler_task_map=scheduler_task_map_path,
     )
     _harden_generated_script(

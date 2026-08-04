@@ -1637,15 +1637,29 @@ class DryRunPhaseExecutor:
             )
         from ..versioning.sampling_iterations import finalise_active_iteration
 
-        self._report_runtime_progress("iteration_finalisation")
+        finalisation_stats: Dict[str, Any] = {}
+
+        def _finalisation_progress(stage: str, **fields: Any) -> None:
+            if stage == "iteration_inventory":
+                finalisation_stats.update(fields)
+            self._report_runtime_progress(stage, **fields)
+
+        self._report_runtime_progress("iteration_authority")
         iteration_manifest = finalise_active_iteration(
             self.campaign_dir,
             iteration,
             str(state.campaign_uid),
+            artifact_snapshot=getattr(
+                self,
+                "_committed_artifact_snapshot",
+                None,
+            ),
+            progress_callback=_finalisation_progress,
         )
         self.artefact_log.append(str(iteration_manifest))
         from .staging_retirement import retire_completed_staging_buckets
 
+        self._report_runtime_progress("staging_retirement")
         retirement = retire_completed_staging_buckets(
             self.campaign_dir,
             through_version=iteration,
@@ -1658,6 +1672,9 @@ class DryRunPhaseExecutor:
             staging_buckets_deleted=int(retirement["n_deleted"]),
             staging_buckets_preserved=int(retirement["n_preserved"]),
             staging_retirement_warnings=list(retirement["warnings"]),
+            inventory_files=int(finalisation_stats.get("total", 0)),
+            inventory_bytes=int(finalisation_stats.get("bytes_total", 0)),
+            inventory_hash_passes=(1 if finalisation_stats else None),
         )
         stop = self.config.stop
         self._report_runtime_progress("stopping_criteria")

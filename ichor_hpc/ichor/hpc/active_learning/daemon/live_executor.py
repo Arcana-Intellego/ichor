@@ -21,14 +21,14 @@ jobs that take seconds, not hours.
 """
 from __future__ import annotations
 
-import os
 import hashlib
+import math
+import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
-import math
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -127,6 +127,100 @@ from .runtime_environment import (
 )
 from ..submit.scheduler_backend import get_scheduler_backend
 from ..submit.sge import sge_safe_job_name
+
+
+class _StableDigestTracker:
+    """Reuse immutable file digests across a same-filesystem directory rename."""
+
+    def __init__(self) -> None:
+        self._digests: Dict[Any, str] = {}
+
+    @staticmethod
+    def _identity(path: Path) -> Any:
+        value = path.stat()
+        stable = (
+            int(value.st_dev),
+            int(value.st_ino),
+            int(value.st_size),
+            int(value.st_mtime_ns),
+            int(value.st_ctime_ns),
+        )
+        if stable[1] == 0:
+            return (str(path.absolute()), *stable)
+        return stable
+
+    def digest(self, path: Path, unused_payload: bool = False) -> str:
+        del unused_payload
+        source = Path(path)
+        if source.is_symlink() or not source.is_file():
+            raise ValueError("digest target is missing, non-regular or symlinked")
+        before = self._identity(source)
+        cached = self._digests.get(before)
+        if cached is not None:
+            if self._identity(source) != before:
+                raise ValueError("digest target changed after cached validation")
+            return cached
+        digest = hashlib.sha256()
+        with source.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        after = self._identity(source)
+        if after != before:
+            raise ValueError("digest target changed while hashing")
+        value = digest.hexdigest()
+        self._digests[before] = value
+        return value
+
+    def capture_rename_tree(self, root: Path) -> Dict[str, Any]:
+        source_root = Path(root)
+        captured: Dict[str, Any] = {}
+        for path in sorted(source_root.rglob("*")):
+            if path.is_symlink():
+                raise ValueError("trained-model rename source contains a symlink")
+            if path.is_file():
+                captured[path.relative_to(source_root).as_posix()] = self._identity(
+                    path
+                )
+        return captured
+
+    def bind_renamed_tree(
+        self,
+        captured: Mapping[str, Any],
+        destination_root: Path,
+    ) -> None:
+        destination = Path(destination_root)
+        for relative, before in captured.items():
+            path = destination.joinpath(*str(relative).split("/"))
+            if path.is_symlink() or not path.is_file():
+                raise ValueError(
+                    "trained-model file disappeared across atomic publication: "
+                    + str(relative)
+                )
+            after = self._identity(path)
+            if isinstance(before[0], str) or isinstance(after[0], str):
+                # Filesystems without stable inode identities use the normal
+                # committed-path rehash.
+                self._digests.pop(before, None)
+                continue
+            if os.name == "nt":
+                # Windows st_ctime is creation time, so a same-size rewrite
+                # with a restored mtime cannot be excluded from metadata alone.
+                self._digests.pop(before, None)
+                continue
+            if before[:4] != after[:4]:
+                raise ValueError(
+                    "trained-model file changed across atomic publication: "
+                    + str(relative)
+                )
+            if before[4] != after[4]:
+                # Some filesystems update ctime when a containing directory is
+                # renamed. Do not trust the staged digest in that case; the
+                # committed-path validation will hash the file again.
+                self._digests.pop(before, None)
+                continue
+            cached = self._digests.get(before)
+            if cached is not None:
+                self._digests[after] = cached
 
 
 __all__ = [
@@ -3137,6 +3231,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 overwrite_workdir=False,
                 move_dataset_files=True,
                 path_to_executable=path_to_executable,
+                python_executable=_python_executable_path_for_script(),
                 expected_tasks=expected_ferebus_tasks,
                 submitted_tasks=len(ferebus_retry_ids),
                 scheduler_task_map=bundle.array_task_map,
@@ -5934,7 +6029,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 },
             )
 
-        self._report_runtime_progress("model_commit")
+        self._report_runtime_progress("model_snapshot_build")
         next_version = int(expected_next)
         from . import input_staging as _stg
         from .model_contract import validate_ferebus_model_contract
@@ -5943,6 +6038,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             validate_trained_model_snapshot,
         )
 
+        digest_tracker = _StableDigestTracker()
+        staged_validation_context = None
         try:
             with trained_models_commit_lock(self.campaign_dir):
                 if artifact_snapshot is not None:
@@ -6012,6 +6109,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         models_version=next_version,
                         parent_model_set=parent_model_set,
                     )
+                    self._report_runtime_progress(
+                        "model_snapshot_build",
+                        completed=int(len(manifest.get("tasks") or [])),
+                        total=int(len(manifest.get("tasks") or [])),
+                        unit="models",
+                    )
+                    self._report_runtime_progress("model_snapshot_validation")
                 except Exception as exc:
                     return PhaseResult(
                         is_complete=True,
@@ -6036,12 +6140,23 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         parent=parent_model_set,
                         verification="deep",
                         reference_view=reference_view,
+                        digest_file=digest_tracker.digest,
                     )
-                    validate_ferebus_model_contract(
+                    staged_validation_context = validate_ferebus_model_contract(
                         staged,
                         committed=True,
                         expected_version=next_version,
                         trained_model_set=staged_model_set,
+                    )
+                    if staged_validation_context is None:
+                        raise ValueError(
+                            "staged FEREBUS validation did not bind its model set"
+                        )
+                    self._report_runtime_progress(
+                        "model_snapshot_validation",
+                        completed=int(len(manifest.get("tasks") or [])),
+                        total=int(len(manifest.get("tasks") or [])),
+                        unit="models",
                     )
                 except Exception as exc:
                     self._journal_event(
@@ -6060,8 +6175,14 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                             + str(exc)
                         ),
                     )
+                rename_capture = digest_tracker.capture_rename_tree(staged)
+                self._report_runtime_progress("model_commit")
                 v_models.commit(next_version)
                 committed_dir = v_models.iteration_path(next_version)
+                digest_tracker.bind_renamed_tree(
+                    rename_capture,
+                    committed_dir,
+                )
                 try:
                     committed_model_set = validate_trained_model_snapshot(
                         self.campaign_dir,
@@ -6070,6 +6191,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         parent=parent_model_set,
                         verification="deep",
                         reference_view=reference_view,
+                        digest_file=digest_tracker.digest,
                         require_directory_manifest=True,
                     )
                     validate_ferebus_model_contract(
@@ -6077,6 +6199,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         committed=True,
                         expected_version=next_version,
                         trained_model_set=committed_model_set,
+                        validation_context=staged_validation_context,
                     )
                     v_models.update_current(next_version)
                     self._report_runtime_progress(
@@ -6115,15 +6238,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
         try:
             from ichor.core.adversarial.posterior import TotalEnergyPosterior
-            from ichor.core.models import Models
+            from .ferebus_model_factors import adopt_ferebus_model_factors
             from .seed_selection_runtime import SeedSelectionRuntimeCache
 
-            factor_models = Models.from_model_files(
-                committed_model_set.root,
-                committed_model_set.model_paths,
-            )
             factor_posterior = TotalEnergyPosterior(
-                factor_models,
+                list(staged_validation_context.parsed_models),
                 property_name="iqa",
                 scaled=True,
             )
@@ -6142,7 +6261,24 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     if str(task.property) == "iqa"
                 },
             )
-            factor_statuses = factor_cache.ensure_model_factors()
+            factor_statuses = adopt_ferebus_model_factors(
+                committed_dir,
+                committed_model_set=committed_model_set,
+                cache=factor_cache,
+                python_executable=_python_executable_path_for_script(),
+                progress=self._report_runtime_progress,
+            )
+            status_counts = {
+                status: sum(
+                    1 for observed in factor_statuses.values() if observed == status
+                )
+                for status in (
+                    "task_adopted",
+                    "existing_hit",
+                    "local_fallback",
+                    "failed_optional",
+                )
+            }
             self._journal_event(
                 "seed_selection_cache",
                 phase=phase_name,
@@ -6150,6 +6286,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 cache_kind="model_factors",
                 cache_status="prewarmed",
                 n_models=int(len(factor_statuses)),
+                n_task_adopted=int(status_counts["task_adopted"]),
+                n_existing_hits=int(status_counts["existing_hit"]),
+                n_local_fallback=int(status_counts["local_fallback"]),
+                n_failed_optional=int(status_counts["failed_optional"]),
             )
         except Exception as exc:
             self._journal_event(
@@ -7869,6 +8009,32 @@ def _python_executable_for_script() -> str:
         "software", "python", "python_path", default=None
     )
     return _shell_executable(python_path or sys.executable)
+
+
+def _python_executable_path_for_script() -> str:
+    """Return the configured lexical venv path without resolving its symlink."""
+    python_path = expanded_profile_value(
+        "software", "python", "python_path", default=None
+    )
+    executable = str(python_path or sys.executable)
+    _reject_shell_control_chars("configured Python executable", executable)
+    path = Path(executable).expanduser()
+    if not path.is_absolute():
+        raise BackendSubmissionError(
+            "configured Python executable must be absolute: " + executable
+        )
+    if os.name != "nt":
+        if not path.is_file() or not os.access(str(path), os.X_OK):
+            raise BackendSubmissionError(
+                "configured Python executable is missing or not executable: "
+                + executable
+            )
+        if path.resolve() != Path(sys.executable).resolve():
+            raise BackendSubmissionError(
+                "configured Python executable does not match the active "
+                "environment generation"
+            )
+    return executable
 
 
 def _normalise_module_list(raw: Any, *, label: str) -> List[str]:

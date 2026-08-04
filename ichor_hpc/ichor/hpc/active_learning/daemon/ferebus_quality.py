@@ -482,6 +482,8 @@ def _measurement_dataset_bindings(
 def measure_ferebus_task(
     staging_dir: Path,
     logical_task_id: int,
+    *,
+    model: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Compute candidate metrics for one authenticated successful task."""
     from ichor.core.models import Model
@@ -518,7 +520,16 @@ def measure_ferebus_task(
     model_path = _stg.resolve_ferebus_task_path(
         staging, normalised["model_path"], "measurement model"
     )
-    model = Model(model_path)
+    if model is None:
+        model = Model(model_path)
+    elif (
+        str(getattr(model, "atom", getattr(model, "atom_name", "")))
+        != str(task.get("atom") or "")
+        or str(getattr(model, "prop", "")) != str(task.get("property") or "")
+    ):
+        raise FerebusQualityDecisionError(
+            "FEREBUS supplied measurement model identity mismatch"
+        )
     performance = None
     performance_path = None
     if task_map.get("performance_required") is True:
@@ -701,6 +712,8 @@ def validate_ferebus_task_measurement(
 def enrich_task_receipt_with_quality(
     staging_dir: Path,
     logical_task_id: int,
+    *,
+    model: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Atomically add optional quality evidence to a successful base receipt."""
     staging = Path(staging_dir).resolve()
@@ -713,7 +726,11 @@ def enrich_task_receipt_with_quality(
         return validate_ferebus_task_measurement(
             staging, int(logical_task_id), existing
         )
-    measurement = measure_ferebus_task(staging, int(logical_task_id))
+    measurement = measure_ferebus_task(
+        staging,
+        int(logical_task_id),
+        model=model,
+    )
     receipt_path = staging.joinpath(*str(task["receipt_path"]).split("/"))
     current = _read_json_object(receipt_path, "FEREBUS task receipt")
     if current != before:
@@ -829,6 +846,8 @@ def _write_quality_cache(
 
 def _measure_task_cache_worker(staging_dir: Path, logical_task_id: int) -> Path:
     from . import input_staging as _stg
+    from .ferebus_model_factors import publish_task_factor
+    from ichor.core.models import Model
 
     staging = Path(staging_dir).resolve()
     context = FerebusQualityContext(
@@ -840,8 +859,33 @@ def _measure_task_cache_worker(staging_dir: Path, logical_task_id: int) -> Path:
         task_execution={},
         incumbent_set=None,
     )
-    measurement = measure_ferebus_task(context.staging, int(logical_task_id))
-    return _write_quality_cache(context, int(logical_task_id), measurement)
+    normalised, unused_receipt, unused_map, unused_task = _raw_task_receipt(
+        context.staging,
+        int(logical_task_id),
+    )
+    del unused_receipt, unused_map, unused_task
+    model_path = _stg.resolve_ferebus_task_path(
+        context.staging,
+        normalised["model_path"],
+        "measurement model",
+    )
+    model = Model(model_path)
+    measurement = measure_ferebus_task(
+        context.staging,
+        int(logical_task_id),
+        model=model,
+    )
+    path = _write_quality_cache(context, int(logical_task_id), measurement)
+    try:
+        publish_task_factor(
+            context.staging,
+            int(logical_task_id),
+            model=model,
+        )
+    except Exception:
+        # Optional factor evidence cannot invalidate exact quality evidence.
+        pass
+    return path
 
 
 def _run_measurement_subprocess(staging: Path, logical_task_id: int) -> None:

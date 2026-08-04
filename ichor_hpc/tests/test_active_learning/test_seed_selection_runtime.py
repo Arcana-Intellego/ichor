@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from ichor.hpc.active_learning.daemon.seed_selection_runtime import (
     SeedSelectionProgressReporter,
@@ -335,6 +336,44 @@ def test_model_factor_cache_failure_falls_back_to_strict_factor(tmp_path):
 
     assert cache.ensure_model_factors() == {"O1": "fallback"}
     assert model.lower_cholesky_calls == 1
+
+
+def test_model_factor_cache_adopts_external_factor_without_recomputing(tmp_path):
+    model = _FactorModel()
+    cache = SeedSelectionRuntimeCache(
+        tmp_path / "campaign",
+        pool=None,
+        posterior=_FactorPosterior(model),
+        model_set_sha256="b" * 64,
+        model_manifest_sha256="c" * 64,
+        iteration=2,
+        model_file_sha256_by_atom={"O1": "d" * 64},
+    )
+    factor = np.linalg.cholesky(
+        model._covariance + model.jitter * np.eye(model.ntrain)
+    ).astype(np.float64)
+
+    assert cache.adopt_model_factor("O1", factor) == "task_adopted"
+    assert model.lower_cholesky_calls == 0
+    assert cache.restore_model_factor("O1") is True
+    np.testing.assert_allclose(model.installed, factor)
+
+
+def test_model_factor_cache_rejects_invalid_external_factor(tmp_path):
+    model = _FactorModel()
+    cache = SeedSelectionRuntimeCache(
+        tmp_path / "campaign",
+        pool=None,
+        posterior=_FactorPosterior(model),
+        model_set_sha256="b" * 64,
+        model_manifest_sha256="c" * 64,
+        iteration=2,
+        model_file_sha256_by_atom={"O1": "d" * 64},
+    )
+    invalid = np.eye(model.ntrain, dtype=np.float64)
+    with pytest.raises(ValueError, match="residual"):
+        cache.adopt_model_factor("O1", invalid)
+    assert model.lower_cholesky_calls == 0
 
 
 def test_partial_feature_build_resumes_from_last_verified_chunk(tmp_path):

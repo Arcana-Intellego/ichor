@@ -989,6 +989,24 @@ def test_live_one_iter_water_tetramer_after_parsers_land(tmp_path, monkeypatch):
         "silently fallen through. Saw events: "
         + str(sorted({e.get("event") for e in events}))
     )
+    finalised = [
+        e
+        for e in events
+        if e.get("event") == "active_iteration_finalised"
+        and e.get("iteration") == 1
+    ]
+    assert len(finalised) == 1
+    assert finalised[0].get("inventory_hash_passes") == 1
+    factor_events = [
+        e
+        for e in events
+        if e.get("event") == "seed_selection_cache"
+        and e.get("cache_kind") == "model_factors"
+        and e.get("phase") in {"INITIAL_FEREBUS", "FEREBUS"}
+    ]
+    assert factor_events
+    assert all(e.get("cache_status") == "prewarmed" for e in factor_events)
+    assert sum(int(e.get("n_failed_optional", 0)) for e in factor_events) == 0
 
 
 

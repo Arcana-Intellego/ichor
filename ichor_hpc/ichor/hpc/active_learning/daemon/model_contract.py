@@ -16,6 +16,22 @@ class ModelContractError(ValueError):
 
 
 @dataclass(frozen=True)
+class FerebusModelValidationContext:
+    """Semantic validation bound to an immutable trained-model snapshot."""
+
+    expected_version: int
+    task_manifest_sha256: str
+    model_set_sha256: str
+    evidence_set_sha256: str
+    task_model_sha256: Tuple[Tuple[str, str, str], ...]
+    training_data_bindings: Tuple[Tuple[str, str, str, int, str], ...]
+    numeric_model_identities: Tuple[Tuple[str, str, str], ...]
+    parsed_models: Tuple[Any, ...]
+    prior_validation_complete: bool
+    config_validation_complete: bool
+
+
+@dataclass(frozen=True)
 class FerebusTask:
     property: str
     atom: str
@@ -399,18 +415,87 @@ def validate_ferebus_model_contract(
     committed: bool = False,
     expected_version: Optional[int] = None,
     trained_model_set: Any = None,
-) -> None:
+    validation_context: Optional[FerebusModelValidationContext] = None,
+) -> Optional[FerebusModelValidationContext]:
     """Validate a staged or committed FEREBUS model directory.
 
     Staged directories use paths relative to FEREBUS staging. Committed model
     versions use the authoritative trained-model set manifest.
     """
-    from ichor.core.models import Model, Models
+    from ichor.core.models import Model
     from . import input_staging as _stg
 
     root = Path(root_dir)
     if not root.is_dir():
         raise ModelContractError("ferebus_model_root_missing: " + str(root))
+    if validation_context is not None:
+        from ..versioning.manifest import sha256_file
+
+        if not committed or trained_model_set is None or expected_version is None:
+            raise ModelContractError(
+                "ferebus_validation_context_requires_committed_snapshot"
+            )
+        if int(validation_context.expected_version) != int(expected_version):
+            raise ModelContractError("ferebus_validation_context_version_mismatch")
+        if Path(trained_model_set.root).resolve() != root.resolve():
+            raise ModelContractError("trained_model_set_root_mismatch")
+        if (
+            str(trained_model_set.model_set_sha256)
+            != str(validation_context.model_set_sha256)
+            or str(trained_model_set.evidence_set_sha256)
+            != str(validation_context.evidence_set_sha256)
+        ):
+            raise ModelContractError("ferebus_validation_context_set_mismatch")
+        task_hashes = tuple(
+            (
+                str(task.property),
+                str(task.atom),
+                str(task.model.sha256),
+            )
+            for task in trained_model_set.tasks
+        )
+        if task_hashes != validation_context.task_model_sha256:
+            raise ModelContractError("ferebus_validation_context_task_mismatch")
+        training_bindings = tuple(
+            (
+                str(task.property),
+                str(task.atom),
+                str(task.datasets["train"].relative_path),
+                int(task.datasets["train"].size),
+                str(task.datasets["train"].sha256),
+            )
+            for task in trained_model_set.tasks
+        )
+        if training_bindings != validation_context.training_data_bindings:
+            raise ModelContractError(
+                "ferebus_validation_context_training_binding_mismatch"
+            )
+        if not (
+            validation_context.prior_validation_complete
+            and validation_context.config_validation_complete
+        ):
+            raise ModelContractError("ferebus_validation_context_incomplete")
+        observed_numeric = tuple(
+            (
+                str(model.type),
+                str(model.atom),
+                str(model.numeric_identity),
+            )
+            for model in validation_context.parsed_models
+        )
+        if observed_numeric != validation_context.numeric_model_identities:
+            raise ModelContractError(
+                "ferebus_validation_context_numeric_identity_mismatch"
+            )
+        manifest_path = root / "FEREBUS_TASKS.json"
+        if (
+            manifest_path.is_symlink()
+            or not manifest_path.is_file()
+            or sha256_file(manifest_path)
+            != validation_context.task_manifest_sha256
+        ):
+            raise ModelContractError("ferebus_validation_context_manifest_mismatch")
+        return validation_context
     manifest = _stg.read_ferebus_manifest(
         root,
         verify_dataset_files=not committed,
@@ -701,14 +786,7 @@ def validate_ferebus_model_contract(
 
     expected_keys = {task.key for task in tasks}
     if committed:
-        try:
-            models = Models.from_model_files(root, model_set.model_paths)
-            loaded = list(models)
-        except Exception as exc:
-            raise ModelContractError(
-                "models_load_failed: " + type(exc).__name__ + ": " + str(exc)
-            ) from exc
-        loaded_keys = {(str(m.type), str(m.atom)) for m in loaded}
+        loaded_keys = set(parsed_models)
         if loaded_keys != expected_keys:
             raise ModelContractError(
                 "models_coverage_mismatch: "
@@ -716,6 +794,45 @@ def validate_ferebus_model_contract(
                 + "!="
                 + repr(sorted(expected_keys))
             )
+    from ..versioning.manifest import sha256_file
+
+    if model_set is None or expected_version is None:
+        return None
+    return FerebusModelValidationContext(
+        expected_version=int(expected_version),
+        task_manifest_sha256=sha256_file(root / "FEREBUS_TASKS.json"),
+        model_set_sha256=str(model_set.model_set_sha256),
+        evidence_set_sha256=str(model_set.evidence_set_sha256),
+        task_model_sha256=tuple(
+            (
+                str(task.property),
+                str(task.atom),
+                str(task.model.sha256),
+            )
+            for task in model_set.tasks
+        ),
+        training_data_bindings=tuple(
+            (
+                str(task.property),
+                str(task.atom),
+                str(task.datasets["train"].relative_path),
+                int(task.datasets["train"].size),
+                str(task.datasets["train"].sha256),
+            )
+            for task in model_set.tasks
+        ),
+        numeric_model_identities=tuple(
+            (
+                str(task.property),
+                str(task.atom),
+                str(parsed_models[task.key].numeric_identity),
+            )
+            for task in model_set.tasks
+        ),
+        parsed_models=tuple(parsed_models[task.key] for task in model_set.tasks),
+        prior_validation_complete=True,
+        config_validation_complete=True,
+    )
 
 
 def _validate_variance_array(values: Any, context: str) -> np.ndarray:

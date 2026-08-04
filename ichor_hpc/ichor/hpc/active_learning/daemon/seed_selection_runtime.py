@@ -105,7 +105,9 @@ def _fsync_file(path: Path) -> None:
 
 def _write_npy_atomic(path: Path, values: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp-" + uuid.uuid4().hex[:12])
+    # Keep the temporary basename no longer than ``factor.npy`` so cache
+    # publication also works near the legacy Windows path-length boundary.
+    temporary = path.with_name(".t" + uuid.uuid4().hex[:8])
     with temporary.open("xb") as handle:
         np.save(handle, np.asarray(values), allow_pickle=False)
         handle.flush()
@@ -121,6 +123,39 @@ def _write_npy_atomic(path: Path, values: np.ndarray) -> None:
         pass
     finally:
         os.close(descriptor)
+
+
+def _copy_regular_file_atomic(source: Path, destination: Path) -> str:
+    """Copy one immutable cache payload and return its copied SHA-256."""
+    if source.is_symlink() or not source.is_file():
+        raise ValueError("model-factor source is not a regular file")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        destination.name + ".tmp-" + uuid.uuid4().hex[:12]
+    )
+    digest = hashlib.sha256()
+    try:
+        with source.open("rb") as reader, temporary.open("xb") as writer:
+            for block in iter(lambda: reader.read(1024 * 1024), b""):
+                writer.write(block)
+                digest.update(block)
+            writer.flush()
+            os.fsync(writer.fileno())
+        os.replace(temporary, destination)
+        try:
+            descriptor = os.open(str(destination.parent), os.O_RDONLY)
+        except OSError:
+            descriptor = None
+        if descriptor is not None:
+            try:
+                os.fsync(descriptor)
+            except OSError:
+                pass
+            finally:
+                os.close(descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return digest.hexdigest()
 
 
 def _invalidate_directory(path: Path) -> None:
@@ -1062,6 +1097,133 @@ class SeedSelectionRuntimeCache:
         if not self._factor_residual_is_valid(model, factor):
             raise ValueError("model-factor cache covariance residual is invalid")
         return factor
+
+    def adopt_model_factor(self, atom: str, factor: Any) -> str:
+        """Install validated external factor evidence in the canonical cache."""
+        import portalocker
+
+        atom_name = str(atom)
+        model = self.posterior._property_models.get(atom_name)
+        if model is None:
+            raise ValueError("posterior model is unavailable for " + atom_name)
+        identity = self._model_factor_identity(atom_name, model)
+        cache_id = _canonical_sha256(identity)
+        namespace = (
+            self.root / "model_factors" / self.model_set_sha256[:24]
+        )
+        namespace.mkdir(parents=True, exist_ok=True)
+        path_token = cache_id[:32]
+        data_path = namespace / (path_token + ".npy")
+        manifest_path = namespace / (path_token + ".json")
+        lock_path = namespace / (path_token + ".lock")
+        if namespace.is_symlink() or lock_path.is_symlink():
+            raise ValueError("model-factor cache path is symlinked")
+        with portalocker.Lock(str(lock_path), mode="a", timeout=600):
+            try:
+                restored = self._read_model_factor(
+                    data_path,
+                    manifest_path,
+                    identity=identity,
+                    model=model,
+                )
+                model.install_lower_cholesky(
+                    restored,
+                    expected_numeric_identity=str(model.numeric_identity),
+                )
+                return "existing_hit"
+            except Exception:
+                data_path.unlink(missing_ok=True)
+                manifest_path.unlink(missing_ok=True)
+
+            source_factor = np.asarray(factor)
+            expected_shape = (int(model.ntrain), int(model.ntrain))
+            if (
+                source_factor.dtype != np.dtype(np.float64)
+                or source_factor.shape != expected_shape
+                or not np.all(np.isfinite(source_factor))
+                or np.any(np.diag(source_factor) <= 0.0)
+            ):
+                raise ValueError("adopted model-factor array is invalid")
+            scale = max(1.0, float(np.max(np.abs(source_factor))))
+            tolerance = (
+                np.finfo(np.float64).eps
+                * max(1, int(model.ntrain))
+                * scale
+                * 16.0
+            )
+            if np.any(np.abs(np.triu(source_factor, k=1)) > tolerance):
+                raise ValueError("adopted model-factor is not lower triangular")
+            if not self._factor_residual_is_valid(model, source_factor):
+                raise ValueError("adopted model-factor residual is invalid")
+            source_filename = getattr(factor, "filename", None)
+            copied_sha = None
+            if source_filename:
+                source_path = Path(str(source_filename))
+                if source_path != data_path:
+                    copied_sha = _copy_regular_file_atomic(
+                        source_path,
+                        data_path,
+                    )
+            if copied_sha is None:
+                _write_npy_atomic(data_path, source_factor)
+                copied_sha = _sha256_file(data_path)
+            elif copied_sha != _sha256_file(data_path):
+                raise ValueError("copied model-factor hash mismatch")
+            atomic_write_json(
+                manifest_path,
+                {
+                    "schema_version": SEED_MODEL_FACTOR_CACHE_SCHEMA_VERSION,
+                    "identity": identity,
+                    "data": {
+                        "size": int(data_path.stat().st_size),
+                        "sha256": copied_sha,
+                        "shape": [int(model.ntrain), int(model.ntrain)],
+                        "dtype": np.dtype(np.float64).str,
+                    },
+                },
+            )
+            restored = self._read_model_factor(
+                data_path,
+                manifest_path,
+                identity=identity,
+                model=model,
+            )
+            model.install_lower_cholesky(
+                restored,
+                expected_numeric_identity=str(model.numeric_identity),
+            )
+            return "task_adopted"
+
+    def restore_model_factor(self, atom: str) -> bool:
+        """Restore one canonical factor without computing a missing value."""
+        import portalocker
+
+        atom_name = str(atom)
+        model = self.posterior._property_models.get(atom_name)
+        if model is None:
+            raise ValueError("posterior model is unavailable for " + atom_name)
+        identity = self._model_factor_identity(atom_name, model)
+        cache_id = _canonical_sha256(identity)
+        namespace = self.root / "model_factors" / self.model_set_sha256[:24]
+        path_token = cache_id[:32]
+        data_path = namespace / (path_token + ".npy")
+        manifest_path = namespace / (path_token + ".json")
+        lock_path = namespace / (path_token + ".lock")
+        if lock_path.is_symlink():
+            raise ValueError("model-factor cache lock is symlinked")
+        namespace.mkdir(parents=True, exist_ok=True)
+        with portalocker.Lock(str(lock_path), mode="a", timeout=600):
+            restored = self._read_model_factor(
+                data_path,
+                manifest_path,
+                identity=identity,
+                model=model,
+            )
+            model.install_lower_cholesky(
+                restored,
+                expected_numeric_identity=str(model.numeric_identity),
+            )
+        return True
 
     def ensure_model_factors(self) -> Dict[str, str]:
         """Restore or compute Cholesky factors for the current posterior models."""

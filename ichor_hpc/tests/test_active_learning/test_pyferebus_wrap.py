@@ -1017,6 +1017,49 @@ def test_submit_ferebus_replaces_untrusted_generated_script_body(tmp_path):
     assert "ferebus_task_runner" in script
 
 
+@pytest.mark.parametrize("scheduler_kind", ["slurm", "sge"])
+def test_submit_ferebus_preserves_lexical_python_path(
+    tmp_path,
+    scheduler_kind,
+):
+    captured: List[_StubModel] = []
+    model_class = _make_model_class(captured)
+    jd = tmp_path / "job.json"
+    jd.write_text("{}")
+    lexical = str(tmp_path / "venv" / "bin" / ".." / "bin" / "python")
+    if os.name != "nt":
+        target = Path(lexical)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("#!/bin/sh\n", encoding="utf-8")
+        os.chmod(target, 0o755)
+    submit_ferebus(
+        jd,
+        tmp_path,
+        python_executable=lexical,
+        scheduler_kind=scheduler_kind,
+        model_class=model_class,
+        submit_runner=_StubRunner(),
+    )
+    script = (tmp_path / "runFerebus.sh").read_text(encoding="utf-8")
+    assert lexical in script
+    assert str(Path(lexical).resolve()) not in script or lexical == str(
+        Path(lexical).resolve()
+    )
+
+
+def test_submit_ferebus_rejects_control_character_in_python_path(tmp_path):
+    jd = tmp_path / "job.json"
+    jd.write_text("{}")
+    with pytest.raises(FerebusSubmissionError, match="control character"):
+        submit_ferebus(
+            jd,
+            tmp_path,
+            python_executable=str(tmp_path / "python") + "\nunsafe",
+            model_class=_make_model_class([]),
+            submit_runner=_StubRunner(),
+        )
+
+
 def test_submit_ferebus_raises_on_sbatch_nonzero(tmp_path):
     captured: List[_StubModel] = []
     model_class = _make_model_class(captured)

@@ -236,14 +236,51 @@ def execute_task(task_map_path: Path, task_index: int) -> int:
                     "VECLIB_MAXIMUM_THREADS",
                 ):
                     os.environ[variable] = "1"
+                optional_model = None
+                try:
+                    from ichor.core.models import Model
+
+                    optional_model = Model(model_path)
+                except Exception as exc:
+                    print(
+                        "WARNING: FEREBUS training succeeded but its optional "
+                        "postprocessing model could not be loaded: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc),
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 try:
                     from .ferebus_quality import enrich_task_receipt_with_quality
 
-                    enrich_task_receipt_with_quality(root, index)
+                    enrich_task_receipt_with_quality(
+                        root,
+                        index,
+                        model=optional_model,
+                    )
                 except Exception as exc:
                     print(
                         "WARNING: FEREBUS training succeeded but optional quality "
                         "measurement was not published: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                try:
+                    from .ferebus_model_factors import publish_task_factor
+
+                    publish_task_factor(
+                        root,
+                        index,
+                        model=optional_model,
+                    )
+                except Exception as exc:
+                    print(
+                        "WARNING: FEREBUS training succeeded but optional model "
+                        "factor evidence was not published: "
                         + type(exc).__name__
                         + ": "
                         + str(exc),
