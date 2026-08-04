@@ -34,11 +34,17 @@ _STAGE_LABELS = {
     "handoff_validation": "Validating phase inputs",
     "resource_resolution": "Resolving resources",
     "ariadne_resource_validation": "Validating ARIADNE resource inputs",
+    "ariadne_task_map_validation": "Validating ARIADNE task map",
+    "ariadne_trajectory_pool_validation": (
+        "Validating ARIADNE trajectory pool"
+    ),
+    "ariadne_current_model_validation": "Validating current ARIADNE models",
     "ariadne_resource_dimensions": "Computing ARIADNE local subspace dimensions",
     "ariadne_resource_bound": "Applying configured ARIADNE resource bound",
     "ariadne_resource_reuse": "Reusing validated ARIADNE resource evidence",
     "resource_rules": "Applying scheduler resource rules",
     "input_staging": "Staging inputs",
+    "array_recovery_validation": "Checking reusable array outputs",
     "gaussian_input_staging": "Staging Gaussian inputs",
     "aimall_input_validation": "Validating Gaussian outputs for AIMAll",
     "aimall_task_staging": "Staging AIMAll tasks",

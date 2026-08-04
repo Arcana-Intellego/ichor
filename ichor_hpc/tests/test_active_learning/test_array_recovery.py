@@ -77,6 +77,259 @@ def test_force_resubmit_array_ignores_reusable_outputs(tmp_path, monkeypatch):
     assert payload["retry_task_ids"] == [0, 1, 2]
 
 
+def test_bound_scan_builds_contract_and_intent_index_once(tmp_path, monkeypatch):
+    from ichor.hpc.active_learning.daemon import (
+        quantum_task_contracts,
+        submission_intent,
+    )
+    from ichor.hpc.active_learning.daemon.quantum_task_contracts import (
+        QuantumLogicalTask,
+        QuantumTaskContract,
+    )
+    from ichor.hpc.active_learning.daemon.state import (
+        fresh_campaign_state,
+        write_state,
+    )
+
+    campaign = tmp_path / "campaign"
+    phase = "GAUSSIAN"
+    staging = campaign / ".DATA" / "STAGING" / "iter_4"
+    staging.mkdir(parents=True)
+    state = fresh_campaign_state(max_iterations=10)
+    (campaign / ".DATA" / "ACTIVE_LEARNING").mkdir(parents=True)
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    tasks = []
+    for task_id in range(4):
+        pointdir = staging / ("POINT_" + str(task_id).zfill(4) + ".pointdir")
+        pointdir.mkdir()
+        (pointdir / "GAUSSIAN_TASK_RECEIPT.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+        tasks.append(
+            QuantumLogicalTask(
+                logical_task_id=task_id,
+                pointdir_name=pointdir.name,
+                pointdir=pointdir,
+                producer_logical_task_id=task_id,
+                candidate_id="candidate-" + str(task_id),
+            )
+        )
+    (staging / "POINTS.txt").write_text(
+        "\n".join(str(task.pointdir.resolve()) for task in tasks) + "\n",
+        encoding="utf-8",
+    )
+    contract = QuantumTaskContract(
+        campaign_uid=str(state.campaign_uid),
+        phase=phase,
+        iteration=4,
+        replacement_round=0,
+        staging_dir=staging,
+        tasks=tuple(tasks),
+    )
+    counts = {"contract": 0, "intents": 0, "task_maps": 0}
+
+    def build_contract(*_args, **_kwargs):
+        counts["contract"] += 1
+        return contract
+
+    intent = {
+        "attempt_id": "attempt-1",
+        "submission_identity": "r0000-a0001-test",
+        "job_id": "123",
+        "status": "COMPLETED",
+        "submission_kind": "array",
+        "replacement_round": 0,
+        "submission_metadata": {},
+    }
+
+    def attempts(*_args, **_kwargs):
+        counts["intents"] += 1
+        return (intent,)
+
+    def submitted(*_args, **_kwargs):
+        counts["task_maps"] += 1
+        return tuple(range(4))
+
+    monkeypatch.setattr(
+        quantum_task_contracts,
+        "quantum_task_contract",
+        build_contract,
+    )
+    monkeypatch.setattr(submission_intent, "intent_attempt_records", attempts)
+    monkeypatch.setattr(
+        submission_intent,
+        "intent_submitted_logical_task_ids",
+        submitted,
+    )
+    monkeypatch.setattr(
+        array_recovery,
+        "logical_task_ids",
+        lambda *_args, **_kwargs: pytest.fail(
+            "bound scan must use its prepared task contract"
+        ),
+    )
+    monkeypatch.setattr(
+        array_recovery,
+        "_validate_task",
+        lambda *_args, **_kwargs: (True, "", str(tasks[_args[3]].pointdir)),
+    )
+    progress = []
+
+    payload = array_recovery.prepare_retry_submission(
+        campaign,
+        phase,
+        4,
+        progress_callback=lambda stage, **values: progress.append(
+            (stage, values.get("completed"), values.get("total"))
+        ),
+    )
+
+    assert payload["n_reuse"] == 4
+    assert counts == {"contract": 1, "intents": 1, "task_maps": 1}
+    assert progress[0] == ("array_recovery_validation", 0, 4)
+    assert progress[-1] == ("array_recovery_validation", 4, 4)
+
+
+def test_bound_scan_refuses_control_mutation_before_ledger(tmp_path, monkeypatch):
+    from ichor.hpc.active_learning.daemon import quantum_task_contracts
+    from ichor.hpc.active_learning.daemon.quantum_task_contracts import (
+        QuantumLogicalTask,
+        QuantumTaskContract,
+    )
+    from ichor.hpc.active_learning.daemon.state import (
+        fresh_campaign_state,
+        write_state,
+    )
+
+    campaign = tmp_path / "campaign"
+    staging = campaign / ".DATA" / "STAGING" / "iter_4"
+    staging.mkdir(parents=True)
+    state = fresh_campaign_state(max_iterations=10)
+    (campaign / ".DATA" / "ACTIVE_LEARNING").mkdir(parents=True)
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    pointdir = staging / "POINT_0000.pointdir"
+    pointdir.mkdir()
+    points = staging / "POINTS.txt"
+    points.write_text(str(pointdir.resolve()) + "\n", encoding="utf-8")
+    contract = QuantumTaskContract(
+        campaign_uid=str(state.campaign_uid),
+        phase="GAUSSIAN",
+        iteration=4,
+        replacement_round=0,
+        staging_dir=staging,
+        tasks=(
+            QuantumLogicalTask(
+                logical_task_id=0,
+                pointdir_name=pointdir.name,
+                pointdir=pointdir,
+                producer_logical_task_id=0,
+                candidate_id="candidate-0",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        quantum_task_contracts,
+        "quantum_task_contract",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        array_recovery,
+        "_validate_task",
+        lambda *_args, **_kwargs: (False, "missing", str(pointdir)),
+    )
+    changed = False
+
+    def progress(_stage, **values):
+        nonlocal changed
+        if values.get("completed") == 1 and not changed:
+            changed = True
+            points.write_text(str(pointdir.resolve()) + "\n\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="authority changed during validation"):
+        array_recovery.prepare_retry_submission(
+            campaign,
+            "GAUSSIAN",
+            4,
+            progress_callback=progress,
+        )
+
+    assert not array_recovery.array_ledger_path(
+        campaign,
+        "GAUSSIAN",
+        4,
+    ).exists()
+
+
+def test_bound_scan_refuses_receipt_mutation_before_ledger(tmp_path, monkeypatch):
+    from ichor.hpc.active_learning.daemon import quantum_task_contracts
+    from ichor.hpc.active_learning.daemon.quantum_task_contracts import (
+        QuantumLogicalTask,
+        QuantumTaskContract,
+    )
+    from ichor.hpc.active_learning.daemon.state import (
+        fresh_campaign_state,
+        write_state,
+    )
+
+    campaign = tmp_path / "campaign"
+    staging = campaign / ".DATA" / "STAGING" / "iter_4"
+    staging.mkdir(parents=True)
+    state = fresh_campaign_state(max_iterations=10)
+    (campaign / ".DATA" / "ACTIVE_LEARNING").mkdir(parents=True)
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    pointdir = staging / "POINT_0000.pointdir"
+    pointdir.mkdir()
+    points = staging / "POINTS.txt"
+    points.write_text(str(pointdir.resolve()) + "\n", encoding="utf-8")
+    receipt = pointdir / "GAUSSIAN_TASK_RECEIPT.json"
+    receipt.write_text("{}", encoding="utf-8")
+    contract = QuantumTaskContract(
+        campaign_uid=str(state.campaign_uid),
+        phase="GAUSSIAN",
+        iteration=4,
+        replacement_round=0,
+        staging_dir=staging,
+        tasks=(
+            QuantumLogicalTask(
+                logical_task_id=0,
+                pointdir_name=pointdir.name,
+                pointdir=pointdir,
+                producer_logical_task_id=0,
+                candidate_id="candidate-0",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        quantum_task_contracts,
+        "quantum_task_contract",
+        lambda *_args, **_kwargs: contract,
+    )
+    monkeypatch.setattr(
+        array_recovery,
+        "_validate_task",
+        lambda *_args, **_kwargs: (True, "", str(pointdir)),
+    )
+
+    def progress(_stage, **values):
+        if values.get("completed") == 1:
+            receipt.write_text('{"changed":true}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="authority changed during validation"):
+        array_recovery.prepare_retry_submission(
+            campaign,
+            "GAUSSIAN",
+            4,
+            progress_callback=progress,
+        )
+
+    assert not array_recovery.array_ledger_path(
+        campaign,
+        "GAUSSIAN",
+        4,
+    ).exists()
+
+
 def test_missing_middle_quantum_task_is_independently_retryable(
     tmp_path,
     monkeypatch,

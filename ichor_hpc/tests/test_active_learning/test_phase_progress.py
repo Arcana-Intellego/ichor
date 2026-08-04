@@ -18,6 +18,18 @@ def test_ariadne_resource_progress_stages_have_explicit_human_labels():
         == "Validating ARIADNE resource inputs"
     )
     assert (
+        format_progress_stage("ariadne_task_map_validation")
+        == "Validating ARIADNE task map"
+    )
+    assert (
+        format_progress_stage("ariadne_trajectory_pool_validation")
+        == "Validating ARIADNE trajectory pool"
+    )
+    assert (
+        format_progress_stage("ariadne_current_model_validation")
+        == "Validating current ARIADNE models"
+    )
+    assert (
         format_progress_stage("ariadne_resource_dimensions")
         == "Computing ARIADNE local subspace dimensions"
     )

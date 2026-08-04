@@ -26,6 +26,7 @@ from .resource_records import (
     resolution_path,
     verify_scientific_evidence,
 )
+from .resource_solver import AriadneResourceAuthorityContext
 from .submission_intent import intent_attempt_records
 
 
@@ -257,6 +258,7 @@ def _candidate_is_compatible(
     task_map_file: Path,
     logical_total: int,
     submitted_task_ids: Sequence[int],
+    authority_context: Optional[AriadneResourceAuthorityContext] = None,
 ) -> Tuple[Tuple[int, ...], bool, bool, str]:
     if str(intent.get("scheduler_identity_kind") or "slurm").lower() != str(
         expected_scheduler_kind
@@ -271,7 +273,12 @@ def _candidate_is_compatible(
     task_path, _task_size, task_sha = _file_identity(evidence, "task_map")
     if Path(task_path).resolve() != task_map_file.resolve():
         raise ValueError("ARIADNE resource evidence task-map path changed")
-    if task_sha != sha256_file(task_map_file):
+    expected_task_sha = (
+        str(authority_context.task_map_evidence["sha256"])
+        if authority_context is not None
+        else sha256_file(task_map_file)
+    )
+    if task_sha != expected_task_sha:
         raise ValueError("ARIADNE resource evidence task-map digest changed")
     pool_path, _pool_size, pool_sha = _file_identity(evidence, "pool")
     canonical_pool = campaign_owned_path(campaign, campaign / POOL_XYZ_FILENAME)
@@ -284,10 +291,14 @@ def _candidate_is_compatible(
         "ARIADNE resource evidence models_version",
     ) != int(expected_models_version):
         raise ValueError("ARIADNE resource evidence model version changed")
-    model_set = resolve_trained_model_set(
-        campaign,
-        int(expected_models_version),
-        verification="metadata",
+    model_set = (
+        authority_context.model_set
+        if authority_context is not None
+        else resolve_trained_model_set(
+            campaign,
+            int(expected_models_version),
+            verification="metadata",
+        )
     )
     if (
         str(evidence.get("model_manifest_sha256") or "")
@@ -350,6 +361,7 @@ def resolve_reusable_ariadne_resource_evidence(
     expected_scheduler_kind: str,
     expected_models_version: int,
     submitted_task_ids: Sequence[int],
+    authority_context: Optional[AriadneResourceAuthorityContext] = None,
 ) -> Optional[ReusableAriadneResourceEvidence]:
     """Return proven current-attempt or full producer evidence for one retry."""
     campaign = Path(campaign_dir).expanduser().resolve()
@@ -396,12 +408,27 @@ def resolve_reusable_ariadne_resource_evidence(
             raise ValueError("active bound resource resolution is missing")
     if not eligible:
         return None
-    iter_dir = active_iteration_dir(campaign, int(iteration))
-    task_map_file = ariadne_task_map_path(iter_dir)
-    task_map = read_ariadne_task_map(
-        iter_dir,
-        expected_iteration=int(iteration),
-    )
+    if authority_context is not None:
+        if authority_context.campaign_dir != campaign:
+            raise ValueError("ARIADNE resource authority campaign changed")
+        if int(authority_context.iteration) != int(iteration):
+            raise ValueError("ARIADNE resource authority iteration changed")
+        if str(authority_context.campaign_uid) != str(expected_campaign_uid):
+            raise ValueError("ARIADNE resource authority campaign UID changed")
+        if int(authority_context.model_set.version) != int(
+            expected_models_version
+        ):
+            raise ValueError("ARIADNE resource authority model version changed")
+        authority_context.assert_unchanged(verify_model_payloads=False)
+        task_map_file = authority_context.task_map_file
+        task_map = authority_context.task_map
+    else:
+        iter_dir = active_iteration_dir(campaign, int(iteration))
+        task_map_file = ariadne_task_map_path(iter_dir)
+        task_map = read_ariadne_task_map(
+            iter_dir,
+            expected_iteration=int(iteration),
+        )
     logical_total = int(task_map["n_tasks"])
     if any(value < 0 or value >= logical_total for value in submitted):
         raise ValueError("ARIADNE retry task identity is outside the task map")
@@ -438,6 +465,7 @@ def resolve_reusable_ariadne_resource_evidence(
                 task_map_file=task_map_file,
                 logical_total=logical_total,
                 submitted_task_ids=submitted,
+                authority_context=authority_context,
             )
         except (FileNotFoundError, OSError, ValueError):
             if index == 0:

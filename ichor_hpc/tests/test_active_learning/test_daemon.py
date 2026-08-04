@@ -1600,6 +1600,72 @@ def test_bounded_run_never_sleeps_after_its_final_tick(
     assert len(sleeps) == expected_sleeps
 
 
+@pytest.mark.parametrize("tick_status", (TickStatus.ADVANCED, TickStatus.SCRUBBED))
+def test_run_loop_does_not_sleep_after_authoritative_advance(
+    tmp_path,
+    tick_status,
+):
+    daemon = _make_daemon(tmp_path)
+    write_state(daemon.state_path(), fresh_campaign_state(max_iterations=2))
+    sleeps = []
+    heartbeats = []
+    calls = []
+
+    def advancing_tick():
+        state = read_state(daemon.state_path())
+        state.phase = (
+            CampaignPhase.PHASE_A_DIVERSITY
+            if not calls
+            else CampaignPhase.INITIAL_GAUSSIAN
+        )
+        calls.append(state.phase)
+        write_state(daemon.state_path(), state)
+        return tick_status
+
+    daemon.tick = advancing_tick
+    daemon.sleep_fn = lambda seconds: sleeps.append(seconds)
+    daemon._write_lease_heartbeat = lambda *_args, **_kwargs: heartbeats.append(True)
+
+    assert daemon._run_loop(max_ticks=2) == 0
+    assert calls == [
+        CampaignPhase.PHASE_A_DIVERSITY,
+        CampaignPhase.INITIAL_GAUSSIAN,
+    ]
+    assert len(heartbeats) == 2
+    assert sleeps == []
+
+
+def test_run_loop_rejects_advance_without_cursor_change(tmp_path):
+    daemon = _make_daemon(tmp_path)
+    write_state(daemon.state_path(), fresh_campaign_state(max_iterations=2))
+    sleeps = []
+    daemon.tick = lambda: TickStatus.ADVANCED
+    daemon.sleep_fn = lambda seconds: sleeps.append(seconds)
+
+    with pytest.raises(RuntimeError, match="did not change"):
+        daemon._run_loop(max_ticks=1)
+
+    assert sleeps == []
+
+
+@pytest.mark.parametrize(
+    "tick_status",
+    (TickStatus.SUBMITTED, TickStatus.POLLING, TickStatus.RETRYING),
+)
+def test_run_loop_preserves_pending_work_polling_delay(tmp_path, tick_status):
+    daemon = _make_daemon(tmp_path)
+    write_state(daemon.state_path(), fresh_campaign_state(max_iterations=2))
+    sleeps = []
+    heartbeats = []
+    daemon.tick = lambda: tick_status
+    daemon.sleep_fn = lambda seconds: sleeps.append(seconds)
+    daemon._write_lease_heartbeat = lambda *_args, **_kwargs: heartbeats.append(True)
+
+    assert daemon._run_loop(max_ticks=2) == 0
+    assert len(heartbeats) == 2
+    assert sleeps == [float(daemon.config.runtime.poll_interval_seconds)]
+
+
 def test_generic_tick_exception_writes_last_exception_sidecar_and_halts(tmp_path):
     d = _make_daemon(tmp_path)
     state = fresh_campaign_state(max_iterations=1)

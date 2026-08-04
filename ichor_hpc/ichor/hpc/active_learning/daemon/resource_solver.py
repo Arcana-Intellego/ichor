@@ -15,7 +15,7 @@ import shutil
 import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from .cluster_profile import active_machine, profile_value
 from .phase_executor import BackendSubmissionError
@@ -438,6 +438,91 @@ def _file_evidence(path: Path) -> Dict[str, Any]:
         "size": int(source.stat().st_size),
         "sha256": sha256_file(source),
     }
+
+
+@dataclass(frozen=True)
+class _AriadneFileAuthority:
+    path: Path
+    size: int
+    mtime_ns: int
+    device: int
+    inode: int
+    sha256: str
+
+    def evidence(self) -> Dict[str, Any]:
+        return {
+            "path": str(self.path),
+            "size": int(self.size),
+            "sha256": str(self.sha256),
+        }
+
+    def assert_unchanged(self) -> None:
+        source = Path(self.path)
+        if source.is_symlink() or not source.is_file():
+            raise ValueError(
+                "ARIADNE resource authority file is missing or unsafe: "
+                + str(source)
+            )
+        stat = source.stat()
+        observed = (
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+            int(stat.st_dev),
+            int(stat.st_ino),
+        )
+        expected = (
+            int(self.size),
+            int(self.mtime_ns),
+            int(self.device),
+            int(self.inode),
+        )
+        if observed != expected:
+            raise ValueError(
+                "ARIADNE resource authority changed before submission: "
+                + str(source)
+            )
+
+
+def _capture_ariadne_file_authority(
+    path: Path,
+    *,
+    known_sha256: Optional[str] = None,
+) -> _AriadneFileAuthority:
+    source = Path(path)
+    if source.is_symlink() or not source.is_file():
+        raise ValueError(
+            "ARIADNE resource authority is not a regular file: " + str(source)
+        )
+    before = source.stat()
+    digest = str(known_sha256) if known_sha256 is not None else sha256_file(source)
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError("ARIADNE resource authority SHA-256 is invalid")
+    after = source.stat()
+    before_identity = (
+        int(before.st_size),
+        int(before.st_mtime_ns),
+        int(before.st_dev),
+        int(before.st_ino),
+    )
+    after_identity = (
+        int(after.st_size),
+        int(after.st_mtime_ns),
+        int(after.st_dev),
+        int(after.st_ino),
+    )
+    if before_identity != after_identity:
+        raise ValueError(
+            "ARIADNE resource authority changed while it was inspected: "
+            + str(source)
+        )
+    return _AriadneFileAuthority(
+        path=source.resolve(),
+        size=int(after.st_size),
+        mtime_ns=int(after.st_mtime_ns),
+        device=int(after.st_dev),
+        inode=int(after.st_ino),
+        sha256=digest,
+    )
 
 
 def _canonical_json_sha256(value: Any) -> str:
@@ -1019,6 +1104,25 @@ def _directory_bytes(root: Path) -> int:
     return total
 
 
+def _manifest_directory_bytes(campaign_dir: Path, root: Path) -> int:
+    from ..versioning.manifest import MANIFEST_FILENAME, read_manifest
+
+    manifest = read_manifest(root)
+    total = 0
+    for relative in sorted(manifest):
+        path = campaign_owned_path(campaign_dir, root / relative)
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(
+                "trained-model manifest references a missing or unsafe file: "
+                + str(path)
+            )
+        total += int(path.stat().st_size)
+    manifest_path = campaign_owned_path(campaign_dir, root / MANIFEST_FILENAME)
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise ValueError("trained-model directory manifest is missing or unsafe")
+    return int(total + manifest_path.stat().st_size)
+
+
 def _report_resource_progress(
     callback: Optional[Callable[..., None]],
     stage: str,
@@ -1032,90 +1136,399 @@ def _report_resource_progress(
         return
 
 
-def _ariadne_evidence(
-    campaign_dir: Path,
+@dataclass(frozen=True)
+class AriadneResourceAuthorityContext:
+    campaign_dir: Path
+    campaign_uid: str
+    iteration: int
+    replacement_round: int
+    task_map: Mapping[str, Any] = field(repr=False)
+    task_map_file: Path
+    pool_manifest: Any = field(repr=False)
+    pool_path: Path
+    model_set: Any = field(repr=False)
+    model_bytes: int
+    validation_source: str
+    authority_files: Tuple[_AriadneFileAuthority, ...] = field(repr=False)
+    model_payload_bindings: Tuple[Any, ...] = field(repr=False)
+    artifact_snapshot: Optional[Any] = field(default=None, repr=False, compare=False)
+
+    @property
+    def task_map_evidence(self) -> Dict[str, Any]:
+        return self.authority_files[0].evidence()
+
+    @property
+    def pool_evidence(self) -> Dict[str, Any]:
+        return self.authority_files[1].evidence()
+
+    @property
+    def pool_manifest_evidence(self) -> Dict[str, Any]:
+        return self.authority_files[2].evidence()
+
+    def assert_unchanged(self, *, verify_model_payloads: bool = True) -> None:
+        from ..versioning.reference_data import ReferenceDataVersioning
+        from ..versioning.trained_models import (
+            TrainedModelVersioning,
+            assert_current_model_payloads_unchanged,
+        )
+
+        if self.artifact_snapshot is not None:
+            expected_references = getattr(
+                self.artifact_snapshot,
+                "committed_reference_data_versions",
+                None,
+            )
+            expected_models = getattr(
+                self.artifact_snapshot,
+                "committed_model_versions",
+                None,
+            )
+            if expected_references is not None and tuple(
+                ReferenceDataVersioning(
+                    self.campaign_dir / "QM_REFERENCE_DATA"
+                ).list_committed_versions()
+            ) != tuple(expected_references):
+                raise ValueError(
+                    "committed reference-data inventory changed before "
+                    "ARIADNE submission"
+                )
+            if expected_models is not None and tuple(
+                TrainedModelVersioning(
+                    trained_models_dir(self.campaign_dir)
+                ).list_committed_versions()
+            ) != tuple(expected_models):
+                raise ValueError(
+                    "committed model inventory changed before ARIADNE submission"
+                )
+        version = int(self.model_set.version)
+        if ReferenceDataVersioning(
+            self.campaign_dir / "QM_REFERENCE_DATA"
+        ).current_version() != version:
+            raise ValueError(
+                "current reference-data pointer changed before ARIADNE submission"
+            )
+        if TrainedModelVersioning(
+            trained_models_dir(self.campaign_dir)
+        ).current_version() != version:
+            raise ValueError(
+                "current trained-model pointer changed before ARIADNE submission"
+            )
+        for binding in self.authority_files:
+            binding.assert_unchanged()
+        if verify_model_payloads:
+            assert_current_model_payloads_unchanged(
+                self.campaign_dir,
+                self.model_set,
+                self.model_payload_bindings,
+            )
+
+
+def build_ariadne_resource_authority_context(
+    campaign_dir: Union[str, Path],
     iteration: int,
-    config: Any,
     *,
+    expected_campaign_uid: Optional[str] = None,
+    replacement_round: int = 0,
+    expected_models_version: Optional[int] = None,
+    artifact_snapshot: Optional[Any] = None,
     progress_callback: Optional[Callable[..., None]] = None,
-) -> Dict[str, Any]:
+) -> AriadneResourceAuthorityContext:
     from ..acquisition.trajectory_pool import (
         POOL_MANIFEST_FILENAME,
         POOL_SUBDIR,
         POOL_XYZ_FILENAME,
         TrajectoryPoolManifest,
     )
+    from ..handoff_manifests import ariadne_task_map_path
     from ..layout import active_iteration_dir
     from ..seed_identity import read_ariadne_task_map
-    from ..versioning.trained_models import resolve_trained_model_set
-
-    iter_dir = campaign_owned_path(
-        campaign_dir,
-        active_iteration_dir(campaign_dir, int(iteration)),
+    from ..versioning.reference_data import ReferenceDataVersioning
+    from ..versioning.trained_models import (
+        TrainedModelVersioning,
+        _verify_current_model_payloads,
+        resolve_trained_model_set,
+        trained_model_set_path,
     )
-    from ..handoff_manifests import ariadne_task_map_path
 
-    task_map_file = ariadne_task_map_path(iter_dir)
-    if task_map_file.is_symlink() or not task_map_file.is_file():
-        raise FileNotFoundError(
-            "ARIADNE task map is not yet available: " + str(task_map_file)
-        )
-    task_map = read_ariadne_task_map(iter_dir, expected_iteration=int(iteration))
+    campaign = Path(campaign_dir).resolve()
+    if int(replacement_round) != 0:
+        raise ValueError("ARIADNE resource authority requires replacement round zero")
+    iter_dir = campaign_owned_path(
+        campaign,
+        active_iteration_dir(campaign, int(iteration)),
+    )
+    task_map_file = campaign_owned_path(campaign, ariadne_task_map_path(iter_dir))
+    task_map_authority = _capture_ariadne_file_authority(task_map_file)
+    task_map = read_ariadne_task_map(
+        iter_dir,
+        expected_iteration=int(iteration),
+    )
+    task_map_authority.assert_unchanged()
+    campaign_uid = str(task_map.get("campaign_uid") or "")
+    if not campaign_uid:
+        raise ValueError("ARIADNE task map has no campaign UID")
+    if (
+        expected_campaign_uid is not None
+        and campaign_uid != str(expected_campaign_uid)
+    ):
+        raise ValueError("ARIADNE task-map campaign UID mismatch")
     _report_resource_progress(
         progress_callback,
-        "ariadne_resource_validation",
+        "ariadne_task_map_validation",
         completed=1,
-        total=3,
+        total=1,
         unit="checks",
+        validation_step="task_map",
     )
+
     manifest_path = campaign_owned_path(
-        campaign_dir,
+        campaign,
         POOL_SUBDIR / POOL_MANIFEST_FILENAME,
     )
-    pool_path = campaign_owned_path(campaign_dir, POOL_XYZ_FILENAME)
-    if manifest_path.is_symlink() or not manifest_path.is_file():
-        raise FileNotFoundError(
-            "trajectory pool manifest is not a regular file: "
-            + str(manifest_path)
-        )
-    if pool_path.is_symlink() or not pool_path.is_file():
-        raise FileNotFoundError(
-            "canonical trajectory pool is not a regular file: " + str(pool_path)
-        )
-    with open(manifest_path, "r", encoding="utf-8") as handle:
-        pool_manifest = TrajectoryPoolManifest.from_dict(json.load(handle))
+    pool_path = campaign_owned_path(campaign, POOL_XYZ_FILENAME)
+    manifest_authority = _capture_ariadne_file_authority(manifest_path)
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            pool_manifest = TrajectoryPoolManifest.from_dict(json.load(handle))
+    finally:
+        manifest_authority.assert_unchanged()
     if Path(pool_manifest.canonical_path).resolve() != pool_path.resolve():
         raise ValueError(
             "trajectory pool manifest canonical path does not identify pool.xyz"
         )
-    pool_sha256 = sha256_file(pool_path)
-    if pool_sha256 != str(pool_manifest.sha256):
+    pool_authority = _capture_ariadne_file_authority(pool_path)
+    if pool_authority.sha256 != str(pool_manifest.sha256):
         raise ValueError("trajectory pool SHA does not match its manifest")
-    if str(task_map["trajectory_sha256"]) != pool_sha256:
+    if str(task_map["trajectory_sha256"]) != pool_authority.sha256:
         raise ValueError("ARIADNE task map trajectory SHA does not match the pool")
+    selection_binding = task_map.get("selection_manifest")
+    if not isinstance(selection_binding, Mapping):
+        raise ValueError("ARIADNE task map selection binding is missing")
+    selection_path = campaign_owned_path(
+        campaign,
+        iter_dir / str(selection_binding.get("path") or ""),
+    )
+    selection_authority = _capture_ariadne_file_authority(
+        selection_path,
+        known_sha256=str(selection_binding.get("sha256") or ""),
+    )
     _report_resource_progress(
         progress_callback,
-        "ariadne_resource_validation",
-        completed=2,
-        total=3,
+        "ariadne_trajectory_pool_validation",
+        completed=1,
+        total=1,
         unit="checks",
+        validation_step="trajectory_pool",
     )
+
     version = int(task_map["models_version"])
-    model_set = resolve_trained_model_set(
-        campaign_dir, version, verification="metadata"
-    )
-    model_root = campaign_owned_path(campaign_dir, model_set.root)
-    if str(model_set.head_manifest_sha256) != str(task_map["model_manifest_sha256"]):
+    if expected_models_version is not None and version != int(
+        expected_models_version
+    ):
+        raise ValueError("ARIADNE task-map model version differs from campaign state")
+    if ReferenceDataVersioning(campaign / "QM_REFERENCE_DATA").current_version() != version:
+        raise ValueError("current reference-data pointer does not match ARIADNE models")
+    if TrainedModelVersioning(trained_models_dir(campaign)).current_version() != version:
+        raise ValueError("current trained-model pointer does not match ARIADNE models")
+    if artifact_snapshot is None:
+        model_set = resolve_trained_model_set(
+            campaign,
+            version,
+            verification="metadata",
+        )
+        validation_source = "legacy_full_chain"
+    else:
+        reference_view = artifact_snapshot.reference_view(version)
+        model_set = artifact_snapshot.model_set(version)
+        if str(reference_view.campaign_uid) != campaign_uid:
+            raise ValueError("ARIADNE reference-data campaign UID mismatch")
+        if (
+            int(model_set.reference_data_version) != version
+            or str(model_set.reference_data_head_manifest_sha256)
+            != str(reference_view.head_manifest_sha256)
+            or str(model_set.reference_data_view_sha256)
+            != str(reference_view.cumulative_view_sha256)
+        ):
+            raise ValueError("ARIADNE model/reference authority mismatch")
+        validation_source = "snapshot_current_delta"
+    if str(model_set.campaign_uid) != campaign_uid:
+        raise ValueError("ARIADNE trained-model campaign UID mismatch")
+    if str(model_set.head_manifest_sha256) != str(
+        task_map["model_manifest_sha256"]
+    ):
         raise ValueError("ARIADNE task map model-manifest SHA mismatch")
     if str(model_set.model_set_sha256) != str(task_map["model_set_sha256"]):
         raise ValueError("ARIADNE task map scientific model-set SHA mismatch")
+    model_payload_bindings = _verify_current_model_payloads(campaign, model_set)
+    model_manifest_authority = _capture_ariadne_file_authority(
+        trained_model_set_path(model_set.root),
+        known_sha256=str(model_set.head_manifest_sha256),
+    )
+    try:
+        model_bytes = _manifest_directory_bytes(campaign, model_set.root)
+    except FileNotFoundError:
+        if artifact_snapshot is not None:
+            raise
+        model_bytes = _directory_bytes(model_set.root)
     _report_resource_progress(
         progress_callback,
-        "ariadne_resource_validation",
-        completed=3,
-        total=3,
+        "ariadne_current_model_validation",
+        completed=1,
+        total=1,
         unit="checks",
+        validation_step="current_model",
+        validation_source=validation_source,
     )
+    context = AriadneResourceAuthorityContext(
+        campaign_dir=campaign,
+        campaign_uid=campaign_uid,
+        iteration=int(iteration),
+        replacement_round=int(replacement_round),
+        task_map=dict(task_map),
+        task_map_file=task_map_file.resolve(),
+        pool_manifest=pool_manifest,
+        pool_path=pool_path.resolve(),
+        model_set=model_set,
+        model_bytes=int(model_bytes),
+        validation_source=validation_source,
+        authority_files=(
+            task_map_authority,
+            pool_authority,
+            manifest_authority,
+            selection_authority,
+            model_manifest_authority,
+        ),
+        model_payload_bindings=tuple(model_payload_bindings),
+        artifact_snapshot=artifact_snapshot,
+    )
+    context.assert_unchanged(verify_model_payloads=False)
+    return context
+
+
+def _ariadne_evidence(
+    campaign_dir: Path,
+    iteration: int,
+    config: Any,
+    *,
+    progress_callback: Optional[Callable[..., None]] = None,
+    authority_context: Optional[AriadneResourceAuthorityContext] = None,
+) -> Dict[str, Any]:
+    if authority_context is None:
+        from ..acquisition.trajectory_pool import (
+            POOL_MANIFEST_FILENAME,
+            POOL_SUBDIR,
+            POOL_XYZ_FILENAME,
+            TrajectoryPoolManifest,
+        )
+        from ..handoff_manifests import ariadne_task_map_path
+        from ..layout import active_iteration_dir
+        from ..seed_identity import read_ariadne_task_map
+        from ..versioning.trained_models import resolve_trained_model_set
+
+        iter_dir = campaign_owned_path(
+            campaign_dir,
+            active_iteration_dir(campaign_dir, int(iteration)),
+        )
+        task_map_file = ariadne_task_map_path(iter_dir)
+        if task_map_file.is_symlink() or not task_map_file.is_file():
+            raise FileNotFoundError(
+                "ARIADNE task map is not yet available: " + str(task_map_file)
+            )
+        task_map = read_ariadne_task_map(
+            iter_dir,
+            expected_iteration=int(iteration),
+        )
+        _report_resource_progress(
+            progress_callback,
+            "ariadne_task_map_validation",
+            completed=1,
+            total=1,
+            unit="checks",
+            validation_step="task_map",
+        )
+        manifest_path = campaign_owned_path(
+            campaign_dir,
+            POOL_SUBDIR / POOL_MANIFEST_FILENAME,
+        )
+        pool_path = campaign_owned_path(campaign_dir, POOL_XYZ_FILENAME)
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise FileNotFoundError(
+                "trajectory pool manifest is not a regular file: "
+                + str(manifest_path)
+            )
+        if pool_path.is_symlink() or not pool_path.is_file():
+            raise FileNotFoundError(
+                "canonical trajectory pool is not a regular file: "
+                + str(pool_path)
+            )
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            pool_manifest = TrajectoryPoolManifest.from_dict(json.load(handle))
+        if Path(pool_manifest.canonical_path).resolve() != pool_path.resolve():
+            raise ValueError(
+                "trajectory pool manifest canonical path does not identify pool.xyz"
+            )
+        pool_sha256 = sha256_file(pool_path)
+        if pool_sha256 != str(pool_manifest.sha256):
+            raise ValueError("trajectory pool SHA does not match its manifest")
+        if str(task_map["trajectory_sha256"]) != pool_sha256:
+            raise ValueError(
+                "ARIADNE task map trajectory SHA does not match the pool"
+            )
+        _report_resource_progress(
+            progress_callback,
+            "ariadne_trajectory_pool_validation",
+            completed=1,
+            total=1,
+            unit="checks",
+            validation_step="trajectory_pool",
+        )
+        version = int(task_map["models_version"])
+        model_set = resolve_trained_model_set(
+            campaign_dir,
+            version,
+            verification="metadata",
+        )
+        if str(model_set.head_manifest_sha256) != str(
+            task_map["model_manifest_sha256"]
+        ):
+            raise ValueError("ARIADNE task map model-manifest SHA mismatch")
+        if str(model_set.model_set_sha256) != str(task_map["model_set_sha256"]):
+            raise ValueError("ARIADNE task map scientific model-set SHA mismatch")
+        _report_resource_progress(
+            progress_callback,
+            "ariadne_current_model_validation",
+            completed=1,
+            total=1,
+            unit="checks",
+            validation_step="current_model",
+            validation_source="legacy_full_chain",
+        )
+        task_map_evidence = _file_evidence(task_map_file)
+        pool_evidence = {
+            "path": str(pool_path.resolve()),
+            "size": int(pool_path.stat().st_size),
+            "sha256": pool_sha256,
+        }
+        pool_manifest_evidence = _file_evidence(manifest_path)
+        model_bytes = _directory_bytes(model_set.root)
+        model_authority_source = "legacy_full_chain"
+    else:
+        context = authority_context
+        if context.campaign_dir != Path(campaign_dir).resolve():
+            raise ValueError("ARIADNE resource authority campaign changed")
+        if int(context.iteration) != int(iteration):
+            raise ValueError("ARIADNE resource authority iteration changed")
+        context.assert_unchanged(verify_model_payloads=False)
+        task_map = context.task_map
+        pool_manifest = context.pool_manifest
+        model_set = context.model_set
+        pool_path = context.pool_path
+        version = int(model_set.version)
+        task_map_evidence = context.task_map_evidence
+        pool_evidence = context.pool_evidence
+        pool_manifest_evidence = context.pool_manifest_evidence
+        model_bytes = int(context.model_bytes)
+        model_authority_source = str(context.validation_source)
     tasks = list(task_map["tasks"])
     if not tasks:
         raise ValueError("ARIADNE task map contains no tasks")
@@ -1164,9 +1577,9 @@ def _ariadne_evidence(
 
     return {
         "source": "ariadne_task_map_and_model_set",
-        "task_map": _file_evidence(task_map_file),
-        "pool": _file_evidence(pool_path),
-        "pool_manifest": _file_evidence(manifest_path),
+        "task_map": task_map_evidence,
+        "pool": pool_evidence,
+        "pool_manifest": pool_manifest_evidence,
         "pool_n_frames": n_pool_frames,
         "pool_file_bytes": int(pool_path.stat().st_size),
         "decoded_coordinate_bytes": decoded_coordinate_bytes,
@@ -1182,9 +1595,10 @@ def _ariadne_evidence(
         "models_version": version,
         "model_manifest_sha256": str(model_set.head_manifest_sha256),
         "model_set_sha256": str(model_set.model_set_sha256),
-        "model_bytes": int(_directory_bytes(model_root)),
+        "model_bytes": int(model_bytes),
         "gradient_dimensions": dimensions,
         "gradient_dimension_source": dimension_source,
+        "model_authority_source": model_authority_source,
     }
 
 
@@ -1310,6 +1724,9 @@ def collect_resource_evidence(
     n_atoms_override: Optional[int] = None,
     require_evidence: bool = True,
     progress_callback: Optional[Callable[..., None]] = None,
+    ariadne_authority_context: Optional[
+        AriadneResourceAuthorityContext
+    ] = None,
 ) -> Dict[str, Any]:
     backend = backend_for_phase(phase_name)
     if campaign_dir is None:
@@ -1344,6 +1761,7 @@ def collect_resource_evidence(
                 int(iteration),
                 config,
                 progress_callback=progress_callback,
+                authority_context=ariadne_authority_context,
             )
         if backend == "ferebus":
             return _ferebus_evidence(campaign_dir)
@@ -1902,6 +2320,9 @@ def resolve_phase_resources(
     require_evidence: bool = True,
     evidence_override: Optional[Dict[str, Any]] = None,
     progress_callback: Optional[Callable[..., None]] = None,
+    ariadne_authority_context: Optional[
+        AriadneResourceAuthorityContext
+    ] = None,
 ) -> ResolvedPhaseResources:
     resources = config.resources
     backend = backend_for_phase(phase_name)
@@ -1933,6 +2354,7 @@ def resolve_phase_resources(
             n_atoms_override=n_atoms_override,
             require_evidence=bool(require_evidence),
             progress_callback=progress_callback,
+            ariadne_authority_context=ariadne_authority_context,
         )
     )
     if not evidence or not isinstance(evidence.get("source"), str):

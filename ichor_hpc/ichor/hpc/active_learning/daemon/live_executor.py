@@ -22,6 +22,7 @@ jobs that take seconds, not hours.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import math
 import os
 import re
@@ -70,9 +71,11 @@ from .phase_executor import (
     SubmissionCancelledBeforeSchedulerAcceptance,
 )
 from .resource_solver import (
+    AriadneResourceAuthorityContext,
     ResourceEvidenceInvalid,
     ResourceEvidenceUnavailable,
     ResolvedPhaseResources,
+    build_ariadne_resource_authority_context,
     gaussian_mdef,
     resolve_phase_resources,
     slurm_memory_mib,
@@ -588,6 +591,33 @@ def _without_keys(payload: Any, *keys: str) -> Dict[str, Any]:
     for key in keys:
         data.pop(str(key), None)
     return data
+
+
+def _prepare_retry_submission_with_progress(
+    campaign_dir: Path,
+    phase_name: str,
+    iteration: int,
+    *,
+    progress_callback: Optional[Callable[..., None]],
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Preserve legacy programmatic injection call signatures."""
+    try:
+        parameters = inspect.signature(prepare_retry_submission).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    supports_progress = "progress_callback" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    if supports_progress:
+        kwargs["progress_callback"] = progress_callback
+    return prepare_retry_submission(
+        campaign_dir,
+        phase_name,
+        int(iteration),
+        **kwargs,
+    )
 
 
 def _campaign_manifest_path(
@@ -2331,11 +2361,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 str(item["receipt"]["receipt_sha256"]) for item in recoveries
             ).encode("ascii")
         ).hexdigest()
-        result = prepare_retry_submission(
+        result = _prepare_retry_submission_with_progress(
             self.campaign_dir,
             phase_name,
             int(state.iteration),
             forced_retry_task_ids=forced_retry_ids,
+            progress_callback=self._report_runtime_progress,
         )
         reusable_ids = [
             int(task["task_id"])
@@ -3709,6 +3740,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         return super()._inline_reference_commit(state)
 
     def submit_or_run(self, state, phase) -> PhaseResult:
+        setattr(self, "_submission_resource_authority_guard", None)
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
         self._set_journal_state(state, phase_name)
         if phase_name in ("INITIAL_FEREBUS", "FEREBUS"):
@@ -3808,10 +3840,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         state,
                         phase_name,
                     )
-                    or prepare_retry_submission(
+                    or _prepare_retry_submission_with_progress(
                         self.campaign_dir,
                         phase_name,
                         int(getattr(state, "iteration", 0)),
+                        progress_callback=self._report_runtime_progress,
                     )
                 )
                 recovery_summary = compact_array_recovery_summary(recovery)
@@ -4015,22 +4048,40 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             total=(int(array_size) if array_size is not None else 1),
             unit="tasks",
         )
-        self._raise_if_immediate_cancel_before_submission(state)
-        environment_guard = getattr(
-            self,
-            "_submission_environment_guard",
-            None,
-        )
-        if callable(environment_guard):
-            try:
-                environment_guard(bound_intent or {})
-            except (OSError, RuntimeError, TypeError, ValueError) as exc:
-                raise BackendSubmissionError(
-                    "submission environment binding failed for "
-                    + phase_name
-                    + ": "
-                    + str(exc)
-                ) from exc
+        try:
+            self._raise_if_immediate_cancel_before_submission(state)
+            environment_guard = getattr(
+                self,
+                "_submission_environment_guard",
+                None,
+            )
+            if callable(environment_guard):
+                try:
+                    environment_guard(bound_intent or {})
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    raise BackendSubmissionError(
+                        "submission environment binding failed for "
+                        + phase_name
+                        + ": "
+                        + str(exc)
+                    ) from exc
+            resource_guard = getattr(
+                self,
+                "_submission_resource_authority_guard",
+                None,
+            )
+            if callable(resource_guard):
+                try:
+                    resource_guard()
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    raise BackendSubmissionError(
+                        "submission resource authority changed for "
+                        + phase_name
+                        + ": "
+                        + str(exc)
+                    ) from exc
+        finally:
+            setattr(self, "_submission_resource_authority_guard", None)
         try:
             submission = self._scheduler_backend.submit(
                 script,
@@ -4111,6 +4162,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         except ValueError as exc:
             raise BackendSubmissionError(str(exc)) from exc
         evidence_override = None
+        ariadne_authority_context: Optional[
+            AriadneResourceAuthorityContext
+        ] = None
         resource_task_ids = submitted_task_ids
         resource_evidence_mode = "computed"
         resource_evidence_source = None
@@ -4125,6 +4179,25 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 else list(range(int(array_size)))
             )
             try:
+                artifact_snapshot = getattr(
+                    self,
+                    "_committed_artifact_snapshot",
+                    None,
+                )
+                if artifact_snapshot is not None:
+                    ariadne_authority_context = (
+                        build_ariadne_resource_authority_context(
+                        self.campaign_dir,
+                        int(state.iteration),
+                        expected_campaign_uid=str(state.campaign_uid),
+                        replacement_round=int(
+                            getattr(state, "replacement_round", 0)
+                        ),
+                        expected_models_version=int(state.models_version),
+                        artifact_snapshot=artifact_snapshot,
+                        progress_callback=self._report_runtime_progress,
+                    )
+                    )
                 resource_evidence_source = (
                     resolve_reusable_ariadne_resource_evidence(
                         self.campaign_dir,
@@ -4138,6 +4211,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         expected_scheduler_kind=self.scheduler_identity_kind,
                         expected_models_version=int(state.models_version),
                         submitted_task_ids=logical_task_ids,
+                        authority_context=ariadne_authority_context,
                     )
                 )
             except (FileNotFoundError, OSError, ValueError) as exc:
@@ -4212,6 +4286,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 evidence_override=evidence_override,
                 require_evidence=True,
                 progress_callback=self._report_runtime_progress,
+                ariadne_authority_context=ariadne_authority_context,
             )
         except (ResourceEvidenceInvalid, ResourceEvidenceUnavailable) as exc:
             if phase_name == "PHASE_B_DIVERSITY":
@@ -4282,6 +4357,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 require_environment_generation=False,
             ),
         )
+        if ariadne_authority_context is not None:
+            ariadne_authority_context.assert_unchanged()
         try:
             resolution_binding = write_resolution(self.campaign_dir, payload)
             _submission_intent.bind_resource_resolution(
@@ -4379,6 +4456,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             raise BackendSubmissionError(
                 "cannot bind final submitted script: " + str(exc)
             ) from exc
+        if ariadne_authority_context is not None:
+            setattr(
+                self,
+                "_submission_resource_authority_guard",
+                ariadne_authority_context.assert_unchanged,
+            )
         return script
 
     # --- postprocess (CSF4-only implementation) -------------------------

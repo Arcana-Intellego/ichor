@@ -18883,7 +18883,10 @@ Examples:
         "--poll-interval",
         type=_positive_cli_int,
         default=None,
-        help="Override poll_interval_seconds from the config.",
+        help=(
+            "Override the pending-work polling interval from the config; "
+            "completed phase transitions continue immediately."
+        ),
     )
     p_start.add_argument(
         "-t",

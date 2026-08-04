@@ -440,12 +440,177 @@ def test_fresh_ariadne_evidence_reports_each_dimension(
         (stage, payload["completed"], payload["total"])
         for stage, payload in progress
     ] == [
-        ("ariadne_resource_validation", 1, 3),
-        ("ariadne_resource_validation", 2, 3),
-        ("ariadne_resource_validation", 3, 3),
+        ("ariadne_task_map_validation", 1, 1),
+        ("ariadne_trajectory_pool_validation", 1, 1),
+        ("ariadne_current_model_validation", 1, 1),
         ("ariadne_resource_bound", 0, 2),
         ("ariadne_resource_bound", 2, 2),
     ]
+
+
+def test_snapshot_resource_context_avoids_full_history_and_reuses_file_hashes(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning import handoff_manifests, seed_identity
+    from ichor.hpc.active_learning.versioning import trained_models
+    from ichor.hpc.active_learning.versioning.reference_data import (
+        ReferenceDataVersioning,
+    )
+
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    iteration_dir = active_iteration_dir(campaign, 15)
+    task_map_file = ariadne_task_map_path(iteration_dir)
+    task_map_file.parent.mkdir(parents=True)
+    task_map_file.write_text("{}", encoding="utf-8")
+    selection_file = iteration_dir / "seed_selection" / "SELECTION.json"
+    selection_file.parent.mkdir(parents=True)
+    selection_file.write_text("{}", encoding="utf-8")
+    pool = campaign / "pool.xyz"
+    pool.write_text("1\nframe\nH 0 0 0\n", encoding="utf-8")
+    pool_sha = sha256_file(pool)
+    pool_manifest = campaign / ".DATA" / "TRAJECTORY" / "pool.manifest.json"
+    pool_manifest.parent.mkdir(parents=True)
+    pool_manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "source_path": str(pool),
+                "canonical_path": str(pool),
+                "sha256": pool_sha,
+                "n_frames": 10_000,
+                "natoms": 6,
+                "atom_types": ["H"] * 6,
+                "masses": [1.0] * 6,
+                "imported_iso": "2026-07-28T00:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    model_root = campaign / "TRAINED_MODELS" / "iteration-000014"
+    model_root.mkdir(parents=True)
+    model_manifest = model_root / "FEREBUS_TASK_ARTEFACTS.json"
+    model_manifest.write_text("{}", encoding="utf-8")
+    task_map = {
+        "campaign_uid": "campaign-resource-reuse",
+        "iteration": 15,
+        "trajectory_sha256": pool_sha,
+        "models_version": 14,
+        "model_manifest_sha256": "a" * 64,
+        "model_set_sha256": "b" * 64,
+        "selection_manifest": {
+            "path": selection_file.relative_to(iteration_dir).as_posix(),
+            "size": selection_file.stat().st_size,
+            "sha256": sha256_file(selection_file),
+        },
+        "n_tasks": 2,
+        "tasks": [
+            {"array_task_id": 0, "pool_row_index_zero_based": 0},
+            {"array_task_id": 1, "pool_row_index_zero_based": 1},
+        ],
+    }
+    reference = SimpleNamespace(
+        campaign_uid="campaign-resource-reuse",
+        head_manifest_sha256="c" * 64,
+        cumulative_view_sha256="d" * 64,
+    )
+    model_set = SimpleNamespace(
+        version=14,
+        campaign_uid="campaign-resource-reuse",
+        reference_data_version=14,
+        reference_data_head_manifest_sha256="c" * 64,
+        reference_data_view_sha256="d" * 64,
+        head_manifest_sha256="a" * 64,
+        model_set_sha256="b" * 64,
+        root=model_root,
+    )
+
+    class Snapshot:
+        def __init__(self):
+            self.anchor_checks = 0
+
+        def assert_anchors_unchanged(self, _campaign):
+            self.anchor_checks += 1
+
+        def reference_view(self, version):
+            assert version == 14
+            return reference
+
+        def model_set(self, version):
+            assert version == 14
+            return model_set
+
+    snapshot = Snapshot()
+    monkeypatch.setattr(
+        handoff_manifests,
+        "ariadne_task_map_path",
+        lambda _iteration_dir: task_map_file,
+    )
+    monkeypatch.setattr(
+        seed_identity,
+        "read_ariadne_task_map",
+        lambda *_args, **_kwargs: task_map,
+    )
+    monkeypatch.setattr(
+        trained_models,
+        "resolve_trained_model_set",
+        lambda *_args, **_kwargs: pytest.fail(
+            "snapshot resource authority must not resolve model history"
+        ),
+    )
+    monkeypatch.setattr(
+        trained_models,
+        "_verify_current_model_payloads",
+        lambda *_args, **_kwargs: (),
+    )
+    monkeypatch.setattr(
+        trained_models,
+        "assert_current_model_payloads_unchanged",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        trained_models.TrainedModelVersioning,
+        "current_version",
+        lambda _self: 14,
+    )
+    monkeypatch.setattr(
+        ReferenceDataVersioning,
+        "current_version",
+        lambda _self: 14,
+    )
+    monkeypatch.setattr(
+        resource_solver,
+        "_manifest_directory_bytes",
+        lambda *_args, **_kwargs: 4096,
+    )
+    original_sha = resource_solver.sha256_file
+    hashed = []
+
+    def counted_sha(path, *args, **kwargs):
+        hashed.append(Path(path).resolve())
+        return original_sha(path, *args, **kwargs)
+
+    monkeypatch.setattr(resource_solver, "sha256_file", counted_sha)
+    context = resource_solver.build_ariadne_resource_authority_context(
+        campaign,
+        15,
+        expected_campaign_uid="campaign-resource-reuse",
+        expected_models_version=14,
+        artifact_snapshot=snapshot,
+    )
+    evidence = resource_solver._ariadne_evidence(
+        campaign,
+        15,
+        CampaignConfig(),
+        authority_context=context,
+    )
+
+    assert evidence["model_authority_source"] == "snapshot_current_delta"
+    assert evidence["gradient_dimensions"] == [6, 6]
+    assert hashed.count(pool.resolve()) == 1
+    assert hashed.count(task_map_file.resolve()) == 1
+    assert snapshot.anchor_checks == 0
 
 
 def test_repeated_retry_prefers_original_full_record_over_subset(

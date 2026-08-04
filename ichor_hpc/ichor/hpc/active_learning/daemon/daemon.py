@@ -14,7 +14,8 @@ production deployment is a single Python process on a configured CSF login node 
             either scrub failed tasks (failure_threshold_fraction allows it)
             or halt.
          d. Persist new state atomically (tempfile + os.replace + fsync).
-         e. Sleep for config.poll_interval_seconds.
+         e. Sleep for config.poll_interval_seconds only while work remains
+            pending; committed phase advances continue immediately.
     4. Honours SIGTERM / SIGINT: finishes the current tick, marks
        shutdown_requested, writes state, releases the lock, exits 0.
 
@@ -2246,6 +2247,11 @@ class Daemon:
                 self._bind_executor_progress(None)
                 setattr(self.executor, "_committed_artifact_snapshot", None)
                 setattr(self.executor, "_submission_environment_guard", None)
+                setattr(
+                    self.executor,
+                    "_submission_resource_authority_guard",
+                    None,
+                )
         except SubmissionCancelledBeforeSchedulerAcceptance as exc:
             if phase_reporter is not None:
                 phase_reporter.fail(
@@ -5570,6 +5576,17 @@ class Daemon:
                 self._journal("shutdown_requested")
                 return 0
 
+            before_cursor = None
+            try:
+                before_state = read_state(self.state_path())
+                before_cursor = (
+                    before_state.phase.value,
+                    int(before_state.iteration),
+                    int(getattr(before_state, "replacement_round", 0)),
+                )
+            except Exception:
+                pass
+
             try:
                 try:
                     status = self.tick()
@@ -5618,8 +5635,26 @@ class Daemon:
                 self._write_lease_heartbeat(state)
             except Exception:
                 self._write_lease_heartbeat()
+            advanced_cursor = False
+            if status in {TickStatus.ADVANCED, TickStatus.SCRUBBED}:
+                if latest_state is None or before_cursor is None:
+                    raise RuntimeError(
+                        "phase advance cannot prove its authoritative state cursor"
+                    )
+                after_cursor = (
+                    latest_state.phase.value,
+                    int(latest_state.iteration),
+                    int(getattr(latest_state, "replacement_round", 0)),
+                )
+                if after_cursor == before_cursor:
+                    raise RuntimeError(
+                        "phase advance did not change the authoritative state cursor"
+                    )
+                advanced_cursor = True
             if max_ticks is not None and ticks >= max_ticks:
                 return 0
+            if advanced_cursor:
+                continue
             poll = (
                 self.config.runtime.poll_interval_idle_seconds
                 if idle_streak >= 3
