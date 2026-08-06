@@ -29,6 +29,8 @@ class FerebusModelValidationContext:
     parsed_models: Tuple[Any, ...]
     prior_validation_complete: bool
     config_validation_complete: bool
+    admission_complete: bool = False
+    admission_sources: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -409,6 +411,204 @@ def validate_imported_model_file(
         ) from exc
 
 
+def _validate_task_bootstrap_prefix(
+    root: Path,
+    manifest: Mapping[str, Any],
+    task: FerebusTask,
+    model: Any,
+) -> bool:
+    """Validate one optional imported-model prefix without scanning peer tasks."""
+    model_bootstrap = manifest.get("model_bootstrap")
+    if model_bootstrap is None:
+        return True
+    if not isinstance(model_bootstrap, Mapping):
+        raise ModelContractError("model_bootstrap_manifest_invalid")
+    from ..strict_json import strict_json as json
+    from ..versioning.manifest import sha256_file
+    from ichor.core.models import Model
+
+    copied_manifest = Path(root) / "MODEL_BOOTSTRAP.json"
+    if copied_manifest.is_symlink() or not copied_manifest.is_file():
+        raise ModelContractError("model_bootstrap_manifest_missing")
+    if sha256_file(copied_manifest) != str(
+        model_bootstrap.get("manifest_sha256") or ""
+    ):
+        raise ModelContractError("model_bootstrap_manifest_sha_mismatch")
+    try:
+        bootstrap_payload = json.loads(copied_manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ModelContractError("model_bootstrap_manifest_unreadable") from exc
+    records = (
+        bootstrap_payload.get("files")
+        if isinstance(bootstrap_payload, Mapping)
+        else None
+    )
+    historical_rows = int(model_bootstrap.get("historical_training_rows", -1))
+    if historical_rows <= 0 or not isinstance(records, list):
+        raise ModelContractError("model_bootstrap_manifest_invalid")
+    matching = [
+        record
+        for record in records
+        if isinstance(record, Mapping)
+        and (str(record.get("property")), str(record.get("atom"))) == task.key
+    ]
+    if len(matching) != 1:
+        raise ModelContractError(
+            "model_bootstrap_task_coverage_mismatch:" + repr(task.key)
+        )
+    record = matching[0]
+    campaign = Path(root).parent.parent
+    immutable_root = campaign / ".DATA" / "ACTIVE_LEARNING" / "bootstrap_inputs"
+    source = immutable_root / str(record.get("path") or "")
+    try:
+        source.resolve(strict=False).relative_to(immutable_root.resolve())
+    except ValueError as exc:
+        raise ModelContractError("model_bootstrap_path_escapes_inputs") from exc
+    if source.is_symlink() or not source.is_file():
+        raise ModelContractError("model_bootstrap_source_missing:" + repr(task.key))
+    if sha256_file(source) != str(record.get("sha256") or ""):
+        raise ModelContractError(
+            "model_bootstrap_source_sha_mismatch:" + repr(task.key)
+        )
+    baseline = Model(source)
+    baseline_x = np.asarray(baseline.x, dtype=float)
+    baseline_y = np.asarray(baseline.y, dtype=float).reshape(-1)
+    trained_x = np.asarray(model.x, dtype=float)
+    trained_y = np.asarray(model.y, dtype=float).reshape(-1)
+    if baseline_x.shape[0] != historical_rows or baseline_y.size != historical_rows:
+        raise ModelContractError("model_bootstrap_row_count_mismatch:" + repr(task.key))
+    if trained_x.shape[0] < historical_rows or trained_y.size < historical_rows:
+        raise ModelContractError("model_bootstrap_prefix_missing:" + repr(task.key))
+    if not np.allclose(
+        trained_x[:historical_rows],
+        baseline_x,
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    ) or not np.allclose(
+        trained_y[:historical_rows],
+        baseline_y,
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    ):
+        raise ModelContractError("model_bootstrap_prefix_changed:" + repr(task.key))
+    return True
+
+
+def validate_ferebus_task_model_semantics(
+    root_dir: Path,
+    manifest: Mapping[str, Any],
+    raw_task: Mapping[str, Any],
+    *,
+    model: Any = None,
+    training_binding_proven: bool = False,
+) -> Dict[str, Any]:
+    """Validate one candidate model for task-side admission evidence."""
+    from ichor.core.models import Model
+    from ..ferebus_prior import (
+        contract_from_payload,
+        validate_ferebus_config_contract,
+        validate_model_prior_mean,
+    )
+    from ..versioning.manifest import sha256_file
+
+    root = Path(root_dir).resolve()
+    task = _task_from_payload(raw_task)
+    config_path = _resolve_under(
+        root,
+        Path(str(raw_task.get("config_path") or "")),
+        "ferebus_config",
+    )
+    model_path = _resolve_under(
+        root,
+        Path(str(raw_task.get("expected_model_path") or "")),
+        "ferebus_model",
+    )
+    training_path = _resolve_under(
+        root,
+        Path(str(raw_task.get("training_csv") or "")),
+        "ferebus_training_csv",
+    )
+    prior_contract = contract_from_payload(manifest.get("prior_mean_contract"))
+    validate_ferebus_config_contract(config_path, prior_contract)
+    generated = raw_task.get("generated_config")
+    if (
+        not isinstance(generated, Mapping)
+        or int(generated.get("size", -1)) != int(config_path.stat().st_size)
+        or str(generated.get("sha256") or "") != sha256_file(config_path)
+    ):
+        raise ModelContractError("ferebus_generated_config_binding_invalid")
+    selected_model = Model(model_path) if model is None else model
+    kernel_contract = manifest.get("kernel_contract")
+    kernel_family = (
+        str(kernel_contract.get("family") or "")
+        if isinstance(kernel_contract, Mapping)
+        else ""
+    )
+    _validate_model_object(
+        selected_model,
+        model_path,
+        task,
+        str(manifest.get("system") or ""),
+        kernel_family=kernel_family,
+    )
+    model_x = np.asarray(selected_model.x, dtype=float)
+    training_values = np.asarray(selected_model.y, dtype=float).reshape(-1)
+    if not training_binding_proven:
+        from .ferebus_dataset import iter_feature_target_chunks
+
+        offset = 0
+        for training_features, targets in iter_feature_target_chunks(
+            training_path,
+            task.property,
+        ):
+            stop = offset + int(targets.shape[0])
+            if (
+                stop > model_x.shape[0]
+                or training_features.shape != model_x[offset:stop].shape
+                or not np.allclose(
+                    training_features,
+                    model_x[offset:stop],
+                    rtol=0.0,
+                    atol=1.0e-12,
+                )
+                or not np.allclose(
+                    targets,
+                    training_values[offset:stop],
+                    rtol=0.0,
+                    atol=1.0e-12,
+                )
+            ):
+                raise ModelContractError("model_training_data_binding_mismatch")
+            offset = stop
+        if offset != model_x.shape[0] or offset != training_values.shape[0]:
+            raise ModelContractError("model_training_data_binding_mismatch")
+    prior_evidence = validate_model_prior_mean(
+        selected_model,
+        contract=prior_contract,
+        property_name=task.property,
+        atom=task.atom,
+        training_values=training_values,
+    )
+    _validate_task_bootstrap_prefix(root, manifest, task, selected_model)
+    return {
+        "numeric_model_identity": str(selected_model.numeric_identity),
+        "system": str(selected_model.system_name),
+        "property": str(selected_model.type),
+        "atom": str(selected_model.atom),
+        "alf_zero_indexed": [
+            int(value)
+            for value in np.asarray(selected_model.ialf, dtype=int).reshape(-1)
+        ],
+        "ntrain": int(selected_model.ntrain),
+        "nfeats": int(selected_model.nfeats),
+        "kernel_family": kernel_family,
+        "prior_mean": prior_evidence,
+        "training_data_binding_complete": True,
+        "bootstrap_validation_complete": True,
+        "config_validation_complete": True,
+    }
+
+
 def validate_ferebus_model_contract(
     root_dir: Path,
     *,
@@ -475,17 +675,26 @@ def validate_ferebus_model_contract(
             and validation_context.config_validation_complete
         ):
             raise ModelContractError("ferebus_validation_context_incomplete")
-        observed_numeric = tuple(
-            (
-                str(model.type),
-                str(model.atom),
-                str(model.numeric_identity),
+        if validation_context.parsed_models:
+            observed_numeric = tuple(
+                (
+                    str(model.type),
+                    str(model.atom),
+                    str(model.numeric_identity),
+                )
+                for model in validation_context.parsed_models
             )
-            for model in validation_context.parsed_models
-        )
-        if observed_numeric != validation_context.numeric_model_identities:
+            if observed_numeric != validation_context.numeric_model_identities:
+                raise ModelContractError(
+                    "ferebus_validation_context_numeric_identity_mismatch"
+                )
+        elif (
+            not validation_context.admission_complete
+            or len(validation_context.numeric_model_identities)
+            != len(validation_context.task_model_sha256)
+        ):
             raise ModelContractError(
-                "ferebus_validation_context_numeric_identity_mismatch"
+                "ferebus_validation_context_numeric_identity_missing"
             )
         manifest_path = root / "FEREBUS_TASKS.json"
         if (
@@ -832,6 +1041,105 @@ def validate_ferebus_model_contract(
         parsed_models=tuple(parsed_models[task.key] for task in model_set.tasks),
         prior_validation_complete=True,
         config_validation_complete=True,
+        admission_complete=True,
+        admission_sources=tuple("local_strict" for unused in model_set.tasks),
+    )
+
+
+def model_validation_context_from_admission(
+    root_dir: Path,
+    *,
+    expected_version: int,
+    trained_model_set: Any,
+    admission_context: Any,
+) -> FerebusModelValidationContext:
+    """Bind task-side semantic admission to a staged model-set snapshot."""
+    from . import input_staging as _stg
+
+    root = Path(root_dir).resolve()
+    if Path(trained_model_set.root).resolve() != root:
+        raise ModelContractError("trained_model_set_root_mismatch")
+    if int(trained_model_set.version) != int(expected_version):
+        raise ModelContractError("trained_model_set_version_mismatch")
+    admissions = tuple(admission_context.admissions)
+    sources = tuple(str(value) for value in admission_context.sources)
+    if len(admissions) != len(trained_model_set.tasks) or len(sources) != len(
+        admissions
+    ):
+        raise ModelContractError("ferebus_model_admission_coverage_mismatch")
+    source_records = [
+        record
+        for record in trained_model_set.root_files
+        if str(record.relative_path) == _stg.FEREBUS_TASK_MANIFEST
+    ]
+    if len(source_records) != 1:
+        raise ModelContractError("ferebus_task_manifest_binding_missing")
+    expected_manifest_sha = str(
+        admission_context.task_execution["task_map"]["task_manifest_sha256"]
+    )
+    if str(source_records[0].sha256) != expected_manifest_sha:
+        raise ModelContractError("ferebus_task_manifest_binding_mismatch")
+    task_model_sha256 = tuple(
+        (
+            str(task.property),
+            str(task.atom),
+            str(task.model.sha256),
+        )
+        for task in trained_model_set.tasks
+    )
+    admitted_model_sha256 = tuple(
+        (
+            str(evidence["property"]),
+            str(evidence["atom"]),
+            str(evidence["files"]["model"]["sha256"]),
+        )
+        for evidence in admissions
+    )
+    if admitted_model_sha256 != task_model_sha256:
+        raise ModelContractError("ferebus_model_admission_hash_mismatch")
+    training_bindings = tuple(
+        (
+            str(task.property),
+            str(task.atom),
+            str(task.datasets["train"].relative_path),
+            int(task.datasets["train"].size),
+            str(task.datasets["train"].sha256),
+        )
+        for task in trained_model_set.tasks
+    )
+    admitted_training = tuple(
+        (
+            str(evidence["property"]),
+            str(evidence["atom"]),
+            str(evidence["files"]["datasets"]["train"]["path"]),
+            int(evidence["files"]["datasets"]["train"]["size"]),
+            str(evidence["files"]["datasets"]["train"]["sha256"]),
+        )
+        for evidence in admissions
+    )
+    if admitted_training != training_bindings:
+        raise ModelContractError("ferebus_model_admission_training_mismatch")
+    numeric_identities = tuple(
+        (
+            str(evidence["property"]),
+            str(evidence["atom"]),
+            str(evidence["semantic"]["numeric_model_identity"]),
+        )
+        for evidence in admissions
+    )
+    return FerebusModelValidationContext(
+        expected_version=int(expected_version),
+        task_manifest_sha256=expected_manifest_sha,
+        model_set_sha256=str(trained_model_set.model_set_sha256),
+        evidence_set_sha256=str(trained_model_set.evidence_set_sha256),
+        task_model_sha256=task_model_sha256,
+        training_data_bindings=training_bindings,
+        numeric_model_identities=numeric_identities,
+        parsed_models=(),
+        prior_validation_complete=True,
+        config_validation_complete=True,
+        admission_complete=True,
+        admission_sources=sources,
     )
 
 

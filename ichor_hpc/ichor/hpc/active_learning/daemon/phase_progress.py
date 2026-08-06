@@ -77,6 +77,12 @@ _STAGE_LABELS = {
     "quality_metrics": "Evaluating FEREBUS model quality",
     "incumbent_comparison": "Comparing candidate and current models",
     "ferebus_authority": "Binding FEREBUS model authority",
+    "ferebus_reference_authority": (
+        "Binding FEREBUS reference and incumbent authority"
+    ),
+    "ferebus_task_control_validation": "Validating FEREBUS task controls",
+    "ferebus_model_admission": "Validating task-produced FEREBUS models",
+    "ferebus_local_admission": "Validating legacy FEREBUS models locally",
     "ferebus_task_quality": "Validating task-computed FEREBUS quality",
     "ferebus_local_quality": "Computing missing FEREBUS quality locally",
     "ferebus_incumbent_quality": "Reusing incumbent external metrics",

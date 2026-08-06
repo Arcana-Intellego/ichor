@@ -52,6 +52,8 @@ class FerebusQualityContext:
     task_manifest: Mapping[str, Any]
     task_execution: Mapping[str, Any]
     incumbent_set: Any
+    task_map: Optional[Mapping[str, Any]] = None
+    receipt_payloads: Tuple[Mapping[str, Any], ...] = ()
 
 
 QualityProgressCallback = Optional[
@@ -370,19 +372,27 @@ def build_ferebus_quality_context(
     staging_dir: Path,
     *,
     incumbent_set: Any = _AUTO_INCUMBENT,
+    task_manifest: Optional[Mapping[str, Any]] = None,
+    task_execution: Optional[Mapping[str, Any]] = None,
 ) -> FerebusQualityContext:
     """Authenticate staging once and bind the incumbent without chain replay."""
     from . import input_staging as _stg
     from .ferebus_task_runner import validate_task_receipts
 
     staging = Path(staging_dir).resolve()
-    manifest = _stg.read_ferebus_manifest(staging)
-    try:
-        task_execution = validate_task_receipts(staging)
-    except Exception as exc:
-        raise FerebusQualityDecisionError(
-            "FEREBUS task execution evidence is invalid: " + str(exc)
-        ) from exc
+    manifest = (
+        _stg.read_ferebus_manifest(staging)
+        if task_manifest is None
+        else task_manifest
+    )
+    selected_execution = task_execution
+    if selected_execution is None:
+        try:
+            selected_execution = validate_task_receipts(staging)
+        except Exception as exc:
+            raise FerebusQualityDecisionError(
+                "FEREBUS task execution evidence is invalid: " + str(exc)
+            ) from exc
     reference_version = int(manifest.get("reference_data_version", -1))
     selected_incumbent = incumbent_set
     if selected_incumbent is _AUTO_INCUMBENT:
@@ -413,21 +423,62 @@ def build_ferebus_quality_context(
             raise FerebusQualityDecisionError(
                 "FEREBUS incumbent model-set authority mismatch"
             )
+    private_task_map = (
+        selected_execution.get("task_map")
+        if isinstance(selected_execution, Mapping)
+        else None
+    )
+    private_receipts = (
+        selected_execution.get("receipt_payloads")
+        if isinstance(selected_execution, Mapping)
+        else None
+    )
+    public_execution = dict(selected_execution)
+    public_execution.pop("task_map", None)
+    public_execution.pop("receipt_payloads", None)
     return FerebusQualityContext(
         staging=staging,
         task_manifest=manifest,
-        task_execution=task_execution,
+        task_execution=public_execution,
         incumbent_set=selected_incumbent,
+        task_map=(
+            None if not isinstance(private_task_map, Mapping) else private_task_map
+        ),
+        receipt_payloads=(
+            ()
+            if not isinstance(private_receipts, list)
+            else tuple(private_receipts)
+        ),
     )
 
 
 def _raw_task_receipt(
     staging: Path,
     logical_task_id: int,
+    *,
+    context: Optional[FerebusQualityContext] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     from .ferebus_task_runner import _read_task_map, validate_task_receipt
 
     root = Path(staging).resolve()
+    if context is not None:
+        task_map = context.task_map
+        receipt_payloads = context.receipt_payloads
+        records = context.task_execution.get("receipts")
+        if (
+            isinstance(task_map, Mapping)
+            and isinstance(receipt_payloads, tuple)
+            and isinstance(records, list)
+            and 0 <= int(logical_task_id) < len(receipt_payloads)
+            and len(receipt_payloads) == len(records)
+        ):
+            task = task_map["tasks"][int(logical_task_id)]
+            return (
+                dict(records[int(logical_task_id)]),
+                dict(receipt_payloads[int(logical_task_id)]),
+                dict(task_map),
+                dict(task),
+            )
     normalised = validate_task_receipt(root, int(logical_task_id))
     task_map = _read_task_map(root / "FEREBUS_TASK_MAP.json")
     task = task_map["tasks"][int(logical_task_id)]
@@ -608,7 +659,9 @@ def validate_ferebus_task_measurement(
             "FEREBUS task quality context path mismatch"
         )
     normalised, receipt, task_map, map_task = _raw_task_receipt(
-        staging, int(logical_task_id)
+        staging,
+        int(logical_task_id),
+        context=context,
     )
     manifest = (
         context.task_manifest
@@ -749,7 +802,9 @@ def _quality_cache_identity(
     logical_task_id: int,
 ) -> Dict[str, Any]:
     normalised, unused_receipt, task_map, map_task = _raw_task_receipt(
-        context.staging, int(logical_task_id)
+        context.staging,
+        int(logical_task_id),
+        context=context,
     )
     del unused_receipt
     task = context.task_manifest["tasks"][int(logical_task_id)]
@@ -1084,7 +1139,9 @@ def evaluate_ferebus_quality(
     )
     for logical_task_id in range(len(tasks)):
         unused_normalised, receipt, unused_map, unused_task = _raw_task_receipt(
-            staging, logical_task_id
+            staging,
+            logical_task_id,
+            context=quality_context,
         )
         del unused_normalised, unused_map, unused_task
         raw_measurement = receipt.get("quality_measurement")

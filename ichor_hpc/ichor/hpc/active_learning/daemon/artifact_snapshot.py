@@ -20,12 +20,14 @@ from ..versioning.reference_data import (
     REFERENCE_DATA_VERSION_FILENAME,
     ReferenceDataView,
     ReferenceDataVersioning,
+    reference_data_version_path,
 )
 from ..versioning.trained_models import (
     TRAINED_MODEL_SET_FILENAME,
     TrainedModelSet,
     TrainedModelVersioning,
     resolve_trained_model_chain,
+    trained_model_set_path,
 )
 from .filesystem import campaign_owned_path
 
@@ -298,6 +300,54 @@ class CommittedArtifactSnapshot:
         if observed != self.anchor_records or digest != self.anchor_sha256:
             raise ArtefactSnapshotError(
                 "committed artefact metadata changed after reconcile inspection"
+            )
+
+    def assert_ferebus_heads_unchanged(
+        self,
+        campaign_dir: Path,
+        *,
+        reference_version: int,
+        parent_model_version: Optional[int],
+    ) -> None:
+        """Recheck only the immutable heads consumed by FEREBUS postprocessing."""
+        campaign = Path(campaign_dir)
+        references = ReferenceDataVersioning(campaign / "QM_REFERENCE_DATA")
+        models = TrainedModelVersioning(campaign / "TRAINED_MODELS")
+        if _committed_versions(references) != self.committed_reference_data_versions:
+            raise ArtefactSnapshotError(
+                "committed reference-data inventory changed during FEREBUS processing"
+            )
+        if _committed_versions(models) != self.committed_model_versions:
+            raise ArtefactSnapshotError(
+                "committed model inventory changed during FEREBUS processing"
+            )
+        reference = self.reference_view(int(reference_version))
+        reference_head = reference_data_version_path(
+            references.iteration_path(int(reference_version))
+        )
+        if (
+            reference_head.is_symlink()
+            or not reference_head.is_file()
+            or sha256_file(reference_head) != str(reference.head_manifest_sha256)
+        ):
+            raise ArtefactSnapshotError(
+                "FEREBUS reference-data head changed during postprocessing"
+            )
+        if parent_model_version is None:
+            if self.committed_model_versions:
+                raise ArtefactSnapshotError(
+                    "bootstrap FEREBUS unexpectedly has committed model authority"
+                )
+            return
+        parent = self.model_set(int(parent_model_version))
+        parent_head = trained_model_set_path(parent.root)
+        if (
+            parent_head.is_symlink()
+            or not parent_head.is_file()
+            or sha256_file(parent_head) != str(parent.head_manifest_sha256)
+        ):
+            raise ArtefactSnapshotError(
+                "FEREBUS incumbent model head changed during postprocessing"
             )
 
     def verification_payload(self, *, deep_required: bool = False) -> Dict[str, Any]:

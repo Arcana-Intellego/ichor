@@ -174,6 +174,19 @@ class _StableDigestTracker:
         self._digests[before] = value
         return value
 
+    def remember(self, path: Path, digest: str) -> None:
+        value = str(digest)
+        if len(value) != 64 or any(
+            character not in "0123456789abcdef" for character in value
+        ):
+            raise ValueError("remembered digest is not a lowercase SHA-256")
+        source = Path(path)
+        identity = self._identity(source)
+        existing = self._digests.get(identity)
+        if existing is not None and existing != value:
+            raise ValueError("stable file identity has conflicting digests")
+        self._digests[identity] = value
+
     def capture_rename_tree(self, root: Path) -> Dict[str, Any]:
         source_root = Path(root)
         captured: Dict[str, Any] = {}
@@ -379,12 +392,39 @@ def _find_ferebus_auxiliary_file(
     return None
 
 
-def _copy_regular_file_no_symlink(src: Path, dest: Path, root: Path) -> None:
+def _copy_regular_file_no_symlink(
+    src: Path,
+    dest: Path,
+    root: Path,
+    *,
+    digest_tracker: Optional[_StableDigestTracker] = None,
+    expected_sha256: Optional[str] = None,
+) -> str:
     if not src.is_file() or src.is_symlink():
         raise BackendSubmissionError("refusing non-regular FEREBUS artefact: " + str(src))
     target = _resolve_ferebus_destination(root, dest, "artefact")
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(str(src), str(target))
+    before = _StableDigestTracker._identity(src)
+    digest = hashlib.sha256()
+    with src.open("rb") as source, target.open("wb") as destination:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            destination.write(block)
+            digest.update(block)
+        destination.flush()
+        os.fsync(destination.fileno())
+    shutil.copystat(str(src), str(target), follow_symlinks=False)
+    if _StableDigestTracker._identity(src) != before:
+        raise BackendSubmissionError(
+            "FEREBUS artefact changed while it was copied: " + str(src)
+        )
+    observed_sha256 = digest.hexdigest()
+    if expected_sha256 is not None and observed_sha256 != str(expected_sha256):
+        raise BackendSubmissionError(
+            "FEREBUS artefact digest changed before model publication: " + str(src)
+        )
+    if digest_tracker is not None:
+        digest_tracker.remember(target, observed_sha256)
+    return observed_sha256
 
 
 def _write_ferebus_task_artefact_layout(
@@ -394,6 +434,8 @@ def _write_ferebus_task_artefact_layout(
     *,
     models_version: int,
     parent_model_set: Any,
+    digest_tracker: Optional[_StableDigestTracker] = None,
+    expected_source_sha256: Optional[Mapping[str, str]] = None,
 ) -> Path:
     """Build one complete hierarchical committed FEREBUS model snapshot."""
     from . import input_staging as _stg
@@ -412,6 +454,26 @@ def _write_ferebus_task_artefact_layout(
 
     staging = Path(staging)
     committed_dir = Path(committed_dir)
+    expected_digests = {
+        str(Path(path).resolve()): str(digest)
+        for path, digest in dict(expected_source_sha256 or {}).items()
+    }
+
+    def copy(source: Path, destination: Path) -> None:
+        _copy_regular_file_no_symlink(
+            source,
+            destination,
+            committed_dir,
+            digest_tracker=digest_tracker,
+            expected_sha256=expected_digests.get(str(source.resolve())),
+        )
+
+    def record(path: Path) -> Dict[str, Any]:
+        return file_record(
+            path,
+            committed_dir,
+            digest_file=(None if digest_tracker is None else digest_tracker.digest),
+        )
     if any(committed_dir.iterdir()):
         raise BackendSubmissionError("trained-model version staging is not empty")
     task_records: List[Dict[str, Any]] = []
@@ -446,8 +508,8 @@ def _write_ferebus_task_artefact_layout(
         task_dir.mkdir(parents=True, exist_ok=True)
         committed_model = task_dir / model_file.name
         committed_config = task_dir / "ferebus.config"
-        _copy_regular_file_no_symlink(model_file, committed_model, committed_dir)
-        _copy_regular_file_no_symlink(config_path, committed_config, committed_dir)
+        copy(model_file, committed_model)
+        copy(config_path, committed_config)
         raw_datasets = task.get("datasets")
         if not isinstance(raw_datasets, dict) or set(raw_datasets) != {
             "train",
@@ -471,15 +533,8 @@ def _write_ferebus_task_artefact_layout(
                 split + " dataset path",
             )
             dataset_destination = dataset_dir / dataset_source.name
-            _copy_regular_file_no_symlink(
-                dataset_source,
-                dataset_destination,
-                committed_dir,
-            )
-            committed_datasets[split] = file_record(
-                dataset_destination,
-                committed_dir,
-            )
+            copy(dataset_source, dataset_destination)
+            committed_datasets[split] = record(dataset_destination)
         receipt_source = _resolve_ferebus_staging_path(
             staging,
             Path(str(task.get("output_dir") or ""))
@@ -487,11 +542,7 @@ def _write_ferebus_task_artefact_layout(
             "task execution receipt",
         )
         committed_receipt = task_dir / FEREBUS_TASK_RECEIPT_FILENAME
-        _copy_regular_file_no_symlink(
-            receipt_source,
-            committed_receipt,
-            committed_dir,
-        )
+        copy(receipt_source, committed_receipt)
         auxiliary: Dict[str, Optional[Dict[str, Any]]] = {}
         for suffix in FEREBUS_TASK_AUXILIARY_SUFFIXES:
             source = _find_ferebus_auxiliary_file(
@@ -504,8 +555,8 @@ def _write_ferebus_task_artefact_layout(
                 auxiliary[suffix] = None
                 continue
             dest = task_dir / source.name
-            _copy_regular_file_no_symlink(source, dest, committed_dir)
-            auxiliary[suffix] = file_record(dest, committed_dir)
+            copy(source, dest)
+            auxiliary[suffix] = record(dest)
         task_records.append(
             {
                 "task_index": int(task.get("task_index")),
@@ -513,12 +564,9 @@ def _write_ferebus_task_artefact_layout(
                 "atom": atom,
                 "alf_1_indexed": [int(value) for value in task.get("alf_1_indexed", [])],
                 "directory": task_dir.relative_to(committed_dir).as_posix(),
-                "model": file_record(committed_model, committed_dir),
-                "config": file_record(committed_config, committed_dir),
-                "execution_receipt": file_record(
-                    committed_receipt,
-                    committed_dir,
-                ),
+                "model": record(committed_model),
+                "config": record(committed_config),
+                "execution_receipt": record(committed_receipt),
                 "datasets": committed_datasets,
                 "auxiliary": auxiliary,
             }
@@ -556,8 +604,8 @@ def _write_ferebus_task_artefact_layout(
                 )
             continue
         destination = committed_dir / sidecar_name
-        _copy_regular_file_no_symlink(source, destination, committed_dir)
-        root_records.append(file_record(destination, committed_dir))
+        copy(source, destination)
+        root_records.append(record(destination))
     root_records.sort(key=lambda record: str(record["path"]))
     root_record_by_path = {str(record["path"]): record for record in root_records}
     payload = build_trained_model_set_payload(
@@ -5712,7 +5760,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         from .phase_executor import PhaseResult
 
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
-        self._report_runtime_progress("ferebus_authority")
+        self._report_runtime_progress("ferebus_reference_authority")
         staging = self._models_staging_path()
         v_models = self._versioning("models")
         committed = v_models.list_committed_versions()
@@ -5737,6 +5785,15 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         + repr(getattr(state, "reference_data_version", None))
                     ),
                 )
+        parent_version = None if is_initial else int(expected_next) - 1
+
+        def assert_ferebus_authority() -> None:
+            if artifact_snapshot is not None:
+                artifact_snapshot.assert_ferebus_heads_unchanged(
+                    self.campaign_dir,
+                    reference_version=int(expected_next),
+                    parent_model_version=parent_version,
+                )
         if expected_next in committed:
             next_version = int(expected_next)
             committed_dir = v_models.iteration_path(next_version)
@@ -5749,7 +5806,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         verification="metadata",
                     )
                 else:
-                    artifact_snapshot.assert_anchors_unchanged(self.campaign_dir)
+                    artifact_snapshot.assert_ferebus_heads_unchanged(
+                        self.campaign_dir,
+                        reference_version=int(next_version),
+                        parent_model_version=int(next_version),
+                    )
                     resolved_model_set = artifact_snapshot.model_set(next_version)
                 validate_ferebus_model_contract(
                     committed_dir,
@@ -5806,37 +5867,21 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     )
             return PhaseResult(is_complete=True, state_updates=state_updates)
 
-        ok, reason = validate_ferebus_completed(staging)
-        if not ok:
-            self._journal_event(
-                "quantum_output_rejected",
-                phase=phase_name,
-                iteration=int(state.iteration),
-                pointdir=str(staging),
-                reason=reason,
-            )
-            return PhaseResult(
-                is_complete=True,
-                failure_reason="ferebus_staging_invalid: " + reason,
-                retry_disposition=(
-                    PostprocessRetryDisposition.FILESYSTEM_SETTLE
-                    if reason == "ferebus_staging_missing"
-                    or reason.startswith("expected_model_missing")
-                    or "task receipt is missing" in reason
-                    else PostprocessRetryDisposition.NONE
-                ),
-            )
-
         quality_context = None
+        admission_context = None
         reference_view = None
         parent_model_set = None
         try:
+            from .ferebus_model_admission import (
+                assert_ferebus_model_admission_context_unchanged,
+                build_ferebus_model_admission_context,
+            )
             from .ferebus_quality import build_ferebus_quality_context
 
             if artifact_snapshot is not None:
                 from ..versioning.reference_data import ReferenceDataVersioning
 
-                artifact_snapshot.assert_anchors_unchanged(self.campaign_dir)
+                assert_ferebus_authority()
                 reference_view = artifact_snapshot.reference_view(expected_next)
                 reference_versioning = ReferenceDataVersioning(
                     Path(self.campaign_dir) / self.reference_data_dir_name
@@ -5860,27 +5905,70 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         raise ValueError(
                             "FEREBUS incumbent pointer does not match the authority snapshot"
                         )
-                quality_context = build_ferebus_quality_context(
-                    staging,
-                    incumbent_set=parent_model_set,
-                )
-            else:
-                quality_context = build_ferebus_quality_context(staging)
-                parent_model_set = quality_context.incumbent_set
             self._report_runtime_progress(
-                "ferebus_authority",
+                "ferebus_reference_authority",
                 completed=1,
                 total=1,
                 unit="contracts",
             )
+
+            def admission_progress(stage, fields):
+                self._report_runtime_progress(str(stage), **dict(fields))
+
+            admission_context = build_ferebus_model_admission_context(
+                staging,
+                progress_callback=admission_progress,
+            )
+            assert_ferebus_model_admission_context_unchanged(admission_context)
+            if artifact_snapshot is not None:
+                quality_context = build_ferebus_quality_context(
+                    staging,
+                    incumbent_set=parent_model_set,
+                    task_manifest=admission_context.task_manifest,
+                    task_execution=admission_context.task_execution,
+                )
+            else:
+                quality_context = build_ferebus_quality_context(
+                    staging,
+                    task_manifest=admission_context.task_manifest,
+                    task_execution=admission_context.task_execution,
+                )
+                parent_model_set = quality_context.incumbent_set
+            self._report_runtime_progress(
+                "ferebus_model_admission",
+                completed=int(admission_context.statistics["total"]),
+                total=int(admission_context.statistics["total"]),
+                unit="models",
+                task_admitted=int(admission_context.statistics["task"]),
+                cache_admitted=int(admission_context.statistics["cache"]),
+                local_admitted=int(admission_context.statistics["local"]),
+            )
         except Exception as exc:
+            reason = type(exc).__name__ + ": " + str(exc)
+            failure_kind = (
+                "ferebus_staging_invalid"
+                if isinstance(exc, FileNotFoundError)
+                or not staging.exists()
+                else "ferebus_authority_invalid"
+            )
+            self._journal_event(
+                "quantum_output_rejected",
+                phase=phase_name,
+                iteration=int(state.iteration),
+                pointdir=str(staging),
+                reason=reason,
+            )
             return PhaseResult(
                 is_complete=True,
                 failure_reason=(
-                    "ferebus_authority_invalid: "
-                    + type(exc).__name__
-                    + ": "
-                    + str(exc)
+                    failure_kind + ": "
+                    + reason
+                ),
+                retry_disposition=(
+                    PostprocessRetryDisposition.FILESYSTEM_SETTLE
+                    if "missing" in str(exc).lower()
+                    or "task receipt" in str(exc).lower()
+                    else PostprocessRetryDisposition.NONE
                 ),
             )
 
@@ -5982,7 +6070,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     },
                 )
             if artifact_snapshot is not None:
-                artifact_snapshot.assert_anchors_unchanged(self.campaign_dir)
+                assert_ferebus_authority()
+            assert_ferebus_model_admission_context_unchanged(admission_context)
             quality_path = write_ferebus_quality_manifest(staging, quality)
             self._report_runtime_progress(
                 "ferebus_quality_validation",
@@ -5997,7 +6086,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 )
             config_sha = config_fingerprint(canonical_config(self.config))
             if artifact_snapshot is not None:
-                artifact_snapshot.assert_anchors_unchanged(self.campaign_dir)
+                assert_ferebus_authority()
+            assert_ferebus_model_admission_context_unchanged(admission_context)
             decision_path = write_ferebus_quality_decision(
                 staging,
                 config_sha256=config_sha,
@@ -6048,6 +6138,15 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 ),
                 n_incumbent_metrics_computed=int(
                     measurement_stats["incumbent_local"]
+                ),
+                n_task_model_admissions=int(
+                    admission_context.statistics["task"]
+                ),
+                n_cached_model_admissions=int(
+                    admission_context.statistics["cache"]
+                ),
+                n_local_model_admissions=int(
+                    admission_context.statistics["local"]
                 ),
             )
             if not bool(current_decision.get("accepted")):
@@ -6115,7 +6214,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         self._report_runtime_progress("model_snapshot_build")
         next_version = int(expected_next)
         from . import input_staging as _stg
-        from .model_contract import validate_ferebus_model_contract
+        from .model_contract import (
+            model_validation_context_from_admission,
+            validate_ferebus_model_contract,
+        )
         from ..versioning.trained_models import (
             trained_models_commit_lock,
             validate_trained_model_snapshot,
@@ -6130,7 +6232,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         ReferenceDataVersioning,
                     )
 
-                    artifact_snapshot.assert_anchors_unchanged(self.campaign_dir)
+                    assert_ferebus_authority()
+                    assert_ferebus_model_admission_context_unchanged(
+                        admission_context
+                    )
                     reference_versioning = ReferenceDataVersioning(
                         Path(self.campaign_dir) / self.reference_data_dir_name
                     )
@@ -6183,14 +6288,33 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                             + str(exc)
                         ),
                     )
-                manifest = _stg.read_ferebus_manifest(staging)
+                manifest = dict(admission_context.task_manifest)
                 try:
+                    expected_source_sha256: Dict[str, str] = {}
+                    for evidence in admission_context.admissions:
+                        files = evidence["files"]
+                        bound_files = [
+                            files["config"],
+                            files["model"],
+                            *files["datasets"].values(),
+                        ]
+                        if files.get("performance") is not None:
+                            bound_files.append(files["performance"])
+                        for binding in bound_files:
+                            source = staging.joinpath(
+                                *str(binding["path"]).split("/")
+                            )
+                            expected_source_sha256[str(source.resolve())] = str(
+                                binding["sha256"]
+                            )
                     _write_ferebus_task_artefact_layout(
                         staging,
                         staged,
                         manifest,
                         models_version=next_version,
                         parent_model_set=parent_model_set,
+                        digest_tracker=digest_tracker,
+                        expected_source_sha256=expected_source_sha256,
                     )
                     self._report_runtime_progress(
                         "model_snapshot_build",
@@ -6225,11 +6349,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         reference_view=reference_view,
                         digest_file=digest_tracker.digest,
                     )
-                    staged_validation_context = validate_ferebus_model_contract(
+                    staged_validation_context = model_validation_context_from_admission(
                         staged,
-                        committed=True,
                         expected_version=next_version,
                         trained_model_set=staged_model_set,
+                        admission_context=admission_context,
                     )
                     if staged_validation_context is None:
                         raise ValueError(
@@ -6321,11 +6445,18 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
         try:
             from ichor.core.adversarial.posterior import TotalEnergyPosterior
+            from ichor.core.models import Model
             from .ferebus_model_factors import adopt_ferebus_model_factors
             from .seed_selection_runtime import SeedSelectionRuntimeCache
 
+            factor_models = list(staged_validation_context.parsed_models)
+            if not factor_models:
+                factor_models = [
+                    Model(task.model.path)
+                    for task in committed_model_set.tasks
+                ]
             factor_posterior = TotalEnergyPosterior(
-                list(staged_validation_context.parsed_models),
+                factor_models,
                 property_name="iqa",
                 scaled=True,
             )

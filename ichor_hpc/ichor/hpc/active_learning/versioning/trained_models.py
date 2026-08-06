@@ -398,7 +398,12 @@ def _safe_relative_path(value: Any, label: str) -> str:
     return path.as_posix()
 
 
-def file_record(path: Union[str, Path], root: Union[str, Path]) -> Dict[str, Any]:
+def file_record(
+    path: Union[str, Path],
+    root: Union[str, Path],
+    *,
+    digest_file: Optional[Callable[[Path, bool], str]] = None,
+) -> Dict[str, Any]:
     file_path = Path(path)
     root_path = Path(root)
     if not file_path.is_file() or file_path.is_symlink():
@@ -410,7 +415,11 @@ def file_record(path: Union[str, Path], root: Union[str, Path]) -> Dict[str, Any
     return {
         "path": relative,
         "size": int(file_path.stat().st_size),
-        "sha256": sha256_file(file_path),
+        "sha256": (
+            sha256_file(file_path)
+            if digest_file is None
+            else digest_file(file_path, False)
+        ),
     }
 
 

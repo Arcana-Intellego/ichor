@@ -1597,6 +1597,11 @@ def test_ferebus_postprocess_snapshot_avoids_historical_chain_resolution(
     from ichor.hpc.active_learning.daemon.ferebus_quality import (
         enrich_task_receipt_with_quality,
     )
+    from ichor.hpc.active_learning.daemon.ferebus_model_admission import (
+        enrich_task_receipt_with_model_admission,
+    )
+    import ichor.hpc.active_learning.daemon.ferebus_model_admission as admission_module
+    import ichor.hpc.active_learning.daemon.model_contract as model_contract_module
     import ichor.hpc.active_learning.daemon.ferebus_quality as quality_module
     import ichor.hpc.active_learning.versioning.trained_models as models_module
     from ichor.hpc.active_learning.versioning.reference_data import (
@@ -1629,6 +1634,7 @@ def test_ferebus_postprocess_snapshot_avoids_historical_chain_resolution(
         reference_version=1,
     )
     enrich_task_receipt_with_quality(staging, 0)
+    enrich_task_receipt_with_model_admission(staging, 0)
     ex._committed_artifact_snapshot = build_committed_artifact_snapshot(
         ex.campaign_dir,
         verification_level="authority",
@@ -1642,9 +1648,22 @@ def test_ferebus_postprocess_snapshot_avoids_historical_chain_resolution(
             "FEREBUS hot path must reuse authenticated incumbent metrics"
         )
 
+    def forbidden_broad_anchor_replay(*args, **kwargs):
+        raise AssertionError(
+            "FEREBUS hot path must use its narrow reference/incumbent guard"
+        )
+
     lock_state = {"held": False}
     real_evaluate = quality_module.evaluate_ferebus_quality
     real_lock = models_module.trained_models_commit_lock
+    real_model_contract = model_contract_module.validate_ferebus_model_contract
+
+    def no_legacy_admission(*args, **kwargs):
+        if kwargs.get("validation_context") is None:
+            raise AssertionError(
+                "inline task admission must avoid full login-node model replay"
+            )
+        return real_model_contract(*args, **kwargs)
 
     def checked_evaluate(*args, **kwargs):
         assert lock_state["held"] is False
@@ -1668,6 +1687,23 @@ def test_ferebus_postprocess_snapshot_avoids_historical_chain_resolution(
     )
     monkeypatch.setattr(quality_module, "evaluate_ferebus_quality", checked_evaluate)
     monkeypatch.setattr(models_module, "trained_models_commit_lock", observed_lock)
+    monkeypatch.setattr(
+        model_contract_module,
+        "validate_ferebus_model_contract",
+        no_legacy_admission,
+    )
+    monkeypatch.setattr(
+        admission_module,
+        "_run_cache_subprocess",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("inline admission must not invoke legacy fallback")
+        ),
+    )
+    monkeypatch.setattr(
+        type(ex._committed_artifact_snapshot),
+        "assert_anchors_unchanged",
+        forbidden_broad_anchor_replay,
+    )
     result = ex._parse_ferebus_postprocess(
         SimpleNamespace(
             iteration=1,

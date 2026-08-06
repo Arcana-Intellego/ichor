@@ -29,6 +29,7 @@ SUBMITTED_PYTHON_IMPORTS = {
         "typing_extensions",
         "ichor.hpc.active_learning.daemon.ferebus_task_runner",
         "ichor.hpc.active_learning.daemon.ferebus_quality",
+        "ichor.hpc.active_learning.daemon.ferebus_model_admission",
         "ichor.hpc.active_learning.daemon.ferebus_model_factors",
         "pyferebus.executors.trainer",
         "pyferebus.writers.config_file",

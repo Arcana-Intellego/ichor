@@ -270,6 +270,26 @@ def execute_task(task_map_path: Path, task_index: int) -> int:
                         flush=True,
                     )
                 try:
+                    from .ferebus_model_admission import (
+                        enrich_task_receipt_with_model_admission,
+                    )
+
+                    enrich_task_receipt_with_model_admission(
+                        root,
+                        index,
+                        model=optional_model,
+                    )
+                except Exception as exc:
+                    print(
+                        "WARNING: FEREBUS training succeeded but optional model "
+                        "admission evidence was not published: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                try:
                     from .ferebus_model_factors import publish_task_factor
 
                     publish_task_factor(
@@ -394,14 +414,14 @@ def write_imported_model_receipts(staging_dir: Path) -> None:
     )
 
 
-def validate_task_receipt(
-    staging_dir: Path,
+def _validate_task_receipt_with_map(
+    root: Path,
+    payload: Mapping[str, Any],
     logical_task_id: int,
-) -> Dict[str, Any]:
-    """Authenticate one zero-based logical FEREBUS task and its outputs."""
-    root = Path(staging_dir).resolve()
-    task_map_path = root / FEREBUS_TASK_MAP_FILENAME
-    payload = _read_task_map(task_map_path)
+    *,
+    verify_payload_hashes: bool,
+) -> tuple[Dict[str, Any], Dict[str, Any], Mapping[str, Any]]:
+    """Validate one receipt against an already authenticated task map."""
     execution_kind = payload.get("execution_kind")
     if execution_kind not in {
         "native_ferebus",
@@ -470,7 +490,16 @@ def validate_task_receipt(
         or model.get("path") != task.get("expected_model_path")
     ):
         raise FerebusTaskRunnerError("FEREBUS task receipt model binding is invalid")
-    model_path = _validate_input(root, model, "FEREBUS model")
+    model_path = _contained_file(root, model.get("path"), "FEREBUS model.path")
+    if model_path.is_symlink() or not model_path.is_file():
+        raise FerebusTaskRunnerError("FEREBUS model is missing")
+    if _exact_int(model.get("size"), "FEREBUS model.size") != int(
+        model_path.stat().st_size
+    ):
+        raise FerebusTaskRunnerError("FEREBUS model size mismatch")
+    _sha256(model.get("sha256"), "FEREBUS model.sha256")
+    if verify_payload_hashes and str(model["sha256"]) != sha256_file(model_path):
+        raise FerebusTaskRunnerError("FEREBUS model SHA-256 mismatch")
     performance = receipt.get("performance")
     performance_path = None
     if performance_required:
@@ -481,16 +510,35 @@ def validate_task_receipt(
             raise FerebusTaskRunnerError(
                 "FEREBUS task receipt performance binding is invalid"
             )
-        performance_path = _validate_input(
+        performance_path = _contained_file(
             root,
-            performance,
-            "FEREBUS performance receipt",
+            performance.get("path"),
+            "FEREBUS performance receipt.path",
         )
+        if performance_path.is_symlink() or not performance_path.is_file():
+            raise FerebusTaskRunnerError("FEREBUS performance receipt is missing")
+        if _exact_int(
+            performance.get("size"),
+            "FEREBUS performance receipt.size",
+        ) != int(performance_path.stat().st_size):
+            raise FerebusTaskRunnerError(
+                "FEREBUS performance receipt size mismatch"
+            )
+        _sha256(
+            performance.get("sha256"),
+            "FEREBUS performance receipt.sha256",
+        )
+        if verify_payload_hashes and str(performance["sha256"]) != sha256_file(
+            performance_path
+        ):
+            raise FerebusTaskRunnerError(
+                "FEREBUS performance receipt SHA-256 mismatch"
+            )
     elif performance is not None:
         raise FerebusTaskRunnerError(
             "non-executed FEREBUS task must not claim native performance evidence"
         )
-    return {
+    normalised = {
         "task_index": task["task_index"],
         "receipt_path": receipt_path.relative_to(root).as_posix(),
         "receipt_sha256": sha256_file(receipt_path),
@@ -505,6 +553,24 @@ def validate_task_receipt(
             None if performance is None else performance["sha256"]
         ),
     }
+    return normalised, receipt, task
+
+
+def validate_task_receipt(
+    staging_dir: Path,
+    logical_task_id: int,
+) -> Dict[str, Any]:
+    """Authenticate one zero-based logical FEREBUS task and its outputs."""
+    root = Path(staging_dir).resolve()
+    payload = _read_task_map(root / FEREBUS_TASK_MAP_FILENAME)
+    normalised, unused_receipt, unused_task = _validate_task_receipt_with_map(
+        root,
+        payload,
+        int(logical_task_id),
+        verify_payload_hashes=True,
+    )
+    del unused_receipt, unused_task
+    return normalised
 
 
 def quarantine_task_outputs(
@@ -588,7 +654,12 @@ def quarantine_task_outputs(
     return tuple(records)
 
 
-def validate_task_receipts(staging_dir: Path) -> Dict[str, Any]:
+def validate_task_receipts(
+    staging_dir: Path,
+    *,
+    verify_payload_hashes: bool = True,
+    include_receipt_payloads: bool = False,
+) -> Dict[str, Any]:
     """Authenticate complete successful task coverage before postprocessing."""
     root = Path(staging_dir).resolve()
     task_map_path = root / FEREBUS_TASK_MAP_FILENAME
@@ -609,11 +680,17 @@ def validate_task_receipts(staging_dir: Path) -> Dict[str, Any]:
         payload.get("tasks") or []
     ):
         raise FerebusTaskRunnerError("FEREBUS task-map cardinality mismatch")
-    records = [
-        validate_task_receipt(root, logical_task_id)
+    validated = [
+        _validate_task_receipt_with_map(
+            root,
+            payload,
+            logical_task_id,
+            verify_payload_hashes=bool(verify_payload_hashes),
+        )
         for logical_task_id in range(len(payload["tasks"]))
     ]
-    return {
+    records = [record for record, unused_receipt, unused_task in validated]
+    result = {
         "task_map_path": FEREBUS_TASK_MAP_FILENAME,
         "task_map_sha256": payload["task_map_sha256"],
         "task_map_file_sha256": sha256_file(task_map_path),
@@ -622,6 +699,12 @@ def validate_task_receipts(staging_dir: Path) -> Dict[str, Any]:
         "n_tasks": len(records),
         "receipts": records,
     }
+    if include_receipt_payloads:
+        result["task_map"] = dict(payload)
+        result["receipt_payloads"] = [
+            receipt for unused_record, receipt, unused_task in validated
+        ]
+    return result
 
 
 def main(argv: Sequence[str] | None = None) -> int:

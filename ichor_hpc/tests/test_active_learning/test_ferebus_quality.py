@@ -26,6 +26,12 @@ from ichor.hpc.active_learning.daemon.ferebus_model_factors import (
     publish_task_factor,
     read_task_factor,
 )
+from ichor.hpc.active_learning.daemon.ferebus_model_admission import (
+    FerebusModelAdmissionError,
+    build_ferebus_model_admission_context,
+    enrich_task_receipt_with_model_admission,
+    validate_ferebus_task_model_admission,
+)
 import ichor.hpc.active_learning.daemon.ferebus_quality as ferebus_quality_module
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.hpc.active_learning.ferebus_prior import (
@@ -331,6 +337,47 @@ def _seed_quality_staging(
         execution_kind="synthetic_dry_run",
     )
     return staging
+
+
+def test_task_model_admission_is_inline_and_stat_bound(tmp_path):
+    staging = _seed_quality_staging(tmp_path, campaign_layout=True)
+    enrich_task_receipt_with_quality(staging, 0)
+
+    evidence = enrich_task_receipt_with_model_admission(staging, 0)
+    context = build_ferebus_model_admission_context(staging)
+
+    assert evidence["semantic"]["training_data_binding_complete"] is True
+    assert context.sources == ("task",)
+    assert context.statistics == {"task": 1, "cache": 0, "local": 0, "total": 1}
+
+    dataset = staging / "iqa/O1/datasets/WATER_O1_EXT_VALIDATION_SET.csv"
+    dataset.write_text(dataset.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(FerebusModelAdmissionError, match="changed after task admission"):
+        validate_ferebus_task_model_admission(staging, 0, evidence)
+
+
+def test_legacy_model_admission_falls_back_once_then_uses_cache(
+    tmp_path,
+    monkeypatch,
+):
+    import ichor.hpc.active_learning.daemon.ferebus_model_admission as admission
+
+    staging = _seed_quality_staging(tmp_path, campaign_layout=True)
+    enrich_task_receipt_with_quality(staging, 0)
+    calls = []
+
+    def inline_worker(observed_staging, logical_task_id):
+        calls.append(int(logical_task_id))
+        admission._cache_worker(observed_staging, logical_task_id)
+
+    monkeypatch.setattr(admission, "_run_cache_subprocess", inline_worker)
+
+    first = build_ferebus_model_admission_context(staging)
+    second = build_ferebus_model_admission_context(staging)
+
+    assert first.sources == ("local",)
+    assert second.sources == ("cache",)
+    assert calls == [0]
 
 
 def test_ferebus_quality_computes_metrics_and_condition_number(tmp_path):
