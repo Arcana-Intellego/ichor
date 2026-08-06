@@ -179,6 +179,7 @@ class MovementUtilityConfig:
     progress_fraction: float = 0.25
     low_softness_ang: float = 0.005
     high_softness_ang: float = 0.020
+    progress_normalisation: str = "legacy_projected_displacement"
 
 
 @dataclass(frozen=True)

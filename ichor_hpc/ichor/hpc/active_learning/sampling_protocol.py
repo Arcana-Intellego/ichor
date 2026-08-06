@@ -31,7 +31,8 @@ from .geometry_protocol import (
 
 SAMPLING_PROTOCOL_SCHEMA_VERSION = 2
 SAMPLING_PROTOCOL_AUDIT_SCHEMA_VERSION = 2
-SAMPLING_AGGRESSIVENESS_POLICY_VERSION = 2
+SAMPLING_AGGRESSIVENESS_POLICY_VERSION = 3
+SAMPLING_AGGRESSIVENESS_POLICY_V2_VERSION = 2
 LEGACY_SAMPLING_AGGRESSIVENESS_POLICY_VERSION = 1
 SAMPLING_PROTOCOL_RESOLVED_FILENAME = "SAMPLING_PROTOCOL_RESOLVED.json"
 SAMPLING_PROTOCOL_AUDIT_FILENAME = "SAMPLING_PROTOCOL_AUDIT.json"
@@ -87,9 +88,49 @@ class SamplingAggressivenessPolicyV2:
     angle_ratio_upper: float = 1.45
 
 
+@dataclass(frozen=True)
+class SamplingAggressivenessPolicyV3:
+    """Calibrated, system-size-independent sampling policy."""
+
+    fallback_scale_angstrom: float
+    phase_b_min_separation_scale: float
+    target_motion_ratio: float
+    initial_trust_multiplier: float
+    trust_max_to_initial_ratio: float
+    lambda_distance: float
+    lambda_residual: float
+    lambda_rmsd: float
+    lambda_move: float
+    movement_hard_min_to_target: float
+    movement_target_low_to_target: float
+    movement_target_peak_to_target: float
+    movement_target_high_to_target: float
+    movement_hard_max_to_target: float
+    movement_low_softness_to_target: float
+    movement_high_softness_to_target: float
+    movement_band_fraction: float
+    movement_progress_fraction: float
+    movement_progress_normalisation: str
+    under_move_feedback_min_factor: float
+    under_move_feedback_max_factor: float
+    under_move_retry_limit: int
+    max_whitened_distance: float
+    max_atom_displacement_ang: float
+    min_pair_distance_ang: float
+    max_scaled_atom_move: float
+    max_scaled_rmsd: float
+    max_scaled_fullspace_residual: float
+    normalised_chemistry_penalty_cap: float
+    bond_ratio_lower: float = 0.70
+    bond_ratio_upper: float = 1.35
+    angle_ratio_lower: float = 0.65
+    angle_ratio_upper: float = 1.45
+
+
 SamplingPolicy = Union[
     SamplingAggressivenessPolicy,
     SamplingAggressivenessPolicyV2,
+    SamplingAggressivenessPolicyV3,
 ]
 
 
@@ -166,9 +207,63 @@ _POLICIES_V2: Dict[int, SamplingAggressivenessPolicyV2] = {
     10: _v2_policy(2.75, 2.00, 0.42),
 }
 
+
+def _v3_policy(
+    target_motion_ratio: float,
+    initial_trust_multiplier: float,
+    lambda_distance: float,
+    lambda_move: float,
+) -> SamplingAggressivenessPolicyV3:
+    return SamplingAggressivenessPolicyV3(
+        fallback_scale_angstrom=0.05,
+        phase_b_min_separation_scale=0.50,
+        target_motion_ratio=float(target_motion_ratio),
+        initial_trust_multiplier=float(initial_trust_multiplier),
+        trust_max_to_initial_ratio=4.0,
+        lambda_distance=float(lambda_distance),
+        lambda_residual=0.50 * float(lambda_distance),
+        lambda_rmsd=0.25 * float(lambda_distance),
+        lambda_move=float(lambda_move),
+        movement_hard_min_to_target=0.25,
+        movement_target_low_to_target=0.85,
+        movement_target_peak_to_target=1.00,
+        movement_target_high_to_target=1.15,
+        movement_hard_max_to_target=3.125,
+        movement_low_softness_to_target=0.06,
+        movement_high_softness_to_target=0.08,
+        movement_band_fraction=0.85,
+        movement_progress_fraction=0.15,
+        movement_progress_normalisation="active_weight_rmsd",
+        under_move_feedback_min_factor=1.0,
+        under_move_feedback_max_factor=2.0,
+        under_move_retry_limit=1,
+        max_whitened_distance=10.0,
+        max_atom_displacement_ang=1.25,
+        min_pair_distance_ang=0.60,
+        max_scaled_atom_move=36.0,
+        max_scaled_rmsd=4.2,
+        max_scaled_fullspace_residual=7.0,
+        normalised_chemistry_penalty_cap=20.0,
+    )
+
+
+_POLICIES_V3: Dict[int, SamplingAggressivenessPolicyV3] = {
+    1: _v3_policy(0.30, 0.45, 2.400, 0.55),
+    2: _v3_policy(0.40, 0.55, 1.900, 0.60),
+    3: _v3_policy(0.54, 0.67, 1.500, 0.65),
+    4: _v3_policy(0.73, 0.82, 1.220, 0.70),
+    5: _v3_policy(1.00, 1.00, 1.000, 0.75),
+    6: _v3_policy(1.35, 1.22, 0.800, 0.75),
+    7: _v3_policy(1.82, 1.49, 0.600, 0.75),
+    8: _v3_policy(2.46, 1.82, 0.440, 0.84),
+    9: _v3_policy(3.32, 2.22, 0.330, 0.94),
+    10: _v3_policy(4.48, 2.71, 0.245, 1.00),
+}
+
 _POLICY_TABLES: Dict[int, Dict[int, SamplingPolicy]] = {
     LEGACY_SAMPLING_AGGRESSIVENESS_POLICY_VERSION: _POLICIES_V1,
-    SAMPLING_AGGRESSIVENESS_POLICY_VERSION: _POLICIES_V2,
+    SAMPLING_AGGRESSIVENESS_POLICY_V2_VERSION: _POLICIES_V2,
+    SAMPLING_AGGRESSIVENESS_POLICY_VERSION: _POLICIES_V3,
 }
 
 
@@ -257,7 +352,10 @@ def _policy_payload(policy: SamplingPolicy) -> Dict[str, Any]:
 def _target_motion_ratio(policy: SamplingPolicy, policy_version: int) -> float:
     if int(policy_version) == LEGACY_SAMPLING_AGGRESSIVENESS_POLICY_VERSION:
         return float(policy.movement_trust_multiplier)
-    if isinstance(policy, SamplingAggressivenessPolicyV2):
+    if isinstance(
+        policy,
+        (SamplingAggressivenessPolicyV2, SamplingAggressivenessPolicyV3),
+    ):
         return float(policy.target_motion_ratio)
     raise ValueError("sampling policy type does not match policy version")
 
@@ -268,7 +366,10 @@ def _initial_trust_multiplier(
 ) -> float:
     if int(policy_version) == LEGACY_SAMPLING_AGGRESSIVENESS_POLICY_VERSION:
         return float(policy.movement_trust_multiplier)
-    if isinstance(policy, SamplingAggressivenessPolicyV2):
+    if isinstance(
+        policy,
+        (SamplingAggressivenessPolicyV2, SamplingAggressivenessPolicyV3),
+    ):
         return float(policy.initial_trust_multiplier)
     raise ValueError("sampling policy type does not match policy version")
 
@@ -331,6 +432,7 @@ def hidden_sampling_overrides(config: CampaignConfig) -> List[Dict[str, Any]]:
 def _effective_campaign_config(
     config: CampaignConfig,
     policy: SamplingPolicy,
+    policy_version: int,
 ) -> CampaignConfig:
     effective = copy.deepcopy(config)
     effective.anti_overlap = AntiOverlapConfigBlock(
@@ -354,7 +456,15 @@ def _effective_campaign_config(
         ),
         backtrack_points=int(config.adversarial_safety.backtrack_points),
         under_move_retry=bool(config.adversarial_safety.under_move_retry),
-        under_move_retry_max=int(config.adversarial_safety.under_move_retry_max),
+        under_move_retry_max=(
+            min(
+                int(config.adversarial_safety.under_move_retry_max),
+                int(policy.under_move_retry_limit),
+            )
+            if int(policy_version) == SAMPLING_AGGRESSIVENESS_POLICY_VERSION
+            and isinstance(policy, SamplingAggressivenessPolicyV3)
+            else int(config.adversarial_safety.under_move_retry_max)
+        ),
         min_whitened_distance=0.0,
         max_whitened_distance=float(policy.max_whitened_distance),
         enforce_min_whitened_distance=False,
@@ -395,12 +505,30 @@ def _apply_policy_to_acquisition_config(
         hard_max_fraction = (
             float(MOVEMENT_BAND_HARD_MAX_FRACTION) * target_motion_ratio
         )
-    else:
+    elif int(policy_version) == SAMPLING_AGGRESSIVENESS_POLICY_V2_VERSION:
         hard_min_fraction = 0.250 * target_motion_ratio
         target_low_fraction = 0.625 * target_motion_ratio
         target_peak_fraction = 1.000 * target_motion_ratio
         target_high_fraction = 1.875 * target_motion_ratio
         hard_max_fraction = 3.125 * target_motion_ratio
+    elif isinstance(policy, SamplingAggressivenessPolicyV3):
+        hard_min_fraction = (
+            float(policy.movement_hard_min_to_target) * target_motion_ratio
+        )
+        target_low_fraction = (
+            float(policy.movement_target_low_to_target) * target_motion_ratio
+        )
+        target_peak_fraction = (
+            float(policy.movement_target_peak_to_target) * target_motion_ratio
+        )
+        target_high_fraction = (
+            float(policy.movement_target_high_to_target) * target_motion_ratio
+        )
+        hard_max_fraction = (
+            float(policy.movement_hard_max_to_target) * target_motion_ratio
+        )
+    else:
+        raise ValueError("sampling policy type does not match policy version")
     scaled_movement = replace(
         movement,
         hard_min_fraction=float(hard_min_fraction),
@@ -409,9 +537,23 @@ def _apply_policy_to_acquisition_config(
         target_high_fraction=float(target_high_fraction),
         hard_max_fraction=float(hard_max_fraction),
     )
+    movement_utility = acquisition_config.movement_utility
+    if int(policy_version) == SAMPLING_AGGRESSIVENESS_POLICY_VERSION:
+        if not isinstance(policy, SamplingAggressivenessPolicyV3):
+            raise ValueError("sampling policy type does not match policy version")
+        movement_utility = replace(
+            movement_utility,
+            lambda_move=float(policy.lambda_move),
+            band_fraction=float(policy.movement_band_fraction),
+            progress_fraction=float(policy.movement_progress_fraction),
+            progress_normalisation=str(
+                policy.movement_progress_normalisation
+            ),
+        )
     return replace(
         acquisition_config,
         movement_band=scaled_movement,
+        movement_utility=movement_utility,
         weights=replace(
             acquisition_config.weights,
             lambda_distance=float(policy.lambda_distance),
@@ -445,6 +587,8 @@ def _positive_model_value(
 def _apply_scale_model_to_acquisition_config(
     acquisition_config: Any,
     scale_model_payload: Dict[str, Any],
+    policy: SamplingPolicy,
+    policy_version: int,
 ) -> Any:
     geom = _positive_model_value(
         scale_model_payload, "geometry_motion_scale", "value_angstrom"
@@ -456,8 +600,26 @@ def _apply_scale_model_to_acquisition_config(
         scale_model_payload, "residual_fullspace_scale", "value_angstrom"
     )
     movement = acquisition_config.movement_band
+    movement_utility = acquisition_config.movement_utility
     if geom is not None:
         movement = replace(movement, geometry_novelty_scale_angstrom=float(geom))
+        if int(policy_version) == SAMPLING_AGGRESSIVENESS_POLICY_VERSION:
+            if not isinstance(policy, SamplingAggressivenessPolicyV3):
+                raise ValueError(
+                    "sampling policy type does not match policy version"
+                )
+            target_angstrom = float(policy.target_motion_ratio) * float(geom)
+            movement_utility = replace(
+                movement_utility,
+                low_softness_ang=(
+                    float(policy.movement_low_softness_to_target)
+                    * target_angstrom
+                ),
+                high_softness_ang=(
+                    float(policy.movement_high_softness_to_target)
+                    * target_angstrom
+                ),
+            )
     fullspace = acquisition_config.fullspace_confinement
     if aligned is not None:
         fullspace = replace(fullspace, rmsd_scale_ang=float(aligned))
@@ -470,6 +632,7 @@ def _apply_scale_model_to_acquisition_config(
     return replace(
         acquisition_config,
         movement_band=movement,
+        movement_utility=movement_utility,
         fullspace_confinement=fullspace,
     )
 
@@ -480,6 +643,15 @@ def _attach_trust_radius_policy(
     policy_version: int,
 ) -> Dict[str, Any]:
     payload = dict(scale_model_payload)
+    feedback_min = 1.0
+    feedback_max = 2.0
+    retry_limit = None
+    if int(policy_version) == SAMPLING_AGGRESSIVENESS_POLICY_VERSION:
+        if not isinstance(policy, SamplingAggressivenessPolicyV3):
+            raise ValueError("sampling policy type does not match policy version")
+        feedback_min = float(policy.under_move_feedback_min_factor)
+        feedback_max = float(policy.under_move_feedback_max_factor)
+        retry_limit = int(policy.under_move_retry_limit)
     payload["trust_radius_policy"] = {
         "enabled": True,
         "normalisation": "weighted_mobility_sqrt_effective_atoms",
@@ -489,13 +661,15 @@ def _attach_trust_radius_policy(
         ),
         "target_motion_ratio": _target_motion_ratio(policy, policy_version),
         "max_to_initial_ratio": float(policy.trust_max_to_initial_ratio),
-        "under_move_feedback_min_factor": 1.0,
-        "under_move_feedback_max_factor": 2.0,
+        "under_move_feedback_min_factor": feedback_min,
+        "under_move_feedback_max_factor": feedback_max,
         "formula": (
             "trust0 = weighted_per_atom_mobility_angstrom * "
             "sqrt(n_effective_movement_atoms) * aggressiveness_multiplier"
         ),
     }
+    if retry_limit is not None:
+        payload["trust_radius_policy"]["under_move_retry_limit"] = retry_limit
     return payload
 
 
@@ -630,8 +804,109 @@ def _validate_v2_policy_table() -> None:
         previous = policy
 
 
+def _validate_v3_policy_table() -> None:
+    if set(_POLICIES_V3) != set(range(1, 11)):
+        raise RuntimeError("sampling-aggressiveness policy must define levels 1 to 10")
+    previous: Optional[SamplingAggressivenessPolicyV3] = None
+    fixed_fields = (
+        "fallback_scale_angstrom",
+        "phase_b_min_separation_scale",
+        "trust_max_to_initial_ratio",
+        "movement_hard_min_to_target",
+        "movement_target_low_to_target",
+        "movement_target_peak_to_target",
+        "movement_target_high_to_target",
+        "movement_hard_max_to_target",
+        "movement_low_softness_to_target",
+        "movement_high_softness_to_target",
+        "movement_band_fraction",
+        "movement_progress_fraction",
+        "movement_progress_normalisation",
+        "under_move_feedback_min_factor",
+        "under_move_feedback_max_factor",
+        "under_move_retry_limit",
+        "max_whitened_distance",
+        "max_atom_displacement_ang",
+        "min_pair_distance_ang",
+        "max_scaled_atom_move",
+        "max_scaled_rmsd",
+        "max_scaled_fullspace_residual",
+        "normalised_chemistry_penalty_cap",
+        "bond_ratio_lower",
+        "bond_ratio_upper",
+        "angle_ratio_lower",
+        "angle_ratio_upper",
+    )
+    baseline = _POLICIES_V3[1]
+    for level, policy in sorted(_POLICIES_V3.items()):
+        for name, raw in asdict(policy).items():
+            if name == "movement_progress_normalisation":
+                if raw != "active_weight_rmsd":
+                    raise RuntimeError(
+                        "sampling policy movement normalisation is invalid"
+                    )
+                continue
+            value = float(raw)
+            if not math.isfinite(value) or value <= 0.0:
+                raise RuntimeError(
+                    "sampling policy level " + str(level) + " has invalid " + name
+                )
+        for name in fixed_fields:
+            if getattr(policy, name) != getattr(baseline, name):
+                raise RuntimeError("sampling policy fixed controls must remain fixed")
+        if policy.lambda_residual != 0.50 * policy.lambda_distance:
+            raise RuntimeError("sampling policy residual penalty ratio is invalid")
+        if policy.lambda_rmsd != 0.25 * policy.lambda_distance:
+            raise RuntimeError("sampling policy RMSD penalty ratio is invalid")
+        if not (
+            policy.movement_hard_min_to_target
+            < policy.movement_target_low_to_target
+            < policy.movement_target_peak_to_target
+            < policy.movement_target_high_to_target
+            < policy.movement_hard_max_to_target
+        ):
+            raise RuntimeError("sampling policy movement band is unordered")
+        if not math.isclose(
+            policy.movement_band_fraction + policy.movement_progress_fraction,
+            1.0,
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        ):
+            raise RuntimeError("sampling policy movement utility weights are invalid")
+        if policy.under_move_feedback_max_factor < policy.under_move_feedback_min_factor:
+            raise RuntimeError("sampling policy retry feedback bounds are unordered")
+        if policy.under_move_retry_limit != 1:
+            raise RuntimeError("sampling policy retry limit must remain one")
+        if not (
+            policy.bond_ratio_lower < policy.bond_ratio_upper
+            and policy.angle_ratio_lower < policy.angle_ratio_upper
+        ):
+            raise RuntimeError("sampling policy chemistry ratios are unordered")
+        if previous is not None:
+            if policy.target_motion_ratio <= previous.target_motion_ratio:
+                raise RuntimeError("sampling policy target movement must increase")
+            if policy.initial_trust_multiplier <= previous.initial_trust_multiplier:
+                raise RuntimeError("sampling policy initial trust must increase")
+            if policy.lambda_distance >= previous.lambda_distance:
+                raise RuntimeError("sampling policy confinement penalty must decrease")
+            if policy.lambda_move < previous.lambda_move:
+                raise RuntimeError("sampling policy movement utility must not decrease")
+            previous_max = (
+                previous.initial_trust_multiplier
+                * previous.trust_max_to_initial_ratio
+            )
+            current_max = (
+                policy.initial_trust_multiplier
+                * policy.trust_max_to_initial_ratio
+            )
+            if current_max <= previous_max:
+                raise RuntimeError("sampling policy maximum trust must increase")
+        previous = policy
+
+
 _validate_v1_policy_table()
 _validate_v2_policy_table()
+_validate_v3_policy_table()
 
 
 def sampling_policy_history_context(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -797,6 +1072,19 @@ def _resolved_manifest_payload(resolved: ResolvedSamplingProtocol) -> Dict[str, 
             "sampling_scale_model_sha256": _canonical_sha(scale_model),
         },
     }
+    if int(resolved.sampling_policy_version) == SAMPLING_AGGRESSIVENESS_POLICY_VERSION:
+        utility = resolved.acquisition_config.movement_utility
+        payload["resolved_movement_utility"] = {
+            "lambda_move": float(utility.lambda_move),
+            "band_fraction": float(utility.band_fraction),
+            "progress_fraction": float(utility.progress_fraction),
+            "low_softness_ang": float(utility.low_softness_ang),
+            "high_softness_ang": float(utility.high_softness_ang),
+            "progress_normalisation": str(utility.progress_normalisation),
+        }
+        payload["resolved_adversarial_safety"]["under_move_retry_max"] = int(
+            resolved.adversarial_safety.under_move_retry_max
+        )
     payload["input_fingerprint"] = {
         "sha256": _canonical_sha(
             {
@@ -1065,7 +1353,7 @@ def resolve_sampling_protocol(
     level = int(config.campaign.sampling_aggressiveness)
     policy = _policy_for(config, policy_version)
     policy_table_sha256 = sampling_policy_table_sha256(policy_version)
-    effective = _effective_campaign_config(config, policy)
+    effective = _effective_campaign_config(config, policy, policy_version)
     calibration_snapshot = _resolve_error_calibration_snapshot(
         campaign_dir,
         effective,
@@ -1117,7 +1405,11 @@ def resolve_sampling_protocol(
         "angle_ratio_upper": float(policy.angle_ratio_upper),
     }
     diagnostics = dict(scale_model_payload.get("diagnostics") or {})
-    diagnostics["size_independence_wave"] = 3
+    diagnostics["size_independence_wave"] = (
+        4
+        if policy_version == SAMPLING_AGGRESSIVENESS_POLICY_VERSION
+        else 3
+    )
     scale_model_payload["diagnostics"] = diagnostics
     acquisition_config = apply_geometry_novelty_to_acquisition_config(
         effective.to_acquisition_config(),
@@ -1132,6 +1424,8 @@ def resolve_sampling_protocol(
     acquisition_config = _apply_scale_model_to_acquisition_config(
         acquisition_config,
         scale_model_payload,
+        policy,
+        policy_version,
     )
     ariadne_run_config = effective.to_ariadne_run_config()
     resolved_consumers = resolve_geometry_novelty_consumers(effective, geometry_payload)
@@ -1187,7 +1481,11 @@ def resolve_sampling_protocol(
         error_calibration_snapshot=calibration_snapshot,
         scale_model_payload=dict(scale_model_payload),
         sources={
-            "level_5_policy": "matches_current_defaults",
+            "level_5_policy": (
+                "balanced_anchor"
+                if policy_version == SAMPLING_AGGRESSIVENESS_POLICY_VERSION
+                else "matches_current_defaults"
+            ),
             "geometry_scale": "sampling_scale_model",
             "pair_distance": "sampling_scale_model_minimum_safe_pair_ratio",
         },
@@ -1301,7 +1599,7 @@ def load_sampling_protocol(
         or scale_policy.get("entry") != _policy_payload(policy)
     ):
         raise ValueError("sampling scale model policy binding mismatch")
-    effective = _effective_campaign_config(config, policy)
+    effective = _effective_campaign_config(config, policy, policy_version)
     frozen_settings = calibration_snapshot.get("settings")
     if isinstance(frozen_settings, dict) and frozen_settings:
         effective.error_calibration = ErrorCalibrationConfigBlock(
@@ -1320,6 +1618,8 @@ def load_sampling_protocol(
     acquisition_config = _apply_scale_model_to_acquisition_config(
         acquisition_config,
         scale_model_payload,
+        policy,
+        policy_version,
     )
     ariadne_run_config = effective.to_ariadne_run_config()
     resolved_consumers = resolve_geometry_novelty_consumers(
@@ -1377,7 +1677,11 @@ def load_sampling_protocol(
         error_calibration_snapshot=calibration_snapshot,
         scale_model_payload=dict(scale_model_payload),
         sources={
-            "level_5_policy": "matches_current_defaults",
+            "level_5_policy": (
+                "balanced_anchor"
+                if policy_version == SAMPLING_AGGRESSIVENESS_POLICY_VERSION
+                else "matches_current_defaults"
+            ),
             "geometry_scale": "sampling_scale_model",
             "pair_distance": "sampling_scale_model_minimum_safe_pair_ratio",
         },
@@ -1408,6 +1712,8 @@ def load_sampling_protocol(
         "hard_safety_rails",
         "hidden_overrides_detected",
     )
+    if policy_version == SAMPLING_AGGRESSIVENESS_POLICY_VERSION:
+        invariant_fields += ("resolved_movement_utility",)
     for field_name in invariant_fields:
         if protocol_payload.get(field_name) != expected_payload.get(field_name):
             raise ValueError(
@@ -1481,7 +1787,7 @@ def preview_sampling_protocol(
     policy_version = SAMPLING_AGGRESSIVENESS_POLICY_VERSION
     policy = _policy_for(config, policy_version)
     policy_table_sha256 = sampling_policy_table_sha256(policy_version)
-    effective = _effective_campaign_config(config, policy)
+    effective = _effective_campaign_config(config, policy, policy_version)
     if geometry_scale_payload is None:
         geometry_scale_payload = {
             "schema_version": 1,
@@ -1524,7 +1830,7 @@ def preview_sampling_protocol(
         "angle_ratio_upper": float(policy.angle_ratio_upper),
     }
     diagnostics = dict(scale_model_payload.get("diagnostics") or {})
-    diagnostics["size_independence_wave"] = 3
+    diagnostics["size_independence_wave"] = 4
     scale_model_payload["diagnostics"] = diagnostics
     acquisition_config = apply_geometry_novelty_to_acquisition_config(
         effective.to_acquisition_config(),
@@ -1539,6 +1845,8 @@ def preview_sampling_protocol(
     acquisition_config = _apply_scale_model_to_acquisition_config(
         acquisition_config,
         scale_model_payload,
+        policy,
+        policy_version,
     )
     ariadne_run_config = effective.to_ariadne_run_config()
     resolved_consumers = resolve_geometry_novelty_consumers(effective, geometry_scale_payload)
@@ -1585,7 +1893,7 @@ def preview_sampling_protocol(
         anti_overlap=asdict(effective.anti_overlap),
         scale_model_payload=dict(scale_model_payload),
         sources={
-            "level_5_policy": "matches_current_defaults",
+            "level_5_policy": "balanced_anchor",
             "geometry_scale": "preview_sampling_scale_model",
             "pair_distance": "sampling_scale_model_minimum_safe_pair_ratio",
         },
@@ -1611,8 +1919,10 @@ __all__ = [
     "ResolvedSamplingProtocol",
     "LEGACY_SAMPLING_AGGRESSIVENESS_POLICY_VERSION",
     "SAMPLING_AGGRESSIVENESS_POLICY_VERSION",
+    "SAMPLING_AGGRESSIVENESS_POLICY_V2_VERSION",
     "SamplingAggressivenessPolicy",
     "SamplingAggressivenessPolicyV2",
+    "SamplingAggressivenessPolicyV3",
     "dimensionless_policy_payload",
     "sampling_policy_history_context",
     "sampling_policy_table_payload",

@@ -192,6 +192,108 @@ iteration: an iteration that already has a resolved snapshot continues with
 that exact policy after an ICHOR update, while the next unresolved iteration
 uses the current policy.
 
+The current policy (v3) keeps level 5 as the balanced anchor and calibrates
+levels 1--10 against observed accepted landing motion. Its target movement is
+defined as a ratio of the campaign's geometry-motion scale, so the preset does
+not grow with atom count. The preferred landing band is 0.85--1.15 times that
+target, while directional progress is normalised into the same active-weighted
+RMSD units before it enters the movement utility. Higher presets increase the
+target and trust radius and reduce confinement penalties; chemistry, overlap,
+absolute displacement, retry-count and Phase-B safety controls remain fixed.
+Because exported batches contain accepted landings only, the v3 redesign does
+not infer looser safety limits or additional retries from those exports.
+
+The immutable v3 preset table is:
+
+.. list-table:: Sampling-aggressiveness policy v3
+   :header-rows: 1
+
+   * - Level
+     - Target ratio
+     - Initial trust
+     - Distance penalty
+     - Residual penalty
+     - RMSD penalty
+     - Movement strength
+   * - 1
+     - 0.30
+     - 0.45
+     - 2.400
+     - 1.2000
+     - 0.60000
+     - 0.55
+   * - 2
+     - 0.40
+     - 0.55
+     - 1.900
+     - 0.9500
+     - 0.47500
+     - 0.60
+   * - 3
+     - 0.54
+     - 0.67
+     - 1.500
+     - 0.7500
+     - 0.37500
+     - 0.65
+   * - 4
+     - 0.73
+     - 0.82
+     - 1.220
+     - 0.6100
+     - 0.30500
+     - 0.70
+   * - 5
+     - 1.00
+     - 1.00
+     - 1.000
+     - 0.5000
+     - 0.25000
+     - 0.75
+   * - 6
+     - 1.35
+     - 1.22
+     - 0.800
+     - 0.4000
+     - 0.20000
+     - 0.75
+   * - 7
+     - 1.82
+     - 1.49
+     - 0.600
+     - 0.3000
+     - 0.15000
+     - 0.75
+   * - 8
+     - 2.46
+     - 1.82
+     - 0.440
+     - 0.2200
+     - 0.11000
+     - 0.84
+   * - 9
+     - 3.32
+     - 2.22
+     - 0.330
+     - 0.1650
+     - 0.08250
+     - 0.94
+   * - 10
+     - 4.48
+     - 2.71
+     - 0.245
+     - 0.1225
+     - 0.06125
+     - 1.00
+
+Every level keeps a maximum-to-initial trust ratio of 4.0. Residual and RMSD
+penalties remain one half and one quarter of the distance penalty,
+respectively. The hard movement range is 0.25--3.125 times the target, its
+preferred range is 0.85--1.15 times the target, and the low/high softnesses are
+0.06/0.08 times the target. Movement utility uses 0.85 band weight and 0.15
+directional-progress weight. Under-movement feedback remains clamped to
+1--2 and permits at most one retry.
+
 Custom bootstrap inputs
 ~~~~~~~~~~~~~~~~~~~~~~~
 

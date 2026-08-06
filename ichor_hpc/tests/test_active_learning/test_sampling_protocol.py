@@ -41,6 +41,7 @@ from ichor.hpc.active_learning.versioning.provenance import (
 from ichor.hpc.active_learning.sampling_protocol import (
     LEGACY_SAMPLING_AGGRESSIVENESS_POLICY_VERSION,
     SAMPLING_AGGRESSIVENESS_POLICY_VERSION,
+    SAMPLING_AGGRESSIVENESS_POLICY_V2_VERSION,
     hidden_sampling_overrides,
     phase_b_min_separation_from_resolved,
     preview_sampling_protocol,
@@ -249,13 +250,13 @@ def _write_strict_history(
     return iter_dir
 
 
-def test_level_five_preview_matches_current_balanced_defaults():
+def test_level_five_preview_is_v3_balanced_anchor():
     cfg = CampaignConfig()
 
     resolved = preview_sampling_protocol(cfg)
 
     assert resolved.sampling_aggressiveness == 5
-    assert resolved.sampling_policy_version == 2
+    assert resolved.sampling_policy_version == 3
     assert resolved.resolved_geometry_scale_angstrom == pytest.approx(0.05)
     assert resolved.phase_b["min_separation_scaled"] == pytest.approx(
         PHASE_B_MIN_SEPARATION_SCALE
@@ -292,6 +293,13 @@ def test_level_five_preview_matches_current_balanced_defaults():
     assert resolved.acquisition_config.movement_band.target_peak_fraction == pytest.approx(
         1.0
     )
+    movement_utility = resolved.acquisition_config.movement_utility
+    assert movement_utility.lambda_move == pytest.approx(0.75)
+    assert movement_utility.band_fraction == pytest.approx(0.85)
+    assert movement_utility.progress_fraction == pytest.approx(0.15)
+    assert movement_utility.low_softness_ang == pytest.approx(0.003)
+    assert movement_utility.high_softness_ang == pytest.approx(0.004)
+    assert movement_utility.progress_normalisation == "active_weight_rmsd"
     assert resolved.acquisition_config.fullspace_confinement.rmsd_scale_ang == pytest.approx(0.05)
     assert resolved.acquisition_config.fullspace_confinement.fixed_residual_scale_ang == pytest.approx(0.5)
     assert resolved.ariadne_run_config.delta0 == pytest.approx(0.10)
@@ -342,9 +350,16 @@ def test_sampling_policy_table_is_versioned_complete_and_hashed():
     assert payload["policy_version"] == SAMPLING_AGGRESSIVENESS_POLICY_VERSION
     assert set(payload["levels"]) == {str(level) for level in range(1, 11)}
     assert len(sampling_policy_table_sha256()) == 64
+    assert (
+        sampling_policy_table_sha256()
+        == "dc1ad8d1632b61d41b70a7b621868a55fb1a9a0651848b5504e2131de171271c"
+    )
     assert payload["levels"]["5"]["target_motion_ratio"] == pytest.approx(1.0)
     assert payload["levels"]["5"]["initial_trust_multiplier"] == pytest.approx(1.0)
     assert payload["levels"]["5"]["trust_max_to_initial_ratio"] == pytest.approx(4.0)
+    assert payload["levels"]["5"]["movement_target_low_to_target"] == pytest.approx(0.85)
+    assert payload["levels"]["5"]["movement_target_high_to_target"] == pytest.approx(1.15)
+    assert payload["levels"]["5"]["movement_progress_normalisation"] == "active_weight_rmsd"
 
 
 def test_legacy_sampling_policy_table_identity_is_frozen():
@@ -363,7 +378,12 @@ def test_legacy_sampling_policy_table_identity_is_frozen():
 
 
 def test_v2_policy_table_has_exact_monotonic_exploration_controls():
-    levels = sampling_policy_table_payload()["levels"]
+    payload = sampling_policy_table_payload(
+        SAMPLING_AGGRESSIVENESS_POLICY_V2_VERSION
+    )
+    levels = payload["levels"]
+
+    assert payload["policy_version"] == 2
 
     assert [levels[str(level)]["target_motion_ratio"] for level in range(1, 11)] == [
         0.35,
@@ -407,9 +427,15 @@ def test_v2_policy_table_has_exact_monotonic_exploration_controls():
     )
     for field in safety_fields:
         assert len({levels[str(level)][field] for level in range(1, 11)}) == 1
+    assert (
+        sampling_policy_table_sha256(
+            SAMPLING_AGGRESSIVENESS_POLICY_V2_VERSION
+        )
+        == "33e6187b259a83469c3540ba7a1bcedb3d53dd1b7eb2482c3ce011451cba8577"
+    )
 
 
-def test_v2_resolved_controls_follow_target_and_trust_tables():
+def test_v2_resolved_controls_follow_target_and_trust_tables(tmp_path):
     target_ratios = []
     initial_trust = []
     maximum_trust = []
@@ -417,7 +443,13 @@ def test_v2_resolved_controls_follow_target_and_trust_tables():
     for level in range(1, 11):
         cfg = CampaignConfig()
         cfg.campaign.sampling_aggressiveness = level
-        resolved = preview_sampling_protocol(cfg)
+        resolved = resolve_sampling_protocol(
+            tmp_path / str(level),
+            cfg,
+            iteration=1,
+            write_manifest=False,
+            _policy_version=SAMPLING_AGGRESSIVENESS_POLICY_V2_VERSION,
+        )
         movement = resolved.acquisition_config.movement_band
         trust = resolved.scale_model_payload["trust_radius_policy"]
         target_ratios.append(float(movement.target_peak_fraction))
@@ -451,6 +483,83 @@ def test_v2_resolved_controls_follow_target_and_trust_tables():
     assert initial_trust == sorted(initial_trust)
     assert maximum_trust == sorted(maximum_trust)
     assert len(set(safety_signatures)) == 1
+
+
+def test_v3_policy_table_has_exact_calibrated_controls():
+    levels = sampling_policy_table_payload()["levels"]
+
+    assert [levels[str(level)]["target_motion_ratio"] for level in range(1, 11)] == [
+        0.30,
+        0.40,
+        0.54,
+        0.73,
+        1.00,
+        1.35,
+        1.82,
+        2.46,
+        3.32,
+        4.48,
+    ]
+    assert [
+        levels[str(level)]["initial_trust_multiplier"]
+        for level in range(1, 11)
+    ] == [0.45, 0.55, 0.67, 0.82, 1.00, 1.22, 1.49, 1.82, 2.22, 2.71]
+    assert [levels[str(level)]["lambda_distance"] for level in range(1, 11)] == [
+        2.400,
+        1.900,
+        1.500,
+        1.220,
+        1.000,
+        0.800,
+        0.600,
+        0.440,
+        0.330,
+        0.245,
+    ]
+    assert [levels[str(level)]["lambda_move"] for level in range(1, 11)] == [
+        0.55,
+        0.60,
+        0.65,
+        0.70,
+        0.75,
+        0.75,
+        0.75,
+        0.84,
+        0.94,
+        1.00,
+    ]
+
+
+def test_v3_resolved_controls_use_target_relative_band_and_softness():
+    cfg = CampaignConfig()
+    cfg.campaign.sampling_aggressiveness = 10
+
+    resolved = preview_sampling_protocol(cfg)
+    movement = resolved.acquisition_config.movement_band
+    utility = resolved.acquisition_config.movement_utility
+    target = 4.48
+
+    assert movement.hard_min_fraction == pytest.approx(0.25 * target)
+    assert movement.target_low_fraction == pytest.approx(0.85 * target)
+    assert movement.target_peak_fraction == pytest.approx(target)
+    assert movement.target_high_fraction == pytest.approx(1.15 * target)
+    assert movement.hard_max_fraction == pytest.approx(3.125 * target)
+    assert utility.low_softness_ang == pytest.approx(0.06 * target * 0.05)
+    assert utility.high_softness_ang == pytest.approx(0.08 * target * 0.05)
+    assert resolved.adversarial_safety.under_move_retry_max == 1
+
+
+def test_v3_retry_limit_preserves_disable_and_caps_custom_values():
+    disabled = CampaignConfig()
+    disabled.adversarial_safety.under_move_retry_max = 0
+    overconfigured = CampaignConfig()
+    overconfigured.adversarial_safety.under_move_retry_max = 4
+
+    disabled_resolved = preview_sampling_protocol(disabled)
+    capped_resolved = preview_sampling_protocol(overconfigured)
+
+    assert disabled_resolved.adversarial_safety.under_move_retry_max == 0
+    assert capped_resolved.adversarial_safety.under_move_retry_max == 1
 
 
 def test_v1_resolved_controls_retain_legacy_band_compilation(tmp_path):
@@ -520,7 +629,7 @@ def test_resolver_writes_round_trippable_manifest(tmp_path):
     assert payload["sampling_aggressiveness"] == 5
     assert payload["sampling_scale_model_manifest"] == str(scale_path)
     assert payload["sampling_protocol_audit_manifest"] == str(audit_path)
-    assert payload["sampling_policy_version"] == 2
+    assert payload["sampling_policy_version"] == 3
     assert payload["sampling_policy_table_sha256"] == sampling_policy_table_sha256()
     assert payload["dimensionless_policy"]["max_scaled_atom_move"] == pytest.approx(36.0)
     assert audit_payload["schema_version"] == 2
@@ -535,6 +644,13 @@ def test_resolver_writes_round_trippable_manifest(tmp_path):
     )
     assert payload["resolved_adversarial_safety"]["max_whitened_distance"] == pytest.approx(
         10.0
+    )
+    assert payload["resolved_adversarial_safety"]["under_move_retry_max"] == 1
+    assert payload["resolved_movement_utility"]["band_fraction"] == pytest.approx(
+        0.85
+    )
+    assert payload["resolved_movement_utility"]["progress_normalisation"] == (
+        "active_weight_rmsd"
     )
 
     threshold, mode = phase_b_min_separation_from_resolved(resolved)
@@ -587,6 +703,54 @@ def test_resolve_or_load_preserves_legacy_v1_protocol_bytes(tmp_path):
         == LEGACY_SAMPLING_SCALE_MODEL_MODEL_VERSION
     )
     assert {path: path.read_bytes() for path in paths} == before
+
+
+def test_resolve_or_load_preserves_v2_protocol_bytes_after_v3_upgrade(tmp_path):
+    cfg = CampaignConfig()
+    resolve_sampling_protocol(
+        tmp_path,
+        cfg,
+        iteration=1,
+        _policy_version=SAMPLING_AGGRESSIVENESS_POLICY_V2_VERSION,
+    )
+    iter_dir = active_iteration_dir(tmp_path, 1)
+    paths = (
+        sampling_protocol_resolved_path(iter_dir),
+        sampling_protocol_audit_path(iter_dir),
+        sampling_scale_model_path(iter_dir),
+    )
+    before = {path: path.read_bytes() for path in paths}
+
+    loaded = resolve_or_load_sampling_protocol(tmp_path, cfg, iteration=1)
+
+    assert loaded.sampling_policy_version == 2
+    assert loaded.sampling_policy_table_sha256 == sampling_policy_table_sha256(2)
+    assert loaded.acquisition_config.movement_utility.progress_normalisation == (
+        "legacy_projected_displacement"
+    )
+    assert {path: path.read_bytes() for path in paths} == before
+
+
+def test_next_unresolved_iteration_uses_v3_after_v2_snapshot(tmp_path):
+    cfg = CampaignConfig()
+    resolve_sampling_protocol(
+        tmp_path,
+        cfg,
+        iteration=1,
+        _policy_version=SAMPLING_AGGRESSIVENESS_POLICY_V2_VERSION,
+    )
+
+    old = resolve_or_load_sampling_protocol(tmp_path, cfg, iteration=1)
+    current = resolve_or_load_sampling_protocol(tmp_path, cfg, iteration=2)
+
+    assert old.sampling_policy_version == 2
+    assert current.sampling_policy_version == 3
+    assert old.acquisition_config.movement_utility.progress_normalisation == (
+        "legacy_projected_displacement"
+    )
+    assert current.acquisition_config.movement_utility.progress_normalisation == (
+        "active_weight_rmsd"
+    )
 
 
 def test_load_accepts_pre_v2_scale_payload_shape(tmp_path):
@@ -914,7 +1078,7 @@ def test_scale_model_normalises_history_by_producer_policy(tmp_path):
     )
 
 
-def test_scale_model_normalises_mixed_v1_and_v2_history(tmp_path):
+def test_scale_model_normalises_mixed_v1_v2_and_v3_history(tmp_path):
     _write_strict_history(
         tmp_path,
         iteration=1,
@@ -929,18 +1093,25 @@ def test_scale_model_normalises_mixed_v1_and_v2_history(tmp_path):
         policy_version=2,
         sampling_aggressiveness=7,
     )
+    _write_strict_history(
+        tmp_path,
+        iteration=3,
+        movement=0.364,
+        policy_version=3,
+        sampling_aggressiveness=7,
+    )
 
-    resolved = resolve_sampling_protocol(tmp_path, CampaignConfig(), iteration=3)
+    resolved = resolve_sampling_protocol(tmp_path, CampaignConfig(), iteration=4)
     scale = resolved.scale_model_payload
 
     assert scale["geometry_motion_scale"]["value_angstrom"] == pytest.approx(0.2)
     normalisation = scale["history"]["policy_normalisation"]
     assert [
         row["normalisation_factor"] for row in normalisation["iterations"]
-    ] == pytest.approx([1.15, 1.55])
+    ] == pytest.approx([1.15, 1.55, 1.82])
     assert [
         row["policy_version"] for row in normalisation["iterations"]
-    ] == [1, 2]
+    ] == [1, 2, 3]
 
 
 def test_scale_model_keeps_pre_protocol_history_with_neutral_factor(tmp_path):

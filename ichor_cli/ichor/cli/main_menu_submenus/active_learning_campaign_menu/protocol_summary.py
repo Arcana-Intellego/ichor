@@ -353,20 +353,34 @@ def format_sampling_protocol_summary(
         ariadne_run = resolved.ariadne_run_config
         scale_model = dict(resolved.scale_model_payload or {})
         movement = acq_cfg.movement_band
+        movement_utility = acq_cfg.movement_utility
         scale = resolved.resolved_geometry_scale_angstrom
         movement_text = "unavailable"
         if scale is not None:
             movement_text = (
                 "scale="
                 + str(scale)
-                + ", min/peak/max="
+                + ", min/low/peak/high/max="
                 + str(float(movement.hard_min_fraction) * float(scale))
                 + "/"
+                + str(float(movement.target_low_fraction) * float(scale))
+                + "/"
                 + str(float(movement.target_peak_fraction) * float(scale))
+                + "/"
+                + str(float(movement.target_high_fraction) * float(scale))
                 + "/"
                 + str(float(movement.hard_max_fraction) * float(scale))
             )
         lines.append(_line("sampling_protocol.geometry_scale_source", geometry_source))
+        lines.append(
+            _line(
+                "sampling_protocol.policy",
+                "version="
+                + str(resolved.sampling_policy_version)
+                + ", table_sha256="
+                + str(resolved.sampling_policy_table_sha256),
+            )
+        )
         lines.append(_line("sampling_protocol.resolved_geometry_scale_angstrom", scale))
         geom_scale = scale_model.get("geometry_motion_scale", {})
         rmsd_scale = scale_model.get("aligned_rmsd_scale", {})
@@ -446,6 +460,23 @@ def format_sampling_protocol_summary(
             )
         )
         lines.append(_line("sampling_protocol.resolved_movement_band", movement_text))
+        lines.append(
+            _line(
+                "sampling_protocol.resolved_movement_utility",
+                "lambda_move="
+                + str(movement_utility.lambda_move)
+                + ", band/progress="
+                + str(movement_utility.band_fraction)
+                + "/"
+                + str(movement_utility.progress_fraction)
+                + ", low/high_softness_angstrom="
+                + str(movement_utility.low_softness_ang)
+                + "/"
+                + str(movement_utility.high_softness_ang)
+                + ", progress_normalisation="
+                + str(movement_utility.progress_normalisation),
+            )
+        )
         lines.append(
             _line(
                 "sampling_protocol.resolved_phase_b",
@@ -538,6 +569,8 @@ def format_sampling_protocol_summary(
                 + str(trust_policy.get("normalisation"))
                 + ", aggressiveness_multiplier="
                 + str(trust_policy.get("aggressiveness_multiplier"))
+                + ", retry_limit="
+                + str(trust_policy.get("under_move_retry_limit", 1))
                 + ", retry_factor_max="
                 + str(trust_policy.get("under_move_feedback_max_factor")),
             )

@@ -568,6 +568,9 @@ def test_mature_acquisition_config_bridge_roundtrips_to_core():
     assert core.movement_utility.high_softness_ang == pytest.approx(
         MOVEMENT_UTILITY_HIGH_SOFTNESS_FRACTION * 0.04
     )
+    assert core.movement_utility.progress_normalisation == (
+        "legacy_projected_displacement"
+    )
     assert core.stencils.negative_curvature_policy == "penalise"
     assert core.stencils.lambda_negative_curvature == 2.0
     assert core.stencils.weak_mode_gating_enabled is False

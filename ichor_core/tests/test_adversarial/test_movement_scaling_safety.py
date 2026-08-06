@@ -103,3 +103,125 @@ def test_initial_projected_acquisition_gradient_is_projected_to_active_subspace(
     assert np.isclose(np.linalg.norm(direction), 1.0)
     assert abs(direction[0]) > 0.999
     assert abs(direction[1]) < 1.0e-8
+
+
+def _vector_movement_metrics(
+    n_atoms: int,
+    *,
+    progress_normalisation: str,
+    spectator_atoms: int = 0,
+):
+    total_atoms = n_atoms + spectator_atoms
+    acq = object.__new__(SeedLocalAdversarialAcquisition)
+    acq.seed_atoms = Atoms(
+        [Atom("H", float(index), 0.0, 0.0) for index in range(total_atoms)]
+    )
+    basis = np.zeros((3 * total_atoms, 1), dtype=float)
+    basis[0, 0] = 1.0
+    acq.subspace = SimpleNamespace(seed_atoms=acq.seed_atoms, basis=basis)
+    acq.config = AcquisitionConfig(
+        movement_band=MovementBandConfig(metric="aligned_active_rmsd"),
+        movement_utility=MovementUtilityConfig(
+            progress_normalisation=progress_normalisation,
+            low_softness_ang=0.01,
+            high_softness_ang=0.01,
+        ),
+    )
+    delta = np.zeros(3 * total_atoms, dtype=float)
+    direction = np.zeros(3 * total_atoms, dtype=float)
+    weights = np.zeros(3 * total_atoms, dtype=float)
+    for index in range(n_atoms):
+        delta[3 * index] = 0.1
+        direction[3 * index] = 1.0
+        weights[3 * index : 3 * index + 3] = 1.0
+    for index in range(n_atoms, total_atoms):
+        delta[3 * index] = 100.0
+        direction[3 * index] = 1.0
+    acq._movement_delta_and_weights = lambda atoms: (delta, weights)
+    acq.movement_direction = lambda: (direction, "test_direction")
+    acq.movement_distance = lambda atoms: (0.1, "aligned_active_rmsd")
+    acq.movement_band = lambda: {
+        "min": 0.01,
+        "low": 0.05,
+        "peak": 0.10,
+        "high": 0.15,
+        "max": 0.30,
+        "scale_source": "test",
+        "geometry_novelty_scale_angstrom": 0.10,
+    }
+    return acq.movement_metrics(acq.seed_atoms)
+
+
+def test_active_weight_rmsd_progress_is_invariant_to_active_system_size():
+    small = _vector_movement_metrics(
+        1,
+        progress_normalisation="active_weight_rmsd",
+    )
+    large = _vector_movement_metrics(
+        30,
+        progress_normalisation="active_weight_rmsd",
+    )
+
+    assert small["movement_progress_ang"] == pytest.approx(0.1)
+    assert large["movement_progress_ang"] == pytest.approx(0.1)
+    assert large["movement_progress_score"] == pytest.approx(
+        small["movement_progress_score"]
+    )
+    assert large["movement_utility_score"] == pytest.approx(
+        small["movement_utility_score"]
+    )
+
+
+def test_active_weight_rmsd_progress_ignores_inactive_spectators():
+    base = _vector_movement_metrics(
+        2,
+        progress_normalisation="active_weight_rmsd",
+    )
+    spectators = _vector_movement_metrics(
+        2,
+        spectator_atoms=20,
+        progress_normalisation="active_weight_rmsd",
+    )
+
+    assert spectators["movement_progress_ang"] == pytest.approx(
+        base["movement_progress_ang"]
+    )
+    assert spectators["movement_utility_score"] == pytest.approx(
+        base["movement_utility_score"]
+    )
+
+
+def test_legacy_projected_progress_retains_extensive_behaviour():
+    small = _vector_movement_metrics(
+        1,
+        progress_normalisation="legacy_projected_displacement",
+    )
+    large = _vector_movement_metrics(
+        25,
+        progress_normalisation="legacy_projected_displacement",
+    )
+
+    assert small["movement_progress_ang"] == pytest.approx(0.1)
+    assert large["movement_progress_ang"] == pytest.approx(0.5)
+
+
+def test_global_v3_progress_uses_atomic_mass_weights():
+    acq = object.__new__(SeedLocalAdversarialAcquisition)
+    acq.seed_atoms = _water_like_atoms()
+    moved = _water_like_atoms()
+    moved[1].coordinates[0] += 0.1
+    acq.config = AcquisitionConfig(
+        movement_band=MovementBandConfig(metric="aligned_global_rmsd"),
+        movement_utility=MovementUtilityConfig(
+            progress_normalisation="active_weight_rmsd"
+        ),
+    )
+
+    _, weights = acq._movement_delta_and_weights(moved)
+
+    assert weights == pytest.approx(np.repeat(acq.seed_atoms.masses, 3))
+
+
+def test_unknown_progress_normalisation_fails_closed():
+    with pytest.raises(ValueError, match="unsupported movement progress"):
+        _vector_movement_metrics(1, progress_normalisation="unknown")

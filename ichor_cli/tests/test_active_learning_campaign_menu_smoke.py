@@ -1493,6 +1493,7 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
         for line in protocol_lines
     ), protocol_lines
     assert "sampling_protocol.geometry_scale_source: sampling-policy fallback preview" in out
+    assert "sampling_protocol.policy: version=3" in out
     assert "sampling_protocol.scale_model" in out
     assert "sampling_protocol.scale_model.geometry_motion_scale" in out
     assert "sampling_protocol.scale_model.aligned_rmsd_scale" in out
@@ -1500,6 +1501,8 @@ def test_in_memory_sampling_protocol_summary_contains_top_three_roi_knobs(capsys
     assert "sampling_protocol.scale_model.pair_reference" in out
     assert "sampling_protocol.dimensionless_landing_gates" in out
     assert "sampling_protocol.resolved_movement_band" in out
+    assert "sampling_protocol.resolved_movement_utility" in out
+    assert "progress_normalisation=active_weight_rmsd" in out
     assert "sampling_protocol.resolved_phase_b" in out
     assert "sampling_protocol.resolved_safety" in out
     assert "sampling_protocol.resolved_quality_gates" in out

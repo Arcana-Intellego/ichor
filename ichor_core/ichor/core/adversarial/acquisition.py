@@ -557,6 +557,13 @@ class SeedLocalAdversarialAcquisition:
             return float(aligned_mass_weighted_rmsd(self.seed_atoms, atoms)), "aligned_global_rmsd_fallback"
 
     def _movement_delta_and_weights(self, atoms: Atoms) -> Tuple[np.ndarray, np.ndarray]:
+        progress_normalisation = str(
+            getattr(
+                self.config.movement_utility,
+                "progress_normalisation",
+                "legacy_projected_displacement",
+            )
+        )
         if str(getattr(self.config.movement_band, "metric", "aligned_active_rmsd")) == "aligned_global_rmsd":
             from .geometry import aligned_mass_weighted_displacement
 
@@ -564,7 +571,12 @@ class SeedLocalAdversarialAcquisition:
             masses = np.asarray(self.seed_atoms.masses, dtype=float)
             masses = np.where(np.isfinite(masses) & (masses > 0.0), masses, 1.0)
             delta = disp.reshape(-1, 3) / np.sqrt(masses)[:, None]
-            return delta.reshape(-1), np.ones(delta.size, dtype=float)
+            weights = (
+                np.repeat(masses, 3)
+                if progress_normalisation == "active_weight_rmsd"
+                else np.ones(delta.size, dtype=float)
+            )
+            return delta.reshape(-1), weights
         try:
             return aligned_active_displacement(self.subspace, atoms)
         except Exception:
@@ -574,7 +586,12 @@ class SeedLocalAdversarialAcquisition:
             masses = np.asarray(self.seed_atoms.masses, dtype=float)
             masses = np.where(np.isfinite(masses) & (masses > 0.0), masses, 1.0)
             delta = disp.reshape(-1, 3) / np.sqrt(masses)[:, None]
-            return delta.reshape(-1), np.ones(delta.size, dtype=float)
+            weights = (
+                np.repeat(masses, 3)
+                if progress_normalisation == "active_weight_rmsd"
+                else np.ones(delta.size, dtype=float)
+            )
+            return delta.reshape(-1), weights
 
     def _base_value(self, atoms: Atoms) -> float:
         return float(self.components(atoms, include_movement=False).total)
@@ -660,6 +677,21 @@ class SeedLocalAdversarialAcquisition:
             source = "movement_direction_zero"
         else:
             progress = float(np.dot(weighted_delta, weighted_direction / direction_norm))
+        progress_normalisation = str(
+            getattr(cfg, "progress_normalisation", "legacy_projected_displacement")
+        )
+        if progress_normalisation == "active_weight_rmsd":
+            progress_denom = float(np.sqrt(np.sum(coord_weights) / 3.0))
+            if not np.isfinite(progress_denom) or progress_denom <= 0.0:
+                progress = 0.0
+                source = "movement_progress_normalisation_unavailable"
+            else:
+                progress /= progress_denom
+        elif progress_normalisation != "legacy_projected_displacement":
+            raise ValueError(
+                "unsupported movement progress normalisation: "
+                + progress_normalisation
+            )
 
         low_soft = max(float(cfg.low_softness_ang), 1.0e-12)
         high_soft = max(float(cfg.high_softness_ang), 1.0e-12)
@@ -685,6 +717,7 @@ class SeedLocalAdversarialAcquisition:
             "movement_band_score": float(band_score),
             "movement_progress_score": float(progress_score),
             "movement_direction_source": source,
+            "movement_progress_normalisation": progress_normalisation,
             "movement_band_scale_source": str(band.get("scale_source", "local_motion")),
             "geometry_novelty_scale_angstrom": (
                 None

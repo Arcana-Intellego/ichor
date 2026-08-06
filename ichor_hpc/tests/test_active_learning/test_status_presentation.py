@@ -723,6 +723,39 @@ def test_sampling_policy_details_are_verbose_only():
     ) in verbose
 
 
+def test_v3_sampling_policy_reports_calibrated_movement_utility():
+    payload = _active_ariadne_payload()
+    payload["_presentation_sampling_protocol"] = {
+        "sampling_aggressiveness": 9,
+        "policy_version": 3,
+        "target_motion_ratio": 3.32,
+        "initial_trust_multiplier": 2.22,
+        "movement_target_low_ratio": 0.85,
+        "movement_target_high_ratio": 1.15,
+        "lambda_move": 0.94,
+        "movement_band_fraction": 0.85,
+        "movement_progress_fraction": 0.15,
+        "movement_progress_normalisation": "active_weight_rmsd",
+        "under_move_retry_limit": 1,
+        "under_move_feedback_min_factor": 1.0,
+        "under_move_feedback_max_factor": 2.0,
+        "baseline_source": "normalised_ariadne_landing_history",
+    }
+
+    verbose = cli._format_status(
+        payload,
+        verbose=True,
+        campaign=Path("campaign"),
+        journal_events=[],
+    )
+
+    assert "preset policy: v3" in verbose
+    assert "preferred movement band: 0.85-1.15x target" in verbose
+    assert "movement utility: lambda=0.94, band/progress=0.85/0.15" in verbose
+    assert "movement progress: active_weight_rmsd" in verbose
+    assert "under-movement retry: limit=1, factor=1.0-2.0" in verbose
+
+
 def test_status_phase_policies_cover_every_campaign_phase():
     expected = {phase.value for phase in CampaignPhase}
 

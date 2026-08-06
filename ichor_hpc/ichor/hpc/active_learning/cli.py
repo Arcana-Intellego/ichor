@@ -3903,6 +3903,40 @@ def _format_status(
                     ),
                 ]
             )
+            if policy_version >= 3:
+                protocol_rows.extend(
+                    [
+                        (
+                            "preferred movement band",
+                            str(sampling_protocol.get("movement_target_low_ratio"))
+                            + "-"
+                            + str(sampling_protocol.get("movement_target_high_ratio"))
+                            + "x target",
+                        ),
+                        (
+                            "movement utility",
+                            "lambda="
+                            + str(sampling_protocol.get("lambda_move"))
+                            + ", band/progress="
+                            + str(sampling_protocol.get("movement_band_fraction"))
+                            + "/"
+                            + str(sampling_protocol.get("movement_progress_fraction")),
+                        ),
+                        (
+                            "movement progress",
+                            sampling_protocol.get("movement_progress_normalisation"),
+                        ),
+                        (
+                            "under-movement retry",
+                            "limit="
+                            + str(sampling_protocol.get("under_move_retry_limit"))
+                            + ", factor="
+                            + str(sampling_protocol.get("under_move_feedback_min_factor"))
+                            + "-"
+                            + str(sampling_protocol.get("under_move_feedback_max_factor")),
+                        ),
+                    ]
+                )
         else:
             protocol_rows.append(
                 (
@@ -8753,6 +8787,31 @@ def cmd_status(args: argparse.Namespace) -> int:
                     ),
                     "movement_trust_multiplier": policy.get(
                         "movement_trust_multiplier"
+                    ),
+                    "movement_target_low_ratio": policy.get(
+                        "movement_target_low_to_target"
+                    ),
+                    "movement_target_high_ratio": policy.get(
+                        "movement_target_high_to_target"
+                    ),
+                    "lambda_move": policy.get("lambda_move"),
+                    "movement_band_fraction": policy.get(
+                        "movement_band_fraction"
+                    ),
+                    "movement_progress_fraction": policy.get(
+                        "movement_progress_fraction"
+                    ),
+                    "movement_progress_normalisation": policy.get(
+                        "movement_progress_normalisation"
+                    ),
+                    "under_move_retry_limit": policy.get(
+                        "under_move_retry_limit"
+                    ),
+                    "under_move_feedback_min_factor": policy.get(
+                        "under_move_feedback_min_factor"
+                    ),
+                    "under_move_feedback_max_factor": policy.get(
+                        "under_move_feedback_max_factor"
                     ),
                     "baseline_source": dict(
                         scale_model.get("geometry_motion_scale") or {}
