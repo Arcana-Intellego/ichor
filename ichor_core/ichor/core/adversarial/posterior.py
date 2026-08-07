@@ -17,31 +17,59 @@ POSTERIOR_CACHE_MAX_SIZE = 4096
 _VARIANCE_CLIPPED_COUNT = 0
 
 
-def _solve_prepared_lower(factor: np.ndarray, right_hand_side: np.ndarray) -> np.ndarray:
-    """Solve a validated lower-triangular system for prepared batch work."""
-    lower = _check_finite_array(factor, "prepared model Cholesky factor")
-    rhs = _check_finite_array(right_hand_side, "prepared train-test covariance")
+def _validate_lower_cholesky(
+    factor: np.ndarray,
+    *,
+    expected_size: Optional[int] = None,
+    label: str = "model Cholesky factor",
+) -> np.ndarray:
+    lower = _check_finite_array(factor, label)
     if lower.ndim != 2 or lower.shape[0] != lower.shape[1]:
-        raise ValueError("prepared model Cholesky factor must be square")
-    if rhs.ndim != 2 or rhs.shape[0] != lower.shape[0]:
-        raise ValueError("prepared train-test covariance shape mismatch")
+        raise ValueError(label + " must be square")
+    if expected_size is not None and lower.shape != (expected_size, expected_size):
+        raise ValueError(
+            label
+            + " shape must be "
+            + repr((expected_size, expected_size))
+            + ", got "
+            + repr(lower.shape)
+        )
     upper_scale = max(1.0, float(np.max(np.abs(lower))))
     upper_tolerance = (
         np.finfo(float).eps * max(1, int(lower.shape[0])) * upper_scale * 16.0
     )
     if np.any(np.abs(np.triu(lower, k=1)) > upper_tolerance):
-        raise ValueError("prepared model Cholesky factor must be lower triangular")
-    diagonal = np.diag(lower)
-    if np.any(diagonal <= 0.0):
-        raise ValueError("prepared model Cholesky diagonal must be positive")
+        raise ValueError(label + " must be lower triangular")
+    if np.any(np.diag(lower) <= 0.0):
+        raise ValueError(label + " diagonal must be positive")
+    return lower
+
+
+def _solve_validated_lower(
+    factor: np.ndarray,
+    right_hand_side: np.ndarray,
+) -> np.ndarray:
+    """Solve with a factor already validated by the posterior runtime."""
     solved = solve_triangular(
-        lower,
-        rhs,
+        factor,
+        right_hand_side,
         lower=True,
         check_finite=False,
         overwrite_b=False,
     )
-    return _check_finite_array(solved, "prepared posterior projection")
+    return _check_finite_array(solved, "posterior projection")
+
+
+def _solve_prepared_lower(factor: np.ndarray, right_hand_side: np.ndarray) -> np.ndarray:
+    """Solve a validated lower-triangular system for prepared batch work."""
+    lower = _validate_lower_cholesky(
+        factor,
+        label="prepared model Cholesky factor",
+    )
+    rhs = _check_finite_array(right_hand_side, "prepared train-test covariance")
+    if rhs.ndim != 2 or rhs.shape[0] != lower.shape[0]:
+        raise ValueError("prepared train-test covariance shape mismatch")
+    return _solve_validated_lower(lower, rhs)
 
 
 
@@ -166,16 +194,10 @@ def _model_numeric_identity(model) -> Hashable:
 
 
 def _model_lower_cholesky(model) -> np.ndarray:
-    factor = _check_finite_array(model.lower_cholesky, "model Cholesky factor")
-    expected = (int(model.ntrain), int(model.ntrain))
-    if factor.shape != expected:
-        raise ValueError(
-            "model Cholesky factor shape must be "
-            + repr(expected)
-            + ", got "
-            + repr(factor.shape)
-        )
-    return factor
+    return _validate_lower_cholesky(
+        model.lower_cholesky,
+        expected_size=int(model.ntrain),
+    )
 
 
 def _estimated_signal_variance(model, *, lower_cholesky: Optional[np.ndarray] = None) -> float:
@@ -205,7 +227,7 @@ def _estimated_signal_variance(model, *, lower_cholesky: Optional[np.ndarray] = 
         if lower_cholesky is None
         else _check_finite_array(lower_cholesky, "model Cholesky factor")
     )
-    whitened = np.linalg.solve(factor, resid)
+    whitened = _solve_validated_lower(factor, resid)
     tau2 = float((whitened.T @ whitened).reshape(-1)[0] / max(model.ntrain, 1))
     if not np.isfinite(tau2) or tau2 <= 0.0:
         tau2 = 1.0
@@ -220,7 +242,7 @@ def _estimated_signal_variance_prepared(
     model,
     *,
     lower_cholesky: np.ndarray,
-) -> float:
+) -> Tuple[float, bool]:
     """Prepared-path signal scale using the validated triangular solver."""
     y_raw = getattr(model, "y")
     x_raw = getattr(model, "x")
@@ -234,11 +256,11 @@ def _estimated_signal_variance_prepared(
     )
     cached = getattr(model, "_ichor_al_signal_variance_cache", None)
     if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == cache_key:
-        return float(cached[1])
+        return float(cached[1]), True
     y = _check_finite_array(model.y, "model.y").reshape((-1, 1))
     x = _check_finite_array(model.x, "model.x")
     mean = _check_finite_array(model.mean.value(x), "model mean").reshape((-1, 1))
-    whitened = _solve_prepared_lower(lower_cholesky, y - mean)
+    whitened = _solve_validated_lower(lower_cholesky, y - mean)
     tau2 = float((whitened.T @ whitened).reshape(-1)[0] / max(model.ntrain, 1))
     if not np.isfinite(tau2) or tau2 <= 0.0:
         tau2 = 1.0
@@ -246,7 +268,7 @@ def _estimated_signal_variance_prepared(
         setattr(model, "_ichor_al_signal_variance_cache", (cache_key, float(tau2)))
     except Exception:
         pass
-    return tau2
+    return tau2, False
 
 
 
@@ -257,8 +279,8 @@ def model_posterior_covariance(model, x1: np.ndarray, x2: np.ndarray, scaled: bo
     r1 = _check_finite_array(model.r(x1), "train-test covariance")
     r2 = _check_finite_array(model.r(x2), "train-test covariance")
     factor = _model_lower_cholesky(model)
-    v1 = np.linalg.solve(factor, r1)
-    v2 = np.linalg.solve(factor, r2)
+    v1 = _solve_validated_lower(factor, r1)
+    v2 = v1 if x1.shape == x2.shape and np.array_equal(x1, x2) else _solve_validated_lower(factor, r2)
     posterior = k12 - v1.T @ v2
     posterior = 0.5 * (posterior + posterior.T) if x1.shape == x2.shape and np.array_equal(x1, x2) else posterior
     if scaled:
@@ -267,6 +289,145 @@ def model_posterior_covariance(model, x1: np.ndarray, x2: np.ndarray, scaled: bo
             lower_cholesky=factor,
         ) * posterior
     return _check_finite_array(posterior, "posterior covariance")
+
+
+@dataclass(frozen=True)
+class _PosteriorModelRuntime:
+    model: object
+    numeric_identity: Hashable
+    lower_cholesky: np.ndarray
+    prediction_weights: np.ndarray
+    signal_variance: float
+    initial_triangular_solves: int
+
+
+def _build_model_runtime(model) -> _PosteriorModelRuntime:
+    factor = _model_lower_cholesky(model)
+    raw_weights = getattr(model, "weights", None)
+    try:
+        weights = _check_finite_array(
+            raw_weights,
+            "model prediction weights",
+        )
+    except (TypeError, ValueError):
+        y = _check_finite_array(model.y, "model.y").reshape((-1, 1))
+        x = _check_finite_array(model.x, "model.x")
+        mean = _check_finite_array(
+            model.mean.value(x),
+            "model mean",
+        ).reshape((-1, 1))
+        lower_solution = _solve_validated_lower(factor, y - mean)
+        signal = float(
+            (lower_solution.T @ lower_solution).reshape(-1)[0]
+            / max(int(model.ntrain), 1)
+        )
+        if not np.isfinite(signal) or signal <= 0.0:
+            signal = 1.0
+        signal_cache_key = (
+            _model_numeric_identity(model),
+            id(getattr(model, "y")),
+            np.asarray(getattr(model, "y")).shape,
+            id(getattr(model, "x")),
+            np.asarray(getattr(model, "x")).shape,
+            int(getattr(model, "ntrain", 0)),
+        )
+        try:
+            setattr(
+                model,
+                "_ichor_al_signal_variance_cache",
+                (signal_cache_key, float(signal)),
+            )
+        except Exception:
+            pass
+        weights = solve_triangular(
+            factor,
+            lower_solution,
+            lower=True,
+            trans="T",
+            check_finite=False,
+            overwrite_b=False,
+        )
+        weights = _check_finite_array(weights, "model prediction weights")
+        initial_solves = 2
+    else:
+        signal, signal_cached = _estimated_signal_variance_prepared(
+            model,
+            lower_cholesky=factor,
+        )
+        initial_solves = 0 if signal_cached else 1
+    if not np.isfinite(signal) or signal <= 0.0:
+        raise ValueError("model posterior signal variance must be finite and positive")
+    if weights.ndim == 1:
+        weights = weights.reshape((-1, 1))
+    if weights.ndim != 2 or weights.shape[0] != int(model.ntrain):
+        raise ValueError("model prediction weights have an invalid shape")
+    return _PosteriorModelRuntime(
+        model=model,
+        numeric_identity=_model_numeric_identity(model),
+        lower_cholesky=factor,
+        prediction_weights=weights,
+        signal_variance=float(signal),
+        initial_triangular_solves=int(initial_solves),
+    )
+
+
+def _model_predictions_from_train_query(
+    model,
+    rows: np.ndarray,
+    train_query: np.ndarray,
+    prediction_weights: np.ndarray,
+) -> np.ndarray:
+    mean = _check_finite_array(
+        model.mean.value(rows),
+        "prepared model mean",
+    ).reshape(-1)
+    correction = np.asarray(train_query.T @ prediction_weights, dtype=float)
+    if correction.ndim == 1:
+        correction = correction.reshape((-1, 1))
+    if correction.shape[0] != rows.shape[0] or correction.shape[1] < 1:
+        raise ValueError("prepared model prediction shape mismatch")
+    return _check_finite_array(
+        mean + correction[:, -1],
+        "prepared model predictions",
+    )
+
+
+def _runtime_model_posterior_covariance(
+    runtime: _PosteriorModelRuntime,
+    x1: np.ndarray,
+    x2: np.ndarray,
+    *,
+    scaled: bool,
+) -> Tuple[np.ndarray, int]:
+    model = runtime.model
+    left = _ensure_2d(x1)
+    right = _ensure_2d(x2)
+    prior = _model_prior_covariance(model, left, right)
+    train_left = _check_finite_array(model.r(left), "train-test covariance")
+    same = left.shape == right.shape and np.array_equal(left, right)
+    train_right = (
+        train_left
+        if same
+        else _check_finite_array(model.r(right), "train-test covariance")
+    )
+    projected_left = _solve_validated_lower(
+        runtime.lower_cholesky,
+        train_left,
+    )
+    projected_right = (
+        projected_left
+        if same
+        else _solve_validated_lower(runtime.lower_cholesky, train_right)
+    )
+    posterior = prior - projected_left.T @ projected_right
+    if same:
+        posterior = 0.5 * (posterior + posterior.T)
+    if scaled:
+        posterior = float(runtime.signal_variance) * posterior
+    return (
+        _check_finite_array(posterior, "posterior covariance"),
+        1 if same else 2,
+    )
 
 
 class PreparedTotalEnergyPosteriorBatch:
@@ -287,6 +448,8 @@ class PreparedTotalEnergyPosteriorBatch:
         means: np.ndarray,
         variances: np.ndarray,
         signal_variances: Mapping[str, float],
+        atom_means: Optional[Mapping[str, np.ndarray]] = None,
+        atom_variances: Optional[Mapping[str, np.ndarray]] = None,
     ) -> None:
         ids = np.asarray(row_ids, dtype=np.int64).reshape(-1)
         if len(set(int(value) for value in ids)) != int(ids.size):
@@ -301,6 +464,17 @@ class PreparedTotalEnergyPosteriorBatch:
         self.variances = _check_variance_array(
             variances, "prepared posterior variances"
         ).reshape(-1)
+        self.atom_means = {
+            str(key): _check_finite_array(value, "prepared atom means").reshape(-1)
+            for key, value in (atom_means or {}).items()
+        }
+        self.atom_variances = {
+            str(key): _check_variance_array(
+                value, "prepared atom variances"
+            ).reshape(-1)
+            for key, value in (atom_variances or {}).items()
+        }
+        self.atom_moments_available = atom_means is not None and atom_variances is not None
         self.signal_variances = {
             str(key): float(value) for key, value in signal_variances.items()
         }
@@ -311,6 +485,14 @@ class PreparedTotalEnergyPosteriorBatch:
             set(self.features) != expected_atoms
             or set(self.projections) != expected_atoms
             or set(self.signal_variances) != expected_atoms
+            or (
+                self.atom_moments_available
+                and set(self.atom_means) != expected_atoms
+            )
+            or (
+                self.atom_moments_available
+                and set(self.atom_variances) != expected_atoms
+            )
         ):
             raise ValueError("prepared posterior atom coverage mismatch")
         for atom, model in posterior._property_models.items():
@@ -327,6 +509,14 @@ class PreparedTotalEnergyPosteriorBatch:
             if self.projections[str(atom)].shape != projection_shape:
                 raise ValueError(
                     "prepared posterior projection shape mismatch for atom "
+                    + str(atom)
+                )
+            if self.atom_moments_available and (
+                self.atom_means[str(atom)].shape != ids.shape
+                or self.atom_variances[str(atom)].shape != ids.shape
+            ):
+                raise ValueError(
+                    "prepared posterior atom-moment count mismatch for atom "
                     + str(atom)
                 )
             signal = float(self.signal_variances[str(atom)])
@@ -355,6 +545,28 @@ class PreparedTotalEnergyPosteriorBatch:
         positions = self._row_positions(row_ids)
         return _check_finite_array(
             self.means[positions], "prepared indexed means"
+        )
+
+    def atom_moments_by_index(
+        self,
+        row_ids: Sequence[int],
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+        if not self.atom_moments_available:
+            raise ValueError("prepared posterior atom moments are unavailable")
+        positions = self._row_positions(row_ids)
+        return (
+            {
+                atom: _check_finite_array(
+                    values[positions], "prepared indexed atom means"
+                )
+                for atom, values in self.atom_means.items()
+            },
+            {
+                atom: _check_variance_array(
+                    values[positions], "prepared indexed atom variances"
+                )
+                for atom, values in self.atom_variances.items()
+            },
         )
 
     def cross_covariances_by_index(
@@ -419,6 +631,10 @@ class TotalEnergyPosterior:
                 for model in property_models
             )
         )
+        self._model_runtimes: Dict[str, _PosteriorModelRuntime] = {
+            str(model.atom): _build_model_runtime(model)
+            for model in property_models
+        }
         self._mean_cache: "OrderedDict[Tuple[object, Tuple[float, ...]], float]" = OrderedDict()
         self._cov_cache: "OrderedDict[Tuple[object, Tuple[float, ...], Tuple[float, ...]], float]" = OrderedDict()
         self.diagnostics = {
@@ -430,6 +646,17 @@ class TotalEnergyPosterior:
             "n_covariance_matrix_scalar_fallbacks": 0,
             "n_prepared_batches": 0,
             "n_prepared_projection_solves": 0,
+            "n_runtime_context_builds": len(self._model_runtimes),
+            "n_factor_validations": len(self._model_runtimes),
+            "n_triangular_solves": sum(
+                runtime.initial_triangular_solves
+                for runtime in self._model_runtimes.values()
+            ),
+            "n_train_query_builds": 0,
+            "n_prepared_component_batches": 0,
+            "n_scalar_fallbacks": 0,
+            "n_alf_batch_calls": 0,
+            "n_alf_scalar_fallbacks": 0,
         }
 
     def _normalise_feature_arrays(
@@ -488,6 +715,8 @@ class TotalEnergyPosterior:
             raise ValueError("prepared posterior row ID count mismatch")
         total_means = np.zeros(n_rows, dtype=float)
         total_variances = np.zeros(n_rows, dtype=float)
+        atom_means: Dict[str, np.ndarray] = {}
+        atom_variances: Dict[str, np.ndarray] = {}
         projections: Dict[str, np.ndarray] = {}
         signal_variances: Dict[str, float] = {}
         total_projection_bytes = sum(
@@ -531,29 +760,17 @@ class TotalEnergyPosterior:
 
         for atom_position, (atom, model) in enumerate(self._property_models.items()):
             rows = features[str(atom)]
-            predictions = _check_finite_array(
-                model.predict(rows), "prepared model predictions"
-            ).reshape(-1)
-            if predictions.shape != (n_rows,):
-                raise ValueError(
-                    "prepared model prediction count mismatch for atom " + str(atom)
-                )
-            total_means += predictions
+            can_reuse_train_query = hasattr(model, "mean")
             prior_diagonal = _model_prior_diagonal(model, rows)
             if prior_diagonal.shape != (n_rows,):
                 raise ValueError(
                     "prepared kernel diagonal count mismatch for atom " + str(atom)
                 )
             expected = (int(model.ntrain), n_rows)
-            factor = _model_lower_cholesky(model)
-            signal = (
-                _estimated_signal_variance_prepared(
-                    model,
-                    lower_cholesky=factor,
-                )
-                if self.scaled
-                else 1.0
-            )
+            runtime = self._model_runtimes[str(atom)]
+            factor = runtime.lower_cholesky
+            signal = runtime.signal_variance if self.scaled else 1.0
+            predictions = np.empty(n_rows, dtype=float)
             if use_disk:
                 assert projection_root is not None
                 projection_path = (
@@ -603,6 +820,11 @@ class TotalEnergyPosterior:
                         * projection[:, :completed_columns],
                         axis=0,
                     )
+                    predictions[:completed_columns] = _check_finite_array(
+                        model.predict(rows[:completed_columns]),
+                        "prepared resumed model predictions",
+                    ).reshape(-1)
+                    self._diagnostic_add("n_scalar_fallbacks")
                 for start in range(completed_columns, n_rows, column_chunk):
                     stop = min(n_rows, start + column_chunk)
                     train_query = _check_finite_array(
@@ -617,8 +839,23 @@ class TotalEnergyPosterior:
                             + " must be "
                             + repr(expected_chunk)
                         )
-                    solved = _solve_prepared_lower(factor, train_query)
+                    self._diagnostic_add("n_train_query_builds")
+                    if can_reuse_train_query:
+                        predictions[start:stop] = _model_predictions_from_train_query(
+                            model,
+                            rows[start:stop],
+                            train_query,
+                            runtime.prediction_weights,
+                        )
+                    else:
+                        predictions[start:stop] = _check_finite_array(
+                            model.predict(rows[start:stop]),
+                            "prepared model predictions",
+                        ).reshape(-1)
+                        self._diagnostic_add("n_scalar_fallbacks")
+                    solved = _solve_validated_lower(factor, train_query)
                     self._diagnostic_add("n_prepared_projection_solves")
+                    self._diagnostic_add("n_triangular_solves")
                     projection[:, start:stop] = solved
                     squared_norms[start:stop] = np.sum(solved * solved, axis=0)
                     projection.flush()
@@ -638,11 +875,37 @@ class TotalEnergyPosterior:
                         + " must be "
                         + repr(expected)
                     )
-                projection = _solve_prepared_lower(factor, train_query)
+                self._diagnostic_add("n_train_query_builds")
+                if can_reuse_train_query:
+                    predictions = _model_predictions_from_train_query(
+                        model,
+                        rows,
+                        train_query,
+                        runtime.prediction_weights,
+                    )
+                else:
+                    predictions = _check_finite_array(
+                        model.predict(rows),
+                        "prepared model predictions",
+                    ).reshape(-1)
+                    self._diagnostic_add("n_scalar_fallbacks")
+                projection = _solve_validated_lower(factor, train_query)
                 self._diagnostic_add("n_prepared_projection_solves")
+                self._diagnostic_add("n_triangular_solves")
                 squared_norms = np.sum(projection * projection, axis=0)
             atom_variance = signal * (prior_diagonal - squared_norms)
+            atom_variance = _check_variance_array(
+                atom_variance,
+                "prepared atom variances for " + str(atom),
+            )
+            if predictions.shape != (n_rows,):
+                raise ValueError(
+                    "prepared model prediction count mismatch for atom " + str(atom)
+                )
+            total_means += predictions
             total_variances += atom_variance
+            atom_means[str(atom)] = predictions
+            atom_variances[str(atom)] = atom_variance
             projections[str(atom)] = projection
             signal_variances[str(atom)] = float(signal)
         self._diagnostic_add("n_prepared_batches")
@@ -653,6 +916,8 @@ class TotalEnergyPosterior:
             projections=projections,
             means=total_means,
             variances=total_variances,
+            atom_means=atom_means,
+            atom_variances=atom_variances,
             signal_variances=signal_variances,
         )
 
@@ -662,11 +927,22 @@ class TotalEnergyPosterior:
         *,
         row_ids: Optional[Sequence[int]] = None,
     ) -> PreparedTotalEnergyPosteriorBatch:
-        features = [self._features(point) for point in points]
-        arrays = {
-            atom: self._stack_feature_rows(features, atom)
-            for atom in self._property_models
-        }
+        batch_features = getattr(self.models, "get_features_batch", None)
+        arrays = None
+        if callable(batch_features) and all(isinstance(point, Atoms) for point in points):
+            try:
+                arrays = batch_features(list(points))
+            except (NotImplementedError, TypeError):
+                arrays = None
+            else:
+                self._diagnostic_add("n_alf_batch_calls")
+        if arrays is None:
+            self._diagnostic_add("n_alf_scalar_fallbacks")
+            features = [self._features(point) for point in points]
+            arrays = {
+                atom: self._stack_feature_rows(features, atom)
+                for atom in self._property_models
+            }
         return self.prepare_feature_batch(arrays, row_ids=row_ids)
 
     def variances_from_feature_arrays(
@@ -804,8 +1080,15 @@ class TotalEnergyPosterior:
         features1 = self._features(x1)
         features2 = self._features(x2)
         total = 0.0
-        for atom, model in self._property_models.items():
-            total += float(model_posterior_covariance(model, features1[atom], features2[atom], scaled=self.scaled)[0, 0])
+        for atom in self._property_models:
+            covariance, solves = _runtime_model_posterior_covariance(
+                self._model_runtimes[str(atom)],
+                features1[atom],
+                features2[atom],
+                scaled=self.scaled,
+            )
+            self._diagnostic_add("n_triangular_solves", solves)
+            total += float(covariance[0, 0])
         self._cache_set(self._cov_cache, cache_key, total)
         return total
 
@@ -824,15 +1107,15 @@ class TotalEnergyPosterior:
         features = self._features(x)
         per_atom: Dict[str, float] = {}
         total = 0.0
-        for atom, model in self._property_models.items():
-            value = float(
-                model_posterior_covariance(
-                    model,
-                    features[atom],
-                    features[atom],
-                    scaled=self.scaled,
-                )[0, 0]
+        for atom in self._property_models:
+            covariance, solves = _runtime_model_posterior_covariance(
+                self._model_runtimes[str(atom)],
+                features[atom],
+                features[atom],
+                scaled=self.scaled,
             )
+            self._diagnostic_add("n_triangular_solves", solves)
+            value = float(covariance[0, 0])
             per_atom[str(atom)] = value
             total += value
         return (
@@ -864,14 +1147,14 @@ class TotalEnergyPosterior:
             prediction = float(
                 np.asarray(model.predict(features[atom]), dtype=float).reshape(-1)[0]
             )
-            variance = float(
-                model_posterior_covariance(
-                    model,
-                    features[atom],
-                    features[atom],
-                    scaled=self.scaled,
-                )[0, 0]
+            covariance, solves = _runtime_model_posterior_covariance(
+                self._model_runtimes[str(atom)],
+                features[atom],
+                features[atom],
+                scaled=self.scaled,
             )
+            self._diagnostic_add("n_triangular_solves", solves)
+            variance = float(covariance[0, 0])
             _check_finite_array([prediction], "atom prediction")
             _check_variance_array([variance], "atom posterior variance")
             out[str(atom)] = {
@@ -922,14 +1205,13 @@ class TotalEnergyPosterior:
                     f"kernel diagonal shape for atom {atom} must be {(n,)}, got {k_diag.shape}"
                 )
             r = _check_finite_array(model.r(X), "train-test covariance")
-            factor = _model_lower_cholesky(model)
-            v = np.linalg.solve(factor, r)
+            runtime = self._model_runtimes[str(atom)]
+            v = _solve_validated_lower(runtime.lower_cholesky, r)
+            self._diagnostic_add("n_train_query_builds")
+            self._diagnostic_add("n_triangular_solves")
             diag = k_diag - np.sum(v * v, axis=0)
             if self.scaled:
-                diag = _estimated_signal_variance(
-                    model,
-                    lower_cholesky=factor,
-                ) * diag
+                diag = runtime.signal_variance * diag
             total = total + diag
         return _check_variance_array(total, "posterior variances")
 
@@ -972,8 +1254,10 @@ class TotalEnergyPosterior:
                     f"train-test covariance shape for atom {atom} must be "
                     f"{expected_r_shape}, got {r.shape}"
                 )
-            factor = _model_lower_cholesky(model)
-            v = np.linalg.solve(factor, r)
+            runtime = self._model_runtimes[str(atom)]
+            v = _solve_validated_lower(runtime.lower_cholesky, r)
+            self._diagnostic_add("n_train_query_builds")
+            self._diagnostic_add("n_triangular_solves")
             if v.shape != expected_r_shape:
                 raise ValueError(
                     f"posterior solve shape for atom {atom} must be "
@@ -985,10 +1269,7 @@ class TotalEnergyPosterior:
                     f"posterior covariance shape for atom {atom} must be {(n, n)}, got {atom_cov.shape}"
                 )
             if self.scaled:
-                atom_cov = _estimated_signal_variance(
-                    model,
-                    lower_cholesky=factor,
-                ) * atom_cov
+                atom_cov = runtime.signal_variance * atom_cov
             total_cov += atom_cov
         total_cov = 0.5 * (total_cov + total_cov.T)
         return _check_finite_array(total_cov, "posterior covariance matrix")
@@ -1073,15 +1354,21 @@ class TotalEnergyPosterior:
                     f"{r_left.shape}/{r_right.shape} != "
                     f"{expected_left}/{expected_right}"
                 )
-            factor = _model_lower_cholesky(model)
-            solved_left = np.linalg.solve(factor, r_left)
-            solved_right = np.linalg.solve(factor, r_right)
+            runtime = self._model_runtimes[str(atom)]
+            solved_left = _solve_validated_lower(runtime.lower_cholesky, r_left)
+            same_features = (
+                x_left.shape == x_right.shape and np.array_equal(x_left, x_right)
+            )
+            solved_right = (
+                solved_left
+                if same_features
+                else _solve_validated_lower(runtime.lower_cholesky, r_right)
+            )
+            self._diagnostic_add("n_train_query_builds", 1 if same_features else 2)
+            self._diagnostic_add("n_triangular_solves", 1 if same_features else 2)
             atom_covariance = prior - solved_left.T @ solved_right
             if self.scaled:
-                atom_covariance = _estimated_signal_variance(
-                    model,
-                    lower_cholesky=factor,
-                ) * atom_covariance
+                atom_covariance = runtime.signal_variance * atom_covariance
             total += atom_covariance
         return _check_finite_array(total, "posterior cross-covariances")
 

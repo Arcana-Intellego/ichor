@@ -1,7 +1,10 @@
 import numpy as np
 import pytest
 from ichor.core.atoms import ALF, Atom, Atoms
-from ichor.core.calculators import calculate_alf_features
+from ichor.core.calculators import (
+    calculate_alf_features,
+    calculate_alf_features_batch,
+)
 from ichor.core.calculators.features import alf_features_calculator as alf_mod
 
 
@@ -166,3 +169,53 @@ def test_alf_zero_bond_denominator_rejects_cleanly():
 
     with pytest.raises(ValueError, match="x-axis atom is coincident"):
         alf_mod.calculate_alf_features(atoms[0], ALF(0, 1, 2))
+
+
+def test_batched_alf_features_match_scalar_order_and_values():
+    atoms = Atoms(
+        [
+            Atom("O", -2.1180124028, 2.6912012640, 0.0151569307),
+            Atom("H", -1.1501254774, 2.7214377667, -0.0200801898),
+            Atom("H", -2.3968615982, 3.2955257987, -0.6891128927),
+            Atom("O", -3.1000000000, 4.1000000000, 1.2000000000),
+            Atom("H", -3.7000000000, 4.5000000000, 1.6000000000),
+            Atom("H", -2.7000000000, 4.8000000000, 0.8000000000),
+        ]
+    )
+    alfs = {
+        "O1": [0, 1, 2],
+        "H2": [1, 0, 2],
+        "H3": [2, 0, 1],
+        "O4": [3, 4, 5],
+        "H5": [4, 3, 5],
+        "H6": [5, 3, 4],
+    }
+    first = np.asarray(atoms.coordinates, dtype=float)
+    second = first.copy()
+    second[2] += np.array([0.013, -0.021, 0.008])
+    second[4] += np.array([-0.017, 0.004, 0.019])
+
+    observed = calculate_alf_features_batch(
+        np.stack([first, second]),
+        [atom.name for atom in atoms],
+        alfs,
+    )
+
+    for row, coordinates in enumerate((first, second)):
+        geometry = Atoms(
+            [
+                Atom(atom.type, *coordinates[index])
+                for index, atom in enumerate(atoms)
+            ]
+        )
+        for atom in geometry:
+            expected = atom.features(
+                calculate_alf_features,
+                ALF(*alfs[atom.name]),
+            )
+            np.testing.assert_allclose(
+                observed[atom.name][row],
+                expected,
+                rtol=1.0e-13,
+                atol=1.0e-13,
+            )

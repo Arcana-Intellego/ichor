@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 import math
 from typing import Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
@@ -27,6 +28,7 @@ from .stencils import (
 )
 from .subspace import (
     LocalSubspace,
+    PreparedSubspaceGeometry,
     aligned_active_displacement,
     aligned_active_rmsd,
     active_participation_weights,
@@ -35,6 +37,7 @@ from .subspace import (
     directional_step_sizes,
     fullspace_residual_distance,
     local_neighbour_residual_scale,
+    prepare_subspace_geometry,
     whitened_distance_squared,
 )
 
@@ -277,6 +280,22 @@ class SeedLocalAdversarialAcquisition:
                 scaled=True,
             )
         )
+        self._component_cache: "OrderedDict[Tuple[object, ...], AcquisitionBreakdown]" = OrderedDict()
+        self._geometry_cache: "OrderedDict[bytes, PreparedSubspaceGeometry]" = OrderedDict()
+        self._atom_diagnostic_cache: "OrderedDict[bytes, Dict[str, Dict[str, float]]]" = OrderedDict()
+        self._prepared_component_overrides: Dict[
+            bytes,
+            Tuple[float, float, Optional[Dict[str, float]], Tuple[ModeEvaluation, ...]],
+        ] = {}
+        self.performance_diagnostics: Dict[str, int] = {
+            "n_prepared_component_batches": 0,
+            "n_prepared_component_centres": 0,
+            "n_component_cache_hits": 0,
+            "n_component_cache_misses": 0,
+            "n_atom_diagnostic_cache_hits": 0,
+            "n_atom_diagnostic_cache_misses": 0,
+            "n_scalar_component_fallbacks": 0,
+        }
         self._reference_progress = reference_progress
         self._use_prepared_reference_stencils = bool(
             use_prepared_reference_stencils
@@ -304,6 +323,18 @@ class SeedLocalAdversarialAcquisition:
         if not neighbours:
             raise ValueError("No local neighbours could be selected around the seed geometry.")
         self.subspace = build_local_subspace(self.seed_atoms, neighbours, self.config.subspace)
+        eig_max = (
+            float(np.max(np.diag(self.subspace.active_covariance)))
+            if self.subspace.dimension
+            else 1.0
+        )
+        regularization = float(
+            self.config.subspace.covariance_regularization
+        ) * max(eig_max, 1.0e-12)
+        self._whitened_metric = np.linalg.inv(
+            self.subspace.active_covariance
+            + regularization * np.eye(self.subspace.dimension)
+        )
         self.mode_directions = self.subspace.cartesian_directions
         self.mode_steps = directional_step_sizes(
             self.subspace,
@@ -334,6 +365,113 @@ class SeedLocalAdversarialAcquisition:
             self.reference_scales = dict(external_reference_scales)
         else:
             self.reference_scales = self._build_reference_scales()
+
+    @staticmethod
+    def _coordinate_key(atoms: Atoms) -> bytes:
+        coordinates = np.ascontiguousarray(atoms.coordinates, dtype=np.float64)
+        return coordinates.tobytes(order="C")
+
+    def _component_cache_key(
+        self,
+        atoms: Atoms,
+        *,
+        include_movement: bool,
+        objective: str,
+    ) -> Tuple[object, ...]:
+        tuned_steps = getattr(self, "tuned_mode_steps", None)
+        steps = tuned_steps if tuned_steps is not None else getattr(
+            self, "mode_steps", ()
+        )
+        return (
+            self._coordinate_key(atoms),
+            bool(include_movement),
+            str(objective),
+            np.ascontiguousarray(steps, dtype=np.float64).tobytes(order="C"),
+        )
+
+    def _cache_component(
+        self,
+        key: Tuple[object, ...],
+        value: AcquisitionBreakdown,
+    ) -> None:
+        cache = getattr(self, "_component_cache", None)
+        if not isinstance(cache, OrderedDict):
+            cache = OrderedDict()
+            self._component_cache = cache
+        if key in cache:
+            cache.pop(key)
+        cache[key] = value
+        while len(cache) > 512:
+            cache.popitem(last=False)
+
+    def _performance_add(self, key: str, amount: int = 1) -> None:
+        diagnostics = getattr(self, "performance_diagnostics", None)
+        if not isinstance(diagnostics, dict):
+            diagnostics = {}
+            self.performance_diagnostics = diagnostics
+        diagnostics[key] = int(diagnostics.get(key, 0)) + int(amount)
+
+    def _geometry_context(self, atoms: Atoms) -> PreparedSubspaceGeometry:
+        key = self._coordinate_key(atoms)
+        cache = getattr(self, "_geometry_cache", None)
+        if not isinstance(cache, OrderedDict):
+            cache = OrderedDict()
+            self._geometry_cache = cache
+        cached = cache.get(key)
+        if cached is not None:
+            cache.move_to_end(key)
+            return cached
+        prepared = prepare_subspace_geometry(
+            self.subspace,
+            atoms,
+            regularization=self.config.subspace.covariance_regularization,
+            whitened_metric=self._whitened_metric,
+        )
+        cache[key] = prepared
+        while len(cache) > 512:
+            cache.popitem(last=False)
+        return prepared
+
+    def _cache_atom_diagnostics(
+        self,
+        key: bytes,
+        atom_means: Mapping[str, float],
+        atom_variances: Mapping[str, float],
+        atoms: Atoms,
+    ) -> None:
+        cache = getattr(self, "_atom_diagnostic_cache", None)
+        if not isinstance(cache, OrderedDict):
+            cache = OrderedDict()
+            self._atom_diagnostic_cache = cache
+        atom_types = {str(atom.name): str(atom.type) for atom in atoms}
+        diagnostics = {
+            str(atom): {
+                "predicted_iqa_ha": float(atom_means[str(atom)]),
+                "raw_variance": float(atom_variances[str(atom)]),
+                "atom_type": atom_types[str(atom)],
+            }
+            for atom in atom_means
+        }
+        if key in cache:
+            cache.pop(key)
+        cache[key] = diagnostics
+        while len(cache) > 512:
+            cache.popitem(last=False)
+
+    def atom_diagnostics(self, atoms: Atoms) -> Dict[str, Dict[str, float]]:
+        """Return per-atom moments, reusing a prepared component batch."""
+        key = self._coordinate_key(atoms)
+        cache = getattr(self, "_atom_diagnostic_cache", None)
+        if isinstance(cache, OrderedDict):
+            cached = cache.get(key)
+            if cached is not None:
+                cache.move_to_end(key)
+                self._performance_add("n_atom_diagnostic_cache_hits")
+                return {
+                    atom: dict(values) for atom, values in cached.items()
+                }
+        self._performance_add("n_atom_diagnostic_cache_misses")
+        return self.posterior.atom_diagnostics(atoms)
 
     @property
     def subspace_frame_ids(self):
@@ -381,6 +519,26 @@ class SeedLocalAdversarialAcquisition:
             )
         except Exception:
             return float(max(self.config.references.floor, minimum))
+
+    def _residual_reference_scale(self) -> float:
+        configured = self.reference_scales.get("residual")
+        try:
+            value = float(configured)
+        except (TypeError, ValueError):
+            value = math.nan
+        if np.isfinite(value) and value > 0.0:
+            return float(
+                max(
+                    value,
+                    float(
+                        self.config.fullspace_confinement.min_residual_scale_ang
+                    ),
+                )
+            )
+        return self._reference_scale(
+            "residual",
+            self._configured_residual_scale(),
+        )
 
     def _band_parameters(self) -> Tuple[Optional[Tuple[float, float, float, float]], Tuple[str, ...]]:
         cfg = self.config.calibrated_energy
@@ -438,12 +596,10 @@ class SeedLocalAdversarialAcquisition:
             "fallback_reasons": [],
         }
         try:
-            residual = float(fullspace_residual_distance(self.subspace, atoms))
-            residual_scale = self._reference_scale(
-                "residual",
-                self._configured_residual_scale(),
-            )
-            rmsd = float(aligned_mass_weighted_rmsd(self.seed_atoms, atoms))
+            prepared = self._geometry_context(atoms)
+            residual = float(prepared.residual_distance)
+            residual_scale = self._residual_reference_scale()
+            rmsd = float(prepared.global_rmsd)
             rmsd_scale = self._reference_scale(
                 "rmsd",
                 float(cfg.rmsd_scale_ang),
@@ -549,9 +705,17 @@ class SeedLocalAdversarialAcquisition:
 
     def movement_distance(self, atoms: Atoms) -> Tuple[float, str]:
         metric = str(getattr(self.config.movement_band, "metric", "aligned_active_rmsd"))
+        try:
+            prepared = self._geometry_context(atoms)
+        except Exception:
+            prepared = None
         if metric == "aligned_global_rmsd":
+            if prepared is not None:
+                return float(prepared.global_rmsd), metric
             return float(aligned_mass_weighted_rmsd(self.seed_atoms, atoms)), metric
         try:
+            if prepared is not None:
+                return float(prepared.active_rmsd), metric
             return float(aligned_active_rmsd(self.subspace, atoms)), metric
         except Exception:
             return float(aligned_mass_weighted_rmsd(self.seed_atoms, atoms)), "aligned_global_rmsd_fallback"
@@ -564,7 +728,22 @@ class SeedLocalAdversarialAcquisition:
                 "legacy_projected_displacement",
             )
         )
+        try:
+            prepared = self._geometry_context(atoms)
+        except Exception:
+            prepared = None
         if str(getattr(self.config.movement_band, "metric", "aligned_active_rmsd")) == "aligned_global_rmsd":
+            if prepared is not None:
+                masses = np.asarray(self.seed_atoms.masses, dtype=float)
+                masses = np.where(
+                    np.isfinite(masses) & (masses > 0.0), masses, 1.0
+                )
+                weights = (
+                    np.repeat(masses, 3)
+                    if progress_normalisation == "active_weight_rmsd"
+                    else np.ones(prepared.coordinate_displacement.size, dtype=float)
+                )
+                return prepared.coordinate_displacement.copy(), weights
             from .geometry import aligned_mass_weighted_displacement
 
             disp = aligned_mass_weighted_displacement(self.seed_atoms, atoms)
@@ -578,6 +757,11 @@ class SeedLocalAdversarialAcquisition:
             )
             return delta.reshape(-1), weights
         try:
+            if prepared is not None:
+                return (
+                    prepared.coordinate_displacement.copy(),
+                    prepared.active_coordinate_weights.copy(),
+                )
             return aligned_active_displacement(self.subspace, atoms)
         except Exception:
             from .geometry import aligned_mass_weighted_displacement
@@ -699,7 +883,10 @@ class SeedLocalAdversarialAcquisition:
         progress_score = float(np.tanh(progress / max(band["low"], 1.0e-12)))
         raw = float(cfg.band_fraction) * float(band_score) + float(cfg.progress_fraction) * float(progress_score)
         score = float(cfg.lambda_move) * raw if bool(cfg.enabled) and bool(band_cfg.enabled) else 0.0
-        atom_weights = active_participation_weights(self.subspace)
+        try:
+            atom_weights = self._geometry_context(atoms).active_participation
+        except Exception:
+            atom_weights = active_participation_weights(self.subspace)
         denom = float(np.sum(np.square(atom_weights)))
         n_eff = None
         if np.isfinite(denom) and denom > 0.0:
@@ -944,31 +1131,6 @@ class SeedLocalAdversarialAcquisition:
         progress_context: Optional[Mapping[str, object]] = None,
     ):
         """Prepare unique geometries once, then evaluate independent 5x5 blocks."""
-        unique_points = []
-        positions = {}
-        mode_records = []
-        for direction, step in zip(self.mode_directions, steps):
-            step_f = float(step)
-            _, points = directional_stencil_points(
-                atoms,
-                direction,
-                step_f,
-            )
-            row_ids = []
-            for point in points:
-                key = np.ascontiguousarray(
-                    point.coordinates,
-                    dtype=np.float64,
-                ).tobytes(order="C")
-                row_id = positions.get(key)
-                if row_id is None:
-                    row_id = len(unique_points)
-                    positions[key] = row_id
-                    unique_points.append(point)
-                row_ids.append(int(row_id))
-            mode_records.append((step_f, points, tuple(row_ids)))
-        if not unique_points:
-            return tuple(), float(self.posterior.variance(atoms))
         progress = getattr(self, "_reference_progress", None)
         if progress is not None and progress_context is not None:
             progress(
@@ -977,24 +1139,133 @@ class SeedLocalAdversarialAcquisition:
                     **dict(progress_context),
                 }
             )
+        values = self._prepare_component_values([atoms], steps)
+        key = self._coordinate_key(atoms)
+        mean, energy_variance, atom_variances, evaluations = values[key]
+        return evaluations, energy_variance
+
+    def _prepare_component_values(
+        self,
+        centres: Sequence[Atoms],
+        steps: Sequence[float],
+    ) -> Dict[
+        bytes,
+        Tuple[float, float, Optional[Dict[str, float]], Tuple[ModeEvaluation, ...]],
+    ]:
+        """Evaluate all mode stencils for one or more centres in one GP batch."""
+        unique_points = []
+        positions = {}
+        centre_records = []
+        for centre in centres:
+            mode_records = []
+            for direction, step in zip(self.mode_directions, steps):
+                step_f = float(step)
+                _, points = directional_stencil_points(
+                    centre,
+                    direction,
+                    step_f,
+                )
+                row_ids = []
+                for point in points:
+                    key = self._coordinate_key(point)
+                    row_id = positions.get(key)
+                    if row_id is None:
+                        row_id = len(unique_points)
+                        positions[key] = row_id
+                        unique_points.append(point)
+                    row_ids.append(int(row_id))
+                mode_records.append((step_f, points, tuple(row_ids)))
+            centre_records.append(
+                (centre, self._coordinate_key(centre), mode_records)
+            )
+        if not unique_points:
+            return {}
         prepared = self.posterior.prepare_points(
             unique_points,
             row_ids=np.arange(len(unique_points), dtype=np.int64),
         )
-        evaluations = []
-        for index, (step_f, points, row_ids) in enumerate(mode_records):
-            bundle = directional_stencils_from_prepared(
-                prepared,
-                row_ids=row_ids,
-                points=points,
-                step=step_f,
+        self.posterior._diagnostic_add("n_prepared_component_batches")
+        self._performance_add("n_prepared_component_batches")
+        self._performance_add("n_prepared_component_centres", len(centre_records))
+        output = {}
+        for centre, centre_key, mode_records in centre_records:
+            evaluations = []
+            for index, (step_f, points, row_ids) in enumerate(mode_records):
+                bundle = directional_stencils_from_prepared(
+                    prepared,
+                    row_ids=row_ids,
+                    points=points,
+                    step=step_f,
+                )
+                evaluations.append(self._mode_evaluation(index, step_f, bundle))
+            centre_row = int(mode_records[0][2][2])
+            mean_energy = float(prepared.means_by_index([centre_row])[0])
+            energy_variance = float(
+                prepared.variances_by_index([centre_row])[0]
             )
-            evaluations.append(self._mode_evaluation(index, step_f, bundle))
-        centre_row = int(mode_records[0][2][2])
-        energy_variance = float(
-            prepared.variances_by_index([centre_row])[0]
+            atom_mean_arrays, atom_variance_arrays = prepared.atom_moments_by_index(
+                [centre_row]
+            )
+            atom_means = {
+                atom: float(values[0])
+                for atom, values in atom_mean_arrays.items()
+            }
+            atom_variances = {
+                atom: float(values[0])
+                for atom, values in atom_variance_arrays.items()
+            }
+            self._cache_atom_diagnostics(
+                centre_key,
+                atom_means,
+                atom_variances,
+                centre,
+            )
+            output[centre_key] = (
+                mean_energy,
+                energy_variance,
+                atom_variances,
+                tuple(evaluations),
+            )
+        return output
+
+    def components_many(
+        self,
+        centres: Sequence[Atoms],
+        *,
+        include_movement: bool = True,
+        objective: str = "full",
+    ) -> Tuple[AcquisitionBreakdown, ...]:
+        """Evaluate several live acquisition centres in one posterior batch."""
+        points = tuple(centres)
+        if not points:
+            return tuple()
+        if self.tuned_mode_steps is None and bool(
+            getattr(self.config.stencils, "autotune_from_cubic", False)
+        ):
+            self.components(
+                points[0],
+                include_movement=include_movement,
+                objective=objective,
+            )
+        steps = (
+            self.tuned_mode_steps
+            if self.tuned_mode_steps is not None
+            else self.mode_steps
         )
-        return tuple(evaluations), energy_variance
+        overrides = self._prepare_component_values(points, steps)
+        previous = self._prepared_component_overrides
+        self._prepared_component_overrides = overrides
+        try:
+            return tuple(
+                self.components(
+                    point,
+                    include_movement=include_movement,
+                    objective=objective,
+                )
+                for point in points
+            )
+        finally:
+            self._prepared_component_overrides = previous
 
     def _reference_mode_metrics(
         self,
@@ -1213,13 +1484,68 @@ class SeedLocalAdversarialAcquisition:
         objective = str(objective or "full")
         if objective != "full":
             raise ValueError("the mature full acquisition is the only objective")
-        mean_energy = self.posterior.mean(atoms)
-        atom_variances = None
-        if self.error_calibration_model and self.error_calibration_apply_strength > 0.0:
-            energy_var, atom_variances = self.posterior.variance_components(atoms)
+        cache_key = self._component_cache_key(
+            atoms,
+            include_movement=include_movement,
+            objective=objective,
+        )
+        component_cache = getattr(self, "_component_cache", OrderedDict())
+        cached = component_cache.get(cache_key)
+        if cached is not None:
+            component_cache.move_to_end(cache_key)
+            self._performance_add("n_component_cache_hits")
+            return cached
+        self._performance_add("n_component_cache_misses")
+
+        coordinate_key = self._coordinate_key(atoms)
+        prepared_values = getattr(
+            self, "_prepared_component_overrides", {}
+        ).get(coordinate_key)
+        if prepared_values is None:
+            try:
+                autotune = bool(
+                    getattr(self.config.stencils, "autotune_from_cubic", False)
+                )
+                if autotune and self.tuned_mode_steps is None:
+                    baseline_values = self._prepare_component_values(
+                        [atoms],
+                        self.mode_steps,
+                    )[coordinate_key]
+                    self.tuned_mode_steps = self._refine_steps_from_cubic(
+                        baseline_values[3]
+                    )
+                steps = (
+                    self.tuned_mode_steps
+                    if self.tuned_mode_steps is not None
+                    else self.mode_steps
+                )
+                prepared_values = self._prepare_component_values(
+                    [atoms],
+                    steps,
+                )[coordinate_key]
+            except (AttributeError, NotImplementedError, TypeError):
+                self._performance_add("n_scalar_component_fallbacks")
+                posterior_diagnostic_add = getattr(
+                    self.posterior, "_diagnostic_add", None
+                )
+                if callable(posterior_diagnostic_add):
+                    posterior_diagnostic_add("n_scalar_fallbacks")
+                mean_energy = self.posterior.mean(atoms)
+                if (
+                    self.error_calibration_model
+                    and self.error_calibration_apply_strength > 0.0
+                ):
+                    energy_var, atom_variances = self.posterior.variance_components(
+                        atoms
+                    )
+                else:
+                    energy_var = self.posterior.variance(atoms)
+                    atom_variances = None
+                mode_evals = self._mode_metrics(atoms, mean_energy=mean_energy)
+            else:
+                mean_energy, energy_var, atom_variances, mode_evals = prepared_values
         else:
-            energy_var = self.posterior.variance(atoms)
-        mode_evals = self._mode_metrics(atoms, mean_energy=mean_energy)
+            mean_energy, energy_var, atom_variances, mode_evals = prepared_values
 
         legacy_weights = self._effective_mode_weights(mode_evals)
         spectral_weights = self._spectral_mode_weights(mode_evals)
@@ -1393,7 +1719,16 @@ class SeedLocalAdversarialAcquisition:
             if not bool(self.config.calibrated_energy.fallback_to_raw_variance):
                 energy_risk = 0.0
                 fallback_reasons.append("calibrated_energy_raw_variance_fallback_disabled")
-        distance_penalty = whitened_distance_squared(self.subspace, atoms, self.config.subspace.covariance_regularization)
+        try:
+            distance_penalty = self._geometry_context(
+                atoms
+            ).whitened_distance_squared
+        except Exception:
+            distance_penalty = whitened_distance_squared(
+                self.subspace,
+                atoms,
+                self.config.subspace.covariance_regularization,
+            )
         dimension = getattr(self.subspace, "dimension", None)
         if dimension is None:
             basis = getattr(self.subspace, "basis", None)
@@ -1432,7 +1767,7 @@ class SeedLocalAdversarialAcquisition:
             + chemistry_penalty
         )
         total = informativeness_score - risk_penalty_score
-        return AcquisitionBreakdown(
+        breakdown = AcquisitionBreakdown(
             total=float(total),
             informativeness_score=float(informativeness_score),
             risk_penalty_score=float(risk_penalty_score),
@@ -1521,6 +1856,13 @@ class SeedLocalAdversarialAcquisition:
             energy_variance=float(energy_var),
             mode_evaluations=mode_evals,
         )
+        cache_key = self._component_cache_key(
+            atoms,
+            include_movement=include_movement,
+            objective=objective,
+        )
+        self._cache_component(cache_key, breakdown)
+        return breakdown
 
     def value(self, atoms: Atoms, *, objective: str = "full") -> float:
         return self.components(atoms, objective=objective).total
@@ -1575,7 +1917,7 @@ class SeedLocalAdversarialAcquisition:
         directional_derivs: List[float] = []
         for direction in directions:
             directional_derivs.append(
-                self._active_fd_single(direction, flat, eps, atoms)
+                self._active_fd_pair(direction, flat, eps, atoms)
             )
         return self._active_fd_project(directions, directional_derivs, shape)
 
@@ -1603,13 +1945,17 @@ class SeedLocalAdversarialAcquisition:
 
     def _active_fd_single(self, direction, flat, eps, atoms):
         """Central-difference derivative along one active Cartesian direction."""
+        return self._active_fd_pair(direction, flat, eps, atoms)
+
+    def _active_fd_pair(self, direction, flat, eps, atoms):
+        """Evaluate a central-difference pair through one prepared GP batch."""
         direction = np.asarray(direction, dtype=float).reshape(-1)
         plus = self._atoms_from_flat(np.asarray(flat, dtype=float) + eps * direction, atoms)
         minus = self._atoms_from_flat(np.asarray(flat, dtype=float) - eps * direction, atoms)
-        return (
-            self.value(plus)
-            - self.value(minus)
-        ) / (2.0 * eps)
+        if not hasattr(self, "posterior"):
+            return (self.value(plus) - self.value(minus)) / (2.0 * eps)
+        plus_value, minus_value = self.components_many((plus, minus))
+        return (plus_value.total - minus_value.total) / (2.0 * eps)
 
     def _active_fd_project(self, directions, directional_derivs, shape) -> np.ndarray:
         """Project active-direction derivatives back to Cartesian coordinates."""

@@ -2022,6 +2022,43 @@ class SeedSelectionRuntimeCache:
                     _invalidate_directory(child)
 
 
+def restore_ariadne_model_factors(
+    campaign_dir: Path,
+    *,
+    pool: Any,
+    models: Any,
+    model_set: Any,
+    iteration: int,
+) -> Dict[str, str]:
+    """Restore current factors before constructing an ARIADNE posterior."""
+    from types import SimpleNamespace
+
+    property_models = {
+        str(model.atom): model
+        for model in models
+        if str(model.type) == "iqa"
+    }
+    if not property_models:
+        raise ValueError("ARIADNE requires current IQA models")
+    file_hashes = {
+        str(task.atom): str(task.model.sha256)
+        for task in model_set.tasks
+        if str(task.property) == "iqa"
+    }
+    if set(property_models) != set(file_hashes):
+        raise ValueError("ARIADNE model-factor inventory is incomplete")
+    cache = SeedSelectionRuntimeCache(
+        Path(campaign_dir),
+        pool=pool,
+        posterior=SimpleNamespace(_property_models=property_models),
+        model_set_sha256=str(model_set.model_set_sha256),
+        model_manifest_sha256=str(model_set.head_manifest_sha256),
+        iteration=int(iteration),
+        model_file_sha256_by_atom=file_hashes,
+    )
+    return cache.ensure_model_factors()
+
+
 __all__ = [
     "CachedPoolPosterior",
     "DeferredCachedPoolPosterior",
@@ -2029,5 +2066,6 @@ __all__ = [
     "SEED_SELECTION_PROGRESS_STAGES",
     "SeedSelectionProgressReporter",
     "SeedSelectionRuntimeCache",
+    "restore_ariadne_model_factors",
     "finalise_seed_selection_workspace",
 ]

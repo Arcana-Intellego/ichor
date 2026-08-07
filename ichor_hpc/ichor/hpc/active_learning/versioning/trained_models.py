@@ -28,6 +28,8 @@ from .manifest import (
     verify_manifest,
 )
 from .reference_data import (
+    REFERENCE_DATA_VERSION_FILENAME,
+    REFERENCE_DATA_VERSION_SCHEMA_VERSION,
     ReferenceDataView,
     ReferenceDataVersioning,
     canonical_json_sha256,
@@ -288,6 +290,170 @@ def load_trained_models_from_snapshot(
             progress_callback("models", {"completed": 1, "total": 1})
         except Exception:
             pass
+    return model_set, models, bindings
+
+
+def load_trained_models_for_ariadne_task(
+    campaign_dir: Union[str, Path],
+    models_version: int,
+    *,
+    task_map: Mapping[str, Any],
+    expected_campaign_uid: str,
+):
+    """Load only task-bound current models without replaying history."""
+    from ichor.core.models import Models
+
+    campaign = Path(campaign_dir).resolve()
+    version = _safe_int(models_version, "models_version", minimum=0)
+    if _safe_int(
+        task_map.get("models_version"),
+        "task-map models_version",
+        minimum=0,
+    ) != version:
+        raise TrainedModelError("task-map trained-model version mismatch")
+    reference_versioning = ReferenceDataVersioning(campaign / "QM_REFERENCE_DATA")
+    model_versioning = TrainedModelVersioning(trained_models_dir(campaign))
+    if reference_versioning.current_version() != version:
+        raise TrainedModelError(
+            "current reference-data pointer does not match the ARIADNE task"
+        )
+    if model_versioning.current_version() != version:
+        raise TrainedModelError(
+            "current trained-model pointer does not match the ARIADNE task"
+        )
+    root = model_versioning.iteration_path(version)
+    manifest_path = trained_model_set_path(root)
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise TrainedModelError("current trained-model manifest is missing or unsafe")
+    manifest_sha = sha256_file(manifest_path)
+    if manifest_sha != _safe_sha(
+        task_map.get("model_manifest_sha256"),
+        "task-map model manifest SHA-256",
+    ):
+        raise TrainedModelError("current model manifest does not match the task map")
+    payload = _read_json_object(manifest_path, "trained-model set manifest")
+    if _safe_int(payload.get("schema_version"), "schema_version") != TRAINED_MODEL_SET_SCHEMA_VERSION:
+        raise TrainedModelError("unsupported trained-model set schema")
+    if str(payload.get("storage_mode")) != TRAINED_MODEL_STORAGE_MODE:
+        raise TrainedModelError("trained-model storage_mode must be full_snapshot")
+    if _safe_int(payload.get("models_version"), "models_version") != version:
+        raise TrainedModelError("trained-model version mismatch")
+    campaign_uid = str(payload.get("campaign_uid") or "")
+    if campaign_uid != str(expected_campaign_uid):
+        raise TrainedModelError("trained-model campaign UID mismatch")
+    if str(task_map.get("campaign_uid") or "") != campaign_uid:
+        raise TrainedModelError("task-map campaign UID mismatch")
+    if _safe_int(payload.get("reference_data_version"), "reference_data_version") != version:
+        raise TrainedModelError("model/reference-data version mismatch")
+    if version == 0:
+        if payload.get("parent_version") is not None or payload.get(
+            "parent_manifest_sha256"
+        ) is not None:
+            raise TrainedModelError("bootstrap model snapshot parent is invalid")
+    else:
+        if _safe_int(payload.get("parent_version"), "parent_version") != version - 1:
+            raise TrainedModelError("trained-model parent version mismatch")
+        _safe_sha(payload.get("parent_manifest_sha256"), "parent_manifest_sha256")
+
+    reference_root = reference_versioning.iteration_path(version)
+    reference_manifest = reference_root / REFERENCE_DATA_VERSION_FILENAME
+    if reference_manifest.is_symlink() or not reference_manifest.is_file():
+        raise TrainedModelError("current reference-data manifest is missing or unsafe")
+    reference_sha = sha256_file(reference_manifest)
+    if str(payload.get("reference_data_head_manifest_sha256")) != reference_sha:
+        raise TrainedModelError("model/reference-data head manifest SHA mismatch")
+    reference_payload = _read_json_object(
+        reference_manifest,
+        "reference-data version manifest",
+    )
+    if _safe_int(reference_payload.get("schema_version"), "reference schema") != REFERENCE_DATA_VERSION_SCHEMA_VERSION:
+        raise TrainedModelError("unsupported reference-data version schema")
+    if _safe_int(
+        reference_payload.get("reference_data_version"),
+        "reference_data_version",
+    ) != version:
+        raise TrainedModelError("reference-data version mismatch")
+    if str(reference_payload.get("campaign_uid") or "") != campaign_uid:
+        raise TrainedModelError("reference-data campaign UID mismatch")
+    reference_view_sha = _safe_sha(
+        reference_payload.get("cumulative_view_sha256"),
+        "reference-data cumulative view SHA-256",
+    )
+    if str(payload.get("reference_data_view_sha256")) != reference_view_sha:
+        raise TrainedModelError("model/reference-data cumulative view SHA mismatch")
+
+    system = _safe_token(payload.get("system"), "system")
+    properties = _safe_token_sequence(payload.get("properties"), "properties")
+    atoms = _safe_token_sequence(payload.get("atoms"), "atoms")
+    raw_tasks = payload.get("tasks")
+    if not isinstance(raw_tasks, list):
+        raise TrainedModelError("trained-model tasks must be a list")
+    tasks = tuple(
+        _parse_task(root, record, verification="metadata")
+        for record in raw_tasks
+    )
+    expected_keys = [(prop, atom) for prop in properties for atom in atoms]
+    if [task.key for task in tasks] != expected_keys:
+        raise TrainedModelError("trained-model tasks do not match property/atom product")
+    if [task.task_index for task in tasks] != list(range(1, len(tasks) + 1)):
+        raise TrainedModelError("trained-model task indexes are not contiguous")
+    if _safe_int(payload.get("n_tasks"), "n_tasks", minimum=1) != len(tasks):
+        raise TrainedModelError("trained-model task count mismatch")
+    _validate_task_file_names(tasks, system)
+    raw_root_files = payload.get("root_files")
+    if not isinstance(raw_root_files, list):
+        raise TrainedModelError("trained-model root_files must be a list")
+    root_files = tuple(
+        _parse_file_record(root, record, "root_file", verification="metadata")
+        for record in raw_root_files
+    )
+    _validate_root_file_records(root_files)
+    model_set_sha = _safe_sha(payload.get("model_set_sha256"), "model_set_sha256")
+    if model_set_sha != canonical_json_sha256(_model_set_identity(payload)):
+        raise TrainedModelError("trained-model set SHA mismatch")
+    if model_set_sha != _safe_sha(
+        task_map.get("model_set_sha256"),
+        "task-map model-set SHA-256",
+    ):
+        raise TrainedModelError("scientific model set does not match the task map")
+    evidence_set_sha = _safe_sha(
+        payload.get("evidence_set_sha256"),
+        "evidence_set_sha256",
+    )
+    if evidence_set_sha != canonical_json_sha256(_evidence_set_identity(payload)):
+        raise TrainedModelError("trained-model evidence-set SHA mismatch")
+    model_set = TrainedModelSet(
+        version=version,
+        campaign_uid=campaign_uid,
+        system=system,
+        reference_data_version=version,
+        reference_data_head_manifest_sha256=reference_sha,
+        reference_data_view_sha256=reference_view_sha,
+        parent_version=None if version == 0 else version - 1,
+        parent_manifest_sha256=(
+            None if version == 0 else str(payload["parent_manifest_sha256"])
+        ),
+        properties=properties,
+        atoms=atoms,
+        tasks=tasks,
+        root_files=root_files,
+        model_set_sha256=model_set_sha,
+        evidence_set_sha256=evidence_set_sha,
+        head_manifest_sha256=manifest_sha,
+        root=root.resolve(),
+    )
+    bindings = _verify_current_model_payloads(campaign, model_set)
+    models = Models.from_model_files(model_set.root, model_set.model_paths)
+    for binding in bindings:
+        stat = binding.path.stat()
+        if (
+            int(stat.st_size) != int(binding.size)
+            or int(stat.st_mtime_ns) != int(binding.mtime_ns)
+        ):
+            raise TrainedModelError(
+                "current model payload changed while it was being parsed: "
+                + str(binding.path)
+            )
     return model_set, models, bindings
 
 
@@ -1546,5 +1712,6 @@ __all__ = [
     "resolve_trained_model_set",
     "load_trained_models",
     "load_trained_models_from_snapshot",
+    "load_trained_models_for_ariadne_task",
     "assert_current_model_payloads_unchanged",
 ]

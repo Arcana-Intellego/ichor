@@ -4,10 +4,15 @@ import gc
 import math
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
-from ichor.core.adversarial.geometry import select_local_neighbours
+from ichor.core.adversarial.geometry import (
+    coordinates_to_atoms,
+    select_local_neighbours,
+)
 from ichor.hpc.active_learning.acquisition.trajectory_pool import (
     POOL_MANIFEST_FILENAME,
     POOL_COORDINATE_CACHE_FILENAME,
@@ -351,6 +356,72 @@ def test_select_local_neighbours_with_bare_list_keeps_enumeration_indices(tmp_pa
     # For this fixture (which happens to equal pool order), the two are
     # numerically identical; the contract-difference is what `index` means.
     assert all(0 <= n.index < len(atoms_list) for n in nbrs)
+
+
+@pytest.mark.parametrize("seed_id", [0, 7, 19])
+def test_vectorised_pool_neighbours_match_legacy_scalar_selection(
+    tmp_path,
+    seed_id,
+):
+    pool = TrajectoryPool.import_from(FIXTURE, tmp_path)
+    seed = pool.frame(seed_id)
+
+    vectorised = select_local_neighbours(seed, pool, max_neighbours=12)
+    scalar = select_local_neighbours(
+        seed,
+        pool.to_atoms_list(),
+        max_neighbours=12,
+    )
+
+    assert [item.index for item in vectorised] == [
+        item.index for item in scalar
+    ]
+    np.testing.assert_allclose(
+        [item.aligned_distance for item in vectorised],
+        [item.aligned_distance for item in scalar],
+        rtol=1.0e-11,
+        atol=1.0e-12,
+    )
+
+
+def test_vectorised_pool_neighbours_do_not_materialise_the_complete_pool(
+    tmp_path,
+):
+    pool = TrajectoryPool.import_from(FIXTURE, tmp_path)
+    seed = pool.frame(5)
+    base = np.asarray(seed.coordinates, dtype=float)
+    coordinates = []
+    for frame_id in range(100):
+        row = base.copy()
+        row[1, 0] += 1.0e-3 * frame_id
+        row[2, 1] -= 5.0e-4 * frame_id
+        coordinates.append(row)
+    calls = []
+
+    class _CoordinatePool:
+        manifest = SimpleNamespace(
+            atom_types=tuple(str(atom.type) for atom in seed)
+        )
+
+        def coordinates_view(self):
+            return np.asarray(coordinates, dtype=float)
+
+        def frame_ids(self):
+            return range(len(coordinates))
+
+        def frame(self, frame_id):
+            calls.append(int(frame_id))
+            return coordinates_to_atoms(seed, coordinates[int(frame_id)])
+
+    candidate_pool = _CoordinatePool()
+    neighbours = select_local_neighbours(
+        seed,
+        candidate_pool,
+        max_neighbours=4,
+    )
+
+    assert [item.index for item in neighbours]
+    assert len(set(calls)) < len(coordinates)
 
 
 def test_acquisition_carries_seed_frame_id_and_subspace_frame_ids():

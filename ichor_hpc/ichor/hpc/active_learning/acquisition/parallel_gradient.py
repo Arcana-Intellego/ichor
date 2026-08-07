@@ -22,12 +22,36 @@ _THREAD_ENV_NAMES = (
 
 def _worker_active_payload(payload):
     direction, flat, step, atoms = payload
-    return _WORKER_ACQUISITION._active_fd_single(
+    posterior = getattr(_WORKER_ACQUISITION, "posterior", None)
+    before_posterior = dict(
+        getattr(posterior, "diagnostics", {})
+    )
+    before_acquisition = dict(
+        getattr(_WORKER_ACQUISITION, "performance_diagnostics", {})
+    )
+    value = _WORKER_ACQUISITION._active_fd_pair(
         np.asarray(direction, dtype=float),
         np.asarray(flat, dtype=float),
         float(step),
         atoms,
     )
+    counters = {}
+    for prefix, before, after in (
+        (
+            "posterior_",
+            before_posterior,
+            getattr(posterior, "diagnostics", {}),
+        ),
+        (
+            "acquisition_",
+            before_acquisition,
+            getattr(_WORKER_ACQUISITION, "performance_diagnostics", {}),
+        ),
+    ):
+        for key, current in after.items():
+            if isinstance(current, (int, np.integer)):
+                counters[prefix + str(key)] = int(current) - int(before.get(key, 0))
+    return float(value), counters
 
 
 def _worker_ping(value):
@@ -235,7 +259,7 @@ class ActiveGradientWorkerPool:
             for direction in directions
         ]
         try:
-            derivatives = list(
+            worker_results = list(
                 self._pool.map(
                     _worker_active_payload,
                     payloads,
@@ -262,7 +286,12 @@ class ActiveGradientWorkerPool:
                 gradient_pool_reused=False,
             )
             return self._acquisition._active_finite_difference_gradient(atoms)
-        _set_last_diagnostics(**self.diagnostics)
+        derivatives = [float(value) for value, _ in worker_results]
+        aggregate = {}
+        for _, counters in worker_results:
+            for key, value in counters.items():
+                aggregate[key] = int(aggregate.get(key, 0)) + int(value)
+        _set_last_diagnostics(**self.diagnostics, **aggregate)
         return self._acquisition._active_fd_project(
             directions,
             derivatives,

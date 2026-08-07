@@ -184,6 +184,134 @@ def kabsch_align(reference: np.ndarray, mobile: np.ndarray, weights: np.ndarray 
     return aligned
 
 
+def _batch_kabsch_align(
+    reference: np.ndarray,
+    mobile: np.ndarray,
+    weights: np.ndarray,
+) -> np.ndarray:
+    """Vectorised weighted Kabsch alignment over a geometry batch."""
+    ref = np.asarray(reference, dtype=float)
+    mobiles = np.asarray(mobile, dtype=float)
+    mass = np.asarray(weights, dtype=float)
+    if mobiles.ndim != 3 or mobiles.shape[1:] != ref.shape:
+        raise ValueError("batched mobile coordinates have an invalid shape")
+    if mass.shape != (ref.shape[0],) or np.any(mass <= 0.0):
+        raise ValueError("batched Kabsch weights are invalid")
+    weight_sum = float(np.sum(mass))
+    ref_centroid = np.sum(mass[:, None] * ref, axis=0) / weight_sum
+    mobile_centroids = np.sum(mass[None, :, None] * mobiles, axis=1) / weight_sum
+    ref0 = ref - ref_centroid
+    mobile0 = mobiles - mobile_centroids[:, None, :]
+    covariance = np.einsum(
+        "bni,nj,n->bij",
+        mobile0,
+        ref0,
+        mass,
+        optimize=True,
+    )
+    u, _, vt = np.linalg.svd(covariance, full_matrices=False)
+    rotations = u @ vt
+    reflected = np.linalg.det(rotations) < 0.0
+    if np.any(reflected):
+        u = u.copy()
+        u[reflected, :, -1] *= -1.0
+        rotations = u @ vt
+    return np.einsum(
+        "bni,bij->bnj",
+        mobile0,
+        rotations,
+        optimize=True,
+    ) + ref_centroid
+
+
+def _select_pool_neighbours_vectorised(
+    seed_atoms: Atoms,
+    trajectory,
+    max_neighbours: int,
+    deduplicate_rmsd: float,
+    progress_callback: Optional[Callable[[int, int], None]],
+) -> List[Neighbour]:
+    coordinates = np.asarray(trajectory.coordinates_view(), dtype=np.float64)
+    frame_ids = tuple(int(value) for value in trajectory.frame_ids())
+    if coordinates.shape != (len(frame_ids), len(seed_atoms), 3):
+        raise ValueError("trajectory coordinate view does not match the seed")
+    if frame_ids != tuple(range(len(frame_ids))):
+        raise ValueError("trajectory coordinate view requires canonical frame ordering")
+    manifest = getattr(trajectory, "manifest", None)
+    if manifest is not None:
+        if tuple(str(atom.type) for atom in seed_atoms) != tuple(manifest.atom_types):
+            raise ValueError("trajectory atom identities do not match the seed")
+    reference = atoms_to_coordinates(seed_atoms)
+    masses = np.asarray(seed_atoms.masses, dtype=float)
+    if not np.all(np.isfinite(masses)) or np.any(masses <= 0.0):
+        raise ValueError("trajectory alignment masses must be finite and positive")
+
+    aligned = np.empty_like(coordinates)
+    distances = np.empty(len(frame_ids), dtype=float)
+    chunk_size = 1024
+    for start in range(0, len(frame_ids), chunk_size):
+        stop = min(len(frame_ids), start + chunk_size)
+        block = _batch_kabsch_align(reference, coordinates[start:stop], masses)
+        aligned[start:stop] = block
+        delta = block - reference[None, :, :]
+        distances[start:stop] = np.sqrt(
+            np.sum(masses[None, :, None] * delta * delta, axis=(1, 2))
+        )
+        if progress_callback is not None:
+            progress_callback(int(stop), int(len(frame_ids)))
+    order = np.argsort(distances, kind="stable")
+
+    # Refine the selection boundary with the scalar implementation. This keeps
+    # exact historical ordering for near ties while retaining batched work for
+    # the full pool.
+    refine_count = min(len(order), max(64, int(max_neighbours) * 4))
+    refined = []
+    for frame_id in order[:refine_count]:
+        frame = trajectory.frame(int(frame_id))
+        exact_aligned = kabsch_align(
+            reference,
+            atoms_to_coordinates(frame),
+            weights=masses,
+        )
+        aligned[int(frame_id)] = exact_aligned
+        exact_delta = exact_aligned - reference
+        exact_distance = float(
+            np.sqrt(np.sum(masses[:, None] * exact_delta * exact_delta))
+        )
+        distances[int(frame_id)] = exact_distance
+        refined.append(
+            (
+                exact_distance,
+                int(frame_id),
+            )
+        )
+    refined.sort(key=lambda item: (item[0], item[1]))
+    ordered_ids = [frame_id for _, frame_id in refined]
+    ordered_ids.extend(int(value) for value in order[refine_count:])
+
+    selected: List[Neighbour] = []
+    selected_coordinates: List[np.ndarray] = []
+    for frame_id in ordered_ids:
+        candidate = aligned[frame_id]
+        if any(
+            float(np.sqrt(np.mean(np.sum((candidate - prior) ** 2, axis=1))))
+            < deduplicate_rmsd
+            for prior in selected_coordinates
+        ):
+            continue
+        selected.append(
+            Neighbour(
+                index=int(frame_id),
+                atoms=trajectory.frame(int(frame_id)),
+                aligned_distance=float(distances[frame_id]),
+            )
+        )
+        selected_coordinates.append(candidate)
+        if len(selected) >= int(max_neighbours):
+            break
+    return selected
+
+
 
 def aligned_mass_weighted_distance(reference: Atoms, mobile: Atoms) -> float:
     _validate_compatible_geometries(reference, mobile)
@@ -267,6 +395,14 @@ def select_local_neighbours(
 
     The duck-typing keeps 'ichor.core' free of an 'ichor.hpc' import.
     """
+    if hasattr(trajectory, "coordinates_view"):
+        return _select_pool_neighbours_vectorised(
+            seed_atoms,
+            trajectory,
+            max_neighbours,
+            deduplicate_rmsd,
+            progress_callback,
+        )
     #Build the (frame_id, atoms) pair generator from whichever form was passed.
     if hasattr(trajectory, "frame") and hasattr(trajectory, "frame_ids"):
         frame_ids = trajectory.frame_ids()

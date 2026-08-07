@@ -34,6 +34,88 @@ class LocalSubspace:
         return [(m_inv_sqrt * self.basis[:, i]) for i in range(self.dimension)]
 
 
+@dataclass(frozen=True)
+class PreparedSubspaceGeometry:
+    displacement: np.ndarray
+    active_coordinates: np.ndarray
+    active_displacement: np.ndarray
+    residual_displacement: np.ndarray
+    coordinate_displacement: np.ndarray
+    active_participation: np.ndarray
+    active_coordinate_weights: np.ndarray
+    global_rmsd: float
+    active_rmsd: float
+    residual_distance: float
+    whitened_distance_squared: float
+
+
+def prepare_subspace_geometry(
+    subspace: LocalSubspace,
+    atoms: Atoms,
+    *,
+    regularization: float = 1.0e-10,
+    whitened_metric: np.ndarray | None = None,
+) -> PreparedSubspaceGeometry:
+    """Resolve all aligned geometry quantities through one Kabsch fit."""
+    displacement = aligned_mass_weighted_displacement(subspace.seed_atoms, atoms)
+    xi = subspace.basis.T @ displacement
+    active = subspace.basis @ xi
+    residual = displacement - active
+    masses = np.asarray(subspace.seed_atoms.masses, dtype=float)
+    masses = np.where(np.isfinite(masses) & (masses > 0.0), masses, 1.0)
+    coordinate_displacement = displacement.reshape(-1, 3) / np.sqrt(masses)[:, None]
+    participation = active_participation_weights(subspace)
+    participation_sum = float(np.sum(participation))
+    if not np.isfinite(participation_sum) or participation_sum <= 0.0:
+        active_rmsd_value = float(
+            np.sqrt(np.mean(np.sum(np.square(coordinate_displacement), axis=1)))
+        )
+    else:
+        active_rmsd_value = float(
+            np.sqrt(
+                max(
+                    0.0,
+                    float(
+                        np.sum(
+                            participation[:, None]
+                            * np.square(coordinate_displacement)
+                        )
+                        / participation_sum
+                    ),
+                )
+            )
+        )
+    mass_normalisation = _mass_normalisation(subspace)
+    if whitened_metric is None:
+        eig_max = (
+            float(np.max(np.diag(subspace.active_covariance)))
+            if subspace.dimension
+            else 1.0
+        )
+        reg = float(regularization) * max(eig_max, 1.0e-12)
+        metric = np.linalg.inv(
+            subspace.active_covariance + reg * np.eye(subspace.dimension)
+        )
+    else:
+        metric = np.asarray(whitened_metric, dtype=float)
+        expected_shape = (int(subspace.dimension), int(subspace.dimension))
+        if metric.shape != expected_shape or not np.all(np.isfinite(metric)):
+            raise ValueError("prepared whitened metric is invalid")
+    return PreparedSubspaceGeometry(
+        displacement=displacement,
+        active_coordinates=xi,
+        active_displacement=active,
+        residual_displacement=residual,
+        coordinate_displacement=coordinate_displacement.reshape(-1),
+        active_participation=participation,
+        active_coordinate_weights=np.repeat(participation, 3),
+        global_rmsd=float(np.linalg.norm(displacement) / mass_normalisation),
+        active_rmsd=active_rmsd_value,
+        residual_distance=float(np.linalg.norm(residual) / mass_normalisation),
+        whitened_distance_squared=float(xi.T @ metric @ xi),
+    )
+
+
 
 def _gaussian_neighbour_weights(distances: np.ndarray, sigma: float | None) -> np.ndarray:
     if sigma is None:

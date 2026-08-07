@@ -22,6 +22,7 @@ from ..acquisition.trajectory_pool import TrajectoryPool
 from ..config import CampaignConfig
 from ..daemon.state import DEFAULT_STATE_FILENAME, read_state
 from ..handoff_manifests import load_seeds_picked
+from ..seed_identity import read_ariadne_task_map
 
 
 def _json_safe(value: Any) -> Any:
@@ -77,16 +78,40 @@ def _load_context(campaign_dir: Path, iteration: int, seed_id: int) -> Dict[str,
     )
     if int(state.models_version) < 0:
         raise ValueError("state.models_version is negative; no trained model version is committed")
-    from ..versioning.trained_models import load_trained_models
-
-    _, models = load_trained_models(
-        campaign,
-        int(state.models_version),
-        verification="deep",
+    from ..versioning.trained_models import (
+        load_trained_models_for_ariadne_task,
     )
+
     from ..layout import active_iteration_dir
 
     iter_dir = active_iteration_dir(campaign, int(iteration))
+    task_map = read_ariadne_task_map(
+        iter_dir,
+        expected_iteration=int(iteration),
+    )
+
+    model_set, models, _model_bindings = load_trained_models_for_ariadne_task(
+        campaign,
+        int(state.models_version),
+        task_map=task_map,
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+    from ..daemon.seed_selection_runtime import restore_ariadne_model_factors
+
+    factor_statuses = restore_ariadne_model_factors(
+        campaign,
+        pool=pool,
+        models=models,
+        model_set=model_set,
+        iteration=int(iteration),
+    )
+    from ichor.core.adversarial.posterior import TotalEnergyPosterior
+
+    posterior = TotalEnergyPosterior(
+        models=models,
+        property_name="iqa",
+        scaled=True,
+    )
     picked = load_seeds_picked(iter_dir, expected_iteration=int(iteration))
     seed_records = list(picked.get("seed_records") or [])
     if not 1 <= int(seed_id) <= len(seed_records):
@@ -110,8 +135,10 @@ def _load_context(campaign_dir: Path, iteration: int, seed_id: int) -> Dict[str,
         "iter_dir": iter_dir,
         "seed_frame_id": frame_id,
         "seed_atoms": pool.frame(frame_id),
-        "trajectory": pool.to_atoms_list(),
+        "trajectory": pool,
         "reference_scales": _load_reference_scales(iter_dir),
+        "posterior": posterior,
+        "factor_statuses": factor_statuses,
     }
 
 
@@ -151,6 +178,7 @@ def _build_acquisition(
         config=config,
         seed_frame_id=int(context["seed_frame_id"]),
         external_reference_scales=context["reference_scales"],
+        posterior_override=context["posterior"],
     )
 
 
@@ -247,6 +275,7 @@ def run_benchmark(
         "objective": "full",
         "workers": workers,
         "repeat": int(repeat),
+        "model_factor_statuses": dict(context.get("factor_statuses") or {}),
         "runs": runs,
         "comparisons": {},
     }

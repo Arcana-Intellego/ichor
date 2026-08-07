@@ -35,6 +35,19 @@ def _posterior_diagnostics(acquisition) -> Dict[str, int]:
     return out
 
 
+def _acquisition_diagnostics(acquisition) -> Dict[str, int]:
+    diagnostics = getattr(acquisition, "performance_diagnostics", None)
+    if not isinstance(diagnostics, Mapping):
+        return {}
+    out: Dict[str, int] = {}
+    for key, value in diagnostics.items():
+        try:
+            out[str(key)] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def static_gradient_diagnostics(acquisition, atoms=None, *, gradient_mode=None, gradient_backend=None) -> Dict[str, Any]:
     mode = "active_fd"
     raw_directions = getattr(acquisition, "mode_directions", ())
@@ -62,6 +75,7 @@ def static_gradient_diagnostics(acquisition, atoms=None, *, gradient_mode=None, 
             None if estimated_calls is None else int(estimated_calls)
         ),
         "posterior_diagnostics": _posterior_diagnostics(acquisition),
+        "acquisition_diagnostics": _acquisition_diagnostics(acquisition),
     }
 
 
@@ -111,6 +125,11 @@ def calculator_gradient_diagnostics(calculator) -> Dict[str, Any]:
         out["posterior_diagnostics"] = {
             str(k): _finite_int(v, 0) for k, v in posterior.items()
         }
+    acquisition = out.get("acquisition_diagnostics")
+    if isinstance(acquisition, Mapping):
+        out["acquisition_diagnostics"] = {
+            str(k): _finite_int(v, 0) for k, v in acquisition.items()
+        }
     return out
 
 
@@ -153,7 +172,28 @@ def flatten_trace_gradient_diagnostics(data: Mapping[str, Any]) -> Dict[str, Any
             "n_covariance_matrix_scalar_fallbacks",
             "n_mean_scalar_calls",
             "n_covariance_scalar_calls",
+            "n_runtime_context_builds",
+            "n_factor_validations",
+            "n_triangular_solves",
+            "n_train_query_builds",
+            "n_prepared_component_batches",
+            "n_scalar_fallbacks",
+            "n_alf_batch_calls",
+            "n_alf_scalar_fallbacks",
         ):
             if key in posterior:
                 out["posterior_" + key] = posterior[key]
+    acquisition = data.get("acquisition_diagnostics")
+    if isinstance(acquisition, Mapping):
+        for key in (
+            "n_prepared_component_batches",
+            "n_prepared_component_centres",
+            "n_component_cache_hits",
+            "n_component_cache_misses",
+            "n_atom_diagnostic_cache_hits",
+            "n_atom_diagnostic_cache_misses",
+            "n_scalar_component_fallbacks",
+        ):
+            if key in acquisition:
+                out["acquisition_" + key] = acquisition[key]
     return out

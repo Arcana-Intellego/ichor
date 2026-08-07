@@ -1587,6 +1587,71 @@ def test_ferebus_parser_happy_path_commits_models_version(tmp_path):
     assert any(e.get("event") == "models_committed" for e in events)
 
 
+def test_ariadne_task_model_loader_avoids_historical_chain_resolution(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.versioning.trained_models import (
+        TrainedModelError,
+        load_trained_models_for_ariadne_task,
+    )
+
+    ex = _make_executor(tmp_path)
+    _commit_bootstrap_reference_data(ex.campaign_dir)
+    _seed_models_staging(ex.campaign_dir)
+    result = ex._parse_ferebus_postprocess(
+        SimpleNamespace(
+            iteration=0,
+            campaign_uid="m16-test",
+            reference_data_version=0,
+        ),
+        CampaignPhase("FEREBUS"),
+        observations=[],
+    )
+    assert result.failure_reason is None
+
+    versioning = TrainedModelVersioning(ex.campaign_dir / "TRAINED_MODELS")
+    committed = versioning.resolve(
+        0,
+        verification="metadata",
+        reference_verification="metadata",
+    )
+    task_map = {
+        "campaign_uid": "m16-test",
+        "models_version": 0,
+        "model_manifest_sha256": committed.head_manifest_sha256,
+        "model_set_sha256": committed.model_set_sha256,
+    }
+
+    def forbidden_resolve(*_args, **_kwargs):
+        raise AssertionError("ARIADNE task loading must not replay history")
+
+    monkeypatch.setattr(TrainedModelVersioning, "resolve", forbidden_resolve)
+    monkeypatch.setattr(ReferenceDataVersioning, "resolve", forbidden_resolve)
+
+    model_set, models, bindings = load_trained_models_for_ariadne_task(
+        ex.campaign_dir,
+        0,
+        task_map=task_map,
+        expected_campaign_uid="m16-test",
+    )
+
+    assert model_set.head_manifest_sha256 == committed.head_manifest_sha256
+    assert model_set.model_set_sha256 == committed.model_set_sha256
+    assert len(models) == 1
+    assert [binding.path for binding in bindings] == list(model_set.model_paths)
+    with pytest.raises(
+        TrainedModelError,
+        match="task-map trained-model version mismatch",
+    ):
+        load_trained_models_for_ariadne_task(
+            ex.campaign_dir,
+            0,
+            task_map={**task_map, "models_version": 1},
+            expected_campaign_uid="m16-test",
+        )
+
+
 def test_ferebus_postprocess_snapshot_avoids_historical_chain_resolution(
     tmp_path,
     monkeypatch,

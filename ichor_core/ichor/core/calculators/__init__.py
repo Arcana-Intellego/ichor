@@ -12,6 +12,7 @@ from ichor.core.calculators.c_matrix_calculator import calculate_c_matrix
 from ichor.core.calculators.connectivity import default_connectivity_calculator
 from ichor.core.calculators.features import (
     calculate_alf_features,
+    calculate_alf_features_batch,
     default_feature_calculator,
     feature_calculators,
 )
@@ -43,6 +44,7 @@ __all__ = [
     "calculate_c_matrix",
     "default_connectivity_calculator",
     "calculate_alf_features",
+    "calculate_alf_features_batch",
     "default_feature_calculator",
     "feature_calculators",
     "angle_names",

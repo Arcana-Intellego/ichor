@@ -665,6 +665,23 @@ class TrajectoryPool:
         """Return the inclusive range of all stable frame IDs."""
         return range(self.n_frames())
 
+    def coordinates_view(self) -> np.ndarray:
+        """Return the immutable, frame-ordered coordinate array."""
+        view = np.asarray(self._coordinates, dtype=np.float64).view()
+        view.setflags(write=False)
+        return view
+
+    def frame_coordinates(self, frame_id: int) -> np.ndarray:
+        """Return an immutable coordinate view for one stable frame ID."""
+        if isinstance(frame_id, bool) or not isinstance(frame_id, (int, np.integer)):
+            raise TypeError("frame_id must be an exact integer")
+        frame_index = int(frame_id)
+        if not 0 <= frame_index < self.n_frames():
+            raise IndexError("frame_id is outside the trajectory pool")
+        view = np.asarray(self._coordinates[frame_index], dtype=np.float64).view()
+        view.setflags(write=False)
+        return view
+
     def to_atoms_list(self) -> List[Atoms]:
         """Return detached frame copies that cannot mutate the pool."""
         return [self.frame(frame_id) for frame_id in self.frame_ids()]

@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
+from scipy.linalg import solve_triangular
 from ichor.core.atoms import ALF
 from ichor.core.common.str import get_digits
 from ichor.core.files.file import FileContents, ReadFile
@@ -288,7 +289,12 @@ class ModelWithGradients(ReadFile):
         """Return the variance for the test data points."""
         train_test_covar = self.r(x_test)
         # temporary matrix, see Rasmussen Williams page 19 algo. 2.1
-        v = np.linalg.solve(self.lower_cholesky, train_test_covar)
+        v = solve_triangular(
+            self.lower_cholesky,
+            train_test_covar,
+            lower=True,
+            check_finite=False,
+        )
 
         # TODO: need to multiply by tau^2 in order to get "true" variance which can be used for error estimations.
         # here it can only be used to compare points to figure out which point has the largest variance.

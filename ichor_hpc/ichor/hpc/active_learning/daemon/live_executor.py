@@ -6872,6 +6872,14 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         accepted = []
         rejected = []
         landing_audit_records = []
+        ariadne_performance = {
+            "n_results": 0,
+            "task_startup_total_seconds": 0.0,
+            "task_startup_max_seconds": 0.0,
+            "posterior": {},
+            "acquisition": {},
+            "model_factors": {},
+        }
 
         if not seeds_root.is_dir():
             for task in task_records:
@@ -7167,6 +7175,37 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 continue
 
             optional_diag_warnings = _ariadne_optional_diagnostic_warnings(result_dict)
+            optimiser_diagnostics = result_dict.get("optimiser_diagnostics")
+            if isinstance(optimiser_diagnostics, dict):
+                ariadne_performance["n_results"] += 1
+                try:
+                    task_startup = float(
+                        optimiser_diagnostics.get(
+                            "task_startup_total_seconds",
+                            0.0,
+                        )
+                    )
+                except (TypeError, ValueError):
+                    task_startup = 0.0
+                if math.isfinite(task_startup) and task_startup >= 0.0:
+                    ariadne_performance["task_startup_total_seconds"] += task_startup
+                    ariadne_performance["task_startup_max_seconds"] = max(
+                        ariadne_performance["task_startup_max_seconds"],
+                        task_startup,
+                    )
+                for source, destination in (
+                    ("posterior_performance", "posterior"),
+                    ("acquisition_performance", "acquisition"),
+                    ("model_factor_status_counts", "model_factors"),
+                ):
+                    counters = optimiser_diagnostics.get(source)
+                    if not isinstance(counters, dict):
+                        continue
+                    totals = ariadne_performance[destination]
+                    for key, value in counters.items():
+                        if isinstance(value, bool) or not isinstance(value, int):
+                            continue
+                        totals[str(key)] = int(totals.get(str(key), 0)) + int(value)
             if optional_diag_warnings:
                 self._journal_event(
                     "ariadne_optional_diagnostics_warning",
@@ -7687,6 +7726,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             backtracked=int(audit_summary.get("backtracked", 0)),
             rejected=int(audit_summary.get("rejected", 0)),
             dominant_rejection_reasons=dominant_rejection_reasons,
+            performance_diagnostics=ariadne_performance,
         )
 
         decision_reasons = []

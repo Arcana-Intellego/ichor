@@ -6,7 +6,7 @@ from typing import Dict, Iterable, List, Optional, Union
 import numpy as np
 import pandas as pd
 from ichor.core.atoms import ALF, Atoms, ListOfAtoms
-from ichor.core.calculators import calculate_alf_features
+from ichor.core.calculators import calculate_alf_features, calculate_alf_features_batch
 from ichor.core.common.sorting import ignore_alpha
 from ichor.core.common.types.itypes import F
 from ichor.core.files.directory import Directory
@@ -196,6 +196,30 @@ class Models(Directory, list):
         elif isinstance(test_x, dict):
             return test_x
         raise TypeError(f"Cannot predict values from type '{type(test_x)}'")
+
+    def get_features_batch(self, points: List[Atoms]) -> Dict[str, np.ndarray]:
+        """Return vectorised ALF features for homogeneous ``Atoms`` objects."""
+        geometries = list(points)
+        if not geometries:
+            return {}
+        if not all(isinstance(point, Atoms) for point in geometries):
+            raise TypeError("batched model features require Atoms geometries")
+        identities = [
+            (str(atom.name), str(atom.type)) for atom in geometries[0]
+        ]
+        coordinate_rows = []
+        for point in geometries:
+            if [
+                (str(atom.name), str(atom.type)) for atom in point
+            ] != identities:
+                raise ValueError("batched model geometries have inconsistent atoms")
+            converted = point.to_angstroms()
+            coordinate_rows.append(np.asarray(converted.coordinates, dtype=float))
+        return calculate_alf_features_batch(
+            np.stack(coordinate_rows, axis=0),
+            [name for name, _ in identities],
+            self.ialf_dict,
+        )
 
     def _features_from_atoms(self, atoms: Atoms) -> Dict[str, np.ndarray]:
         """Returns a dictionary containing atom name as key and atom features for values."""

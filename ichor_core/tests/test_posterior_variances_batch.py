@@ -76,11 +76,13 @@ class _Model:
         self.ntrain = self.x.shape[0]
         self.kernel = _Kernel(self.x)
         self.mean = _Mean()
+        self.r_calls = 0
         K = self.kernel.k(self.x, self.x) + jitter * np.eye(self.ntrain)
         self.lower_cholesky = np.linalg.cholesky(K)
 
     def r(self, x):
         # cross-covariance train x query, shape (ntrain, nquery)
+        self.r_calls += 1
         return self.kernel.k(self.x, x)
 
     def predict(self, x):
@@ -414,6 +416,31 @@ def test_prepared_posterior_matches_existing_batch_contract(scaled):
     )
 
 
+def test_prepared_posterior_validates_factors_once_and_builds_one_query_per_atom():
+    post, rng = _make_posterior(scaled=True)
+    points = _points(rng, 6)
+    models = list(post._property_models.values())
+    before_queries = [model.r_calls for model in models]
+
+    post.prepare_points(points)
+
+    assert post.diagnostics["n_runtime_context_builds"] == len(models)
+    assert post.diagnostics["n_factor_validations"] == len(models)
+    assert [
+        model.r_calls - before
+        for model, before in zip(models, before_queries)
+    ] == [1] * len(models)
+    assert post.diagnostics["n_train_query_builds"] == len(models)
+
+    post.prepare_points(points)
+
+    assert post.diagnostics["n_factor_validations"] == len(models)
+    assert [
+        model.r_calls - before
+        for model, before in zip(models, before_queries)
+    ] == [2] * len(models)
+
+
 def test_prepared_posterior_spills_projections_to_memmap(tmp_path):
     post, rng = _make_posterior(scaled=True)
     points = _points(rng, 8)
@@ -596,6 +623,78 @@ def test_complete_prepared_reference_scales_match_legacy_contract():
             rel=5.0e-8,
             abs=1.0e-10,
         )
+
+
+def test_components_many_matches_individual_scoring_and_caches_atom_moments():
+    batched_post, rng = _make_posterior(scaled=True)
+    trajectory = _points(rng, 9)
+    config = AcquisitionConfig()
+    batched_reference = compute_reference_scales(
+        models=batched_post.models,
+        seed=trajectory[0],
+        trajectory=trajectory,
+        config=config,
+        seed_frame_id=0,
+        posterior_override=batched_post,
+        use_prepared_reference_stencils=True,
+    )
+    batched = SeedLocalAdversarialAcquisition(
+        models=batched_post.models,
+        seed=trajectory[0],
+        trajectory=trajectory,
+        config=config,
+        external_reference_scales=batched_reference.reference_scales,
+        posterior_override=batched_post,
+        use_prepared_reference_stencils=True,
+    )
+    scalar_post, _ = _make_posterior(scaled=True)
+    scalar_reference = compute_reference_scales(
+        models=scalar_post.models,
+        seed=trajectory[0],
+        trajectory=trajectory,
+        config=config,
+        seed_frame_id=0,
+        posterior_override=scalar_post,
+        use_prepared_reference_stencils=True,
+    )
+    scalar = SeedLocalAdversarialAcquisition(
+        models=scalar_post.models,
+        seed=trajectory[0],
+        trajectory=trajectory,
+        config=config,
+        external_reference_scales=scalar_reference.reference_scales,
+        posterior_override=scalar_post,
+        use_prepared_reference_stencils=True,
+    )
+    centres = trajectory[1:3]
+
+    expected = tuple(
+        scalar.components(point, include_movement=False)
+        for point in centres
+    )
+    observed = batched.components_many(
+        centres,
+        include_movement=False,
+    )
+
+    for actual, reference in zip(observed, expected):
+        assert actual.total == pytest.approx(reference.total, rel=5.0e-8)
+        assert actual.mean_energy == pytest.approx(
+            reference.mean_energy,
+            rel=1.0e-10,
+        )
+        assert actual.energy_variance == pytest.approx(
+            reference.energy_variance,
+            rel=1.0e-9,
+        )
+    before = batched.performance_diagnostics[
+        "n_atom_diagnostic_cache_hits"
+    ]
+    diagnostics = batched.atom_diagnostics(centres[0])
+    assert set(diagnostics) == set(batched_post._property_models)
+    assert batched.performance_diagnostics[
+        "n_atom_diagnostic_cache_hits"
+    ] == before + 1
 
 
 def test_tolerated_negative_variances_are_clipped_and_reported():

@@ -4,6 +4,7 @@ import re
 from typing import Dict, List, Optional
 
 import numpy as np
+from scipy.linalg import solve_triangular
 from ichor.core.atoms import ALF
 from ichor.core.common.io import mkdir
 from ichor.core.common.str import get_digits
@@ -581,11 +582,19 @@ class Model(ReadFile, WriteFile):
 
     def compute_weights(self) -> np.ndarray:
         """Computes the training weights from the data given"""
-        lower_solution = np.linalg.solve(
+        lower_solution = solve_triangular(
             self.lower_cholesky,
             self._y_minus_mean,
+            lower=True,
+            check_finite=False,
         )
-        return np.linalg.solve(self.lower_cholesky.T, lower_solution)
+        return solve_triangular(
+            self.lower_cholesky,
+            lower_solution,
+            lower=True,
+            trans="T",
+            check_finite=False,
+        )
 
     def compute_log_marginal_likelihood(self) -> float:
         """Return the conventional Gaussian-process log marginal likelihood."""
@@ -613,7 +622,12 @@ class Model(ReadFile, WriteFile):
         """Return the variance for the test data points."""
         train_test_covar = self.r(x_test)
         # temporary matrix, see Rasmussen Williams page 19 algo. 2.1
-        v = np.linalg.solve(self.lower_cholesky, train_test_covar)
+        v = solve_triangular(
+            self.lower_cholesky,
+            train_test_covar,
+            lower=True,
+            check_finite=False,
+        )
 
         # TODO: need to multiply by tau^2 in order to get "true" variance which can be used for error estimations.
         # here it can only be used to compare points to figure out which point has the largest variance.

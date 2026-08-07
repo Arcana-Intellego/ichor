@@ -527,7 +527,7 @@ def _import_ariadne():
 def optimise_seed(
     models,
     seed: Atoms,
-    trajectory: Sequence[Atoms],
+    trajectory,
     *,
     acquisition_config: Optional[AcquisitionConfig] = None,
     run_config: Optional[AriadneRunConfig] = None,
@@ -544,6 +544,7 @@ def optimise_seed(
     quality_gates: Optional[Any] = None,
     scale_model: Optional[Dict[str, Any]] = None,
     trace_path: Optional[Any] = None,
+    posterior_override: Optional[Any] = None,
 ) -> AriadneRunResult:
     """Drive the adversarial descent for a single seed.
 
@@ -578,6 +579,7 @@ def optimise_seed(
         quality_gates=quality_gates,
         scale_model=scale_model,
         trace_path=trace_path,
+        posterior_override=posterior_override,
     )
 
 
@@ -980,13 +982,19 @@ def _evaluate_landing_candidate(
             reasons.append("ariadne_min_pair_distance_threshold_exceeded")
 
     try:
-        from ichor.core.adversarial.subspace import whitened_distance_squared
+        geometry_context = getattr(acquisition, "_geometry_context", None)
+        if callable(geometry_context):
+            d_sq = geometry_context(atoms).whitened_distance_squared
+        else:
+            from ichor.core.adversarial.subspace import (
+                whitened_distance_squared,
+            )
 
-        d_sq = whitened_distance_squared(
-            acquisition.subspace,
-            atoms,
-            acquisition.config.subspace.covariance_regularization,
-        )
+            d_sq = whitened_distance_squared(
+                acquisition.subspace,
+                atoms,
+                acquisition.config.subspace.covariance_regularization,
+            )
         metrics["whitened_distance"] = float(math.sqrt(max(0.0, float(d_sq))))
     except Exception:
         metrics["whitened_distance"] = None
@@ -1217,7 +1225,7 @@ def _selection_prediction_diagnostics(
 ) -> Dict[str, Any]:
     breakdown = acquisition.components(atoms)
     per_atom = []
-    for atom, diag in acquisition.posterior.atom_diagnostics(atoms).items():
+    for atom, diag in acquisition.atom_diagnostics(atoms).items():
         per_atom.append(
             {
                 "atom": str(atom),
@@ -1337,6 +1345,34 @@ def _is_seed_equivalent(seed_coords: np.ndarray, coords: np.ndarray) -> bool:
     )
 
 
+def _prepare_landing_components(
+    acquisition: SeedLocalAdversarialAcquisition,
+    seed_atoms: Atoms,
+    coordinate_arrays: Sequence[np.ndarray],
+) -> None:
+    """Best-effort cache fill; candidate validation remains authoritative."""
+    expected_shape = _coords_array(seed_atoms).shape
+    points = []
+    seen = set()
+    for value in coordinate_arrays:
+        coords = np.asarray(value, dtype=float)
+        if coords.shape != expected_shape or not np.all(np.isfinite(coords)):
+            continue
+        key = np.ascontiguousarray(coords, dtype=np.float64).tobytes(order="C")
+        if key in seen:
+            continue
+        seen.add(key)
+        points.append(_copy_atoms_with_coords(seed_atoms, coords))
+    if not points:
+        return
+    try:
+        acquisition.components_many(points)
+    except Exception:
+        # Individual evaluation below retains the historical per-candidate
+        # failure isolation and reason reporting.
+        return
+
+
 def _select_safe_landing(
     *,
     acquisition: SeedLocalAdversarialAcquisition,
@@ -1368,6 +1404,16 @@ def _select_safe_landing(
     idx = 0
 
     salvage = bool(_cfg_value(safety_config, "salvage_safe_iterate", True))
+    _prepare_landing_components(
+        acquisition,
+        seed_atoms,
+        [
+            np.asarray(coords, dtype=float).reshape(-1, 3)
+            for k, coords in enumerate(opt_candidate_positions)
+            if k == 0 or salvage
+        ]
+        + [raw_coords],
+    )
     for k, coords in enumerate(opt_candidate_positions):
         coords = np.asarray(coords, dtype=float).reshape(-1, 3)
         if k > 0 and not salvage:
@@ -1477,8 +1523,25 @@ def _select_safe_landing(
     ):
         seed_coords = _coords_array(seed_atoms)
         n_backtrack = int(_cfg_value(safety_config, "backtrack_points", 16))
-        for frac in np.linspace(1.0, 0.0, n_backtrack + 2, dtype=float)[1:-1]:
-            coords = seed_coords + float(frac) * (raw_coords - seed_coords)
+        backtrack_coordinates = [
+            seed_coords + float(frac) * (raw_coords - seed_coords)
+            for frac in np.linspace(
+                1.0,
+                0.0,
+                n_backtrack + 2,
+                dtype=float,
+            )[1:-1]
+        ]
+        _prepare_landing_components(
+            acquisition,
+            seed_atoms,
+            [
+                coords
+                for coords in backtrack_coordinates
+                if not _duplicate_coords(coords, seen_coords)
+            ],
+        )
+        for coords in backtrack_coordinates:
             if _duplicate_coords(coords, seen_coords):
                 continue
             seen_coords.append(coords.copy())
@@ -1998,7 +2061,7 @@ def _under_move_trust_feedback(
 def _live_optimise_seed(
     models,
     seed: Atoms,
-    trajectory: Sequence[Atoms],
+    trajectory,
     acquisition_config: AcquisitionConfig,
     run_config: AriadneRunConfig,
     *,
@@ -2014,6 +2077,7 @@ def _live_optimise_seed(
     quality_gates: Optional[Any] = None,
     scale_model: Optional[Dict[str, Any]] = None,
     trace_path: Optional[Any] = None,
+    posterior_override: Optional[Any] = None,
 ) -> AriadneRunResult:
     """Run ARIADNE adversarial descent for one seed against a real
     FEREBUS-trained posterior.
@@ -2046,6 +2110,7 @@ def _live_optimise_seed(
         external_reference_scales=external_reference_scales,
         error_calibration_model=error_calibration_model,
         error_calibration_apply_strength=error_calibration_apply_strength,
+        posterior_override=posterior_override,
     )
     run_config, trust_radius_diagnostics = _size_normalised_trust_radius(
         acquisition,
@@ -2287,6 +2352,13 @@ def _live_optimise_seed(
         gradient_diagnostics = None
     calculator.close()
 
+    opt_result.diagnostics["posterior_performance"] = dict(
+        getattr(acquisition.posterior, "diagnostics", {})
+    )
+    opt_result.diagnostics["acquisition_performance"] = dict(
+        getattr(acquisition, "performance_diagnostics", {})
+    )
+
     return AriadneRunResult(
         initial_atoms=acquisition.seed_atoms,
         seed_atoms=acquisition.seed_atoms,
@@ -2437,12 +2509,19 @@ def main(argv=None) -> int:
     from ..handoff_manifests import load_seeds_picked
     from ..layout import active_iteration_dir, active_protocol_dir, ariadne_seed_dir
     from ..seed_identity import read_ariadne_task_map, task_for_array_task_id
-    from ..versioning.trained_models import load_trained_models
+    from ..versioning.trained_models import (
+        assert_current_model_payloads_unchanged,
+        load_trained_models_for_ariadne_task,
+    )
 
     config = CampaignConfig.from_yaml(cfg_path)
+    startup_started = time.perf_counter()
+    startup_timings: Dict[str, float] = {}
 
     try:
+        stage_started = time.perf_counter()
         pool = TrajectoryPool.load(campaign)
+        startup_timings["trajectory_pool"] = time.perf_counter() - stage_started
     except (FileNotFoundError, ValueError) as exc:
         print(
             "trajectory pool not loadable: " + str(exc),
@@ -2533,11 +2612,34 @@ def main(argv=None) -> int:
         )
         return 3
     try:
-        model_set, models = load_trained_models(
+        stage_started = time.perf_counter()
+        model_set, models, model_bindings = load_trained_models_for_ariadne_task(
             campaign,
             models_version,
-            verification="metadata",
+            task_map=task_map,
+            expected_campaign_uid=str(state.campaign_uid),
         )
+        startup_timings["current_models"] = time.perf_counter() - stage_started
+        from ..daemon.seed_selection_runtime import restore_ariadne_model_factors
+
+        stage_started = time.perf_counter()
+        factor_statuses = restore_ariadne_model_factors(
+            campaign,
+            pool=pool,
+            models=models,
+            model_set=model_set,
+            iteration=int(args.iteration),
+        )
+        startup_timings["model_factors"] = time.perf_counter() - stage_started
+        from ichor.core.adversarial.posterior import TotalEnergyPosterior
+
+        stage_started = time.perf_counter()
+        posterior = TotalEnergyPosterior(
+            models=models,
+            property_name="iqa",
+            scaled=True,
+        )
+        startup_timings["posterior_runtime"] = time.perf_counter() - stage_started
     except Exception as exc:
         print(
             "trained models are not loadable: "
@@ -2584,6 +2686,7 @@ def main(argv=None) -> int:
         return 3
 
     try:
+        stage_started = time.perf_counter()
         from ..sampling_protocol import load_sampling_protocol
 
         resolved_protocol = load_sampling_protocol(
@@ -2613,6 +2716,7 @@ def main(argv=None) -> int:
         audit_manifest, audit_manifest_sha256 = protocol_binding(
             resolved_protocol.audit_manifest_path
         )
+        startup_timings["sampling_protocol"] = time.perf_counter() - stage_started
     except Exception as exc:
         print(
             "sampling protocol resolution failed for ARIADNE: "
@@ -2700,11 +2804,13 @@ def main(argv=None) -> int:
     (staging_dir / TRAJECTORY_DIRNAME).mkdir(parents=True, exist_ok=False)
     trace_path = staging_dir / TRAJECTORY_DIRNAME / TRAJECTORY_TRACE_FILENAME
 
+    task_startup_total_seconds = time.perf_counter() - startup_started
     try:
+        optimisation_started = time.perf_counter()
         result = optimise_seed(
             models=models,
             seed=seed_atoms,
-            trajectory=pool.to_atoms_list(),
+            trajectory=pool,
             acquisition_config=acquisition_config,
             run_config=ariadne_run_config,
             mock=False,
@@ -2720,7 +2826,9 @@ def main(argv=None) -> int:
             quality_gates=resolved_protocol.quality_gates,
             scale_model=resolved_protocol.scale_model_payload,
             trace_path=trace_path,
+            posterior_override=posterior,
         )
+        optimisation_seconds = time.perf_counter() - optimisation_started
     except Exception as exc:
         print(
             "ARIADNE descent raised: " + repr(exc),
@@ -2740,6 +2848,35 @@ def main(argv=None) -> int:
         close_open_gradient_calculators()
 
     payload = result.to_dict()
+    optimiser_diagnostics = dict(payload.get("optimiser_diagnostics") or {})
+    optimiser_diagnostics["task_startup_timings_seconds"] = {
+        key: float(value) for key, value in startup_timings.items()
+    }
+    optimiser_diagnostics["task_startup_total_seconds"] = float(
+        task_startup_total_seconds
+    )
+    optimiser_diagnostics["optimisation_seconds"] = float(
+        optimisation_seconds
+    )
+    optimiser_diagnostics["task_total_seconds"] = float(
+        time.perf_counter() - startup_started
+    )
+    optimiser_diagnostics["model_factor_statuses"] = dict(factor_statuses)
+    optimiser_diagnostics["model_factor_status_counts"] = {
+        status: sum(1 for value in factor_statuses.values() if value == status)
+        for status in ("hit", "published", "fallback")
+    }
+    optimiser_diagnostics["n_model_factors_restored"] = int(
+        sum(1 for value in factor_statuses.values() if value == "hit")
+    )
+    optimiser_diagnostics["n_model_factors_built"] = int(
+        sum(
+            1
+            for value in factor_statuses.values()
+            if value in {"published", "fallback"}
+        )
+    )
+    payload["optimiser_diagnostics"] = optimiser_diagnostics
     payload["seed_frame_id"] = seed_frame_id
     payload["seed_id"] = int(seed_id)
     payload["seed_uid"] = seed_uid
@@ -2797,6 +2934,21 @@ def main(argv=None) -> int:
         )
         payload["optimiser_diagnostics"] = diag
     from ..daemon.state import atomic_write_json
+    from ..versioning.manifest import sha256_file
+
+    if sha256_file(pool.canonical_path) != str(pool.sha256):
+        raise RuntimeError("trajectory pool changed before ARIADNE publication")
+    assert_current_model_payloads_unchanged(
+        campaign,
+        model_set,
+        model_bindings,
+    )
+    current_task_map = read_ariadne_task_map(
+        iter_dir,
+        expected_iteration=int(args.iteration),
+    )
+    if current_task_map != task_map:
+        raise RuntimeError("ARIADNE task map changed before result publication")
 
     trajectory_coordinates = list(result.optimisation_trajectory_coordinates)
     if not trajectory_coordinates:
