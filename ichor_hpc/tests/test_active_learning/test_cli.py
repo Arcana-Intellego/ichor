@@ -1920,12 +1920,17 @@ def test_cli_init_bootstraps_fresh_state_and_config_lock(tmp_path, capsys):
     assert "ichor-al-daemon start --campaign-dir " in out
     assert " --mode live" not in out
     assert " --mode dry_run" in out
-    assert "pool SHA-256" not in out
+    assert "Bootstrap discovery complete" in out
+    assert "pool SHA-256" in out
+    assert "Final planned allocation" in out
+    assert "bootstrap identity" in out
+    assert "config_lock.json: created" in out
+    assert "supplied bootstrap geometries: training=0" in out
     assert "ALF (1-based)" not in out
     assert " --source /path/to/pool.xyz" not in out
 
 
-def test_cli_init_verbose_retains_bootstrap_diagnostics(tmp_path, capsys):
+def test_cli_init_verbose_remains_a_compatible_detailed_spelling(tmp_path, capsys):
     campaign = _campaign_with_config(tmp_path)
 
     rc = main(
@@ -1937,6 +1942,92 @@ def test_cli_init_verbose_retains_bootstrap_diagnostics(tmp_path, capsys):
     assert "Bootstrap discovery complete" in out
     assert "pool SHA-256" in out
     assert "bootstrap identity" in out
+
+
+def test_cli_init_default_confirms_two_custom_training_geometries(tmp_path, capsys):
+    campaign = tmp_path / "campaign"
+    campaign.mkdir()
+    config = CampaignConfig(max_iterations=2)
+    config.campaign.custom_bootstrap = True
+    config.point_allocation.bootstrap_training_size = 50
+    config.seed_selection.n_seeds_per_iteration = 10
+    config.to_yaml(campaign / "campaign.yaml")
+    (campaign / "pool.xyz").write_text(
+        "".join(
+            "2\nframe "
+            + str(index)
+            + "\nH 0.0 0.0 0.0\nH 0.0 0.0 "
+            + format(0.5 + 0.001 * index, ".6f")
+            + "\n"
+            for index in range(128)
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+    bootstrap = campaign / "bootstrap"
+    bootstrap.mkdir()
+    (bootstrap / "training_set_bootstrap.xyz").write_text(
+        "2\ncustom 0\nH 0.0 0.0 0.0\nH 0.0 0.0 0.31\n"
+        "2\ncustom 1\nH 0.0 0.0 0.0\nH 0.0 0.0 0.32\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    rc = main(["init", "--campaign-dir", str(campaign), "--yes"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "custom bootstrap: enabled" in out
+    assert "supplied: 2" in out
+    assert "configured target: 50" in out
+    assert "Diversity top-up: 48" in out
+    assert (
+        "supplied bootstrap geometries: training=2, internal_validation=0, "
+        "external_validation=0"
+    ) in out
+    assert (
+        "diversity top-up: training=48, internal_validation=2, "
+        "external_validation=2"
+    ) in out
+
+
+def test_detailed_bootstrap_plan_reports_custom_supplied_and_top_up_counts(capsys):
+    plan = SimpleNamespace(
+        custom_enabled=True,
+        pool_sha256="a" * 64,
+        configured_targets={"train": 50, "int_val": 10, "ext_val": 10},
+        diversity_deficits={"train": 48, "int_val": 10, "ext_val": 10},
+        effective_training_count=50,
+        model=None,
+        sources={
+            "train": SimpleNamespace(
+                path=Path("bootstrap/training_set_bootstrap.xyz"),
+                count=2,
+                alf_zero_indexed=None,
+            ),
+            "int_val": None,
+            "ext_val": None,
+        },
+    )
+
+    cli_mod._print_bootstrap_plan(plan, verbose=True)
+
+    out = capsys.readouterr().out
+    assert "custom bootstrap: enabled" in out
+    assert "source: " + str(Path("bootstrap/training_set_bootstrap.xyz")) in out
+    assert "supplied: 2" in out
+    assert "configured target: 50" in out
+    assert "Diversity top-up: 48" in out
+    assert (
+        "Final planned allocation: training=50, internal_validation=10, "
+        "external_validation=10"
+    ) in out
+
+
+def test_bootstrap_split_count_summary_reports_all_splits():
+    assert cli_mod._bootstrap_split_count_summary(
+        {"train": 2, "int_val": 0, "ext_val": 0}
+    ) == "training=2, internal_validation=0, external_validation=0"
 
 
 def test_cli_init_rerun_preserves_existing_campaign_uid(tmp_path, capsys):

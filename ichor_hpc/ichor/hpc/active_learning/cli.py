@@ -16478,6 +16478,17 @@ def _print_bootstrap_plan(plan: Any, *, verbose: bool = False) -> None:
     )
 
 
+def _bootstrap_split_count_summary(counts: Mapping[str, Any]) -> str:
+    return (
+        "training="
+        + str(int(counts.get("train", 0)))
+        + ", internal_validation="
+        + str(int(counts.get("int_val", 0)))
+        + ", external_validation="
+        + str(int(counts.get("ext_val", 0)))
+    )
+
+
 def _confirm_bootstrap_plan(*, assume_yes: bool) -> bool:
     if assume_yes:
         print("Bootstrap plan accepted by --yes.")
@@ -16830,8 +16841,9 @@ def cmd_init(args: argparse.Namespace) -> int:
         print("campaign bootstrap inspection failed: " + str(exc), file=sys.stderr)
         return 18
 
-    init_verbose = bool(getattr(args, "verbose", False))
-    _print_bootstrap_plan(plan, verbose=init_verbose)
+    # Initialisation is an explicit review boundary. Always show the complete
+    # bootstrap allocation before the user confirms it.
+    _print_bootstrap_plan(plan, verbose=True)
     if not _confirm_bootstrap_plan(assume_yes=bool(getattr(args, "yes", False))):
         print("Campaign initialisation cancelled; no campaign files were changed.")
         return 19
@@ -16938,24 +16950,38 @@ def cmd_init(args: argparse.Namespace) -> int:
     print("Campaign initialised")
     print("  campaign: " + str(campaign))
     print("  campaign.yaml: valid")
-    _print_pool_summary(pool_summary, verbose=init_verbose)
+    _print_pool_summary(pool_summary, verbose=True)
     print("  bootstrap inputs: confirmed")
-    if init_verbose:
-        print("  campaign schema: " + str(config.schema_version))
-        print(
-            "  bootstrap identity: "
-            + str(bootstrap_manifest.get("plan_identity_sha256", ""))
+    print(
+        "  custom bootstrap: "
+        + ("enabled" if bool(bootstrap_manifest.get("custom_bootstrap")) else "disabled")
+    )
+    print(
+        "  supplied bootstrap geometries: "
+        + _bootstrap_split_count_summary(
+            dict(bootstrap_manifest.get("supplied_counts") or {})
         )
+    )
+    print(
+        "  diversity top-up: "
+        + _bootstrap_split_count_summary(
+            dict(bootstrap_manifest.get("diversity_deficits") or {})
+        )
+    )
+    print("  campaign schema: " + str(config.schema_version))
+    print(
+        "  bootstrap identity: "
+        + str(bootstrap_manifest.get("plan_identity_sha256", ""))
+    )
     if feasibility_summary:
-        _print_pool_feasibility(feasibility_summary, verbose=init_verbose)
+        _print_pool_feasibility(feasibility_summary, verbose=True)
     print(
         "  state.json: "
         + str(bootstrap["state_status"])
         + ", phase="
         + str(state.phase.value)
     )
-    if init_verbose:
-        print("  config_lock.json: " + str(bootstrap["config_lock_status"]))
+    print("  config_lock.json: " + str(bootstrap["config_lock_status"]))
     print("")
     if str(pool_summary.get("status")) == "ok":
         print("Next:")
@@ -19341,7 +19367,10 @@ Examples:
             "-v",
             "--verbose",
             action="store_true",
-            help="Show hashes, ALFs and detailed bootstrap evidence.",
+            help=(
+                "Compatibility flag; init now shows hashes, ALFs and detailed "
+                "bootstrap evidence by default."
+            ),
         )
 
     p_init = sub.add_parser(
