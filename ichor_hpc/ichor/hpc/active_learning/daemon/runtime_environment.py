@@ -131,6 +131,16 @@ def configured_python_library_paths() -> List[str]:
     return paths
 
 
+def configured_python_isolation_lines() -> List[str]:
+    """Keep CSF4 EasyBuild package paths from shadowing the configured venv."""
+    if (active_machine() or "").lower() != "csf4":
+        return []
+    return [
+        "unset PYTHONPATH PYTHONHOME",
+        "export PYTHONNOUSERSITE=1",
+    ]
+
+
 def python_library_path_export_lines(paths: List[str]) -> List[str]:
     """Render deterministic loader-path exports before the first Python call."""
     if not paths:
@@ -245,6 +255,7 @@ __all__ = [
     "SUBMITTED_PYTHON_IMPORTS",
     "ariadne_runtime_command_prefix",
     "configured_daemon_runtime_modules",
+    "configured_python_isolation_lines",
     "configured_python_library_paths",
     "module_initialisation_lines",
     "module_load_lines",

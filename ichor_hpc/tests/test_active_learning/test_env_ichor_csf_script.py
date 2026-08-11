@@ -95,6 +95,7 @@ def test_env_script_contains_required_runtime_contracts():
     assert "umf compiler-rt tbb compiler" in text
     assert "mkl/2025.0" in text
     assert "python/3.11.3-gcccore-12.3.0" in text
+    assert "python-bundle-pypi" not in text
     assert "compilers/oneapi/2024.2.0" in text
     assert "mkl/2024.2" in text
     assert "libmkl_intel_lp64.so.1" in text
@@ -109,6 +110,8 @@ def test_env_script_contains_required_runtime_contracts():
     assert "PLUMED_KERNEL" in text
     assert 'venv="${HOME}/.venv/ichor-${machine}"' in text
     assert "ichor_csf_deactivate_existing_venv" in text
+    assert "ichor_csf_isolate_python_environment" in text
+    assert "PYTHONNOUSERSITE" in text
     assert "ichor_csf_warn_path_hazards" in text
     assert "ichor_csf_path_inside" in text
     assert "--machine csf3|csf4|ffluxlab" in text
@@ -216,6 +219,38 @@ printf 'machine=%s\\nvenv=%s\\n' "$ICHOR_MACHINE" "$VIRTUAL_ENV"
     assert result.returncode == 0, result.stdout + result.stderr
     assert f"machine={machine}" in result.stdout
     assert f"venv={venv.as_posix()}" in result.stdout
+
+
+def test_csf4_runtime_discards_easybuild_python_package_paths(tmp_path: Path):
+    _, environment = _make_fake_venv(tmp_path, "csf4")
+    environment["PYTHONPATH"] = "/poisoned/login/site-packages"
+    environment["PYTHONHOME"] = "/poisoned/login/python"
+    source = f"""
+module_calls=""
+module() {{
+    module_calls="${{module_calls}}|$*"
+    if [[ "${{1:-}}" == "load" && "${{2:-}}" == python/* ]]; then
+        export PYTHONPATH=/poisoned/module/site-packages
+        export PYTHONHOME=/poisoned/module/python
+    fi
+    return 0
+}}
+hostname() {{ printf 'login02\n'; }}
+source {shlex.quote(SCRIPT.as_posix())} --machine csf4 --quiet --no-purge
+printf 'PYTHONPATH=%s\n' "${{PYTHONPATH-}}"
+printf 'PYTHONHOME=%s\n' "${{PYTHONHOME-}}"
+printf 'PYTHONNOUSERSITE=%s\n' "${{PYTHONNOUSERSITE-}}"
+printf 'MODULES=%s\n' "$module_calls"
+"""
+
+    result = _run_bash(source, env=environment)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PYTHONPATH=\n" in result.stdout
+    assert "PYTHONHOME=\n" in result.stdout
+    assert "PYTHONNOUSERSITE=1\n" in result.stdout
+    assert "python/3.11.3-gcccore-12.3.0" in result.stdout
+    assert "python-bundle-pypi" not in result.stdout
 
 
 def test_env_script_accepts_options_first_with_automatic_detection(tmp_path: Path):

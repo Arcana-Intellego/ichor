@@ -26,6 +26,7 @@ from .resource_solver import (
 from .runtime_environment import (
     SUBMITTED_PYTHON_IMPORTS,
     ariadne_runtime_command_prefix,
+    configured_python_isolation_lines,
     module_initialisation_lines,
     native_runtime_setup_lines,
     normalise_module_list,
@@ -216,6 +217,7 @@ def render_submitted_environment_smoke_script(
     ]
     lines.extend("module load " + module for module in runtime_modules)
     lines.extend(native_runtime_setup_lines())
+    lines.extend(configured_python_isolation_lines())
     lines.extend(
         python_library_path_export_lines(
             list(getattr(availability, "batch_python_library_paths", ()) or ())

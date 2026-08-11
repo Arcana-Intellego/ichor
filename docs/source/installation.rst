@@ -71,11 +71,13 @@ To load the recommended CSF4 Python module, use
 .. code-block:: text
 
     module load python/3.11.3-gcccore-12.3.0
-    module load python-bundle-pypi/2023.06-gcccore-12.3.0
+    unset PYTHONPATH PYTHONHOME
+    export PYTHONNOUSERSITE=1
 
-The ``python-bundle-pypi`` module is useful while bootstrapping a venv because
-it provides common packaging tools. Once the venv exists, use the venv's own
-``python -m pip``.
+Do not load ``python-bundle-pypi`` for the ICHOR venv. Its injected
+``PYTHONPATH`` can shadow packages installed in the private environment. Use
+the base module's ``venv`` and ``pip``, then install every dependency with the
+venv's own ``python -m pip``.
 
 On CSF3, do not use the central ``python/3.13.1`` module for the
 active-learning stack unless every compiled dependency has been proven against
@@ -205,7 +207,8 @@ for the ICHOR venv:
 
     module purge
     module load python/3.11.3-gcccore-12.3.0
-    module load python-bundle-pypi/2023.06-gcccore-12.3.0
+    unset PYTHONPATH PYTHONHOME
+    export PYTHONNOUSERSITE=1
 
     tar -xf plumed-2.10.0.tgz
     cd plumed-2.10.0

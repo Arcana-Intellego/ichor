@@ -122,6 +122,7 @@ from .runtime_environment import (
     DEFAULT_DAEMON_RUNTIME_MODULES,
     ariadne_runtime_command_prefix,
     configured_daemon_runtime_modules,
+    configured_python_isolation_lines,
     configured_python_library_paths,
     module_initialisation_lines,
     native_runtime_setup_lines,
@@ -3237,6 +3238,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                             for module in _configured_daemon_runtime_modules()
                         ],
                         *native_runtime_setup_lines(),
+                        *configured_python_isolation_lines(),
                         "export ICHOR_ACTIVE_WORKERS="
                         + str(
                             int(
@@ -8735,6 +8737,7 @@ def build_scheduler_script(
         "module purge",
         *["module load " + m for m in _configured_daemon_runtime_modules()],
         *native_runtime_setup_lines(),
+        *configured_python_isolation_lines(),
         *python_library_path_export_lines(configured_python_library_paths()),
         "",
     ]
@@ -8938,6 +8941,7 @@ def _gaussian_invocation_block(
     uid_q = _shell_quote(uid)
     return [
         *["module load " + m for m in gaussian_modules],
+        *configured_python_isolation_lines(),
         "",
         "# per-point gaussian array: task N runs the Nth staged pointdir.",
         "export ICHOR_CAMPAIGN_DIR=" + camp_q,
@@ -9037,6 +9041,7 @@ def _aimall_invocation_block(
     python = _python_executable_for_script()
     return [
         *["module load " + module for module in aimall_modules],
+        *configured_python_isolation_lines(),
         "",
         "# per-point AIMAll array over the .wfn files gaussian produced.",
         "export ICHOR_CAMPAIGN_DIR=" + camp_q,

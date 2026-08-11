@@ -37,6 +37,7 @@ from .runtime_environment import (
     SUBMITTED_PYTHON_IMPORTS,
     ariadne_runtime_command_prefix,
     configured_daemon_runtime_modules,
+    configured_python_isolation_lines,
     configured_python_library_paths,
     native_runtime_setup_lines,
     normalise_module_list,
@@ -268,6 +269,7 @@ def _probe_configured_python_details(
                 "module purge",
                 *module_lines,
                 *native_runtime_setup_lines(),
+                *configured_python_isolation_lines(),
                 *python_library_path_export_lines(list(library_paths or [])),
             ]
             + [
@@ -405,6 +407,7 @@ def _probe_gaussian_environment() -> tuple[bool, str, str]:
                     "module purge",
                     *module_lines,
                     *native_runtime_setup_lines(),
+                    *configured_python_isolation_lines(),
                     command,
                 ]
             ),
@@ -449,9 +452,14 @@ def _probe_aimall_environment() -> tuple[bool, str, str]:
     try:
         completed = _run_login_shell(
             "\n".join(
-                ["set -euo pipefail", "module purge", *[
-                    "module load " + module for module in modules
-                ], *native_runtime_setup_lines(), command]
+                [
+                    "set -euo pipefail",
+                    "module purge",
+                    *["module load " + module for module in modules],
+                    *native_runtime_setup_lines(),
+                    *configured_python_isolation_lines(),
+                    command,
+                ]
             ),
             timeout=30,
         )

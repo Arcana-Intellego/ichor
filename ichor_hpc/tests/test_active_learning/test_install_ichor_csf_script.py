@@ -97,6 +97,10 @@ def test_install_script_is_present():
     assert "--with-openssl=" in text
     assert "--with-openssl-rpath=auto" in text
     assert "source \"${SCRIPT_DIR}/lib_ichor.sh\"" in text
+    assert "python-bundle-pypi" not in text
+    assert "ichor_csf_isolate_python_environment" in text
+    assert "verify_ariadne_packaging_api" in text
+    assert "verify_csf4_python_package_origins" in text
     assert "ichor_csf_module_is_shell_function()" in lib_text
     assert "ichor_csf_module_debug()" in lib_text
     assert "ichor_csf_find_ariadne_compiler_path()" in lib_text
@@ -320,6 +324,18 @@ def test_install_script_dry_run_uses_parallel_build_flags(tmp_path):
     assert "make -j 4" in output
     assert "cmake --build" in output
     assert "-j 4" in output
+
+
+def test_csf4_dry_run_uses_isolated_venv_package_authority(tmp_path):
+    result = _run_dry("csf4", tmp_path)
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "python-bundle-pypi" not in output
+    assert "validate isolated CSF4 venv contract" in output
+    assert "verify CSF4 Python package origins" in output
+    assert "verify isolated packaging API required by ARIADNE" in output
+    assert "preserve bundled FEREBUS OpenBLAS archive" in output
 
 
 @pytest.mark.parametrize(

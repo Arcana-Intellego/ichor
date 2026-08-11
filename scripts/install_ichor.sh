@@ -240,6 +240,11 @@ deactivate_existing_venv() {
     ichor_csf_deactivate_existing_venv "$@"
 }
 
+isolate_target_python_environment() {
+    [[ "${MACHINE}" == "csf4" ]] || return 0
+    ichor_csf_isolate_python_environment
+}
+
 backup_existing_path() {
     local path="$1"
     local label="$2"
@@ -562,6 +567,7 @@ EOF
 
 python_import_ok() {
     local module_name="$1"
+    isolate_target_python_environment
     "${PYTHON}" -c "import ${module_name}" >/dev/null 2>&1
 }
 
@@ -572,6 +578,8 @@ run_ariadne_python() {
         env \
             LD_PRELOAD="${ICHOR_ARIADNE_LD_PRELOAD}${LD_PRELOAD:+:${LD_PRELOAD}}" \
             "${PYTHON}" "$@"
+    elif [[ "${MACHINE}" == "csf4" ]]; then
+        ichor_csf_run_isolated_python "${PYTHON}" "$@"
     else
         "${PYTHON}" "$@"
     fi
@@ -607,7 +615,7 @@ load_python_stack() {
     if [[ "${MACHINE}" == "csf4" ]]; then
         module_cmd purge
         module_cmd load python/3.11.3-gcccore-12.3.0
-        module_cmd load python-bundle-pypi/2023.06-gcccore-12.3.0
+        isolate_target_python_environment
     elif [[ "${MACHINE}" == "ffluxlab" ]]; then
         module_cmd purge
         module_cmd load compilers/gcc/11.1.0
@@ -697,10 +705,10 @@ load_ariadne_modules() {
         export LD_LIBRARY_PATH="${PYTHON_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
     elif [[ "${MACHINE}" == "csf4" ]]; then
         module_cmd load python/3.11.3-gcccore-12.3.0
-        module_cmd load python-bundle-pypi/2023.06-gcccore-12.3.0
         module_cmd load compilers/oneapi/2024.2.0
         module_cmd load compiler-rt tbb compiler
         module_cmd load mkl/2024.2
+        isolate_target_python_environment
     else
         module_cmd load compilers/intel/21.0.3
         resolve_ffluxlab_intel_runtime
@@ -731,8 +739,8 @@ load_gcc_build_modules() {
         export LD_LIBRARY_PATH="${PYTHON_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
     elif [[ "${MACHINE}" == "csf4" ]]; then
         module_cmd load python/3.11.3-gcccore-12.3.0
-        module_cmd load python-bundle-pypi/2023.06-gcccore-12.3.0
         module_cmd load cmake/3.23.1-gcccore-11.3.0
+        isolate_target_python_environment
     else
         module_cmd load compilers/gcc/11.1.0
         if [[ -d "${VENV:-}/bin" ]]; then
@@ -981,6 +989,151 @@ ensure_csf3_python() {
     ensure_private_python "$@"
 }
 
+validate_csf4_venv_contract() {
+    [[ "${MACHINE}" == "csf4" ]] || return 0
+    isolate_target_python_environment
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "+ validate isolated CSF4 venv contract at ${VENV}"
+        return 0
+    fi
+    "${PYTHON}" - "${VENV}" <<'PY'
+from pathlib import Path
+import os
+import site
+import sys
+
+expected = Path(sys.argv[1]).resolve()
+observed = Path(sys.prefix).resolve()
+if observed != expected or sys.prefix == sys.base_prefix:
+    raise SystemExit(
+        f"configured Python is not isolated in the target venv: "
+        f"expected={expected} observed={observed}"
+    )
+
+config = expected / "pyvenv.cfg"
+settings = {}
+for line in config.read_text(encoding="utf-8").splitlines():
+    if "=" in line:
+        key, value = line.split("=", 1)
+        settings[key.strip().lower()] = value.strip().lower()
+if settings.get("include-system-site-packages") != "false":
+    raise SystemExit(
+        "target venv must set include-system-site-packages = false"
+    )
+if site.ENABLE_USER_SITE is not False:
+    raise SystemExit("target venv unexpectedly enables user site-packages")
+if os.environ.get("PYTHONPATH") or os.environ.get("PYTHONHOME"):
+    raise SystemExit("CSF4 Python isolation variables were not cleared")
+if os.environ.get("PYTHONNOUSERSITE") != "1":
+    raise SystemExit("PYTHONNOUSERSITE=1 is required on CSF4")
+PY
+}
+
+verify_csf4_python_package_origins() {
+    [[ "${MACHINE}" == "csf4" ]] || return 0
+    local include_ariadne="${1:-0}"
+    isolate_target_python_environment
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "+ verify CSF4 Python package origins are inside ${VENV}"
+        return 0
+    fi
+    "${PYTHON}" - \
+        "${VENV}" \
+        "${include_ariadne}" \
+        "${REPO_ROOT}" \
+        "${PROJECTS_DIR}/FEREBUS_CPU/pyferebus" <<'PY'
+from importlib import import_module
+from pathlib import Path
+import sys
+
+venv = Path(sys.argv[1]).resolve()
+modules = [
+    "packaging",
+    "numpy",
+    "scipy",
+    "pandas",
+    "yaml",
+    "cffi",
+    "ase",
+    "xtb",
+    "plumed",
+    "rdkit",
+    "tqdm",
+    "portalocker",
+    "typing_extensions",
+]
+if sys.argv[2] == "1":
+    modules.append("ariadne")
+
+failures = []
+for name in modules:
+    module = import_module(name)
+    raw_origin = getattr(module, "__file__", None)
+    if not raw_origin:
+        failures.append(f"{name}: import has no file origin")
+        continue
+    origin = Path(raw_origin).resolve()
+    try:
+        origin.relative_to(venv)
+    except ValueError:
+        failures.append(f"{name}: {origin} is outside {venv}")
+if failures:
+    raise SystemExit(
+        "CSF4 venv package isolation failed:\n  " + "\n  ".join(failures)
+    )
+
+editable_origins = {
+    "ichor.core": Path(sys.argv[3]).resolve() / "ichor_core",
+    "ichor.hpc": Path(sys.argv[3]).resolve() / "ichor_hpc",
+    "ichor.cli": Path(sys.argv[3]).resolve() / "ichor_cli",
+    "pyferebus.executors.trainer": Path(sys.argv[4]).resolve(),
+}
+for name, expected_root in editable_origins.items():
+    module = import_module(name)
+    origin = Path(module.__file__).resolve()
+    try:
+        origin.relative_to(expected_root)
+    except ValueError as exc:
+        raise SystemExit(
+            f"editable package {name} is outside {expected_root}: {origin}"
+        ) from exc
+print("CSF4 venv package origins OK")
+PY
+}
+
+verify_ariadne_packaging_api() {
+    [[ "${MACHINE}" == "csf4" ]] || return 0
+    isolate_target_python_environment
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "+ verify isolated packaging API required by ARIADNE"
+        return 0
+    fi
+    "${PYTHON}" - "${VENV}" <<'PY'
+from pathlib import Path
+import inspect
+import sys
+
+import packaging
+import packaging.utils
+
+venv = Path(sys.argv[1]).resolve()
+origin = Path(packaging.__file__).resolve()
+try:
+    origin.relative_to(venv)
+except ValueError as exc:
+    raise SystemExit(
+        f"ARIADNE build packaging is outside the target venv: {origin}"
+    ) from exc
+parameters = inspect.signature(packaging.utils.canonicalize_name).parameters
+if "validate" not in parameters or not hasattr(packaging.utils, "InvalidName"):
+    raise SystemExit(
+        "ARIADNE requires a modern isolated packaging API; rerun --only python "
+        "or --only packages"
+    )
+print(f"ARIADNE packaging API OK: {origin}")
+PY
+}
+
 create_or_activate_venv() {
     local recreate="${1:-0}"
     local base_python
@@ -992,6 +1145,7 @@ create_or_activate_venv() {
     if [[ "${recreate}" -eq 1 && -d "${VENV}" ]]; then
         backup_existing_path "${VENV}" "venv"
     fi
+    isolate_target_python_environment
     if [[ ! -x "${VENV}/bin/python" ]]; then
         note "Creating venv at ${VENV}"
         run_cmd "${base_python}" -m venv "${VENV}"
@@ -1005,6 +1159,8 @@ create_or_activate_venv() {
     fi
     PYTHON="${VENV}/bin/python"
     PIP="${PYTHON} -m pip"
+    isolate_target_python_environment
+    validate_csf4_venv_contract
     if [[ "${MACHINE}" == "csf3" || "${MACHINE}" == "ffluxlab" ]]; then
         verify_python_ssl "${PYTHON}"
         verify_private_python_stdlib "${PYTHON}"
@@ -1024,6 +1180,8 @@ activate_existing_venv() {
     fi
     PYTHON="${VENV}/bin/python"
     PIP="${PYTHON} -m pip"
+    isolate_target_python_environment
+    validate_csf4_venv_contract
     if [[ "${MACHINE}" == "csf3" || "${MACHINE}" == "ffluxlab" ]]; then
         verify_python_ssl "${PYTHON}"
         verify_private_python_stdlib "${PYTHON}"
@@ -1061,6 +1219,7 @@ pip_install() {
             "ffluxlab Python constraints"
         constraint_args=(--constraint "${FFLUXLAB_PYTHON_CONSTRAINTS}")
     fi
+    isolate_target_python_environment
     run_cmd "${PYTHON}" -m pip install "${constraint_args[@]}" "$@"
 }
 
@@ -1105,11 +1264,12 @@ install_python_packages() {
             scipy \
             xtb
     fi
-    pip_install pytest
+    pip_install cffi pytest
     pip_install -e "${REPO_ROOT}/ichor_core"
     pip_install -e "${REPO_ROOT}/ichor_hpc"
     pip_install -e "${REPO_ROOT}/ichor_cli"
     pip_install -e "${PROJECTS_DIR}/FEREBUS_CPU/pyferebus" --no-deps
+    verify_csf4_python_package_origins 0
 }
 
 verify_ariadne_api() {
@@ -1321,10 +1481,11 @@ EOF
     elif [[ "${MACHINE:-}" == "csf4" ]]; then
         cat >&2 <<'EOF'
 module load python/3.11.3-gcccore-12.3.0
-module load python-bundle-pypi/2023.06-gcccore-12.3.0
 module load compilers/oneapi/2024.2.0
 module load compiler-rt tbb compiler
 module load mkl/2024.2
+unset PYTHONPATH PYTHONHOME
+export PYTHONNOUSERSITE=1
 EOF
         echo "source ${VENV:-${HOME}/.venv/ichor-csf4}/bin/activate" >&2
     else
@@ -1383,6 +1544,7 @@ install_ariadne_if_needed() {
     local ariadne_root="${PROJECTS_DIR}/ARIADNE"
     require_dir "${ariadne_root}" "ARIADNE source tree"
     pip_install -r "${ariadne_root}/requirements-build.txt"
+    verify_ariadne_packaging_api
     [[ -n "${ARIADNE_CC:-}" && -n "${ARIADNE_CXX:-}" && -n "${ARIADNE_FC:-}" ]] || die "ARIADNE compiler paths were not resolved after loading oneAPI modules."
     [[ "${DRY_RUN}" -eq 1 || -x "${ARIADNE_CC}" ]] || die "resolved ARIADNE C compiler is not executable: ${ARIADNE_CC}"
     [[ "${DRY_RUN}" -eq 1 || -x "${ARIADNE_CXX}" ]] || die "resolved ARIADNE C++ compiler is not executable: ${ARIADNE_CXX}"
@@ -1402,6 +1564,7 @@ install_ariadne_if_needed() {
     else
         rm -rf "${ariadne_root}/_skbuild" "${ariadne_root}/build"
     fi
+    isolate_target_python_environment
     # shellcheck disable=SC2086
     if ! run_in_dir "${ariadne_root}" "${PYTHON}" -m pip install . --no-build-isolation -v --force-reinstall --no-deps ${ariadne_pip_config}; then
         print_ariadne_manual_recovery_block
@@ -1412,6 +1575,7 @@ install_ariadne_if_needed() {
     print_ariadne_import_info "ARIADNE after install"
     verify_ariadne_api
     assert_ariadne_inside_venv
+    verify_csf4_python_package_origins 1
     write_ariadne_receipt
 }
 
@@ -1669,6 +1833,7 @@ install_ferebus_if_needed() {
 
 upsert_ichor_config() {
     note "Updating ~/ichor_config.yaml"
+    isolate_target_python_environment
     local venv_config
     local aimall_config
     local ferebus_config
@@ -1719,6 +1884,7 @@ verify_operator_backends() {
 }
 
 require_yaml_available() {
+    isolate_target_python_environment
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         echo "+ ${PYTHON} -c 'import yaml'"
         return 0
@@ -1736,6 +1902,9 @@ final_checks() {
     [[ -f "${HOME}/ichor_config.yaml" ]] \
         || die "ICHOR configuration not found: ${HOME}/ichor_config.yaml. Complete the full installer or run --only config before --only verify."
     export ICHOR_MACHINE="${MACHINE}"
+    isolate_target_python_environment
+    validate_csf4_venv_contract
+    verify_csf4_python_package_origins 1
     "${PYTHON}" -c "import ichor.core, ichor.hpc, ichor.cli; print('ICHOR packages OK')"
     "${PYTHON}" -c "import pyferebus.executors.trainer; print('pyferebus OK')"
     verify_ariadne_api
@@ -1849,10 +2018,11 @@ doctor_load_ariadne_modules() {
             echo "+ module load mkl/2025.0"
         elif [[ "${MACHINE}" == "csf4" ]]; then
             echo "+ module load python/3.11.3-gcccore-12.3.0"
-            echo "+ module load python-bundle-pypi/2023.06-gcccore-12.3.0"
             echo "+ module load compilers/oneapi/2024.2.0"
             echo "+ module load compiler-rt tbb compiler"
             echo "+ module load mkl/2024.2"
+            echo "+ unset PYTHONPATH PYTHONHOME"
+            echo "+ export PYTHONNOUSERSITE=1"
         else
             echo "+ module load compilers/intel/21.0.3"
             echo "+ resolve 64-bit Intel and MKL runtimes beneath /home/modules/compilers/intel/21.0.3"
@@ -1870,10 +2040,10 @@ doctor_load_ariadne_modules() {
         export LD_LIBRARY_PATH="${PYTHON_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
     elif [[ "${MACHINE}" == "csf4" ]]; then
         ichor_csf_module load python/3.11.3-gcccore-12.3.0 || return 1
-        ichor_csf_module load python-bundle-pypi/2023.06-gcccore-12.3.0 || return 1
         ichor_csf_module load compilers/oneapi/2024.2.0 || return 1
         ichor_csf_module load compiler-rt tbb compiler || return 1
         ichor_csf_module load mkl/2024.2 || return 1
+        ichor_csf_isolate_python_environment
     else
         ichor_csf_module load compilers/intel/21.0.3 || return 1
         resolve_ffluxlab_intel_runtime || return 1

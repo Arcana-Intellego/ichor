@@ -37,11 +37,14 @@ daemon.
 ssh csf4
 module purge
 module load python/3.11.3-gcccore-12.3.0
-module load python-bundle-pypi/2023.06-gcccore-12.3.0
+unset PYTHONPATH PYTHONHOME
+export PYTHONNOUSERSITE=1
 module load gaussian/g16c01_em64t_detectcpu
 ```
 
-The non-Anaconda Python module is the base for the daemon venv. Gaussian
+The non-Anaconda Python module is the base for the daemon venv. Do not load
+`python-bundle-pypi`: its injected `PYTHONPATH` shadows packages installed in
+the private venv. Gaussian
 g16 is the SCF backend for the INITIAL_GAUSSIAN + GAUSSIAN phases. AIMAll
 and FEREBUS do not have modules; you install them yourself (see section 3).
 
@@ -102,7 +105,8 @@ build and exits with `error: command 'icx' failed: Permission denied`.
 ```
 module purge
 module load python/3.11.3-gcccore-12.3.0
-module load python-bundle-pypi/2023.06-gcccore-12.3.0
+unset PYTHONPATH PYTHONHOME
+export PYTHONNOUSERSITE=1
 module load gaussian/g16c01_em64t_detectcpu
 
 source ~/.venv/ichor-csf4/bin/activate

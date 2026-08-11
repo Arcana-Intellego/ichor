@@ -148,6 +148,9 @@ _ichor_env_ariadne_check() {
 _ichor_env_print_env() {
     echo "ICHOR_MACHINE=${ICHOR_MACHINE:-}"
     echo "VIRTUAL_ENV=${VIRTUAL_ENV:-}"
+    echo "PYTHONPATH=${PYTHONPATH:-}"
+    echo "PYTHONHOME=${PYTHONHOME:-}"
+    echo "PYTHONNOUSERSITE=${PYTHONNOUSERSITE:-}"
     echo "python=$(command -v python || true)"
     echo "ichor-cli=$(command -v ichor-cli || true)"
     echo "ichor-al-daemon=$(command -v ichor-al-daemon || true)"
@@ -189,7 +192,6 @@ _ichor_env_load_runtime_modules() {
         _ichor_env_module load mkl/2025.0 || return 1
     elif [[ "${machine}" == "csf4" ]]; then
         _ichor_env_module load python/3.11.3-gcccore-12.3.0 || return 1
-        _ichor_env_module load python-bundle-pypi/2023.06-gcccore-12.3.0 || return 1
         _ichor_env_module load compilers/oneapi/2024.2.0 || return 1
         _ichor_env_module load compiler-rt tbb compiler || return 1
         _ichor_env_module load mkl/2024.2 || return 1
@@ -407,6 +409,9 @@ _ichor_env_main() {
 
     ichor_csf_deactivate_existing_venv "loading cluster modules" || return 1
     _ichor_env_load_runtime_modules "${machine}" "${do_purge}" || return 1
+    if [[ "${machine}" == "csf4" ]]; then
+        ichor_csf_isolate_python_environment
+    fi
     if [[ "${machine}" == "ffluxlab" ]]; then
         _ichor_env_ffluxlab_intel_runtime || return 1
         _ichor_env_ffluxlab_gcc_runtime || return 1
@@ -434,6 +439,9 @@ _ichor_env_main() {
     fi
     # shellcheck disable=SC1091
     source "${venv}/bin/activate" || return 1
+    if [[ "${machine}" == "csf4" ]]; then
+        ichor_csf_isolate_python_environment
+    fi
     hash -r 2>/dev/null || true
 
     ichor_csf_warn_path_hazards "${venv}"

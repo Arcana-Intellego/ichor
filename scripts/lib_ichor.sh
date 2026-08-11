@@ -310,6 +310,20 @@ ichor_csf_deactivate_existing_venv() {
     hash -r 2>/dev/null || true
 }
 
+ichor_csf_isolate_python_environment() {
+    # A configured venv is the sole Python package authority. EasyBuild
+    # modules may prepend package directories which otherwise shadow it.
+    unset PYTHONPATH PYTHONHOME
+    export PYTHONNOUSERSITE=1
+}
+
+ichor_csf_run_isolated_python() {
+    (
+        ichor_csf_isolate_python_environment
+        "$@"
+    )
+}
+
 ichor_csf_find_ariadne_compiler_path() {
     local exe="$1"
     local resolved

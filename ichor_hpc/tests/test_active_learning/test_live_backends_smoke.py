@@ -90,6 +90,19 @@ requires_ariadne = pytest.mark.skipif(
 )
 
 
+def test_python_package_isolation_is_scoped_to_csf4(monkeypatch):
+    from ichor.hpc.active_learning.daemon import runtime_environment
+
+    monkeypatch.setattr(runtime_environment, "active_machine", lambda: "csf4")
+    assert runtime_environment.configured_python_isolation_lines() == [
+        "unset PYTHONPATH PYTHONHOME",
+        "export PYTHONNOUSERSITE=1",
+    ]
+
+    monkeypatch.setattr(runtime_environment, "active_machine", lambda: "csf3")
+    assert runtime_environment.configured_python_isolation_lines() == []
+
+
 def _install_fake_global_variables(monkeypatch, config, machine):
     fake_global_variables = ModuleType("ichor.hpc.global_variables")
     fake_global_variables.ICHOR_CONFIG = config
@@ -141,6 +154,40 @@ def _install_fake_script_render_profile(monkeypatch):
         "csf3",
     )
     return python_path, gaussian_module
+
+
+def _install_fake_csf4_script_render_profile(monkeypatch):
+    python_path = "/venv/ichor-csf4/bin/python"
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf4": {
+                "hpc": {
+                    "scheduler": "slurm",
+                    "jobscript_shebang": "#!/bin/bash --login",
+                    "memory_per_core_gb_by_partition": {"multicore": 4},
+                    "parallel_environments": {"multicore": [1, 40]},
+                },
+                "software": {
+                    "python": {
+                        "modules": ["python/test"],
+                        "python_path": python_path,
+                    },
+                    "ariadne_runtime": {"modules": []},
+                    "gaussian": {
+                        "modules": ["gaussian/test"],
+                        "executable_path": "g16",
+                    },
+                    "aimall": {
+                        "modules": ["aimall/test"],
+                        "executable_path": "aimqb.ish",
+                    },
+                },
+            }
+        },
+        "csf4",
+    )
+    return python_path
 
 
 # --- preflight introspection (always run) ----------------------------------
@@ -310,11 +357,71 @@ def test_submitted_environment_smoke_renders_exact_runtime_contract(
         "/home/user/.venv/ichor-csf3/bin/python"
     )
     assert "ICHOR_ARIADNE_LD_PRELOAD" not in body
+    assert "unset PYTHONPATH PYTHONHOME" not in body
+    assert "PYTHONNOUSERSITE" not in body
     assert "pyferebus.executors.trainer" in body
     assert "probe_ariadne_runtime" in body
     assert "test -x /opt/gaussian/g16" in body
     assert "test -x /home/user/AIMAll/aimqb.ish" in body
     assert SMOKE_SUCCESS_MARKER in body
+
+
+def test_csf4_submitted_environment_smoke_isolates_venv_python(
+    tmp_path,
+    monkeypatch,
+):
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf4": {
+                "hpc": {
+                    "scheduler": "slurm",
+                    "jobscript_shebang": "#!/bin/bash --login",
+                    "max_array_task_id": 25000,
+                    "max_job_log_files_per_directory": 5000,
+                    "memory_per_core_gb_by_partition": {"multicore": 4},
+                    "partitions": {
+                        "multicore": {
+                            "min_cpus": 2,
+                            "max_cpus": 40,
+                            "memory_per_core_gb": 4,
+                            "max_walltime_hours": 168,
+                            "daemon_supported": True,
+                        }
+                    },
+                },
+                "software": {
+                    "python": {"python_path": "/venv/ichor-csf4/bin/python"},
+                    "ferebus": {"pyferebus_platform": "CSF4"},
+                },
+            }
+        },
+        "csf4",
+    )
+    availability = SimpleNamespace(
+        active_profile="csf4",
+        batch_runtime_modules=("python/test", "mkl/test"),
+        batch_python_library_paths=(),
+        python_executable="/venv/ichor-csf4/bin/python",
+        gaussian_binary="/opt/gaussian/g16",
+        aimall_path="/home/user/AIMAll/aimqb.ish",
+        ferebus_path="/home/user/.local/bin/ferebus",
+        bc_path="/usr/bin/bc",
+    )
+
+    body = render_submitted_environment_smoke_script(
+        config=CampaignConfig(),
+        availability=availability,
+        output_path=tmp_path / "smoke.out",
+    )
+
+    assert body.index("module load python/test") < body.index(
+        "unset PYTHONPATH PYTHONHOME"
+    )
+    assert body.index("unset PYTHONPATH PYTHONHOME") < body.index(
+        "/venv/ichor-csf4/bin/python"
+    )
+    assert "export PYTHONNOUSERSITE=1" in body
 
 
 def test_submitted_environment_smoke_records_success(tmp_path, monkeypatch):
@@ -424,6 +531,29 @@ def test_build_sbatch_script_renders_gaussian_block(monkeypatch):
     preparation = "ichor.hpc.active_learning.daemon.quantum_job_prepare"
     assert preparation in body
     assert body.index(preparation) < body.index("g16 < input.gjf")
+
+
+@pytest.mark.parametrize("phase", ("INITIAL_GAUSSIAN", "INITIAL_AIMALL"))
+def test_csf4_backend_modules_cannot_recontaminate_venv_python(
+    monkeypatch,
+    phase,
+):
+    python_path = _install_fake_csf4_script_render_profile(monkeypatch)
+    body = build_sbatch_script(
+        phase_name=phase,
+        iteration=0,
+        campaign_dir=Path("/scratch/campaign"),
+        config=CampaignConfig(),
+        array_size=1,
+    )
+    backend_module = "gaussian/test" if "GAUSSIAN" in phase else "aimall/test"
+    backend_position = body.index("module load " + backend_module)
+    backend_python_position = body.index(python_path, backend_position)
+
+    assert backend_position < body.rindex(
+        "unset PYTHONPATH PYTHONHOME"
+    )
+    assert body.rindex("unset PYTHONPATH PYTHONHOME") < backend_python_position
 
 
 def test_build_sbatch_script_renders_aimall_directives():
@@ -546,6 +676,10 @@ def test_build_sbatch_script_uses_configured_runtime_modules(monkeypatch):
     assert "module load oneapi/custom" in body
     assert "module load mkl/custom" in body
     assert "module load python/3.11.3-gcccore-12.3.0" not in body
+    assert body.index("module load mkl/custom") < body.index(
+        "unset PYTHONPATH PYTHONHOME"
+    )
+    assert "export PYTHONNOUSERSITE=1" in body
 
 
 def test_csf3_private_python_path_and_loader_are_expanded_before_use(monkeypatch):
@@ -701,6 +835,8 @@ def test_csf3_profile_accepts_empty_python_modules_and_uses_runtime_modules(monk
     assert "module load umf compiler-rt tbb compiler" in body
     assert "module load mkl/2025.0" in body
     assert "$HOME/.venv/ichor-al-csf3/bin/python" in body
+    assert "unset PYTHONPATH PYTHONHOME" not in body
+    assert "PYTHONNOUSERSITE" not in body
 
 
 def test_csf3_gaussian_block_uses_configured_module_path_and_scratch(monkeypatch):
@@ -2139,9 +2275,11 @@ def test_replacement_pointdir_guard_executes_valid_round_and_rejects_sibling(
 
 def test_configured_batch_python_probe_uses_exact_interpreter(monkeypatch):
     from ichor.hpc.active_learning.daemon import preflight
+    from ichor.hpc.active_learning.daemon import runtime_environment
 
-    executable = "/home/user/.venv/ichor-csf3/bin/python"
+    executable = "/home/user/.venv/ichor-csf4/bin/python"
     calls = []
+    monkeypatch.setattr(runtime_environment, "active_machine", lambda: "csf4")
     monkeypatch.setattr(preflight.os.path, "isfile", lambda value: value == executable)
     monkeypatch.setattr(preflight.os, "access", lambda value, mode: value == executable)
     monkeypatch.setattr(preflight.shutil, "which", lambda name: "/bin/bash" if name == "bash" else None)
@@ -2177,6 +2315,11 @@ def test_configured_batch_python_probe_uses_exact_interpreter(monkeypatch):
     script = calls[0][0][3]
     assert "module load python/3.11" in script
     assert "module load mkl/2024.2" in script
+    assert script.index("module load mkl/2024.2") < script.index(
+        "unset PYTHONPATH PYTHONHOME"
+    )
+    assert script.index("unset PYTHONPATH PYTHONHOME") < script.index(executable)
+    assert "export PYTHONNOUSERSITE=1" in script
     assert executable in script
     assert "ariadne" in script
     assert "ichor.hpc" in script
