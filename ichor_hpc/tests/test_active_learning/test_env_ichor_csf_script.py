@@ -95,6 +95,7 @@ def test_env_script_contains_required_runtime_contracts():
     assert "umf compiler-rt tbb compiler" in text
     assert "mkl/2025.0" in text
     assert "python/3.11.3-gcccore-12.3.0" in text
+    assert "slurm/23.02.1" in text
     assert "python-bundle-pypi" not in text
     assert "compilers/oneapi/2024.2.0" in text
     assert "mkl/2024.2" in text
@@ -250,6 +251,7 @@ printf 'MODULES=%s\n' "$module_calls"
     assert "PYTHONHOME=\n" in result.stdout
     assert "PYTHONNOUSERSITE=1\n" in result.stdout
     assert "python/3.11.3-gcccore-12.3.0" in result.stdout
+    assert "slurm/23.02.1" in result.stdout
     assert "python-bundle-pypi" not in result.stdout
 
 

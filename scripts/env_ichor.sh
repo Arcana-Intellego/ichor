@@ -191,6 +191,7 @@ _ichor_env_load_runtime_modules() {
         _ichor_env_module load umf compiler-rt tbb compiler || return 1
         _ichor_env_module load mkl/2025.0 || return 1
     elif [[ "${machine}" == "csf4" ]]; then
+        _ichor_env_module load slurm/23.02.1 || return 1
         _ichor_env_module load python/3.11.3-gcccore-12.3.0 || return 1
         _ichor_env_module load compilers/oneapi/2024.2.0 || return 1
         _ichor_env_module load compiler-rt tbb compiler || return 1

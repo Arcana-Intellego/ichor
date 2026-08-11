@@ -41,6 +41,7 @@ from ..submit.sacct_poll import aggregate_states
 SMOKE_SUCCESS_MARKER = "ICHOR_SUBMITTED_ENVIRONMENT_SMOKE_OK"
 _SAFE_SHEBANG_RE = re.compile(r"^#![A-Za-z0-9_./+-]+(?: [A-Za-z0-9_./+-]+)*$")
 _SAFE_SLURM_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:+/-]*$")
+_SAFE_EXECUTABLE_EXPRESSION_RE = re.compile(r"^[A-Za-z0-9_./${}:+~-]+$")
 
 
 class SubmittedEnvironmentSmokeError(RuntimeError):
@@ -119,6 +120,49 @@ def _required_path(label: str, value: Any) -> str:
     return path
 
 
+def _configured_executable_expression(
+    backend: str,
+    availability_value: Any,
+) -> str:
+    raw = profile_value("software", backend, "executable_path", default=None)
+    value = str(raw or availability_value or "").strip()
+    if value.startswith("jobscript:"):
+        value = value[len("jobscript:") :]
+    if not value:
+        raise SubmittedEnvironmentSmokeError(
+            backend + " executable is not configured"
+        )
+    if not _SAFE_EXECUTABLE_EXPRESSION_RE.fullmatch(value):
+        raise SubmittedEnvironmentSmokeError(
+            backend
+            + " executable expression contains unsafe characters: "
+            + repr(value)
+        )
+    return value
+
+
+def _submitted_executable_probe_lines(
+    label: str,
+    expression: str,
+) -> list[str]:
+    if any(character in expression for character in "/$~"):
+        resolver = [
+            "candidate=" + shlex.quote(expression),
+            'candidate=$(eval "printf \'%s\' \\"$candidate\\"")',
+        ]
+    else:
+        resolver = [
+            "candidate=$(command -v " + shlex.quote(expression) + ")",
+        ]
+    return [
+        *resolver,
+        'test -n "$candidate" && test -x "$candidate"',
+        "printf '%s: %s\\n' "
+        + shlex.quote(label)
+        + ' "$candidate"',
+    ]
+
+
 def render_submitted_environment_smoke_script(
     *,
     config: Any,
@@ -154,7 +198,10 @@ def render_submitted_environment_smoke_script(
     python_executable = _required_path(
         "configured submitted Python", availability.python_executable
     )
-    gaussian_path = _required_path("Gaussian", availability.gaussian_binary)
+    gaussian_expression = _configured_executable_expression(
+        "gaussian",
+        availability.gaussian_binary,
+    )
     aimall_path = _required_path("AIMAll", availability.aimall_path)
     ferebus_path = _required_path("FEREBUS", availability.ferebus_path)
     bc_path = _required_path("bc", availability.bc_path)
@@ -235,8 +282,11 @@ def render_submitted_environment_smoke_script(
     for module in aimall_modules:
         if module not in runtime_modules and module not in gaussian_modules:
             lines.append("module load " + module)
+    lines.extend(configured_python_isolation_lines())
+    lines.extend(
+        _submitted_executable_probe_lines("Gaussian", gaussian_expression)
+    )
     for label, executable in (
-        ("Gaussian", gaussian_path),
         ("AIMAll", aimall_path),
         ("FEREBUS", ferebus_path),
         ("bc", bc_path),

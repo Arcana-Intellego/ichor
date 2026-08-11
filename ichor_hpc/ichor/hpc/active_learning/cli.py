@@ -17439,15 +17439,36 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
 
     lines.append("")
     lines.append("Quantum Backends")
+    gaussian_available = bool(avail.get("gaussian"))
+    gaussian_verified = bool(avail.get("gaussian_verified"))
+    gaussian_detail = (
+        avail.get("gaussian_binary")
+        or avail.get("gaussian_probe_error")
+        or "not configured"
+    )
+    if gaussian_available and not gaussian_verified:
+        gaussian_detail = (
+            str(gaussian_detail)
+            + " (jobscript-only; run submitted-environment smoke to verify)"
+        )
     lines.append(
         _preflight_check_line(
             "Gaussian submitted environment",
-            avail.get("gaussian_verified"),
-            avail.get("gaussian_binary")
-            or avail.get("gaussian_probe_error")
-            or "not configured",
+            gaussian_available and gaussian_verified,
+            gaussian_detail,
+            warn=gaussian_available and not gaussian_verified,
         )
     )
+    if (
+        verbose
+        and gaussian_available
+        and not gaussian_verified
+        and avail.get("gaussian_probe_error")
+    ):
+        lines.append(
+            "  login-node probe: "
+            + str(avail.get("gaussian_probe_error"))
+        )
     lines.append(
         _preflight_check_line(
             "AIMAll submitted environment",

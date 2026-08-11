@@ -361,7 +361,8 @@ def test_submitted_environment_smoke_renders_exact_runtime_contract(
     assert "PYTHONNOUSERSITE" not in body
     assert "pyferebus.executors.trainer" in body
     assert "probe_ariadne_runtime" in body
-    assert "test -x /opt/gaussian/g16" in body
+    assert "candidate=/opt/gaussian/g16" in body
+    assert 'test -n "$candidate" && test -x "$candidate"' in body
     assert "test -x /home/user/AIMAll/aimqb.ish" in body
     assert SMOKE_SUCCESS_MARKER in body
 
@@ -392,6 +393,10 @@ def test_csf4_submitted_environment_smoke_isolates_venv_python(
                 },
                 "software": {
                     "python": {"python_path": "/venv/ichor-csf4/bin/python"},
+                    "gaussian": {
+                        "modules": ["gaussian/g16c01_em64t_detectcpu"],
+                        "executable_path": "$g16root/g16/g16",
+                    },
                     "ferebus": {"pyferebus_platform": "CSF4"},
                 },
             }
@@ -403,7 +408,7 @@ def test_csf4_submitted_environment_smoke_isolates_venv_python(
         batch_runtime_modules=("python/test", "mkl/test"),
         batch_python_library_paths=(),
         python_executable="/venv/ichor-csf4/bin/python",
-        gaussian_binary="/opt/gaussian/g16",
+        gaussian_binary="jobscript:$g16root/g16/g16",
         aimall_path="/home/user/AIMAll/aimqb.ish",
         ferebus_path="/home/user/.local/bin/ferebus",
         bc_path="/usr/bin/bc",
@@ -422,6 +427,15 @@ def test_csf4_submitted_environment_smoke_isolates_venv_python(
         "/venv/ichor-csf4/bin/python"
     )
     assert "export PYTHONNOUSERSITE=1" in body
+    assert "jobscript:" not in body
+    assert "candidate='$g16root/g16/g16'" in body
+    assert 'candidate=$(eval "printf \'%s\' \\"$candidate\\"")' in body
+    assert body.index("module load gaussian/g16c01_em64t_detectcpu") < body.index(
+        "candidate='$g16root/g16/g16'"
+    )
+    assert body.rindex("unset PYTHONPATH PYTHONHOME") < body.index(
+        "candidate='$g16root/g16/g16'"
+    )
 
 
 def test_submitted_environment_smoke_records_success(tmp_path, monkeypatch):
@@ -2549,6 +2563,128 @@ def test_gaussian_probe_uses_combined_submitted_runtime_module_stack(monkeypatch
         "module load apps/gaussian/g16"
     )
     assert "module load mkl/2025.0" in scripts[0]
+
+
+def test_gaussian_probe_accepts_discoverable_jobscript_only_module(monkeypatch):
+    from ichor.hpc.active_learning.daemon import preflight
+
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf4": {
+                "hpc": {"scheduler": "slurm"},
+                "software": {
+                    "python": {"modules": ["python/3.11"]},
+                    "gaussian": {
+                        "modules": ["gaussian/g16c01_em64t_detectcpu"],
+                        "executable_path": "$g16root/g16/g16",
+                    },
+                },
+            }
+        },
+        "csf4",
+    )
+    scripts = []
+
+    def fake_login_shell(script, *, timeout=30):
+        scripts.append(script)
+        if len(scripts) == 1:
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="This module must be loaded from a jobscript",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(preflight, "_run_login_shell", fake_login_shell)
+
+    ok, resolved, error = preflight._probe_gaussian_environment()
+
+    assert ok is True
+    assert resolved == "jobscript:$g16root/g16/g16"
+    assert "compute-node verification is recommended" in error
+    assert "module load gaussian/g16c01_em64t_detectcpu" in scripts[0]
+    assert "module show gaussian/g16c01_em64t_detectcpu" in scripts[1]
+    assert "module load gaussian/g16c01_em64t_detectcpu" not in scripts[1]
+
+
+def test_gaussian_probe_rejects_missing_jobscript_module(monkeypatch):
+    from ichor.hpc.active_learning.daemon import preflight
+
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf4": {
+                "hpc": {"scheduler": "slurm"},
+                "software": {
+                    "gaussian": {
+                        "modules": ["gaussian/missing"],
+                        "executable_path": "$g16root/g16/g16",
+                    },
+                },
+            }
+        },
+        "csf4",
+    )
+    responses = iter(
+        (
+            SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="module may only be loaded from a jobscript",
+            ),
+            SimpleNamespace(returncode=1, stdout="", stderr="module not found"),
+        )
+    )
+    monkeypatch.setattr(
+        preflight,
+        "_run_login_shell",
+        lambda _script, timeout=30: next(responses),
+    )
+
+    ok, resolved, error = preflight._probe_gaussian_environment()
+
+    assert ok is False
+    assert resolved == ""
+    assert "module not found" in error
+
+
+def test_gaussian_probe_does_not_mask_ordinary_module_failure(monkeypatch):
+    from ichor.hpc.active_learning.daemon import preflight
+
+    _install_fake_global_variables(
+        monkeypatch,
+        {
+            "csf4": {
+                "hpc": {"scheduler": "slurm"},
+                "software": {
+                    "gaussian": {
+                        "modules": ["gaussian/g16"],
+                        "executable_path": "$g16root/g16/g16",
+                    },
+                },
+            }
+        },
+        "csf4",
+    )
+    scripts = []
+
+    def fake_login_shell(script, *, timeout=30):
+        scripts.append(script)
+        return SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="module load failed: dependency missing",
+        )
+
+    monkeypatch.setattr(preflight, "_run_login_shell", fake_login_shell)
+
+    ok, resolved, error = preflight._probe_gaussian_environment()
+
+    assert ok is False
+    assert resolved == ""
+    assert "dependency missing" in error
+    assert len(scripts) == 1
 
 
 def test_replacement_resource_solver_uses_nested_round_atom_count(

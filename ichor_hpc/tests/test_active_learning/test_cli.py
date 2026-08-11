@@ -630,6 +630,52 @@ def test_cli_preflight_prints_operator_dashboard_by_default(tmp_path, capsys, mo
     assert not out.lstrip().startswith("{")
 
 
+def test_cli_preflight_warns_for_jobscript_only_gaussian(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    _write_locked_state(campaign, fresh_campaign_state(max_iterations=2))
+    monkeypatch.setattr(
+        cli_mod,
+        "check_backends",
+        lambda: _backend_availability(
+            gaussian=True,
+            gaussian_verified=False,
+            gaussian_binary="jobscript:$g16root/g16/g16",
+            gaussian_probe_error=(
+                "login-node Gaussian probe unavailable; compute-node "
+                "verification is recommended"
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "_pool_feasibility_summary",
+        lambda _campaign, _config: _pool_feasibility_payload(),
+    )
+
+    rc = main(["preflight", "--campaign-dir", str(campaign)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "  result: ready" in out
+    assert (
+        "[WARN] Gaussian submitted environment: "
+        "jobscript:$g16root/g16/g16 "
+        "(jobscript-only; run submitted-environment smoke to verify)"
+    ) in out
+
+    rc = main(
+        ["preflight", "--campaign-dir", str(campaign), "--verbose"]
+    )
+
+    assert rc == 0
+    verbose_out = capsys.readouterr().out
+    assert "login-node probe: login-node Gaussian probe unavailable" in verbose_out
+
+
 def test_campaign_preflight_allows_and_reports_pending_boundary_stop(
     tmp_path,
     monkeypatch,

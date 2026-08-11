@@ -51,6 +51,12 @@ __all__ = [
 ]
 
 
+_JOBSCRIPT_ONLY_MODULE_RE = re.compile(
+    r"(?:job\s*script|batch\s+job|compute\s+node)",
+    re.IGNORECASE,
+)
+
+
 @dataclass(frozen=True)
 class BackendAvailability:
     profile: bool
@@ -370,7 +376,7 @@ def _probe_configured_python(
 
 
 def _probe_gaussian_environment() -> tuple[bool, str, str]:
-    """Resolve Gaussian under the same module block used by its jobs."""
+    """Resolve Gaussian locally or validate a jobscript-only contract."""
     raw_modules = profile_value("software", "gaussian", "modules", default=None)
     try:
         gaussian_modules = normalise_module_list(raw_modules, label="gaussian")
@@ -419,7 +425,60 @@ def _probe_gaussian_environment() -> tuple[bool, str, str]:
     resolved_path = resolved[-1] if resolved else ""
     if int(completed.returncode) != 0 or not resolved_path:
         detail = (completed.stderr or completed.stdout or "").strip()
-        return False, "", "Gaussian module/path probe failed: " + detail[:500]
+        if (
+            not gaussian_modules
+            or not executable
+            or not _JOBSCRIPT_ONLY_MODULE_RE.search(detail)
+        ):
+            return False, "", "Gaussian module/path probe failed: " + detail[:500]
+
+        # Some sites, notably CSF4, deliberately reject loading Gaussian on
+        # login nodes.  Confirm that every declared modulefile exists without
+        # loading it, then leave executable resolution to the submitted smoke
+        # and the real jobscript.
+        try:
+            discovery = _run_login_shell(
+                "\n".join(
+                    [
+                        "set -euo pipefail",
+                        "module purge",
+                        *[
+                            "module load " + module
+                            for module in runtime_modules
+                        ],
+                        *[
+                            "module show " + module + " >/dev/null 2>&1"
+                            for module in gaussian_modules
+                        ],
+                    ]
+                ),
+                timeout=30,
+            )
+        except Exception as exc:
+            return (
+                False,
+                "",
+                "Gaussian module discovery failed: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:400],
+            )
+        if int(discovery.returncode) != 0:
+            discovery_detail = (
+                discovery.stderr or discovery.stdout or ""
+            ).strip()
+            return (
+                False,
+                "",
+                "Gaussian module discovery failed: " + discovery_detail[:500],
+            )
+        return (
+            True,
+            "jobscript:" + executable,
+            "login-node Gaussian probe unavailable; compute-node verification "
+            "is recommended"
+            + (": " + detail[:350] if detail else ""),
+        )
     return True, resolved_path, ""
 
 
@@ -569,7 +628,9 @@ def check_backends() -> BackendAvailability:
         batch_python_error=batch_python_error,
         batch_runtime_modules=tuple(runtime_modules),
         batch_python_library_paths=tuple(python_library_paths),
-        gaussian_verified=bool(gauss_ok),
+        gaussian_verified=bool(
+            gauss_ok and gauss and not str(gauss).startswith("jobscript:")
+        ),
         gaussian_probe_error=str(gaussian_probe_error),
         ariadne_probe_error=str(ariadne_status.get("error") or ""),
         ariadne_abi_probe=(

@@ -332,6 +332,7 @@ def test_csf4_dry_run_uses_isolated_venv_package_authority(tmp_path):
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
     assert "python-bundle-pypi" not in output
+    assert "module load slurm/23.02.1" in output
     assert "validate isolated CSF4 venv contract" in output
     assert "verify CSF4 Python package origins" in output
     assert "verify isolated packaging API required by ARIADNE" in output

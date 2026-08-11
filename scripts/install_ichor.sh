@@ -704,6 +704,7 @@ load_ariadne_modules() {
         module_cmd load mkl/2025.0
         export LD_LIBRARY_PATH="${PYTHON_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
     elif [[ "${MACHINE}" == "csf4" ]]; then
+        module_cmd load slurm/23.02.1
         module_cmd load python/3.11.3-gcccore-12.3.0
         module_cmd load compilers/oneapi/2024.2.0
         module_cmd load compiler-rt tbb compiler
@@ -1952,6 +1953,11 @@ EOF
     done
     "${VENV}/bin/ichor-al-daemon" init --campaign-dir "${smoke_dir}" --yes
     "${VENV}/bin/ichor-al-daemon" preflight --campaign-dir "${smoke_dir}"
+    if [[ "${MACHINE}" == "csf4" ]]; then
+        echo "CSF4 Gaussian is jobscript-only on login nodes. Before the first live"
+        echo "campaign, verify it on a compute node with:"
+        echo "  ichor-al-daemon preflight --campaign-dir CAMPAIGN --submit-environment-smoke"
+    fi
     echo ""
     if [[ "${label}" == "verify" ]]; then
         echo "Verification complete."
@@ -2017,6 +2023,7 @@ doctor_load_ariadne_modules() {
             echo "+ module load umf compiler-rt tbb compiler"
             echo "+ module load mkl/2025.0"
         elif [[ "${MACHINE}" == "csf4" ]]; then
+            echo "+ module load slurm/23.02.1"
             echo "+ module load python/3.11.3-gcccore-12.3.0"
             echo "+ module load compilers/oneapi/2024.2.0"
             echo "+ module load compiler-rt tbb compiler"
@@ -2039,6 +2046,7 @@ doctor_load_ariadne_modules() {
         ichor_csf_module load mkl/2025.0 || return 1
         export LD_LIBRARY_PATH="${PYTHON_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
     elif [[ "${MACHINE}" == "csf4" ]]; then
+        ichor_csf_module load slurm/23.02.1 || return 1
         ichor_csf_module load python/3.11.3-gcccore-12.3.0 || return 1
         ichor_csf_module load compilers/oneapi/2024.2.0 || return 1
         ichor_csf_module load compiler-rt tbb compiler || return 1
