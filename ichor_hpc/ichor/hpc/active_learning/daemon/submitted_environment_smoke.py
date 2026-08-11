@@ -1,8 +1,9 @@
 """Opt-in scheduler smoke for the configured daemon runtime environment.
 
-The smoke submits one short, single-core job.  It imports the Python modules
-used by daemon jobs and verifies configured executable paths, but performs no
-scientific calculation.  Ordinary preflight and daemon start never submit it.
+The smoke submits one short job at the selected partition's minimum core
+count.  It imports the Python modules used by daemon jobs and verifies
+configured executable paths, but performs no scientific calculation.
+Ordinary preflight and daemon start never submit it.
 """
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ from typing import Any, Callable, Dict
 from .cluster_profile import profile_value, require_cluster_profile
 from .resource_solver import (
     parallel_environment_for_partition,
+    partition_core_range,
     partition_memory_per_core_gb,
     scheduler_queue_for_partition,
     slurm_memory_mib,
@@ -111,6 +113,11 @@ def _smoke_partition(config: Any, scheduler: str) -> str:
     return configured
 
 
+def _smoke_cpus(partition: str) -> int:
+    configured = partition_core_range(partition)
+    return 1 if configured is None else int(configured[0])
+
+
 def _required_path(label: str, value: Any) -> str:
     path = str(value or "").strip()
     if not path:
@@ -181,6 +188,7 @@ def render_submitted_environment_smoke_script(
         _smoke_partition(config, scheduler),
     )
     validate_partition_supported(partition)
+    cpus = _smoke_cpus(partition)
     mem_per_cpu = _smoke_mem_per_cpu(config, partition)
     output_text = _safe_directive_path("smoke output path", output_path)
     runtime_modules = normalise_module_list(
@@ -228,7 +236,7 @@ def render_submitted_environment_smoke_script(
             "#SBATCH --partition=" + partition,
             "#SBATCH --time=00:05:00",
             "#SBATCH --mem-per-cpu=" + mem_per_cpu,
-            "#SBATCH --cpus-per-task=1",
+            "#SBATCH --cpus-per-task=" + str(cpus),
             "#SBATCH --ntasks=1",
             "#SBATCH --output=" + output_text,
         ]
@@ -245,12 +253,17 @@ def render_submitted_environment_smoke_script(
             "#$ -q " + queue,
             "#$ -l h_rt=00:05:00",
             "#$ -l h_vmem="
-            + str(int(math.ceil(slurm_memory_mib(mem_per_cpu))))
+            + str(int(math.ceil(slurm_memory_mib(mem_per_cpu))) * cpus)
             + "M",
             "#$ -o " + output_text,
         ]
         if pe:
-            lines.append("#$ -pe " + _safe_slurm_token("SGE PE", pe) + " 1")
+            lines.append(
+                "#$ -pe "
+                + _safe_slurm_token("SGE PE", pe)
+                + " "
+                + str(cpus)
+            )
     lines += [
         "set -euo pipefail",
         "export LC_ALL=C",

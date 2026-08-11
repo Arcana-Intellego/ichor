@@ -351,6 +351,7 @@ def test_submitted_environment_smoke_renders_exact_runtime_contract(
 
     assert body.startswith("#!/bin/bash --login\n")
     assert "#SBATCH --partition=multicore" in body
+    assert "#SBATCH --cpus-per-task=2" in body
     assert "#SBATCH --mem-per-cpu=8G" in body
     assert body.index("module load python/test") < body.index("module load gaussian/test")
     assert body.index("export LD_LIBRARY_PATH=") < body.index(
@@ -426,6 +427,8 @@ def test_csf4_submitted_environment_smoke_isolates_venv_python(
     assert body.index("unset PYTHONPATH PYTHONHOME") < body.index(
         "/venv/ichor-csf4/bin/python"
     )
+    assert "#SBATCH --partition=multicore" in body
+    assert "#SBATCH --cpus-per-task=2" in body
     assert "export PYTHONNOUSERSITE=1" in body
     assert "jobscript:" not in body
     assert "candidate='$g16root/g16/g16'" in body
@@ -484,9 +487,12 @@ def test_submitted_environment_smoke_records_success(tmp_path, monkeypatch):
 
     def fake_runner(argv, **kwargs):
         script_path = Path(argv[-1])
+        script = script_path.read_text(encoding="utf-8")
+        assert "#SBATCH --partition=multicore" in script
+        assert "#SBATCH --cpus-per-task=2" in script
         output_line = next(
             line
-            for line in script_path.read_text(encoding="utf-8").splitlines()
+            for line in script.splitlines()
             if line.startswith("#SBATCH --output=")
         )
         Path(output_line.split("=", 1)[1]).write_text(
