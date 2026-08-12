@@ -53,6 +53,9 @@ _STAGE_LABELS = {
     "sge_submission": "Submitting Sun Grid Engine work",
     "scheduler_wait": "Waiting for Slurm work",
     "sge_scheduler_wait": "Waiting for Sun Grid Engine work",
+    "scheduler_retirement_wait": (
+        "Scientific publication complete; waiting for scheduler termination/accounting"
+    ),
     "output_visibility": "Checking output visibility",
     "structural_parsing": "Parsing completed outputs",
     "scientific_quality": "Evaluating scientific quality",
@@ -60,6 +63,9 @@ _STAGE_LABELS = {
     "acceptance_publication": "Publishing accepted outputs",
     "allocation_join": "Updating point allocation",
     "calibration": "Updating calibration evidence",
+    "reference_coordinate_authority": "Binding Phase B reference coordinates",
+    "phase_b_reference_coordinates": "Building Phase B reference coordinates",
+    "novelty_distance_oracle": "Computing exact Phase B novelty distances",
     "descriptor_construction": "Building diversity descriptors",
     "medoid_selection": "Selecting diversity medoid",
     "farthest_point_sampling": "Selecting diverse geometries",
@@ -81,7 +87,12 @@ _STAGE_LABELS = {
         "Binding FEREBUS reference and incumbent authority"
     ),
     "ferebus_task_control_validation": "Validating FEREBUS task controls",
+    "ferebus_admission_evidence": "Binding FEREBUS admission evidence",
     "ferebus_model_admission": "Validating task-produced FEREBUS models",
+    "ferebus_candidate_inventory": "Inventorying candidate FEREBUS models",
+    "ferebus_boundary_anchor_validation": (
+        "Rechecking FEREBUS publication anchors"
+    ),
     "ferebus_local_admission": "Validating legacy FEREBUS models locally",
     "ferebus_task_quality": "Validating task-computed FEREBUS quality",
     "ferebus_local_quality": "Computing missing FEREBUS quality locally",
@@ -617,9 +628,13 @@ class PhaseProgressReporter:
                 "missing",
                 "accepted",
                 "rejected",
+                "scientific_publication_complete",
+                "pending_reason",
+                "pending_queue",
+                "scheduler_native_state",
             ):
                 value = details.get(key)
-                if isinstance(value, int) and not isinstance(value, bool):
+                if isinstance(value, (str, int, bool)):
                     payload[key] = value
         if record.get("throughput") is not None:
             payload["throughput"] = record["throughput"]
@@ -662,7 +677,9 @@ def newest_matching_progress(
             and str(record["daemon_start_id"]) != str(daemon_start_id)
         ):
             continue
-        if record.get("producer_kind") == "scheduler" and record.get("job_id"):
+        if record.get("producer_kind") in {"scheduler", "worker"} and record.get(
+            "job_id"
+        ):
             if allowed_jobs and str(record["job_id"]) not in allowed_jobs:
                 continue
         matches.append(record)

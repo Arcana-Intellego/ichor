@@ -1061,6 +1061,7 @@ modules = [
     "rdkit",
     "tqdm",
     "portalocker",
+    "threadpoolctl",
     "typing_extensions",
 ]
 if sys.argv[2] == "1":

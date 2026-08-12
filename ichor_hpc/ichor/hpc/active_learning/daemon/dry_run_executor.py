@@ -1598,6 +1598,16 @@ class DryRunPhaseExecutor:
                 for pdir_name in committed_pointdirs
             ],
         )
+        try:
+            from ..sampling.phase_b_reference import (
+                prewarm_phase_b_reference_cache,
+            )
+
+            prewarm_phase_b_reference_cache(self.campaign_dir, view)
+        except Exception:
+            # This namespace is derived evidence only; the next Phase B run
+            # retains the strict parser fallback.
+            pass
         self._journal_phase_event(
             "reference_data_committed",
             phase=CampaignPhase.REFERENCE_COMMIT,

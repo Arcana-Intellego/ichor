@@ -75,6 +75,211 @@ def test_ariadne_resource_progress_stages_have_explicit_human_labels():
     )
 
 
+def test_scheduler_retirement_stage_is_explicit_and_scheduler_neutral():
+    assert format_progress_stage("scheduler_retirement_wait") == (
+        "Scientific publication complete; waiting for scheduler "
+        "termination/accounting"
+    )
+
+
+def test_scheduler_pending_diagnostics_render_in_journal_and_status():
+    record = {
+        "producer_kind": "scheduler",
+        "stage": "scheduler_wait",
+        "status": "running",
+        "counters": {"completed": 0, "total": 200, "unit": "tasks"},
+        "details": {
+            "running": 0,
+            "pending": 200,
+            "pending_reason": "Resources",
+            "pending_queue": "multicore",
+            "scheduler_native_state": "PENDING",
+        },
+    }
+    payload = {
+        "phase": "ARIADNE_ARRAY",
+        "runtime_progress": {
+            "state": "current",
+            "record": record,
+            "age_seconds": 5,
+        },
+        "active_submission_intents": [],
+    }
+
+    assert ("recorded pending reason", "Resources") in cli._status_progress_rows(
+        payload
+    )
+    assert ("recorded scheduler queue", "multicore") in cli._status_progress_rows(
+        payload
+    )
+    assert (
+        "recorded native scheduler state",
+        "PENDING",
+    ) in cli._status_progress_rows(payload)
+    assert cli._journal_operator_summary(
+        {
+            "event": "scheduler_progress",
+            "stage": "scheduler_wait",
+            "status": "running",
+            "completed": 0,
+            "total": 200,
+            "unit": "tasks",
+            "running": 0,
+            "pending": 200,
+            "pending_reason": "Resources",
+            "pending_queue": "multicore",
+            "scheduler_native_state": "PENDING",
+        }
+    ).endswith(
+        "; pending reason=Resources, queue=multicore, native state=PENDING"
+    )
+
+
+def test_matching_progress_rejects_worker_from_an_old_job():
+    records = [
+        {
+            "campaign_uid": "uid",
+            "phase": "PHASE_B_DIVERSITY",
+            "iteration": 4,
+            "replacement_round": 0,
+            "producer_kind": "worker",
+            "job_id": "old",
+            "updated_at_iso": "2026-01-01T00:00:00+00:00",
+        },
+        {
+            "campaign_uid": "uid",
+            "phase": "PHASE_B_DIVERSITY",
+            "iteration": 4,
+            "replacement_round": 0,
+            "producer_kind": "scheduler",
+            "job_id": "current",
+            "updated_at_iso": "2025-01-01T00:00:00+00:00",
+        },
+    ]
+
+    selected = newest_matching_progress(
+        records,
+        campaign_uid="uid",
+        phase="PHASE_B_DIVERSITY",
+        iteration=4,
+        replacement_round=0,
+        job_ids=["current"],
+    )
+
+    assert selected["producer_kind"] == "scheduler"
+    assert selected["job_id"] == "current"
+
+
+def test_daemon_observes_worker_publication_and_throttles_queue_diagnostics(
+    tmp_path,
+):
+    from ichor.hpc.active_learning.config import CampaignConfig
+    from ichor.hpc.active_learning.daemon.daemon import Daemon
+    from ichor.hpc.active_learning.daemon.state import (
+        CampaignPhase,
+        fresh_campaign_state,
+    )
+
+    state = fresh_campaign_state()
+    state.phase = CampaignPhase.PHASE_B_DIVERSITY
+    state.iteration = 3
+    worker = PhaseProgressReporter(
+        tmp_path,
+        campaign_uid=state.campaign_uid,
+        phase=state.phase.value,
+        iteration=3,
+        producer_kind="worker",
+        identity={"job_id": "9001"},
+    )
+    worker.start("split_publication")
+    worker.complete(stage="split_publication")
+    worker.close()
+    calls = []
+
+    def diagnostics(job_id, **_kwargs):
+        calls.append(str(job_id))
+        return {
+            "active": True,
+            "inconclusive": False,
+            "rows": [{
+                "state": "PENDING",
+                "reason": "Resources",
+                "queue": "multicore",
+            }],
+        }
+
+    daemon = Daemon(
+        campaign_dir=tmp_path,
+        config=CampaignConfig(),
+        queue_diagnostics_collector=diagnostics,
+    )
+
+    assert daemon._worker_publication_complete(state, state.phase, "9001") is True
+    assert daemon._worker_publication_complete(state, state.phase, "9002") is False
+    first = daemon._pending_queue_diagnostics(
+        job_id="9001",
+        scheduler_identity={
+            "expected_job_name": "job",
+            "expected_owner": "user",
+        },
+    )
+    second = daemon._pending_queue_diagnostics(
+        job_id="9001",
+        scheduler_identity={},
+    )
+
+    assert first == {
+        "scheduler_native_state": "PENDING",
+        "pending_reason": "Resources",
+        "pending_queue": "multicore",
+    }
+    assert second == {}
+    assert calls == ["9001"]
+
+
+def test_scheduler_completion_preserves_retirement_wait_stage(tmp_path):
+    from ichor.hpc.active_learning.config import CampaignConfig
+    from ichor.hpc.active_learning.daemon.daemon import Daemon
+    from ichor.hpc.active_learning.daemon.state import (
+        CampaignPhase,
+        fresh_campaign_state,
+    )
+
+    state = fresh_campaign_state()
+    state.phase = CampaignPhase.PHASE_B_DIVERSITY
+    state.iteration = 3
+    daemon = Daemon(campaign_dir=tmp_path, config=CampaignConfig())
+    reporter = daemon._scheduler_progress_reporter(
+        state,
+        state.phase,
+        "9001",
+        expected_tasks=1,
+    )
+    reporter.update(
+        stage="scheduler_retirement_wait",
+        completed=1,
+        total=1,
+        unit="tasks",
+    )
+
+    daemon._finish_scheduler_progress(state.phase, "9001")
+
+    record = newest_matching_progress(
+        read_phase_progress_records(
+            tmp_path,
+            phase=state.phase.value,
+            expected_campaign_uid=state.campaign_uid,
+        ),
+        campaign_uid=state.campaign_uid,
+        phase=state.phase.value,
+        iteration=3,
+        replacement_round=0,
+        job_ids=["9001"],
+    )
+    assert record["status"] == "completed"
+    assert record["stage"] == "scheduler_retirement_wait"
+
+
 def _reporter(tmp_path, clock, events, **overrides):
     options = {
         "campaign_uid": "campaign-uid",

@@ -148,6 +148,14 @@ def parse_qstat_xml(stdout: str, *, maximum_tasks: int = 75000) -> List[SgeQueue
     except ET.ParseError as exc:
         raise ValueError("qstat XML is malformed: " + str(exc)) from exc
     rows: List[SgeQueueRow] = []
+    enclosing_queues: Dict[int, str] = {}
+    for queue_element in root.iter():
+        if _local_name(queue_element.tag) != "Queue-List":
+            continue
+        queue_name = _child_text(queue_element, "name")
+        for child in queue_element.iter():
+            if _local_name(child.tag) == "job_list":
+                enclosing_queues[id(child)] = queue_name
     for element in root.iter():
         if _local_name(element.tag) != "job_list":
             continue
@@ -164,12 +172,10 @@ def parse_qstat_xml(stdout: str, *, maximum_tasks: int = 75000) -> List[SgeQueue
             slots = int(slots_text) if slots_text else None
         except ValueError as exc:
             raise ValueError("qstat XML contains a malformed slot count") from exc
-        queue = _child_text(element, "queue_name")
-        if not queue:
-            parent_element = element
-            # Queue-List/name is not a child of job_list. ElementTree has no
-            # parent pointer, so leave this optional field empty.
-            del parent_element
+        queue = _child_text(element, "queue_name") or enclosing_queues.get(
+            id(element),
+            "",
+        )
         if tasks:
             for native_task_id in tasks:
                 rows.append(

@@ -135,6 +135,18 @@ class SchedulerBackend:
     ) -> dict:
         raise NotImplementedError
 
+    def queue_diagnostics(
+        self,
+        job_id: str,
+        *,
+        queue_runner: Callable[..., Any] = subprocess.run,
+        timeout_seconds: int = 60,
+        expected_job_name: Optional[str] = None,
+        expected_owner: Optional[str] = None,
+    ) -> dict:
+        """Return observational queue details without deciding job state."""
+        raise NotImplementedError
+
     def collect_usage_evidence(
         self,
         job_id: str,
@@ -382,6 +394,109 @@ class SlurmScheduler(SchedulerBackend):
             "error": None,
         }
 
+    def queue_diagnostics(
+        self,
+        job_id: str,
+        *,
+        queue_runner: Callable[..., Any] = subprocess.run,
+        timeout_seconds: int = 60,
+        expected_job_name: Optional[str] = None,
+        expected_owner: Optional[str] = None,
+    ) -> dict:
+        parent = self.validate_job_id(job_id)
+        command = [
+            "squeue",
+            "-j",
+            parent,
+            "--noheader",
+            "--format=%i|%T|%R|%P|%j|%u",
+        ]
+        if expected_owner:
+            command[1:1] = ["--user", str(expected_owner)]
+        try:
+            completed = run_scheduler_command(
+                queue_runner,
+                command,
+                timeout_seconds=int(timeout_seconds),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except Exception as exc:
+            return {
+                "active": False,
+                "inconclusive": True,
+                "rows": [],
+                "error": type(exc).__name__ + ": " + str(exc),
+            }
+        if int(getattr(completed, "returncode", 1)) != 0:
+            stderr = str(getattr(completed, "stderr", "") or "")
+            if sacct_poll._squeue_invalid_job_id(stderr):
+                return {
+                    "active": False,
+                    "inconclusive": False,
+                    "rows": [],
+                    "error": None,
+                }
+            return {
+                "active": False,
+                "inconclusive": True,
+                "rows": [],
+                "error": "squeue diagnostics failed: " + stderr[:240],
+            }
+        rows = []
+        for line in str(getattr(completed, "stdout", "") or "").splitlines():
+            if not line.strip():
+                continue
+            parts = line.split("|", 5)
+            if len(parts) != 6:
+                return {
+                    "active": False,
+                    "inconclusive": True,
+                    "rows": rows,
+                    "error": "malformed squeue diagnostic row",
+                }
+            row_parent = sacct_poll.parse_squeue_job_id(parts[0].strip())
+            if row_parent != parent:
+                return {
+                    "active": False,
+                    "inconclusive": True,
+                    "rows": rows,
+                    "error": "squeue diagnostics returned a foreign JobID",
+                }
+            job_name = parts[4].strip()
+            owner = parts[5].strip()
+            if expected_job_name is not None and job_name != str(expected_job_name):
+                return {
+                    "active": False,
+                    "inconclusive": True,
+                    "rows": rows,
+                    "error": "squeue diagnostics job-name mismatch",
+                }
+            if expected_owner is not None and owner != str(expected_owner):
+                return {
+                    "active": False,
+                    "inconclusive": True,
+                    "rows": rows,
+                    "error": "squeue diagnostics owner mismatch",
+                }
+            rows.append(
+                {
+                    "job_id": parts[0].strip(),
+                    "state": parts[1].strip(),
+                    "reason": parts[2].strip(),
+                    "queue": parts[3].strip(),
+                    "job_name": job_name,
+                    "owner": owner,
+                }
+            )
+        return {
+            "active": bool(rows),
+            "inconclusive": False,
+            "rows": rows,
+            "error": None,
+        }
+
     def collect_usage_evidence(
         self,
         job_id: str,
@@ -574,6 +689,62 @@ class SgeScheduler(SchedulerBackend):
                 {
                     "job_id": row.logical_job_id,
                     "state": row.state,
+                    "job_name": row.job_name,
+                    "owner": row.owner,
+                }
+                for row in rows
+            ],
+            "error": None,
+        }
+
+    def queue_diagnostics(
+        self,
+        job_id: str,
+        *,
+        queue_runner: Callable[..., Any] = subprocess.run,
+        timeout_seconds: int = 60,
+        expected_job_name: Optional[str] = None,
+        expected_owner: Optional[str] = None,
+    ) -> dict:
+        try:
+            parent = self.validate_job_id(job_id)
+            rows = [
+                row
+                for row in sge.query_qstat(
+                    runner=queue_runner,
+                    timeout_seconds=int(timeout_seconds),
+                )
+                if row.parent_job_id == parent
+            ]
+        except Exception as exc:
+            return {
+                "active": False,
+                "inconclusive": True,
+                "rows": [],
+                "error": type(exc).__name__ + ": " + str(exc),
+            }
+        if any(
+            expected_job_name is not None and row.job_name != str(expected_job_name)
+            for row in rows
+        ) or any(
+            expected_owner is not None and row.owner != str(expected_owner)
+            for row in rows
+        ):
+            return {
+                "active": False,
+                "inconclusive": True,
+                "rows": [],
+                "error": "SGE queue diagnostics identity mismatch",
+            }
+        return {
+            "active": bool(rows),
+            "inconclusive": False,
+            "rows": [
+                {
+                    "job_id": row.logical_job_id,
+                    "state": row.state,
+                    "reason": "",
+                    "queue": row.queue,
                     "job_name": row.job_name,
                     "owner": row.owner,
                 }

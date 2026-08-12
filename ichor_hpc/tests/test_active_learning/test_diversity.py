@@ -4,12 +4,17 @@ import pytest
 from ichor.hpc.active_learning.sampling.diversity import (
     DEFAULT_DESCRIPTORS,
     FPSResult,
+    _phase_b_build_reserve,
     _phase_b_refill_after_anti_overlap,
     _phase_b_target_size,
     _relax_scaled_novelty,
     fps_select,
 )
-from ichor.hpc.active_learning.sampling.anti_overlap import DedupReport
+from ichor.hpc.active_learning.sampling.anti_overlap import (
+    DedupReport,
+    PhaseBNoveltyDistanceOracle,
+    min_distance_to_training,
+)
 from ichor.hpc.active_learning.sampling.descriptors import CondensedDistanceStore
 from ichor.hpc.active_learning.config import CampaignConfig
 from ichor.core.atoms import Atom, Atoms
@@ -17,6 +22,105 @@ from ichor.core.atoms import Atom, Atoms
 
 def _h2(length):
     return Atoms([Atom("H", 0.0, 0.0, 0.0), Atom("H", float(length), 0.0, 0.0)])
+
+
+def test_phase_b_novelty_oracle_matches_exact_serial_order():
+    references = [_h2(0.8), _h2(1.0), _h2(1.2)]
+    candidates = [_h2(1.05), _h2(1.4), _h2(1.8), _h2(2.1)]
+
+    serial = PhaseBNoveltyDistanceOracle(candidates, references, workers=1)
+    parallel = PhaseBNoveltyDistanceOracle(candidates, references, workers=3)
+
+    accepted = []
+    for candidate_index, candidate in enumerate(candidates):
+        expected = min_distance_to_training(
+            candidate,
+            references + [candidates[index] for index in accepted],
+        )
+        assert serial.nearest_distance(candidate_index, accepted) == expected
+        assert parallel.nearest_distance(candidate_index, accepted) == expected
+        accepted.append(candidate_index)
+    assert serial.candidate_reference_pairs == 12
+    assert serial.directed_candidate_pairs == 12
+
+
+def test_phase_b_oracle_preserves_refill_relaxation_and_reserve_decisions():
+    references = [_h2(1.0)]
+    candidates = [_h2(1.05), _h2(1.4), _h2(1.8), _h2(2.2)]
+    records = [{"seed_index": index} for index in range(len(candidates))]
+    order = [0, 1, 2, 3]
+    oracle = PhaseBNoveltyDistanceOracle(candidates, references, workers=2)
+
+    legacy = _phase_b_refill_after_anti_overlap(
+        ordered_indices=order,
+        candidate_frames=candidates,
+        candidate_records=records,
+        training=references,
+        min_separation=0.1,
+        target_size=2,
+    )
+    optimised = _phase_b_refill_after_anti_overlap(
+        ordered_indices=order,
+        candidate_frames=candidates,
+        candidate_records=records,
+        training=(),
+        min_separation=0.1,
+        target_size=2,
+        distance_oracle=oracle,
+    )
+    assert optimised[0] == legacy[0]
+    assert optimised[2:] == legacy[2:]
+    for observed, expected in zip(optimised[1], legacy[1]):
+        np.testing.assert_array_equal(observed.coordinates, expected.coordinates)
+
+    relaxed_legacy = _relax_scaled_novelty(
+        considered_frames=legacy[1],
+        report=legacy[3],
+        training=references,
+        target_size=3,
+    )
+    relaxed_optimised = _relax_scaled_novelty(
+        considered_frames=optimised[1],
+        report=optimised[3],
+        training=(),
+        target_size=3,
+        considered_candidate_indices=optimised[0],
+        distance_oracle=oracle,
+    )
+    assert relaxed_optimised == relaxed_legacy
+
+    selected_candidate_indices = [
+        optimised[0][index] for index in relaxed_optimised[0].kept_indices
+    ]
+    selected_frames = [candidates[index] for index in selected_candidate_indices]
+    legacy_reserve = _phase_b_build_reserve(
+        ordered_indices=order,
+        already_considered_indices=optimised[0],
+        candidate_frames=candidates,
+        candidate_records=records,
+        training=references,
+        selected_frames=selected_frames,
+        min_separation=0.1,
+    )
+    optimised_reserve = _phase_b_build_reserve(
+        ordered_indices=order,
+        already_considered_indices=optimised[0],
+        candidate_frames=candidates,
+        candidate_records=records,
+        training=(),
+        selected_frames=selected_frames,
+        min_separation=0.1,
+        selected_candidate_indices=selected_candidate_indices,
+        distance_oracle=oracle,
+    )
+    assert optimised_reserve["candidate_indices"] == legacy_reserve[
+        "candidate_indices"
+    ]
+    assert optimised_reserve["records"] == legacy_reserve["records"]
+    assert optimised_reserve["distances_to_nearest_angstrom"] == legacy_reserve[
+        "distances_to_nearest_angstrom"
+    ]
+    assert optimised_reserve["rejected"] == legacy_reserve["rejected"]
 
 
 def test_phase_b_target_size_is_exact_active_allocation_total():

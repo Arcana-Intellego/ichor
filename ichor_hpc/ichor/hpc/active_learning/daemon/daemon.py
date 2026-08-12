@@ -63,7 +63,7 @@ from .phase_executor import (
     SBATCH_PHASES,
     SubmissionCancelledBeforeSchedulerAcceptance,
 )
-from .phase_progress import PhaseProgressReporter
+from .phase_progress import PhaseProgressReporter, read_phase_progress_records
 from .reconcile import stateful_campaign_artifacts
 from .state import (
     CampaignPhase,
@@ -301,6 +301,9 @@ class Daemon:
     # missing sacct array rows from throttled jobs that are still visible in
     # squeue.
     job_liveness_checker: Optional[Callable[[str], Any]] = None
+    # Advisory only: native pending reasons and queues. Its output never
+    # participates in scheduler-state or ownership decisions.
+    queue_diagnostics_collector: Optional[Callable[..., Mapping[str, Any]]] = None
     # Live-mode only advisory collector. It is injected by the CLI so mock and
     # dry-run daemons never contact Slurm for accounting telemetry.
     resource_usage_collector: Optional[Callable[..., Dict[str, Any]]] = None
@@ -353,6 +356,9 @@ class Daemon:
         default=None, init=False, repr=False
     )
     _scheduler_progress_reporters: Dict[str, PhaseProgressReporter] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _queue_diagnostic_last_monotonic: Dict[str, float] = field(
         default_factory=dict, init=False, repr=False
     )
 
@@ -852,12 +858,11 @@ class Daemon:
     ) -> None:
         key = phase.value + ":" + str(job_id)
         reporter = self._scheduler_progress_reporters.pop(key, None)
+        self._queue_diagnostic_last_monotonic.pop(
+            str(self.scheduler_identity_kind) + ":" + str(job_id),
+            None,
+        )
         if reporter is not None:
-            stage = (
-                "sge_scheduler_wait"
-                if self.scheduler_identity_kind == "sge"
-                else "scheduler_wait"
-            )
             scheduler_name = (
                 "Sun Grid Engine"
                 if self.scheduler_identity_kind == "sge"
@@ -869,15 +874,101 @@ class Daemon:
                     + " reported "
                     + str(int(failed or 0))
                     + " failed task(s)",
-                    stage=stage,
                 )
             else:
-                reporter.complete(stage=stage)
+                reporter.complete()
 
     def _close_scheduler_progress_reporters(self) -> None:
         for reporter in list(self._scheduler_progress_reporters.values()):
             reporter.close()
         self._scheduler_progress_reporters.clear()
+        self._queue_diagnostic_last_monotonic.clear()
+
+    def _worker_publication_complete(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+        job_id: str,
+    ) -> bool:
+        """Return bounded observational evidence for a finished scalar worker."""
+        if phase not in {
+            CampaignPhase.PHASE_A_DIVERSITY,
+            CampaignPhase.PHASE_B_DIVERSITY,
+        }:
+            return False
+        try:
+            records = read_phase_progress_records(
+                self.campaign_dir,
+                phase=phase.value,
+                expected_campaign_uid=str(state.campaign_uid),
+            )
+        except Exception:
+            return False
+        for record in reversed(records):
+            if (
+                record.get("producer_kind") == "worker"
+                and record.get("status") == "completed"
+                and record.get("stage") == "split_publication"
+                and record.get("iteration") == int(state.iteration)
+                and record.get("replacement_round")
+                == int(getattr(state, "replacement_round", 0))
+                and str(record.get("job_id") or "") == str(job_id)
+            ):
+                return True
+        return False
+
+    def _pending_queue_diagnostics(
+        self,
+        *,
+        job_id: str,
+        scheduler_identity: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Collect throttled queue details without affecting scheduler authority."""
+        collector = self.queue_diagnostics_collector
+        if collector is None:
+            return {}
+        key = str(self.scheduler_identity_kind) + ":" + str(job_id)
+        now = time.monotonic()
+        prior = self._queue_diagnostic_last_monotonic.get(key)
+        if prior is not None and now - float(prior) < 300.0:
+            return {}
+        self._queue_diagnostic_last_monotonic[key] = now
+        try:
+            payload = collector(
+                str(job_id),
+                expected_job_name=scheduler_identity.get("expected_job_name"),
+                expected_owner=scheduler_identity.get("expected_owner"),
+            )
+        except Exception:
+            return {}
+        if not isinstance(payload, Mapping) or bool(payload.get("inconclusive")):
+            return {}
+        rows = payload.get("rows")
+        if not isinstance(rows, list):
+            return {}
+
+        def values(field: str) -> str:
+            observed = sorted(
+                {
+                    " ".join(str(row.get(field) or "").split())
+                    for row in rows
+                    if isinstance(row, Mapping)
+                    and " ".join(str(row.get(field) or "").split())
+                }
+            )
+            return ", ".join(observed)[:160]
+
+        out: Dict[str, Any] = {}
+        states = values("state")
+        reasons = values("reason")
+        queues = values("queue")
+        if states:
+            out["scheduler_native_state"] = states
+        if reasons:
+            out["pending_reason"] = reasons
+        if queues:
+            out["pending_queue"] = queues
+        return out
 
     def _bind_executor_progress(
         self,
@@ -2805,9 +2896,28 @@ class Daemon:
             str(getattr(observation.status, "value", observation.status)).upper()
             for observation in summary.observations
         ]
+        n_running = sum(value in running_states for value in status_values)
+        n_pending = sum(value in pending_states for value in status_values)
+        publication_complete = self._worker_publication_complete(
+            state,
+            phase,
+            str(job_id),
+        )
+        queue_details: Dict[str, Any] = {}
+        if (
+            n_pending > 0
+            and n_running == 0
+            and int(getattr(summary, "n_failed", 0)) == 0
+        ):
+            queue_details = self._pending_queue_diagnostics(
+                job_id=str(job_id),
+                scheduler_identity=scheduler_identity,
+            )
         scheduler_reporter.update(
             stage=(
-                "sge_scheduler_wait"
+                "scheduler_retirement_wait"
+                if publication_complete
+                else "sge_scheduler_wait"
                 if self.scheduler_identity_kind == "sge"
                 else "scheduler_wait"
             ),
@@ -2818,10 +2928,12 @@ class Daemon:
                 else int(getattr(summary, "n_tasks", 0)) or None
             ),
             unit="tasks",
-            running=sum(value in running_states for value in status_values),
-            pending=sum(value in pending_states for value in status_values),
+            running=n_running,
+            pending=n_pending,
             failed=int(getattr(summary, "n_failed", 0)),
             missing=int(getattr(summary, "n_missing", 0)),
+            scientific_publication_complete=bool(publication_complete),
+            **queue_details,
         )
         if observations:
             first_status = getattr(observations[0].status, "value", observations[0].status)

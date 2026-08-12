@@ -1,6 +1,8 @@
 """FEREBUS quality sidecar tests."""
 import json
 import hashlib
+import shutil
+from types import SimpleNamespace
 import numpy as np
 import pytest
 
@@ -28,6 +30,7 @@ from ichor.hpc.active_learning.daemon.ferebus_model_factors import (
 )
 from ichor.hpc.active_learning.daemon.ferebus_model_admission import (
     FerebusModelAdmissionError,
+    assert_ferebus_model_admission_context_unchanged,
     build_ferebus_model_admission_context,
     enrich_task_receipt_with_model_admission,
     validate_ferebus_task_model_admission,
@@ -354,6 +357,71 @@ def test_task_model_admission_is_inline_and_stat_bound(tmp_path):
     dataset.write_text(dataset.read_text(encoding="utf-8") + "\n", encoding="utf-8")
     with pytest.raises(FerebusModelAdmissionError, match="changed after task admission"):
         validate_ferebus_task_model_admission(staging, 0, evidence)
+
+
+def test_model_admission_guard_rechecks_anchors_without_semantic_replay(
+    tmp_path,
+    monkeypatch,
+):
+    import ichor.hpc.active_learning.daemon.ferebus_model_admission as admission
+
+    staging = _seed_quality_staging(tmp_path, campaign_layout=True)
+    enrich_task_receipt_with_quality(staging, 0)
+    enrich_task_receipt_with_model_admission(staging, 0)
+    context = build_ferebus_model_admission_context(staging)
+
+    monkeypatch.setattr(
+        admission,
+        "validate_ferebus_task_model_admission",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("semantic replay")
+        ),
+    )
+    assert_ferebus_model_admission_context_unchanged(context)
+
+    config = staging / "iqa/O1/ferebus.config"
+    config.write_text(config.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(FerebusModelAdmissionError, match="ferebus.config"):
+        assert_ferebus_model_admission_context_unchanged(context)
+
+
+def test_committed_model_admission_uses_content_not_producer_inode(
+    tmp_path,
+    monkeypatch,
+):
+    import ichor.hpc.active_learning.daemon.ferebus_model_admission as admission
+    import ichor.hpc.active_learning.daemon.model_contract as model_contract
+
+    staging = _seed_quality_staging(tmp_path / "source", campaign_layout=True)
+    enrich_task_receipt_with_quality(staging, 0)
+    evidence = enrich_task_receipt_with_model_admission(staging, 0)
+    committed = tmp_path / "campaign/TRAINED_MODELS/iteration-000000"
+    committed.parent.mkdir(parents=True)
+    shutil.copytree(staging, committed)
+    model_set = SimpleNamespace(version=0, root=committed)
+    monkeypatch.setattr(
+        admission,
+        "_authenticate_committed_model_root",
+        lambda root: model_set,
+    )
+    monkeypatch.setattr(
+        model_contract,
+        "validate_ferebus_model_contract",
+        lambda *_args, **_kwargs: None,
+    )
+
+    validated = validate_ferebus_task_model_admission(committed, 0, evidence)
+    assert validated == evidence
+
+    arbitrary_copy = tmp_path / "arbitrary-copy"
+    shutil.copytree(staging, arbitrary_copy)
+    with pytest.raises(FerebusModelAdmissionError, match="changed after task admission"):
+        validate_ferebus_task_model_admission(arbitrary_copy, 0, evidence)
+
+    config = committed / "iqa/O1/ferebus.config"
+    config.write_text(config.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(FerebusModelAdmissionError, match="committed file size mismatch"):
+        validate_ferebus_task_model_admission(committed, 0, evidence)
 
 
 def test_legacy_model_admission_falls_back_once_then_uses_cache(

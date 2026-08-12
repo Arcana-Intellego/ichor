@@ -993,6 +993,50 @@ def test_snapshot_rejects_completion_receipt_added_after_inspection(tmp_path):
         snapshot.assert_anchors_unchanged(campaign)
 
 
+def test_snapshot_reference_head_guard_allows_submission_control_publication(
+    tmp_path,
+):
+    from ichor.hpc.active_learning.daemon.artifact_snapshot import (
+        ArtefactSnapshotError,
+        build_committed_artifact_snapshot,
+    )
+
+    campaign = tmp_path / "campaign"
+    _commit_two_versions(campaign)
+    snapshot = build_committed_artifact_snapshot(
+        campaign,
+        verification_level="authority",
+    )
+
+    intents = campaign / ".DATA" / "ACTIVE_LEARNING" / "submission_intents"
+    intents.mkdir(parents=True, exist_ok=True)
+    (intents / "PHASE_B_DIVERSITY-000002.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    snapshot.assert_reference_head_unchanged(
+        campaign,
+        reference_version=1,
+        purpose="Phase B submission",
+    )
+
+    head = (
+        campaign
+        / "QM_REFERENCE_DATA"
+        / "iteration-000001"
+        / REFERENCE_DATA_VERSION_FILENAME
+    )
+    head.write_text(head.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(ArtefactSnapshotError, match="head changed"):
+        snapshot.assert_reference_head_unchanged(
+            campaign,
+            reference_version=1,
+            purpose="Phase B submission",
+        )
+
+
 def test_snapshot_stops_at_first_invalid_reference_without_rescanning_prefix(
     tmp_path,
     monkeypatch,

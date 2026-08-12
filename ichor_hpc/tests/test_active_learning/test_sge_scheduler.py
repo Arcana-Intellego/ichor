@@ -24,7 +24,10 @@ from ichor.hpc.active_learning.daemon.submitted_environment_smoke import (
 )
 from ichor.hpc.active_learning.daemon.submission_intent import expected_job_name
 from ichor.hpc.active_learning.submit.sacct_poll import JobStatus, aggregate_states
-from ichor.hpc.active_learning.submit.scheduler_backend import SgeScheduler
+from ichor.hpc.active_learning.submit.scheduler_backend import (
+    SgeScheduler,
+    SlurmScheduler,
+)
 from ichor.hpc.active_learning.submit.sge import (
     expand_sge_tasks,
     find_accounted_job_by_name_detailed,
@@ -87,6 +90,50 @@ maxvmem      14.570MB
 
 def _completed(stdout="", stderr="", returncode=0):
     return SimpleNamespace(stdout=stdout, stderr=stderr, returncode=returncode)
+
+
+def test_slurm_queue_diagnostics_records_reason_and_partition():
+    calls = []
+
+    def runner(command, **_kwargs):
+        calls.append(list(command))
+        return _completed(
+            "123_1|PENDING|Resources|multicore|ichor-phase|user\n"
+        )
+
+    result = SlurmScheduler().queue_diagnostics(
+        "123",
+        queue_runner=runner,
+        expected_job_name="ichor-phase",
+        expected_owner="user",
+    )
+
+    assert result["inconclusive"] is False
+    assert result["rows"] == [{
+        "job_id": "123_1",
+        "state": "PENDING",
+        "reason": "Resources",
+        "queue": "multicore",
+        "job_name": "ichor-phase",
+        "owner": "user",
+    }]
+    assert "--format=%i|%T|%R|%P|%j|%u" in calls[0]
+
+
+def test_sge_queue_diagnostics_records_native_state_and_queue():
+    result = SgeScheduler().queue_diagnostics(
+        "898176",
+        queue_runner=lambda *_args, **_kwargs: _completed(QSTAT_XML),
+        expected_job_name="ichor-campaign-ariadne",
+        expected_owner="q81036tb",
+    )
+
+    assert result["inconclusive"] is False
+    assert {row["state"] for row in result["rows"]} == {"r", "qw"}
+    assert {row["queue"] for row in result["rows"]} == {
+        "",
+        "all.q@compute-0-1.local",
+    }
 
 
 def _install_ffluxlab_profile(monkeypatch):

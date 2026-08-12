@@ -249,6 +249,7 @@ __all__ = [
     "make_live_job_finder",
     "make_live_job_accounting_finder",
     "make_live_job_liveness_checker",
+    "make_live_queue_diagnostics_collector",
     "LIVE_POSTPROCESS_IMPLEMENTED",
 ]
 
@@ -4215,10 +4216,43 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         ariadne_authority_context: Optional[
             AriadneResourceAuthorityContext
         ] = None
+        phase_b_authority_context = None
         resource_task_ids = submitted_task_ids
         resource_evidence_mode = "computed"
         resource_evidence_source = None
-        if phase_name == "ARIADNE_ARRAY" and array_size is not None:
+        if phase_name == "PHASE_B_DIVERSITY":
+            artifact_snapshot = getattr(
+                self,
+                "_committed_artifact_snapshot",
+                None,
+            )
+            if artifact_snapshot is not None:
+                from ..sampling.phase_b_reference import (
+                    build_phase_b_diversity_authority_context,
+                )
+
+                try:
+                    phase_b_authority_context = (
+                        build_phase_b_diversity_authority_context(
+                            self.campaign_dir,
+                            int(state.iteration),
+                            expected_campaign_uid=str(state.campaign_uid),
+                            expected_reference_version=int(
+                                state.reference_data_version
+                            ),
+                            artifact_snapshot=artifact_snapshot,
+                            progress_callback=self._report_runtime_progress,
+                        )
+                    )
+                except (FileNotFoundError, OSError, ValueError) as exc:
+                    raise BackendSubmissionError(
+                        "Phase B reference authority is unsafe: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc)
+                    ) from exc
+            self._report_runtime_progress("resource_resolution")
+        elif phase_name == "ARIADNE_ARRAY" and array_size is not None:
             from .ariadne_resource_reuse import (
                 resolve_reusable_ariadne_resource_evidence,
             )
@@ -4337,6 +4371,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 require_evidence=True,
                 progress_callback=self._report_runtime_progress,
                 ariadne_authority_context=ariadne_authority_context,
+                phase_b_authority_context=phase_b_authority_context,
             )
         except (ResourceEvidenceInvalid, ResourceEvidenceUnavailable) as exc:
             if phase_name == "PHASE_B_DIVERSITY":
@@ -4409,6 +4444,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         )
         if ariadne_authority_context is not None:
             ariadne_authority_context.assert_unchanged()
+        if phase_b_authority_context is not None:
+            phase_b_authority_context.assert_unchanged()
         try:
             resolution_binding = write_resolution(self.campaign_dir, payload)
             _submission_intent.bind_resource_resolution(
@@ -4511,6 +4548,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 self,
                 "_submission_resource_authority_guard",
                 ariadne_authority_context.assert_unchanged,
+            )
+        elif phase_b_authority_context is not None:
+            setattr(
+                self,
+                "_submission_resource_authority_guard",
+                phase_b_authority_context.assert_unchanged,
             )
         return script
 
@@ -5921,7 +5964,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 staging,
                 progress_callback=admission_progress,
             )
-            assert_ferebus_model_admission_context_unchanged(admission_context)
+            assert_ferebus_model_admission_context_unchanged(
+                admission_context,
+                progress_callback=admission_progress,
+            )
             if artifact_snapshot is not None:
                 quality_context = build_ferebus_quality_context(
                     staging,
@@ -6073,7 +6119,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 )
             if artifact_snapshot is not None:
                 assert_ferebus_authority()
-            assert_ferebus_model_admission_context_unchanged(admission_context)
+            assert_ferebus_model_admission_context_unchanged(
+                admission_context,
+                progress_callback=admission_progress,
+            )
             quality_path = write_ferebus_quality_manifest(staging, quality)
             self._report_runtime_progress(
                 "ferebus_quality_validation",
@@ -6089,7 +6138,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             config_sha = config_fingerprint(canonical_config(self.config))
             if artifact_snapshot is not None:
                 assert_ferebus_authority()
-            assert_ferebus_model_admission_context_unchanged(admission_context)
+            assert_ferebus_model_admission_context_unchanged(
+                admission_context,
+                progress_callback=admission_progress,
+            )
             decision_path = write_ferebus_quality_decision(
                 staging,
                 config_sha256=config_sha,
@@ -6236,7 +6288,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
 
                     assert_ferebus_authority()
                     assert_ferebus_model_admission_context_unchanged(
-                        admission_context
+                        admission_context,
+                        progress_callback=admission_progress,
                     )
                     reference_versioning = ReferenceDataVersioning(
                         Path(self.campaign_dir) / self.reference_data_dir_name
@@ -8230,6 +8283,32 @@ def make_live_job_liveness_checker(
         )
 
     return _checker
+
+
+def make_live_queue_diagnostics_collector(
+    queue_runner=None,
+    *,
+    timeout_seconds: int = 60,
+    scheduler_kind: Optional[str] = None,
+):
+    """Return best-effort, non-authoritative native queue diagnostics."""
+    backend = get_scheduler_backend(scheduler_kind or _configured_scheduler())
+
+    def _collector(
+        job_id,
+        *,
+        expected_job_name=None,
+        expected_owner=None,
+    ):
+        return backend.queue_diagnostics(
+            job_id,
+            queue_runner=(queue_runner or subprocess.run),
+            timeout_seconds=int(timeout_seconds),
+            expected_job_name=expected_job_name,
+            expected_owner=expected_owner,
+        )
+
+    return _collector
 
 
 def _reject_shell_control_chars(label: str, value: str) -> None:

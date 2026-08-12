@@ -663,6 +663,8 @@ def _phase_b_evidence_with_config(
     campaign_dir: Path,
     iteration: int,
     config: Any,
+    *,
+    authority_context: Any = None,
 ) -> Dict[str, Any]:
     from ..handoff_manifests import (
         HandoffManifestError,
@@ -700,10 +702,17 @@ def _phase_b_evidence_with_config(
             config,
             iteration=int(iteration),
         )
-        payload, frames, records = authoritative_ariadne_candidate_frames(
-            campaign_dir,
-            int(iteration),
-        )
+        if authority_context is None:
+            payload, frames, records = authoritative_ariadne_candidate_frames(
+                campaign_dir,
+                int(iteration),
+            )
+        else:
+            if int(authority_context.iteration) != int(iteration):
+                raise ValueError("Phase B authority context iteration mismatch")
+            payload = authority_context.ariadne_manifest
+            frames = [frame.copy() for frame in authority_context.candidate_frames]
+            records = [dict(record) for record in authority_context.candidate_records]
     except (ResourceEvidenceUnavailable, ResourceEvidenceInvalid):
         raise
     except FileNotFoundError as exc:
@@ -728,12 +737,43 @@ def _phase_b_evidence_with_config(
     n_atoms = len(frames[0])
     if any(len(frame) != n_atoms for frame in frames):
             raise ValueError("ARIADNE accepted candidates disagree on atom count")
-    result_files = [
-        _file_evidence(
-            campaign_owned_path(campaign_dir, Path(str(record["result_json"])))
-        )
-        for record in records
-    ]
+    if authority_context is None:
+        result_files = [
+            _file_evidence(
+                campaign_owned_path(campaign_dir, Path(str(record["result_json"])))
+            )
+            for record in records
+        ]
+        reference_count = 0
+        reference_version = None
+        reference_view_sha256 = None
+        reference_cache_status = None
+    else:
+        anchors = {
+            str(anchor.path.resolve()): anchor
+            for anchor in authority_context.handoff_anchors
+        }
+        result_files = []
+        for record in records:
+            result_path = campaign_owned_path(
+                campaign_dir,
+                Path(str(record["result_json"])),
+            ).resolve()
+            anchor = anchors.get(str(result_path))
+            if anchor is None:
+                raise ValueError("Phase B result is absent from authority anchors")
+            result_files.append(
+                {
+                    "path": str(anchor.path),
+                    "size": int(anchor.size),
+                    "sha256": str(anchor.sha256),
+                }
+            )
+        reference_data = authority_context.reference_coordinates
+        reference_count = int(reference_data.n_references)
+        reference_version = int(reference_data.reference_version)
+        reference_view_sha256 = str(reference_data.cumulative_view_sha256)
+        reference_cache_status = str(reference_data.cache_status)
     protocol_files = []
     for path in (
         protocol.manifest_path,
@@ -742,6 +782,10 @@ def _phase_b_evidence_with_config(
     ):
         if path is not None:
             protocol_files.append(_file_evidence(Path(path)))
+    candidate_count = len(frames)
+    descriptor_pairs = int(candidate_count * (candidate_count - 1) // 2)
+    candidate_reference_pairs = int(candidate_count * reference_count)
+    directed_candidate_pairs = int(candidate_count * max(0, candidate_count - 1))
     return {
         "source": "validated_phase_b_handoff",
         "manifest": _file_evidence(results_path),
@@ -750,9 +794,19 @@ def _phase_b_evidence_with_config(
         "accepted_result_files": result_files,
         "accepted_seed_ids": [int(record["seed_id"]) for record in records],
         "safety_filter": safety_filter,
-        "n_frames": len(frames),
+        "n_frames": candidate_count,
         "n_atoms": int(n_atoms or 0),
         "coordinate_dimension": int(3 * int(n_atoms or 0)),
+        "reference_count": reference_count,
+        "reference_data_version": reference_version,
+        "reference_view_sha256": reference_view_sha256,
+        "reference_coordinate_cache_status": reference_cache_status,
+        "descriptor_pairs": descriptor_pairs,
+        "candidate_reference_pairs": candidate_reference_pairs,
+        "directed_candidate_pairs": directed_candidate_pairs,
+        "exact_novelty_pairs": (
+            candidate_reference_pairs + directed_candidate_pairs
+        ),
     }
 
 
@@ -1727,6 +1781,7 @@ def collect_resource_evidence(
     ariadne_authority_context: Optional[
         AriadneResourceAuthorityContext
     ] = None,
+    phase_b_authority_context: Any = None,
 ) -> Dict[str, Any]:
     backend = backend_for_phase(phase_name)
     if campaign_dir is None:
@@ -1744,7 +1799,10 @@ def collect_resource_evidence(
                 _pool_evidence(campaign_dir)
                 if phase_name == "PHASE_A_DIVERSITY"
                 else _phase_b_evidence_with_config(
-                    campaign_dir, int(iteration), config
+                    campaign_dir,
+                    int(iteration),
+                    config,
+                    authority_context=phase_b_authority_context,
                 )
             )
         if backend in {"gaussian", "aimall"}:
@@ -2018,7 +2076,16 @@ def _estimate_backend_memory_gb(
         descriptor = str(getattr(getattr(config, "phase_b", object()), "descriptor", "rmsd_massweight"))
         store_mode = str(evidence.get("distance_store_mode") or "memory")
         resident_store_gb = store_gb if store_mode == "memory" else min(store_gb, 0.25)
-        raw_gb = 1.0 + resident_store_gb + 0.25 * float(workers)
+        reference_count = int(evidence.get("reference_count") or 0)
+        n_atoms = int(evidence.get("n_atoms") or 0)
+        reference_bytes = int(reference_count * n_atoms * 3 * 8)
+        candidate_matrix_bytes = int(n * n * 8 + n * 8)
+        raw_gb = (
+            1.0
+            + resident_store_gb
+            + float(reference_bytes + candidate_matrix_bytes) / (1024.0 ** 3)
+            + 0.25 * float(workers)
+        )
         total_gb = raw_gb * safety
         extra.update({
             "n_frames": int(n),
@@ -2027,6 +2094,9 @@ def _estimate_backend_memory_gb(
             "condensed_store_bytes": store_bytes,
             "distance_store_mode": store_mode,
             "active_workers": workers,
+            "reference_count": reference_count,
+            "reference_coordinate_bytes": reference_bytes,
+            "novelty_candidate_matrix_bytes": candidate_matrix_bytes,
             "unprotected_total_memory_gb": raw_gb,
         })
         return total_gb, "diversity_condensed_distance_store", extra
@@ -2223,11 +2293,20 @@ def _auto_cpu_target(
         pairs = int(n_frames * (n_frames - 1) // 2)
         target_pairs = int(config.resources.diversity.target_pairs_per_worker)
         wanted = max(1, int(math.ceil(float(pairs) / float(target_pairs))))
-        active = min(
-            wanted,
-            int(config.resources.diversity.auto_max_workers),
-            int(partition_max),
-        )
+        if phase_name == "PHASE_B_DIVERSITY":
+            active = min(
+                n_frames,
+                int(config.resources.diversity.auto_max_workers),
+                int(partition_max),
+            )
+            reason = "phase_b_exact_novelty_candidate_workers"
+        else:
+            active = min(
+                wanted,
+                int(config.resources.diversity.auto_max_workers),
+                int(partition_max),
+            )
+            reason = "diversity_pairs_per_worker"
         target = max(partition_min, active)
         extra.update({
             "n_frames": n_frames,
@@ -2235,7 +2314,7 @@ def _auto_cpu_target(
             "active_workers": active,
             "worker_target_before_caps": wanted,
         })
-        return target, "diversity_pairs_per_worker", extra, 0.0, "diversity_condensed_distance_store"
+        return target, reason, extra, 0.0, "diversity_condensed_distance_store"
     if backend == "gaussian":
         n_atoms = int(evidence["max_n_atoms"])
         weighted = float(n_atoms) * _basis_factor(config) * _method_factor(config)
@@ -2323,6 +2402,7 @@ def resolve_phase_resources(
     ariadne_authority_context: Optional[
         AriadneResourceAuthorityContext
     ] = None,
+    phase_b_authority_context: Any = None,
 ) -> ResolvedPhaseResources:
     resources = config.resources
     backend = backend_for_phase(phase_name)
@@ -2355,6 +2435,7 @@ def resolve_phase_resources(
             require_evidence=bool(require_evidence),
             progress_callback=progress_callback,
             ariadne_authority_context=ariadne_authority_context,
+            phase_b_authority_context=phase_b_authority_context,
         )
     )
     if not evidence or not isinstance(evidence.get("source"), str):
@@ -2461,11 +2542,18 @@ def resolve_phase_resources(
                 / float(config.resources.diversity.target_pairs_per_worker)
             )),
         )
-        active_workers = min(
-            wanted,
-            int(config.resources.diversity.auto_max_workers),
-            int(scientific_cpus),
-        )
+        if phase_name == "PHASE_B_DIVERSITY" and _is_auto(raw_cpu):
+            active_workers = min(
+                int(evidence["n_frames"]),
+                int(config.resources.diversity.auto_max_workers),
+                int(scientific_cpus),
+            )
+        else:
+            active_workers = min(
+                wanted,
+                int(config.resources.diversity.auto_max_workers),
+                int(scientific_cpus),
+            )
         store_bytes = int(8 * pairs)
         if _is_auto(raw_mem):
             prospective_allocation_bytes = (

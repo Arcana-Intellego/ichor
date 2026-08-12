@@ -135,6 +135,7 @@ def test_csf4_critical_runtime_dependencies_are_declared():
         "xtb",
         "plumed",
         "portalocker",
+        "threadpoolctl",
         "tqdm",
         "ruamel-yaml",
     } <= hpc_deps

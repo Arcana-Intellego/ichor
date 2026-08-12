@@ -298,24 +298,22 @@ def _load_committed_reference_data(campaign_dir):
     Returns an empty list when nothing has been committed yet, so the
     anti-overlap filter is a clean no-op against a fresh campaign.
     """
-    from ..versioning.reference_data import ReferenceDataVersioning
-    from ichor.core.files import PointDirectory
-    v = ReferenceDataVersioning(Path(campaign_dir) / "QM_REFERENCE_DATA")
-    cur = v.current_version()
-    if cur is None:
-        return []
-    view = v.resolve(int(cur), verification="index")
-    atoms_list = []
-    for entry in view.entries:
-        try:
-            pd = PointDirectory(entry.pointdir_path)
-            atoms_list.append(pd.atoms)
-        except Exception as exc:
-            raise ValueError(
-                "committed QM reference point cannot be parsed: "
-                + str(entry.pointdir_path)
-            ) from exc
-    return atoms_list
+    return _load_committed_reference_coordinates(campaign_dir).to_atoms_list()
+
+
+def _load_committed_reference_coordinates(
+    campaign_dir,
+    *,
+    workers: int = 8,
+    progress_callback=None,
+):
+    from .phase_b_reference import load_phase_b_reference_coordinates
+
+    return load_phase_b_reference_coordinates(
+        Path(campaign_dir),
+        workers=max(1, int(workers)),
+        progress_callback=progress_callback,
+    )
 
 
 def _phase_b_landing_safety_filter(
@@ -408,6 +406,7 @@ def _phase_b_refill_after_anti_overlap(
     training,
     min_separation: float,
     target_size: int,
+    distance_oracle=None,
 ):
     from .anti_overlap import DedupReport, min_distance_to_training
 
@@ -418,12 +417,18 @@ def _phase_b_refill_after_anti_overlap(
     dropped_indices = []
     distances = []
     kept_frames = []
+    kept_candidate_indices = []
 
     for candidate_index in ordered_indices:
         considered_index = len(considered_indices)
         cand = candidate_frames[int(candidate_index)]
         distance = float(
-            min_distance_to_training(cand, list(training) + list(kept_frames))
+            distance_oracle.nearest_distance(
+                int(candidate_index),
+                kept_candidate_indices,
+            )
+            if distance_oracle is not None
+            else min_distance_to_training(cand, list(training) + list(kept_frames))
         )
         considered_indices.append(int(candidate_index))
         considered_frames.append(cand)
@@ -434,6 +439,7 @@ def _phase_b_refill_after_anti_overlap(
         else:
             kept_indices.append(int(considered_index))
             kept_frames.append(cand)
+            kept_candidate_indices.append(int(candidate_index))
             if len(kept_indices) >= int(target_size):
                 break
 
@@ -476,12 +482,17 @@ def _phase_b_build_reserve(
     training,
     selected_frames,
     min_separation: float,
+    selected_candidate_indices=None,
+    distance_oracle=None,
 ):
     """Return the remaining safe FPS candidates in deterministic reserve order."""
     from .anti_overlap import min_distance_to_training
 
     considered = {int(value) for value in already_considered_indices}
     accepted_context = list(selected_frames)
+    accepted_candidate_indices = [
+        int(value) for value in (selected_candidate_indices or [])
+    ]
     reserve_indices = []
     reserve_frames = []
     reserve_records = []
@@ -493,7 +504,12 @@ def _phase_b_build_reserve(
             continue
         frame = candidate_frames[candidate_index]
         distance = float(
-            min_distance_to_training(frame, list(training) + accepted_context)
+            distance_oracle.nearest_distance(
+                candidate_index,
+                accepted_candidate_indices,
+            )
+            if distance_oracle is not None
+            else min_distance_to_training(frame, list(training) + accepted_context)
         )
         if not np.isfinite(distance) or distance < float(min_separation):
             rejected.append({
@@ -509,6 +525,7 @@ def _phase_b_build_reserve(
         reserve_records.append(candidate_records[candidate_index])
         reserve_distances.append(distance)
         accepted_context.append(frame)
+        accepted_candidate_indices.append(candidate_index)
     return {
         "candidate_indices": reserve_indices,
         "frames": reserve_frames,
@@ -524,6 +541,8 @@ def _relax_scaled_novelty(
     report,
     training,
     target_size: int,
+    considered_candidate_indices=None,
+    distance_oracle=None,
 ):
     """Admit the farthest non-duplicate candidates until the target is met."""
     from .anti_overlap import DedupReport, min_distance_to_training
@@ -532,13 +551,21 @@ def _relax_scaled_novelty(
     kept = [int(value) for value in report.kept_indices]
     remaining = [int(value) for value in report.dropped_indices]
     accepted_context = [considered_frames[index] for index in kept]
+    accepted_candidate_indices = [
+        int(considered_candidate_indices[index]) for index in kept
+    ] if considered_candidate_indices is not None else []
     admitted = []
     while len(kept) < int(target_size) and remaining:
         ranked = []
         context = list(training) + accepted_context
         for considered_index in remaining:
             distance = float(
-                min_distance_to_training(considered_frames[considered_index], context)
+                distance_oracle.nearest_distance(
+                    int(considered_candidate_indices[considered_index]),
+                    accepted_candidate_indices,
+                )
+                if distance_oracle is not None
+                else min_distance_to_training(considered_frames[considered_index], context)
             )
             if np.isfinite(distance) and distance > EXACT_DUPLICATE_EPSILON_ANGSTROM:
                 ranked.append((distance, considered_index))
@@ -548,6 +575,10 @@ def _relax_scaled_novelty(
         kept.append(int(considered_index))
         remaining.remove(int(considered_index))
         accepted_context.append(considered_frames[int(considered_index)])
+        if considered_candidate_indices is not None:
+            accepted_candidate_indices.append(
+                int(considered_candidate_indices[int(considered_index)])
+            )
         admitted.append({
             "considered_index_zero_based": int(considered_index),
             "distance_to_nearest_angstrom": float(distance),
@@ -1137,7 +1168,42 @@ def _run_phase_b(args, campaign, config, *, progress_reporter: Any = None):
     final_path = phase_b_dir / "selected.xyz"
     manifest_diagnostic_path = phase_b_dir / "SELECTION.json"
     try:
-        training = _load_committed_reference_data(campaign) if min_sep > 0.0 else []
+        if progress_reporter is not None:
+            progress_reporter.update(
+                stage="reference_coordinate_authority",
+                completed=0,
+                total=1,
+                unit="reference views",
+            )
+        reference_data = (
+            _load_committed_reference_coordinates(
+                campaign,
+                workers=int(getattr(args, "workers", 1)),
+                progress_callback=(
+                    None
+                    if progress_reporter is None
+                    else lambda stage, payload: progress_reporter.update(
+                        stage=str(stage), **dict(payload)
+                    )
+                ),
+            )
+            if min_sep > 0.0
+            else []
+        )
+        if progress_reporter is not None:
+            reference_count = (
+                int(reference_data.n_references)
+                if hasattr(reference_data, "n_references")
+                else int(len(reference_data))
+            )
+            progress_reporter.update(
+                stage="reference_coordinate_authority",
+                completed=1,
+                total=1,
+                unit="reference views",
+                reference_count=reference_count,
+                cache_status=getattr(reference_data, "cache_status", "not_required"),
+            )
     except Exception as exc:
         print(
             "committed QM reference data invalid for Phase B anti-overlap: "
@@ -1164,6 +1230,30 @@ def _run_phase_b(args, campaign, config, *, progress_reporter: Any = None):
             total=int(len(candidate_frames)),
             unit="ranked candidates",
         )
+    distance_oracle = None
+    if min_sep > 0.0:
+        try:
+            from .anti_overlap import PhaseBNoveltyDistanceOracle
+
+            distance_oracle = PhaseBNoveltyDistanceOracle(
+                candidate_frames,
+                reference_data,
+                workers=int(getattr(args, "workers", 1)),
+                progress_callback=(
+                    None
+                    if progress_reporter is None
+                    else lambda **payload: progress_reporter.update(**payload)
+                ),
+            )
+        except Exception as exc:
+            print(
+                "Phase B exact novelty distance calculation failed: "
+                + type(exc).__name__
+                + ": "
+                + str(exc),
+                file=_sys.stderr,
+            )
+            return 3
     (
         selected_candidate_indices,
         selected_frames,
@@ -1174,9 +1264,10 @@ def _run_phase_b(args, campaign, config, *, progress_reporter: Any = None):
         ordered_indices=ordered_sel.indices,
         candidate_frames=candidate_frames,
         candidate_records=candidate_records,
-        training=training,
+        training=(),
         min_separation=min_sep,
         target_size=n_select,
+        distance_oracle=distance_oracle,
     )
     phase_b_dir.mkdir(parents=True, exist_ok=True)
     considered_path = phase_b_dir / "considered_candidates.xyz"
@@ -1189,8 +1280,10 @@ def _run_phase_b(args, campaign, config, *, progress_reporter: Any = None):
         report, relaxation = _relax_scaled_novelty(
             considered_frames=selected_frames,
             report=report,
-            training=training,
+            training=(),
             target_size=int(n_select),
+            considered_candidate_indices=selected_candidate_indices,
+            distance_oracle=distance_oracle,
         )
         relaxation["effective_min_separation_angstrom"] = float(min_sep)
     if progress_reporter is not None:
@@ -1361,9 +1454,13 @@ def _run_phase_b(args, campaign, config, *, progress_reporter: Any = None):
         already_considered_indices=selected_candidate_indices,
         candidate_frames=candidate_frames,
         candidate_records=candidate_records,
-        training=training,
+        training=(),
         selected_frames=kept_frames,
         min_separation=min_sep,
+        selected_candidate_indices=[
+            selected_candidate_indices[index] for index in report.kept_indices
+        ],
+        distance_oracle=distance_oracle,
     )
     try:
         if progress_reporter is not None:

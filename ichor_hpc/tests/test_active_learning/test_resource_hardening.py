@@ -206,6 +206,62 @@ def test_polus_ten_thousand_frame_formula_resolves_ten_workers(resource_profile)
     }
 
 
+def test_phase_b_auto_resources_use_candidate_rows_and_novelty_memory(
+    resource_profile,
+):
+    config = CampaignConfig()
+    evidence = {
+        "source": "validated_phase_b_handoff",
+        "n_frames": 200,
+        "n_atoms": 6,
+        "reference_count": 4_200,
+        "candidate_reference_pairs": 840_000,
+        "directed_candidate_pairs": 39_800,
+    }
+
+    resolved = resource_solver.resolve_phase_resources(
+        phase_name="PHASE_B_DIVERSITY",
+        config=config,
+        partition="multicore",
+        campaign_dir=None,
+        require_evidence=False,
+        evidence_override=evidence,
+    )
+
+    assert resolved.cpus_per_task == config.resources.diversity.auto_max_workers
+    assert resolved.cpu_reason == "phase_b_exact_novelty_candidate_workers"
+    assert resolved.extra["active_workers"] == resolved.cpus_per_task
+    assert resolved.extra["reference_count"] == 4_200
+    assert resolved.extra["reference_coordinate_bytes"] == 4_200 * 6 * 3 * 8
+    assert resolved.extra["novelty_candidate_matrix_bytes"] == (
+        200 * 200 * 8 + 200 * 8
+    )
+
+
+def test_phase_b_explicit_cpu_request_retains_existing_worker_heuristic(
+    resource_profile,
+):
+    config = CampaignConfig()
+    config.resources.diversity.cpus_per_task = 3
+
+    resolved = resource_solver.resolve_phase_resources(
+        phase_name="PHASE_B_DIVERSITY",
+        config=config,
+        partition="multicore",
+        campaign_dir=None,
+        require_evidence=False,
+        evidence_override={
+            "source": "validated_phase_b_handoff",
+            "n_frames": 200,
+            "n_atoms": 6,
+            "reference_count": 4_200,
+        },
+    )
+
+    assert resolved.cpus_per_task == 3
+    assert resolved.extra["active_workers"] == 1
+
+
 def test_polus_large_store_falls_back_to_campaign_scratch(
     monkeypatch,
     resource_profile,

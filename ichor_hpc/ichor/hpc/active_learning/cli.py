@@ -120,6 +120,7 @@ from .daemon.live_executor import (
     make_live_job_accounting_finder,
     make_live_job_finder,
     make_live_job_liveness_checker,
+    make_live_queue_diagnostics_collector,
 )
 from .daemon.preflight import check_backends, missing_backend_message
 from .daemon.presentation_assessment import (
@@ -2494,6 +2495,20 @@ def _status_progress_rows(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
                 + " progress"
             )
         rows.append((progress_label, count))
+    details = record.get("details")
+    if (
+        str(record.get("producer_kind") or "") == "scheduler"
+        and isinstance(details, Mapping)
+    ):
+        diagnostic_prefix = "recorded " if historical_scheduler_progress else ""
+        for key, label in (
+            ("pending_reason", "pending reason"),
+            ("pending_queue", "scheduler queue"),
+            ("scheduler_native_state", "native scheduler state"),
+        ):
+            value = " ".join(str(details.get(key) or "").split())
+            if value:
+                rows.append((diagnostic_prefix + label, value[:160]))
     elapsed = _format_elapsed_seconds(record.get("elapsed_seconds"))
     if elapsed:
         rows.append(
@@ -4832,6 +4847,17 @@ def _journal_operator_summary(
                     counts.append(str(value) + " " + key)
             if counts:
                 message += ": " + ", ".join(counts) + " " + unit
+            diagnostics = []
+            for key, label in (
+                ("pending_reason", "pending reason"),
+                ("pending_queue", "queue"),
+                ("scheduler_native_state", "native state"),
+            ):
+                value = " ".join(str(event.get(key) or "").split())
+                if value:
+                    diagnostics.append(label + "=" + value[:160])
+            if diagnostics:
+                message += "; " + ", ".join(diagnostics)
         elif completed is not None and total is not None:
             message += ": " + str(completed) + "/" + str(total) + " " + unit
         elif completed is not None:
@@ -5600,6 +5626,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     job_finder = None
     job_name_accounting_finder = None
     job_liveness_checker = None
+    queue_diagnostics_collector = None
     resource_usage_collector = None
     if effective_mode == "live":
         _report_background_startup(
@@ -5665,6 +5692,11 @@ def cmd_start(args: argparse.Namespace) -> int:
             timeout_seconds=scheduler_timeout,
             scheduler_kind=scheduler_kind,
         )
+        queue_diagnostics_collector = _call_timeout_aware(
+            make_live_queue_diagnostics_collector,
+            timeout_seconds=scheduler_timeout,
+            scheduler_kind=scheduler_kind,
+        )
         from .daemon.resource_usage import collect_usage
 
         resource_usage_collector = collect_usage
@@ -5701,6 +5733,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         daemon_kwargs["job_name_accounting_finder"] = job_name_accounting_finder
     if job_liveness_checker is not None:
         daemon_kwargs["job_liveness_checker"] = job_liveness_checker
+    if queue_diagnostics_collector is not None:
+        daemon_kwargs["queue_diagnostics_collector"] = queue_diagnostics_collector
     if resource_usage_collector is not None:
         daemon_kwargs["resource_usage_collector"] = resource_usage_collector
     d = Daemon(**daemon_kwargs)

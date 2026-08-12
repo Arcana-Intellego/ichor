@@ -324,6 +324,32 @@ def aligned_mass_weighted_distance(reference: Atoms, mobile: Atoms) -> float:
     return float(np.sqrt(np.dot(m, diff.reshape(-1) ** 2)))
 
 
+def _aligned_mass_weighted_rmsd_arrays(
+    reference: np.ndarray,
+    mobile: np.ndarray,
+    masses: np.ndarray,
+) -> float:
+    """Exact scalar RMSD kernel shared by object and cached-coordinate paths."""
+    ref = np.asarray(reference, dtype=float)
+    mob = np.asarray(mobile, dtype=float)
+    mass = np.asarray(masses, dtype=float)
+    if ref.shape != mob.shape or ref.ndim != 2 or ref.shape[1] != 3:
+        raise ValueError("aligned geometry coordinate arrays must match (n_atoms, 3)")
+    if mass.shape != (ref.shape[0],):
+        raise ValueError("aligned geometry masses must be shaped (n_atoms,)")
+    if not np.all(np.isfinite(ref)) or not np.all(np.isfinite(mob)):
+        raise ValueError("aligned geometry coordinates must be finite")
+    aligned = kabsch_align(ref, mob, weights=mass)
+    diff = aligned - ref
+    denom = float(np.sum(mass))
+    if denom <= 0.0 or not np.isfinite(denom):
+        denom = float(ref.shape[0])
+    if denom <= 0.0:
+        return 0.0
+    weighted_sq = float(np.sum(mass[:, None] * diff ** 2))
+    return float(np.sqrt(max(0.0, weighted_sq / denom)))
+
+
 def aligned_mass_weighted_rmsd(reference: Atoms, mobile: Atoms) -> float:
     """Return aligned mass-normalised RMSD in coordinate units.
 
@@ -335,15 +361,7 @@ def aligned_mass_weighted_rmsd(reference: Atoms, mobile: Atoms) -> float:
     ref = atoms_to_coordinates(reference)
     mob = atoms_to_coordinates(mobile)
     masses = np.asarray(reference.masses, dtype=float)
-    aligned = kabsch_align(ref, mob, weights=masses)
-    diff = aligned - ref
-    denom = float(np.sum(masses))
-    if denom <= 0.0 or not np.isfinite(denom):
-        denom = float(len(reference))
-    if denom <= 0.0:
-        return 0.0
-    weighted_sq = float(np.sum(masses[:, None] * diff ** 2))
-    return float(np.sqrt(max(0.0, weighted_sq / denom)))
+    return _aligned_mass_weighted_rmsd_arrays(ref, mob, masses)
 
 
 def aligned_per_atom_displacements(reference: Atoms, mobile: Atoms) -> np.ndarray:

@@ -350,6 +350,39 @@ class CommittedArtifactSnapshot:
                 "FEREBUS incumbent model head changed during postprocessing"
             )
 
+    def assert_reference_head_unchanged(
+        self,
+        campaign_dir: Path,
+        *,
+        reference_version: int,
+        purpose: str,
+    ) -> None:
+        """Recheck a reference consumer without replaying mutable controls.
+
+        Scheduler submission legitimately creates and binds a PRE_SUBMIT intent
+        after the daemon captures its committed-artifact snapshot.  Consumers
+        that do not read intent history must therefore authenticate only the
+        committed reference inventory and the exact head they consume.
+        """
+        campaign = Path(campaign_dir)
+        references = ReferenceDataVersioning(campaign / "QM_REFERENCE_DATA")
+        if _committed_versions(references) != self.committed_reference_data_versions:
+            raise ArtefactSnapshotError(
+                "committed reference-data inventory changed during " + str(purpose)
+            )
+        reference = self.reference_view(int(reference_version))
+        reference_head = reference_data_version_path(
+            references.iteration_path(int(reference_version))
+        )
+        if (
+            reference_head.is_symlink()
+            or not reference_head.is_file()
+            or sha256_file(reference_head) != str(reference.head_manifest_sha256)
+        ):
+            raise ArtefactSnapshotError(
+                "reference-data head changed during " + str(purpose)
+            )
+
     def verification_payload(self, *, deep_required: bool = False) -> Dict[str, Any]:
         return {
             "level": self.verification_level,
