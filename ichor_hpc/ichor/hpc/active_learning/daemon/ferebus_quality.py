@@ -54,6 +54,7 @@ class FerebusQualityContext:
     incumbent_set: Any
     task_map: Optional[Mapping[str, Any]] = None
     receipt_payloads: Tuple[Mapping[str, Any], ...] = ()
+    campaign_dir: Optional[Path] = None
 
 
 QualityProgressCallback = Optional[
@@ -368,31 +369,14 @@ def _emit_quality_progress(
         pass
 
 
-def build_ferebus_quality_context(
-    staging_dir: Path,
+def _quality_context_from_bound_evidence(
+    staging: Path,
+    manifest: Mapping[str, Any],
+    selected_execution: Mapping[str, Any],
     *,
-    incumbent_set: Any = _AUTO_INCUMBENT,
-    task_manifest: Optional[Mapping[str, Any]] = None,
-    task_execution: Optional[Mapping[str, Any]] = None,
+    incumbent_set: Any,
 ) -> FerebusQualityContext:
-    """Authenticate staging once and bind the incumbent without chain replay."""
-    from . import input_staging as _stg
-    from .ferebus_task_runner import validate_task_receipts
-
-    staging = Path(staging_dir).resolve()
-    manifest = (
-        _stg.read_ferebus_manifest(staging)
-        if task_manifest is None
-        else task_manifest
-    )
-    selected_execution = task_execution
-    if selected_execution is None:
-        try:
-            selected_execution = validate_task_receipts(staging)
-        except Exception as exc:
-            raise FerebusQualityDecisionError(
-                "FEREBUS task execution evidence is invalid: " + str(exc)
-            ) from exc
+    """Bind already-authenticated quality evidence without filesystem access."""
     reference_version = int(manifest.get("reference_data_version", -1))
     selected_incumbent = incumbent_set
     if selected_incumbent is _AUTO_INCUMBENT:
@@ -449,7 +433,80 @@ def build_ferebus_quality_context(
             if not isinstance(private_receipts, list)
             else tuple(private_receipts)
         ),
+        campaign_dir=staging.parent.parent,
     )
+
+
+def build_ferebus_quality_context_from_admission(
+    admission_context: Any,
+    *,
+    incumbent_set: Any,
+) -> FerebusQualityContext:
+    """Bind a quality context from immutable model-admission authority."""
+    staging = admission_context.staging
+    manifest = admission_context.task_manifest
+    execution = admission_context.task_execution
+    if (
+        not isinstance(staging, Path)
+        or not isinstance(manifest, Mapping)
+        or not isinstance(execution, Mapping)
+    ):
+        raise FerebusQualityDecisionError(
+            "FEREBUS model-admission context is incomplete"
+        )
+    return _quality_context_from_bound_evidence(
+        staging,
+        manifest,
+        execution,
+        incumbent_set=incumbent_set,
+    )
+
+
+def build_ferebus_quality_context(
+    staging_dir: Path,
+    *,
+    incumbent_set: Any = _AUTO_INCUMBENT,
+    task_manifest: Optional[Mapping[str, Any]] = None,
+    task_execution: Optional[Mapping[str, Any]] = None,
+) -> FerebusQualityContext:
+    """Authenticate staging once and bind the incumbent without chain replay."""
+    from . import input_staging as _stg
+    from .ferebus_task_runner import validate_task_receipts
+
+    staging = Path(staging_dir).resolve()
+    manifest = (
+        _stg.read_ferebus_manifest(staging)
+        if task_manifest is None
+        else task_manifest
+    )
+    selected_execution = task_execution
+    if selected_execution is None:
+        try:
+            selected_execution = validate_task_receipts(staging)
+        except Exception as exc:
+            raise FerebusQualityDecisionError(
+                "FEREBUS task execution evidence is invalid: " + str(exc)
+            ) from exc
+    return _quality_context_from_bound_evidence(
+        staging,
+        manifest,
+        selected_execution,
+        incumbent_set=incumbent_set,
+    )
+
+
+def _quality_context_root(
+    staging: Path,
+    context: Optional[FerebusQualityContext],
+) -> Path:
+    if context is None:
+        return Path(staging).resolve()
+    supplied = Path(staging)
+    if supplied != context.staging:
+        raise FerebusQualityDecisionError(
+            "FEREBUS task quality context path mismatch"
+        )
+    return context.staging
 
 
 def _raw_task_receipt(
@@ -460,7 +517,7 @@ def _raw_task_receipt(
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     from .ferebus_task_runner import _read_task_map, validate_task_receipt
 
-    root = Path(staging).resolve()
+    root = _quality_context_root(staging, context)
     if context is not None:
         task_map = context.task_map
         receipt_payloads = context.receipt_payloads
@@ -653,11 +710,7 @@ def validate_ferebus_task_measurement(
 
     if not isinstance(measurement, Mapping):
         raise FerebusQualityDecisionError("FEREBUS task quality measurement is invalid")
-    staging = Path(staging_dir).resolve()
-    if context is not None and context.staging != staging:
-        raise FerebusQualityDecisionError(
-            "FEREBUS task quality context path mismatch"
-        )
+    staging = _quality_context_root(staging_dir, context)
     normalised, receipt, task_map, map_task = _raw_task_receipt(
         staging,
         int(logical_task_id),
@@ -836,7 +889,9 @@ def _quality_cache_path(
 ) -> Path:
     from .filesystem import campaign_owned_path
 
-    campaign = context.staging.parent.parent.resolve()
+    campaign = context.campaign_dir
+    if campaign is None:
+        campaign = context.staging.parent.parent.resolve()
     digest = _canonical_sha256(identity)
     return campaign_owned_path(
         campaign,
@@ -2101,6 +2156,7 @@ __all__ = [
     "FerebusQualityMeasurementIncomplete",
     "FerebusQualityDecisionError",
     "build_ferebus_quality_context",
+    "build_ferebus_quality_context_from_admission",
     "enrich_task_receipt_with_quality",
     "evaluate_ferebus_quality",
     "evaluate_ferebus_quality_decision",

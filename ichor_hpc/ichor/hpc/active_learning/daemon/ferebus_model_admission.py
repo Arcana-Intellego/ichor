@@ -41,6 +41,7 @@ class FerebusModelAdmissionAnchor:
     kind: str
     stat_identity: Tuple[int, ...]
     control_sha256: Optional[str] = None
+    expected_sha256: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -150,8 +151,7 @@ def _file_stat_identity(path: Path) -> Dict[str, int]:
     }
 
 
-def _file_stat_tuple(path: Path) -> Tuple[int, int, int, int, int]:
-    value = path.stat()
+def _file_stat_tuple_from_result(value: os.stat_result) -> Tuple[int, int, int, int, int]:
     return (
         int(value.st_dev),
         int(value.st_ino),
@@ -161,9 +161,56 @@ def _file_stat_tuple(path: Path) -> Tuple[int, int, int, int, int]:
     )
 
 
-def _directory_stat_tuple(path: Path) -> Tuple[int, int]:
-    value = path.stat()
+def _directory_stat_tuple_from_result(value: os.stat_result) -> Tuple[int, int]:
     return (int(value.st_dev), int(value.st_ino))
+
+
+def _anchored_sha256(
+    path: Path,
+    expected_stat: Tuple[int, int, int, int, int],
+) -> str:
+    def matches(value: os.stat_result) -> bool:
+        observed = _file_stat_tuple_from_result(value)
+        # Windows fstat reports creation time with different rounding from
+        # path lstat. The path guard still compares the full identity.
+        return (
+            observed[:4] == expected_stat[:4]
+            if os.name == "nt"
+            else observed == expected_stat
+        )
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    digest = hashlib.sha256()
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat_module.S_ISREG(before.st_mode)
+            or not matches(before)
+        ):
+            raise FerebusModelAdmissionError(
+                "FEREBUS admission control changed before hashing: " + str(path)
+            )
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        after = os.fstat(descriptor)
+        if not matches(after):
+            raise FerebusModelAdmissionError(
+                "FEREBUS admission control changed while hashing: " + str(path)
+            )
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest()
+
+
+def _canonical_relative_parts(relative: str, label: str) -> Tuple[str, ...]:
+    if not relative or "\\" in relative:
+        raise FerebusModelAdmissionError(label + " must be a relative POSIX path")
+    parts = tuple(relative.split("/"))
+    if any(part in {"", ".", ".."} for part in parts):
+        raise FerebusModelAdmissionError(label + " must be a canonical relative path")
+    return parts
 
 
 def _capture_file_binding(
@@ -189,6 +236,7 @@ def _validate_file_binding(
     label: str,
     *,
     captured_files: Optional[Mapping[str, FerebusModelAdmissionAnchor]] = None,
+    committed_files: Optional[Mapping[str, Mapping[str, Any]]] = None,
     validation_scope: str = "staging",
 ) -> None:
     from .ferebus_task_runner import _contained_file
@@ -206,6 +254,23 @@ def _validate_file_binding(
     }:
         raise FerebusModelAdmissionError(label + " file binding mismatch")
     relative = str(expected.get("path") or "")
+    committed_record = (
+        None if committed_files is None else committed_files.get(relative)
+    )
+    if validation_scope == "committed" and committed_record is not None:
+        if {
+            "path": committed_record.get("path"),
+            "size": committed_record.get("size"),
+            "sha256": committed_record.get("sha256"),
+        } != {
+            "path": expected.get("path"),
+            "size": expected.get("size"),
+            "sha256": expected.get("sha256"),
+        }:
+            raise FerebusModelAdmissionError(
+                label + " committed authority binding mismatch"
+            )
+        return
     anchor = None if captured_files is None else captured_files.get(relative)
     if anchor is None:
         path = _contained_file(staging, relative, label + ".path")
@@ -435,18 +500,38 @@ def validate_ferebus_task_model_admission(
     _captured_files: Optional[
         Mapping[str, FerebusModelAdmissionAnchor]
     ] = None,
+    _canonical_root: Optional[Path] = None,
+    _committed_model_set: Any = None,
+    _defer_committed_contract: bool = False,
 ) -> Dict[str, Any]:
     """Validate task evidence against staging stats or committed content."""
     supplied_root = Path(staging_dir)
-    if supplied_root.is_symlink():
-        raise FerebusModelAdmissionError("FEREBUS model root must not be a symlink")
-    staging = supplied_root.resolve()
+    if _canonical_root is None:
+        if supplied_root.is_symlink():
+            raise FerebusModelAdmissionError("FEREBUS model root must not be a symlink")
+        staging = supplied_root.resolve()
+    else:
+        staging = Path(_canonical_root)
+        if (
+            supplied_root != staging
+            or _captured_files is None
+            or str(validation_scope).strip().lower() != "staging"
+        ):
+            raise FerebusModelAdmissionError(
+                "FEREBUS canonical admission root is not bound to staging evidence"
+            )
     scope = _normalise_validation_scope(staging, validation_scope)
-    committed_model_set = (
-        _authenticate_committed_model_root(staging)
-        if scope == "committed"
-        else None
-    )
+    committed_model_set = None
+    if scope == "committed":
+        committed_model_set = (
+            _authenticate_committed_model_root(staging)
+            if _committed_model_set is None
+            else _committed_model_set
+        )
+        if Path(committed_model_set.root) != staging:
+            raise FerebusModelAdmissionError(
+                "committed FEREBUS model root identity mismatch"
+            )
     if not isinstance(evidence, Mapping):
         raise FerebusModelAdmissionError("FEREBUS task model admission is invalid")
     manifest, selected_map, map_task, selected_receipt = _task_material(
@@ -475,12 +560,30 @@ def validate_ferebus_task_model_admission(
     files = evidence.get("files")
     if not isinstance(files, Mapping):
         raise FerebusModelAdmissionError("FEREBUS admission file bindings are invalid")
+    committed_files: Optional[Dict[str, Mapping[str, Any]]] = None
+    if _committed_model_set is not None:
+        committed_files = {}
+        for committed_task in committed_model_set.tasks:
+            records = (
+                committed_task.model,
+                committed_task.config,
+                committed_task.execution_receipt,
+                *committed_task.datasets.values(),
+                *(
+                    record
+                    for record in committed_task.auxiliary.values()
+                    if record is not None
+                ),
+            )
+            for record in records:
+                committed_files[record.relative_path] = record.identity_payload()
     _validate_file_binding(
         staging,
         files.get("config"),
         map_task["config"],
         "config",
         captured_files=_captured_files,
+        committed_files=committed_files,
         validation_scope=scope,
     )
     _validate_file_binding(
@@ -489,6 +592,7 @@ def validate_ferebus_task_model_admission(
         selected_receipt["model"],
         "model",
         captured_files=_captured_files,
+        committed_files=committed_files,
         validation_scope=scope,
     )
     map_datasets = map_task.get("datasets")
@@ -504,6 +608,7 @@ def validate_ferebus_task_model_admission(
             map_datasets[split],
             split,
             captured_files=_captured_files,
+            committed_files=committed_files,
             validation_scope=scope,
         )
     if selected_receipt.get("performance") is None:
@@ -518,6 +623,7 @@ def validate_ferebus_task_model_admission(
             selected_receipt["performance"],
             "performance",
             captured_files=_captured_files,
+            committed_files=committed_files,
             validation_scope=scope,
         )
     quality = selected_receipt.get("quality_measurement")
@@ -573,7 +679,7 @@ def validate_ferebus_task_model_admission(
         raise FerebusModelAdmissionError(
             "FEREBUS task model semantic admission is invalid"
         )
-    if committed_model_set is not None:
+    if committed_model_set is not None and not _defer_committed_contract:
         try:
             from .model_contract import validate_ferebus_model_contract
 
@@ -824,7 +930,7 @@ def _build_admission_anchors(
 ]:
     """Capture each unique admission path once for later cheap guards."""
     from . import input_staging as _stg
-    from .ferebus_task_runner import FEREBUS_TASK_MAP_FILENAME, _contained_file
+    from .ferebus_task_runner import FEREBUS_TASK_MAP_FILENAME
 
     task_map = execution.get("task_map")
     receipts = execution.get("receipt_payloads")
@@ -843,16 +949,34 @@ def _build_admission_anchors(
 
     def register(record: Mapping[str, Any], label: str, *, control: bool = False) -> None:
         relative = str(record.get("path") or "")
-        size = record.get("size")
+        _canonical_relative_parts(relative, label + ".path")
+        raw_size = record.get("size")
+        size = None
+        if raw_size is not None:
+            if isinstance(raw_size, bool) or not isinstance(raw_size, int):
+                raise FerebusModelAdmissionError(label + " file size is invalid")
+            size = int(raw_size)
         digest = str(record.get("sha256") or "")
-        if not relative or isinstance(size, bool) or not isinstance(size, int):
-            raise FerebusModelAdmissionError(label + " file record is invalid")
-        candidate = {"path": relative, "size": int(size), "sha256": digest}
+        if len(digest) != 64 or any(
+            character not in "0123456789abcdef" for character in digest
+        ):
+            raise FerebusModelAdmissionError(label + " file digest is invalid")
+        candidate = {"path": relative, "size": size, "sha256": digest}
         prior = expected.get(relative)
-        if prior is not None and prior != candidate:
-            raise FerebusModelAdmissionError(
-                "FEREBUS admission path has conflicting bindings: " + relative
-            )
+        if prior is not None:
+            if (
+                prior["sha256"] != digest
+                or (
+                    prior["size"] is not None
+                    and size is not None
+                    and prior["size"] != size
+                )
+            ):
+                raise FerebusModelAdmissionError(
+                    "FEREBUS admission path has conflicting bindings: " + relative
+                )
+            if prior["size"] is not None:
+                candidate["size"] = prior["size"]
         expected[relative] = candidate
         if control:
             prior_digest = control_digests.get(relative)
@@ -866,22 +990,27 @@ def _build_admission_anchors(
     register(
         {
             "path": manifest_path.relative_to(staging).as_posix(),
-            "size": int(manifest_path.stat().st_size),
             "sha256": str(task_map.get("task_manifest_sha256") or ""),
         },
         "FEREBUS task manifest",
         control=True,
     )
-    task_map_path = staging / FEREBUS_TASK_MAP_FILENAME
     register(
         {
             "path": FEREBUS_TASK_MAP_FILENAME,
-            "size": int(task_map_path.stat().st_size),
             "sha256": str(execution.get("task_map_file_sha256") or ""),
         },
         "FEREBUS task map",
         control=True,
     )
+    for field_name, label in (
+        ("row_identity_snapshot", "FEREBUS row-identity snapshot"),
+        ("split_ledger", "FEREBUS split-ledger snapshot"),
+    ):
+        binding = manifest.get(field_name)
+        if not isinstance(binding, Mapping):
+            raise FerebusModelAdmissionError(label + " binding is invalid")
+        register(binding, label, control=True)
     tasks = task_map.get("tasks")
     if not isinstance(tasks, list) or len(tasks) != len(receipts):
         raise FerebusModelAdmissionError(
@@ -895,15 +1024,9 @@ def _build_admission_anchors(
                 "FEREBUS admission task control is invalid"
             )
         receipt_relative = str(receipt_record.get("receipt_path") or "")
-        receipt_path = _contained_file(
-            staging,
-            receipt_relative,
-            "FEREBUS task receipt",
-        )
         register(
             {
                 "path": receipt_relative,
-                "size": int(receipt_path.stat().st_size),
                 "sha256": str(receipt_record.get("receipt_sha256") or ""),
             },
             "FEREBUS task receipt",
@@ -921,57 +1044,65 @@ def _build_admission_anchors(
         if receipt.get("performance") is not None:
             register(receipt["performance"], "FEREBUS performance")
 
-    file_anchors: Dict[str, FerebusModelAdmissionAnchor] = {}
-    directory_paths = {staging}
+    directory_paths: Dict[str, Path] = {".": staging}
     for relative in sorted(expected):
-        record = expected[relative]
-        path = _contained_file(staging, relative, "FEREBUS admission path")
-        observed = _file_stat_tuple(path)
-        if observed[2] != int(record["size"]):
-            raise FerebusModelAdmissionError(
-                "FEREBUS admission file size mismatch: " + relative
-            )
-        control_digest = control_digests.get(relative)
-        if control_digest is not None and sha256_file(path) != control_digest:
-            raise FerebusModelAdmissionError(
-                "FEREBUS admission control hash mismatch: " + relative
-            )
-        anchor = FerebusModelAdmissionAnchor(
-            relative_path=relative,
-            path=path,
-            kind="file",
-            stat_identity=observed,
-            control_sha256=control_digest,
-        )
-        file_anchors[relative] = anchor
-        parent = path.parent
-        while True:
-            directory_paths.add(parent)
-            if parent == staging:
-                break
-            try:
-                parent.relative_to(staging)
-            except ValueError as exc:
-                raise FerebusModelAdmissionError(
-                    "FEREBUS admission path escapes staging"
-                ) from exc
-            parent = parent.parent
+        parts = _canonical_relative_parts(relative, "FEREBUS admission path")
+        for index in range(1, len(parts)):
+            directory_relative = "/".join(parts[:index])
+            directory_paths[directory_relative] = staging.joinpath(*parts[:index])
 
     directory_anchors = []
-    for path in sorted(directory_paths, key=lambda value: value.as_posix()):
+    for relative in sorted(
+        directory_paths,
+        key=lambda value: (0 if value == "." else value.count("/") + 1, value),
+    ):
+        path = directory_paths[relative]
         value = path.lstat()
-        if path.is_symlink() or not stat_module.S_ISDIR(value.st_mode):
+        if not stat_module.S_ISDIR(value.st_mode):
             raise FerebusModelAdmissionError(
                 "FEREBUS admission directory is missing or unsafe: " + str(path)
             )
-        relative = "." if path == staging else path.relative_to(staging).as_posix()
         directory_anchors.append(
             FerebusModelAdmissionAnchor(
                 relative_path=relative,
                 path=path,
                 kind="directory",
-                stat_identity=_directory_stat_tuple(path),
+                stat_identity=_directory_stat_tuple_from_result(value),
             )
+        )
+
+    file_anchors: Dict[str, FerebusModelAdmissionAnchor] = {}
+    for relative in sorted(expected):
+        record = expected[relative]
+        path = staging.joinpath(
+            *_canonical_relative_parts(relative, "FEREBUS admission path")
+        )
+        value = path.lstat()
+        if not stat_module.S_ISREG(value.st_mode):
+            raise FerebusModelAdmissionError(
+                "FEREBUS admission file is missing or unsafe: " + relative
+            )
+        observed = _file_stat_tuple_from_result(value)
+        expected_size = record["size"]
+        if expected_size is not None and observed[2] != int(expected_size):
+            raise FerebusModelAdmissionError(
+                "FEREBUS admission file size mismatch: " + relative
+            )
+        control_digest = control_digests.get(relative)
+        if (
+            control_digest is not None
+            and _anchored_sha256(path, observed) != control_digest
+        ):
+            raise FerebusModelAdmissionError(
+                "FEREBUS admission control hash mismatch: " + relative
+            )
+        file_anchors[relative] = FerebusModelAdmissionAnchor(
+            relative_path=relative,
+            path=path,
+            kind="file",
+            stat_identity=observed,
+            control_sha256=control_digest,
+            expected_sha256=str(record["sha256"]),
         )
     anchors = tuple(directory_anchors) + tuple(
         file_anchors[key] for key in sorted(file_anchors)
@@ -1044,6 +1175,7 @@ def build_ferebus_model_admission_context(
                     receipt=receipt,
                     validation_scope="staging",
                     _captured_files=captured_files,
+                    _canonical_root=staging,
                 )
                 sources[logical_task_id] = "task"
             except Exception:
@@ -1204,20 +1336,26 @@ def assert_ferebus_model_admission_context_unchanged(
         try:
             value = anchor.path.lstat()
             if anchor.kind == "directory":
-                if anchor.path.is_symlink() or not stat_module.S_ISDIR(value.st_mode):
+                if not stat_module.S_ISDIR(value.st_mode):
                     return "directory is missing or unsafe"
-                if _directory_stat_tuple(anchor.path) != anchor.stat_identity:
+                if (
+                    _directory_stat_tuple_from_result(value)
+                    != anchor.stat_identity
+                ):
                     return "directory identity changed"
                 return None
-            if anchor.path.is_symlink() or not stat_module.S_ISREG(value.st_mode):
+            if not stat_module.S_ISREG(value.st_mode):
                 return "file is missing or unsafe"
-            if _file_stat_tuple(anchor.path) != anchor.stat_identity:
+            if _file_stat_tuple_from_result(value) != anchor.stat_identity:
                 return "file identity changed"
-            if (
-                anchor.control_sha256 is not None
-                and sha256_file(anchor.path) != anchor.control_sha256
-            ):
-                return "control-file content changed"
+            required_digest = None
+            if os.name == "nt" or int(anchor.stat_identity[1]) == 0:
+                required_digest = anchor.expected_sha256
+            if required_digest is not None and _anchored_sha256(
+                anchor.path,
+                anchor.stat_identity,
+            ) != required_digest:
+                return "file content changed"
             return None
         except OSError as exc:
             return type(exc).__name__ + ": " + str(exc)

@@ -1,9 +1,10 @@
 """Runtime contract checks for daemon-owned FEREBUS model commits."""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -13,6 +14,10 @@ VARIANCE_NEGATIVE_TOLERANCE = 1.0e-10
 
 class ModelContractError(ValueError):
     """Raised when a staged or committed FEREBUS model set is not usable."""
+
+
+class CommittedAdmissionUnavailable(ModelContractError):
+    """Raised when a legacy committed set has no reusable admission proof."""
 
 
 @dataclass(frozen=True)
@@ -616,6 +621,7 @@ def validate_ferebus_model_contract(
     expected_version: Optional[int] = None,
     trained_model_set: Any = None,
     validation_context: Optional[FerebusModelValidationContext] = None,
+    digest_file: Optional[Callable[[Path, bool], str]] = None,
 ) -> Optional[FerebusModelValidationContext]:
     """Validate a staged or committed FEREBUS model directory.
 
@@ -700,7 +706,11 @@ def validate_ferebus_model_contract(
         if (
             manifest_path.is_symlink()
             or not manifest_path.is_file()
-            or sha256_file(manifest_path)
+            or (
+                sha256_file(manifest_path)
+                if digest_file is None
+                else digest_file(manifest_path, True)
+            )
             != validation_context.task_manifest_sha256
         ):
             raise ModelContractError("ferebus_validation_context_manifest_mismatch")
@@ -1056,8 +1066,9 @@ def model_validation_context_from_admission(
     """Bind task-side semantic admission to a staged model-set snapshot."""
     from . import input_staging as _stg
 
-    root = Path(root_dir).resolve()
-    if Path(trained_model_set.root).resolve() != root:
+    root = Path(os.path.abspath(os.fspath(root_dir)))
+    model_root = Path(os.path.abspath(os.fspath(trained_model_set.root)))
+    if os.path.normcase(os.fspath(model_root)) != os.path.normcase(os.fspath(root)):
         raise ModelContractError("trained_model_set_root_mismatch")
     if int(trained_model_set.version) != int(expected_version):
         raise ModelContractError("trained_model_set_version_mismatch")
@@ -1140,6 +1151,123 @@ def model_validation_context_from_admission(
         config_validation_complete=True,
         admission_complete=True,
         admission_sources=sources,
+    )
+
+
+def model_validation_context_from_committed_admissions(
+    root_dir: Path,
+    *,
+    trained_model_set: Any,
+) -> FerebusModelValidationContext:
+    """Recover semantic authority from admissions copied into a committed set."""
+    from ..strict_json import strict_json as json
+    from ..versioning.manifest import sha256_file
+    from . import input_staging as _stg
+    from .ferebus_model_admission import (
+        FerebusModelAdmissionContext,
+        validate_ferebus_task_model_admission,
+    )
+    from .ferebus_task_runner import FEREBUS_TASK_MAP_FILENAME, _read_task_map
+
+    root = Path(root_dir).resolve()
+    if Path(trained_model_set.root).resolve() != root:
+        raise ModelContractError("trained_model_set_root_mismatch")
+    manifest = _stg.read_ferebus_manifest(root, verify_dataset_files=False)
+    task_map_path = root / FEREBUS_TASK_MAP_FILENAME
+    task_map = _read_task_map(task_map_path)
+    source_records = {
+        record.relative_path: record
+        for record in trained_model_set.root_files
+    }
+    source_record = source_records.get(_stg.FEREBUS_TASK_MANIFEST)
+    task_map_record = source_records.get(FEREBUS_TASK_MAP_FILENAME)
+    if (
+        source_record is None
+        or task_map_record is None
+        or sha256_file(root / _stg.FEREBUS_TASK_MANIFEST)
+        != source_record.sha256
+        or sha256_file(task_map_path) != task_map_record.sha256
+        or str(task_map.get("task_manifest_sha256") or "")
+        != source_record.sha256
+    ):
+        raise ModelContractError("committed_ferebus_control_binding_mismatch")
+    if len(trained_model_set.tasks) != len(task_map.get("tasks") or []):
+        raise ModelContractError("committed_ferebus_task_coverage_mismatch")
+
+    receipts = []
+    admissions = []
+    receipt_records = []
+    for logical_task_id, task in enumerate(trained_model_set.tasks):
+        receipt_path = task.execution_receipt.path
+        if receipt_path.is_symlink() or not receipt_path.is_file():
+            raise ModelContractError("committed_ferebus_receipt_missing")
+        if sha256_file(receipt_path) != task.execution_receipt.sha256:
+            raise ModelContractError("committed_ferebus_receipt_hash_mismatch")
+        try:
+            receipt = json.loads(
+                receipt_path.read_text(encoding="utf-8"),
+                source=receipt_path,
+            )
+        except (OSError, ValueError) as exc:
+            raise ModelContractError("committed_ferebus_receipt_unreadable") from exc
+        if not isinstance(receipt, dict):
+            raise ModelContractError("committed_ferebus_receipt_invalid")
+        evidence = receipt.get("model_admission")
+        if not isinstance(evidence, Mapping):
+            raise CommittedAdmissionUnavailable(
+                "committed_ferebus_admission_unavailable"
+            )
+        try:
+            validated_admission = validate_ferebus_task_model_admission(
+                root,
+                logical_task_id,
+                evidence,
+                task_manifest=manifest,
+                task_map=task_map,
+                receipt=receipt,
+                validation_scope="committed",
+                _committed_model_set=trained_model_set,
+                _defer_committed_contract=True,
+            )
+        except Exception as exc:
+            raise ModelContractError(
+                "committed_ferebus_admission_invalid"
+            ) from exc
+        admissions.append(validated_admission)
+        receipts.append(receipt)
+        receipt_records.append(
+            {
+                "task_index": int(task.task_index),
+                "receipt_path": task.execution_receipt.relative_path,
+                "receipt_sha256": task.execution_receipt.sha256,
+            }
+        )
+    execution = {
+        "task_map": task_map,
+        "task_map_sha256": task_map["task_map_sha256"],
+        "task_map_file_sha256": task_map_record.sha256,
+        "n_tasks": len(receipts),
+        "receipts": receipt_records,
+        "receipt_payloads": receipts,
+    }
+    admission_context = FerebusModelAdmissionContext(
+        staging=root,
+        task_manifest=manifest,
+        task_execution=execution,
+        admissions=tuple(admissions),
+        sources=tuple("committed_task" for unused in admissions),
+        statistics={
+            "task": len(admissions),
+            "cache": 0,
+            "local": 0,
+            "total": len(admissions),
+        },
+    )
+    return model_validation_context_from_admission(
+        root,
+        expected_version=int(trained_model_set.version),
+        trained_model_set=trained_model_set,
+        admission_context=admission_context,
     )
 
 

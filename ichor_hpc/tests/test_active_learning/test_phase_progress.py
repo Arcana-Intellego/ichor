@@ -82,6 +82,22 @@ def test_scheduler_retirement_stage_is_explicit_and_scheduler_neutral():
     )
 
 
+def test_ferebus_publication_stages_have_explicit_human_labels():
+    expected = {
+        "ferebus_quality_context_binding": "Binding FEREBUS quality authority",
+        "model_snapshot_inventory": "Inventorying staged FEREBUS publication",
+        "model_snapshot_semantic_validation": (
+            "Validating staged FEREBUS semantics"
+        ),
+        "model_snapshot_durability": "Synchronising staged FEREBUS publication",
+        "model_commit_publication": "Publishing FEREBUS model version",
+        "model_commit_validation": "Validating committed FEREBUS publication",
+    }
+    assert {
+        stage: format_progress_stage(stage) for stage in expected
+    } == expected
+
+
 def test_scheduler_pending_diagnostics_render_in_journal_and_status():
     record = {
         "producer_kind": "scheduler",
@@ -325,7 +341,9 @@ def test_progress_stage_changes_and_throttling_are_deterministic(tmp_path):
     assert events[0][1]["iteration"] == 3
     assert events[0][1]["replacement_round"] == 1
     assert round(float(events[1][1]["throughput"]), 3) == round(40.0 / 31.0, 3)
+    assert events[1][1]["stage_elapsed_seconds"] == 31.0
     assert events[2][1]["stage"] == "structural_parsing"
+    assert events[2][1]["stage_elapsed_seconds"] == 0.0
     assert len(json.dumps(events[1][1]).encode("utf-8")) < 1024
     assert reporter.thread_alive is False
 

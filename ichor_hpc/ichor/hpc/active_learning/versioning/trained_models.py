@@ -961,7 +961,16 @@ def _validate_source_and_quality(
     payload: Mapping[str, Any],
     tasks: Sequence[TrainedModelTask],
     reference_view: Any,
+    *,
+    digest_file: Optional[Callable[[Path, bool], str]] = None,
 ) -> None:
+    def digest(path: Path) -> str:
+        return (
+            sha256_file(path)
+            if digest_file is None
+            else digest_file(path, True)
+        )
+
     source = _read_json_object(root / "FEREBUS_TASKS.json", "FEREBUS task manifest")
     quality = _read_json_object(root / "FEREBUS_QUALITY.json", "FEREBUS quality manifest")
     decision = _read_json_object(
@@ -1024,7 +1033,7 @@ def _validate_source_and_quality(
             raise TrainedModelError(
                 "committed model-bootstrap manifest is missing"
             )
-        if sha256_file(copied_model_manifest) != _safe_sha(
+        if digest(copied_model_manifest) != _safe_sha(
             model_bootstrap.get("manifest_sha256"),
             "model-bootstrap manifest SHA-256",
         ):
@@ -1178,7 +1187,7 @@ def _validate_source_and_quality(
     if _safe_sha(
         quality.get("source_task_manifest_sha256"),
         "source_task_manifest_sha256",
-    ) != sha256_file(
+    ) != digest(
         root / "FEREBUS_TASKS.json"
     ):
         raise TrainedModelError("FEREBUS quality/source task manifest SHA mismatch")
@@ -1231,7 +1240,7 @@ def _validate_source_and_quality(
             quality_binding.get("sha256"),
             "FEREBUS decision quality SHA-256",
         )
-        != sha256_file(quality_path)
+        != digest(quality_path)
     ):
         raise TrainedModelError("FEREBUS decision/raw-quality binding mismatch")
     evaluations = decision.get("evaluations")
@@ -1282,7 +1291,7 @@ def _validate_source_and_quality(
             execution.get("task_map_file_sha256"),
             "FEREBUS task-map file SHA-256",
         )
-        != sha256_file(task_map_path)
+        != digest(task_map_path)
         or _safe_int(
             execution.get("n_tasks"),
             "FEREBUS execution task count",
@@ -1509,8 +1518,11 @@ def validate_trained_model_snapshot(
             )
             for record in task_records:
                 expected_records[record.relative_path] = record.sha256
-        expected_records[TRAINED_MODEL_SET_FILENAME] = sha256_file(
-            trained_model_set_path(root)
+        model_set_path = trained_model_set_path(root)
+        expected_records[TRAINED_MODEL_SET_FILENAME] = (
+            sha256_file(model_set_path)
+            if digest_file is None
+            else digest_file(model_set_path, True)
         )
         if directory_manifest != expected_records:
             unexpected = sorted(set(directory_manifest) - set(expected_records))
@@ -1535,7 +1547,13 @@ def validate_trained_model_snapshot(
             root_files,
             require_directory_manifest=require_directory_manifest,
         )
-    _validate_source_and_quality(root, payload, tasks, reference_view)
+    _validate_source_and_quality(
+        root,
+        payload,
+        tasks,
+        reference_view,
+        digest_file=digest_file,
+    )
     return TrainedModelSet(
         version=expected_version,
         campaign_uid=campaign_uid,
@@ -1553,8 +1571,12 @@ def validate_trained_model_snapshot(
         root_files=root_files,
         model_set_sha256=str(payload["model_set_sha256"]),
         evidence_set_sha256=str(payload["evidence_set_sha256"]),
-        head_manifest_sha256=sha256_file(trained_model_set_path(root)),
-        root=root.resolve(),
+        head_manifest_sha256=(
+            sha256_file(trained_model_set_path(root))
+            if digest_file is None
+            else digest_file(trained_model_set_path(root), True)
+        ),
+        root=(root if verification == "authority" else root.resolve()),
     )
 
 

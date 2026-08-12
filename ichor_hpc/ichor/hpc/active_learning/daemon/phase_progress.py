@@ -93,6 +93,7 @@ _STAGE_LABELS = {
     "ferebus_boundary_anchor_validation": (
         "Rechecking FEREBUS publication anchors"
     ),
+    "ferebus_quality_context_binding": "Binding FEREBUS quality authority",
     "ferebus_local_admission": "Validating legacy FEREBUS models locally",
     "ferebus_task_quality": "Validating task-computed FEREBUS quality",
     "ferebus_local_quality": "Computing missing FEREBUS quality locally",
@@ -102,6 +103,13 @@ _STAGE_LABELS = {
     "model_snapshot_build": "Building FEREBUS model snapshot",
     "model_snapshot_validation": "Validating staged FEREBUS model snapshot",
     "model_commit": "Committing FEREBUS models",
+    "model_snapshot_inventory": "Inventorying staged FEREBUS publication",
+    "model_snapshot_semantic_validation": (
+        "Validating staged FEREBUS semantics"
+    ),
+    "model_snapshot_durability": "Synchronising staged FEREBUS publication",
+    "model_commit_publication": "Publishing FEREBUS model version",
+    "model_commit_validation": "Validating committed FEREBUS publication",
     "model_factor_validation": "Validating FEREBUS model factors",
     "model_factor_adoption": "Adopting FEREBUS model factors",
     "model_factor_fallback": "Computing missing FEREBUS model factors locally",
@@ -198,6 +206,10 @@ def validate_phase_progress(
     if completed is not None and total is not None and completed > total:
         raise ValueError("phase progress completed count exceeds total")
     _finite_optional(out.get("elapsed_seconds"), "phase progress elapsed_seconds")
+    _finite_optional(
+        out.get("stage_elapsed_seconds"),
+        "phase progress stage_elapsed_seconds",
+    )
     _finite_optional(out.get("throughput"), "phase progress throughput")
     for key in ("started_at_iso", "updated_at_iso"):
         value = out.get(key)
@@ -516,6 +528,7 @@ class PhaseProgressReporter:
             "status": str(status),
             "counters": counters,
             "elapsed_seconds": max(0.0, now - self._started_monotonic),
+            "stage_elapsed_seconds": stage_elapsed,
             "throughput": resolved_throughput,
             "started_at_iso": self._started_at_iso,
             "updated_at_iso": _now_iso(),
@@ -614,6 +627,9 @@ class PhaseProgressReporter:
             "stage": str(record.get("stage") or ""),
             "status": str(record.get("status") or ""),
             "elapsed_seconds": float(record.get("elapsed_seconds") or 0.0),
+            "stage_elapsed_seconds": float(
+                record.get("stage_elapsed_seconds") or 0.0
+            ),
         }
         payload.update(self.identity)
         for key in ("completed", "total", "unit"):
@@ -632,6 +648,12 @@ class PhaseProgressReporter:
                 "pending_reason",
                 "pending_queue",
                 "scheduler_native_state",
+                "path_count",
+                "control_hashes",
+                "reused_digests",
+                "bytes_hashed",
+                "fsync_count",
+                "strict_fallback",
             ):
                 value = details.get(key)
                 if isinstance(value, (str, int, bool)):

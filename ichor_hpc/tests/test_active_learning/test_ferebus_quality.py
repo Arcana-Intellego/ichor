@@ -13,6 +13,7 @@ from ichor.hpc.active_learning.daemon.ferebus_quality import (
     FEREBUS_QUALITY_MANIFEST,
     FerebusQualityMeasurementIncomplete,
     _parse_perf,
+    build_ferebus_quality_context_from_admission,
     evaluate_ferebus_quality,
     enrich_task_receipt_with_quality,
     validate_ferebus_task_measurement,
@@ -383,6 +384,119 @@ def test_model_admission_guard_rechecks_anchors_without_semantic_replay(
     config.write_text(config.read_text(encoding="utf-8") + "\n", encoding="utf-8")
     with pytest.raises(FerebusModelAdmissionError, match="ferebus.config"):
         assert_ferebus_model_admission_context_unchanged(context)
+
+
+def test_quality_context_from_admission_performs_no_filesystem_resolution(
+    tmp_path,
+    monkeypatch,
+):
+    staging = _seed_quality_staging(tmp_path, campaign_layout=True)
+    enrich_task_receipt_with_quality(staging, 0)
+    enrich_task_receipt_with_model_admission(staging, 0)
+    admission = build_ferebus_model_admission_context(staging)
+
+    def forbidden_filesystem(*_args, **_kwargs):
+        raise AssertionError("quality binding touched the filesystem")
+
+    for method in ("resolve", "stat", "read_text", "is_file", "is_symlink"):
+        monkeypatch.setattr(
+            ferebus_quality_module.Path,
+            method,
+            forbidden_filesystem,
+        )
+    context = build_ferebus_quality_context_from_admission(
+        admission,
+        incumbent_set=None,
+    )
+
+    assert context.staging == admission.staging
+    assert context.task_map == admission.task_execution["task_map"]
+    assert context.receipt_payloads == tuple(
+        admission.task_execution["receipt_payloads"]
+    )
+
+
+def test_model_admission_guard_uses_one_lstat_per_anchor(tmp_path, monkeypatch):
+    from collections import Counter
+    from pathlib import Path
+
+    staging = _seed_quality_staging(tmp_path, campaign_layout=True)
+    enrich_task_receipt_with_quality(staging, 0)
+    enrich_task_receipt_with_model_admission(staging, 0)
+    context = build_ferebus_model_admission_context(staging)
+
+    original_lstat = Path.lstat
+    calls = []
+
+    def counted_lstat(path):
+        calls.append(str(path))
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", counted_lstat)
+    assert_ferebus_model_admission_context_unchanged(context)
+
+    observed = Counter(calls)
+    assert set(observed) == {str(anchor.path) for anchor in context.anchors}
+    assert set(observed.values()) == {1}
+
+
+def test_stable_model_admission_guard_reuses_captured_control_hashes(
+    tmp_path,
+    monkeypatch,
+):
+    import ichor.hpc.active_learning.daemon.ferebus_model_admission as admission
+
+    staging = _seed_quality_staging(tmp_path, campaign_layout=True)
+    enrich_task_receipt_with_quality(staging, 0)
+    enrich_task_receipt_with_model_admission(staging, 0)
+    context = build_ferebus_model_admission_context(staging)
+    if any(
+        anchor.kind == "file" and int(anchor.stat_identity[1]) == 0
+        for anchor in context.anchors
+    ):
+        pytest.skip("filesystem has no stable inode identity")
+    monkeypatch.setattr(admission.os, "name", "posix")
+    monkeypatch.setattr(
+        admission,
+        "_anchored_sha256",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("stable guard rehashed a captured control")
+        ),
+    )
+
+    assert_ferebus_model_admission_context_unchanged(context)
+
+
+def test_context_bound_model_admission_does_not_resolve_root(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    staging = _seed_quality_staging(tmp_path, campaign_layout=True)
+    enrich_task_receipt_with_quality(staging, 0)
+    enrich_task_receipt_with_model_admission(staging, 0)
+    context = build_ferebus_model_admission_context(staging)
+    captured_files = {
+        anchor.relative_path: anchor
+        for anchor in context.anchors
+        if anchor.kind == "file"
+    }
+
+    def forbidden_resolution(*_args, **_kwargs):
+        raise AssertionError("context-bound admission resolved its canonical root")
+
+    monkeypatch.setattr(Path, "resolve", forbidden_resolution)
+    validated = validate_ferebus_task_model_admission(
+        context.staging,
+        0,
+        context.admissions[0],
+        task_manifest=context.task_manifest,
+        task_map=context.task_execution["task_map"],
+        receipt=context.task_execution["receipt_payloads"][0],
+        validation_scope="staging",
+        _captured_files=captured_files,
+        _canonical_root=context.staging,
+    )
+
+    assert validated == context.admissions[0]
 
 
 def test_committed_model_admission_uses_content_not_producer_inode(

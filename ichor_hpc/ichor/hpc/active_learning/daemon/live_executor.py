@@ -28,12 +28,13 @@ import os
 import re
 import shlex
 import shutil
+import stat as stat_module
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -187,6 +188,43 @@ class _StableDigestTracker:
         if existing is not None and existing != value:
             raise ValueError("stable file identity has conflicting digests")
         self._digests[identity] = value
+
+    def remember_captured_identity(
+        self,
+        path: Path,
+        identity: Tuple[int, int, int, int, int],
+        digest: str,
+    ) -> None:
+        """Bind copy-time evidence without repeating a destination stat."""
+        if not isinstance(identity, tuple) or len(identity) != 5:
+            raise ValueError("captured file identity is invalid")
+        value = str(digest)
+        if len(value) != 64 or any(
+            character not in "0123456789abcdef" for character in value
+        ):
+            raise ValueError("remembered digest is not a lowercase SHA-256")
+        key: Any = identity
+        if int(identity[1]) == 0:
+            key = (str(Path(path).absolute()), *identity)
+        existing = self._digests.get(key)
+        if existing is not None and existing != value:
+            raise ValueError("stable file identity has conflicting digests")
+        self._digests[key] = value
+
+    def digest_for_captured_identity(
+        self,
+        path: Path,
+        identity: Any,
+    ) -> Optional[str]:
+        """Return a digest already bound to one captured path identity."""
+        if not isinstance(identity, tuple) or len(identity) != 5:
+            raise ValueError("captured file identity is invalid")
+        if int(identity[1]) == 0:
+            return self.digest(Path(path))
+        value = self._digests.get(identity)
+        if value is not None:
+            return value
+        return self.digest(Path(path))
 
     def capture_rename_tree(self, root: Path) -> Dict[str, Any]:
         source_root = Path(root)
@@ -355,7 +393,7 @@ def _dedupe_paths(paths: Sequence[Path]) -> List[Path]:
     seen = set()
     ordered: List[Path] = []
     for path in paths:
-        key = str(Path(path).resolve(strict=False))
+        key = os.path.normcase(os.path.abspath(os.fspath(path)))
         if key in seen:
             continue
         seen.add(key)
@@ -369,25 +407,45 @@ def _find_ferebus_auxiliary_file(
     search_dirs: Sequence[Path],
     suffix: str,
 ) -> Optional[Path]:
+    def regular_candidate(candidate: Path) -> Optional[Path]:
+        try:
+            candidate.relative_to(staging)
+        except ValueError as exc:
+            raise BackendSubmissionError(
+                "FEREBUS auxiliary path escapes iteration-staging: "
+                + str(candidate)
+            ) from exc
+        try:
+            value = candidate.lstat()
+        except FileNotFoundError:
+            return None
+        if stat_module.S_ISLNK(value.st_mode):
+            raise BackendSubmissionError(
+                "refusing symlinked FEREBUS auxiliary file: " + str(candidate)
+            )
+        if not stat_module.S_ISREG(value.st_mode):
+            raise BackendSubmissionError(
+                "refusing non-regular FEREBUS auxiliary file: " + str(candidate)
+            )
+        return candidate
+
     stem = model_file.stem
     for directory in search_dirs:
         candidate = directory / (stem + "." + suffix)
-        if candidate.is_file():
-            return _resolve_ferebus_staging_path(
-                staging,
-                candidate,
-                "auxiliary ." + suffix + " file",
-            )
+        selected = regular_candidate(candidate)
+        if selected is not None:
+            return selected
     model_dir = model_file.parent
     if model_dir != Path(staging):
         matches = sorted(model_dir.glob("*." + suffix))
-        if len(matches) == 1 and matches[0].is_file():
-            return _resolve_ferebus_staging_path(
-                staging,
-                matches[0],
-                "auxiliary ." + suffix + " file",
-            )
-        if len(matches) > 1:
+        regular_matches = [
+            selected
+            for selected in (regular_candidate(candidate) for candidate in matches)
+            if selected is not None
+        ]
+        if len(regular_matches) == 1:
+            return regular_matches[0]
+        if len(regular_matches) > 1:
             raise BackendSubmissionError(
                 "ambiguous FEREBUS auxiliary ." + suffix + " files in " + str(model_dir)
             )
@@ -401,32 +459,185 @@ def _copy_regular_file_no_symlink(
     *,
     digest_tracker: Optional[_StableDigestTracker] = None,
     expected_sha256: Optional[str] = None,
-) -> str:
-    if not src.is_file() or src.is_symlink():
-        raise BackendSubmissionError("refusing non-regular FEREBUS artefact: " + str(src))
-    target = _resolve_ferebus_destination(root, dest, "artefact")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    before = _StableDigestTracker._identity(src)
-    digest = hashlib.sha256()
-    with src.open("rb") as source, target.open("wb") as destination:
-        for block in iter(lambda: source.read(1024 * 1024), b""):
-            destination.write(block)
-            digest.update(block)
-        destination.flush()
-        os.fsync(destination.fileno())
-    shutil.copystat(str(src), str(target), follow_symlinks=False)
-    if _StableDigestTracker._identity(src) != before:
+    source_anchor: Any = None,
+    verified_destination_directories: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
+    source = Path(src)
+    target = Path(dest)
+    try:
+        relative_target = target.relative_to(root)
+    except ValueError as exc:
         raise BackendSubmissionError(
-            "FEREBUS artefact changed while it was copied: " + str(src)
+            "FEREBUS artefact destination escapes committed model directory: "
+            + str(target)
+        ) from exc
+    if not relative_target.parts or any(
+        part in {"", ".", ".."} for part in relative_target.parts
+    ):
+        raise BackendSubmissionError(
+            "FEREBUS artefact destination is not canonical: " + str(target)
+        )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    verified = (
+        verified_destination_directories
+        if verified_destination_directories is not None
+        else set()
+    )
+    current = Path(root)
+    for part in relative_target.parts[:-1]:
+        current = current / part
+        key = os.path.normcase(os.path.abspath(os.fspath(current)))
+        if key in verified:
+            continue
+        value = current.lstat()
+        if not stat_module.S_ISDIR(value.st_mode):
+            raise BackendSubmissionError(
+                "FEREBUS artefact destination contains an unsafe directory: "
+                + str(current)
+            )
+        verified.add(key)
+    try:
+        target.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        raise BackendSubmissionError(
+            "FEREBUS artefact destination already exists: " + str(target)
+        )
+
+    before_value = source.lstat()
+    if not stat_module.S_ISREG(before_value.st_mode):
+        raise BackendSubmissionError(
+            "refusing non-regular FEREBUS artefact: " + str(source)
+        )
+    before = (
+        int(before_value.st_dev),
+        int(before_value.st_ino),
+        int(before_value.st_size),
+        int(before_value.st_mtime_ns),
+        int(before_value.st_ctime_ns),
+    )
+    if source_anchor is not None and (
+        getattr(source_anchor, "kind", None) != "file"
+        or Path(getattr(source_anchor, "path", "")) != source
+        or tuple(getattr(source_anchor, "stat_identity", ())) != before
+    ):
+        raise BackendSubmissionError(
+            "FEREBUS source no longer matches its admission anchor: " + str(source)
+        )
+    digest = hashlib.sha256()
+    source_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    target_flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    source_descriptor = os.open(source, source_flags)
+    try:
+        opened_source = os.fstat(source_descriptor)
+        opened_identity = (
+            int(opened_source.st_dev),
+            int(opened_source.st_ino),
+            int(opened_source.st_size),
+            int(opened_source.st_mtime_ns),
+            int(opened_source.st_ctime_ns),
+        )
+        source_identity_matches = (
+            opened_identity[:4] == before[:4]
+            if os.name == "nt"
+            else opened_identity == before
+        )
+        if (
+            not stat_module.S_ISREG(opened_source.st_mode)
+            or not source_identity_matches
+        ):
+            raise BackendSubmissionError(
+                "FEREBUS artefact changed before it was opened: " + str(source)
+            )
+        target_descriptor = os.open(target, target_flags, 0o666)
+        try:
+            with os.fdopen(
+                source_descriptor,
+                "rb",
+                closefd=False,
+            ) as source_handle, os.fdopen(
+                target_descriptor,
+                "wb",
+                closefd=False,
+            ) as destination:
+                for block in iter(lambda: source_handle.read(1024 * 1024), b""):
+                    destination.write(block)
+                    digest.update(block)
+                destination.flush()
+                os.fsync(destination.fileno())
+            closed_source = os.fstat(source_descriptor)
+            closed_identity = (
+                int(closed_source.st_dev),
+                int(closed_source.st_ino),
+                int(closed_source.st_size),
+                int(closed_source.st_mtime_ns),
+                int(closed_source.st_ctime_ns),
+            )
+            source_identity_matches = (
+                closed_identity[:4] == before[:4]
+                if os.name == "nt"
+                else closed_identity == before
+            )
+            if not source_identity_matches:
+                raise BackendSubmissionError(
+                    "FEREBUS artefact changed while it was copied: " + str(source)
+                )
+        finally:
+            os.close(target_descriptor)
+    finally:
+        os.close(source_descriptor)
+    shutil.copystat(str(source), str(target), follow_symlinks=False)
+    after_value = source.lstat()
+    after = (
+        int(after_value.st_dev),
+        int(after_value.st_ino),
+        int(after_value.st_size),
+        int(after_value.st_mtime_ns),
+        int(after_value.st_ctime_ns),
+    )
+    if not stat_module.S_ISREG(after_value.st_mode) or after != before:
+        raise BackendSubmissionError(
+            "FEREBUS artefact changed while it was copied: " + str(source)
         )
     observed_sha256 = digest.hexdigest()
     if expected_sha256 is not None and observed_sha256 != str(expected_sha256):
         raise BackendSubmissionError(
             "FEREBUS artefact digest changed before model publication: " + str(src)
         )
+    target_value = target.lstat()
+    if not stat_module.S_ISREG(target_value.st_mode):
+        raise BackendSubmissionError(
+            "copied FEREBUS artefact is not regular: " + str(target)
+        )
+    target_identity = (
+        int(target_value.st_dev),
+        int(target_value.st_ino),
+        int(target_value.st_size),
+        int(target_value.st_mtime_ns),
+        int(target_value.st_ctime_ns),
+    )
     if digest_tracker is not None:
-        digest_tracker.remember(target, observed_sha256)
-    return observed_sha256
+        digest_tracker.remember_captured_identity(
+            target,
+            target_identity,
+            observed_sha256,
+        )
+    return {
+        "path": relative_target.as_posix(),
+        "size": int(target_identity[2]),
+        "sha256": observed_sha256,
+    }
 
 
 def _write_ferebus_task_artefact_layout(
@@ -438,6 +649,7 @@ def _write_ferebus_task_artefact_layout(
     parent_model_set: Any,
     digest_tracker: Optional[_StableDigestTracker] = None,
     expected_source_sha256: Optional[Mapping[str, str]] = None,
+    source_anchors: Optional[Mapping[str, Any]] = None,
 ) -> Path:
     """Build one complete hierarchical committed FEREBUS model snapshot."""
     from . import input_staging as _stg
@@ -451,31 +663,95 @@ def _write_ferebus_task_artefact_layout(
     )
     from ..versioning.trained_models import (
         build_trained_model_set_payload,
-        file_record,
     )
 
     staging = Path(staging)
     committed_dir = Path(committed_dir)
+    committed_root_stat = committed_dir.lstat()
+    if not stat_module.S_ISDIR(committed_root_stat.st_mode):
+        raise BackendSubmissionError(
+            "trained-model version staging is missing or unsafe"
+        )
     expected_digests = {
-        str(Path(path).resolve()): str(digest)
+        str(Path(path)): str(digest)
         for path, digest in dict(expected_source_sha256 or {}).items()
     }
+    anchors = dict(source_anchors or {})
+    copied_records: Dict[str, Dict[str, Any]] = {}
+    verified_destination_directories: Set[str] = set()
+
+    def source_path(raw_path: Any, label: str) -> Tuple[Path, Any]:
+        raw_text = os.fspath(raw_path)
+        raw = Path(raw_text)
+        if raw.is_absolute():
+            try:
+                relative = raw.relative_to(staging).as_posix()
+            except ValueError as exc:
+                raise BackendSubmissionError(
+                    "FEREBUS " + label + " escapes iteration-staging: " + raw_text
+                ) from exc
+        else:
+            if "\\" in raw_text:
+                raise BackendSubmissionError(
+                    "FEREBUS " + label + " must use POSIX separators"
+                )
+            relative_path = PurePosixPath(raw_text)
+            if (
+                not raw_text
+                or relative_path.is_absolute()
+                or any(part in {"", ".", ".."} for part in relative_path.parts)
+                or relative_path.as_posix() != raw_text
+            ):
+                raise BackendSubmissionError(
+                    "FEREBUS " + label + " is not a canonical relative path"
+                )
+            relative = relative_path.as_posix()
+        candidate = staging.joinpath(*PurePosixPath(relative).parts)
+        anchor = anchors.get(relative)
+        if anchor is not None:
+            if (
+                getattr(anchor, "kind", None) != "file"
+                or Path(getattr(anchor, "path", "")) != candidate
+            ):
+                raise BackendSubmissionError(
+                    "FEREBUS " + label + " has contradictory admission authority"
+                )
+            return candidate, anchor
+        try:
+            value = candidate.lstat()
+        except FileNotFoundError as exc:
+            raise BackendSubmissionError(
+                "FEREBUS " + label + " is missing: " + str(candidate)
+            ) from exc
+        if not stat_module.S_ISREG(value.st_mode):
+            raise BackendSubmissionError(
+                "FEREBUS " + label + " is non-regular or symlinked: "
+                + str(candidate)
+            )
+        return candidate, None
 
     def copy(source: Path, destination: Path) -> None:
-        _copy_regular_file_no_symlink(
-            source,
+        selected_source, anchor = source_path(source, "artefact")
+        expected_digest = expected_digests.get(str(selected_source))
+        if expected_digest is None and anchor is not None:
+            expected_digest = getattr(anchor, "expected_sha256", None)
+        copied_records[str(destination)] = _copy_regular_file_no_symlink(
+            selected_source,
             destination,
             committed_dir,
             digest_tracker=digest_tracker,
-            expected_sha256=expected_digests.get(str(source.resolve())),
+            expected_sha256=expected_digest,
+            source_anchor=anchor,
+            verified_destination_directories=verified_destination_directories,
         )
 
     def record(path: Path) -> Dict[str, Any]:
-        return file_record(
-            path,
-            committed_dir,
-            digest_file=(None if digest_tracker is None else digest_tracker.digest),
-        )
+        try:
+            return dict(copied_records[str(path)])
+        except KeyError as exc:
+            raise BackendSubmissionError(
+                "FEREBUS publication record has no copy-time evidence: " + str(path)
+            ) from exc
     if any(committed_dir.iterdir()):
         raise BackendSubmissionError("trained-model version staging is not empty")
     task_records: List[Dict[str, Any]] = []
@@ -487,27 +763,14 @@ def _write_ferebus_task_artefact_layout(
             _stg.validate_safe_path_token("FEREBUS atom label", atom)
         except ValueError as exc:
             raise BackendSubmissionError(str(exc)) from exc
-        model_file = _resolve_ferebus_staging_path(
-            staging,
-            task["expected_model_path"],
-            "model path",
-        )
-        config_path = _resolve_ferebus_staging_path(
-            staging,
-            task.get("config_path", ""),
-            "config path",
-        )
+        model_file, _ = source_path(task["expected_model_path"], "model path")
+        config_path, _ = source_path(task.get("config_path", ""), "config path")
         search_dirs = _dedupe_paths([
             directory
             for directory in (model_file.parent, config_path.parent, staging)
             if _is_relative_to_path(directory, staging)
         ])
-        task_dir = _resolve_ferebus_destination(
-            committed_dir,
-            committed_dir / prop / atom,
-            "task artefact directory",
-        )
-        task_dir.mkdir(parents=True, exist_ok=True)
+        task_dir = committed_dir / prop / atom
         committed_model = task_dir / model_file.name
         committed_config = task_dir / "ferebus.config"
         copy(model_file, committed_model)
@@ -529,17 +792,15 @@ def _write_ferebus_task_artefact_layout(
                 raise BackendSubmissionError(
                     "FEREBUS " + split + " dataset identity is invalid"
                 )
-            dataset_source = _resolve_ferebus_staging_path(
-                staging,
+            dataset_source, _ = source_path(
                 dataset_record.get("path", ""),
                 split + " dataset path",
             )
             dataset_destination = dataset_dir / dataset_source.name
             copy(dataset_source, dataset_destination)
             committed_datasets[split] = record(dataset_destination)
-        receipt_source = _resolve_ferebus_staging_path(
-            staging,
-            Path(str(task.get("output_dir") or ""))
+        receipt_source, _ = source_path(
+            PurePosixPath(str(task.get("output_dir") or ""))
             / FEREBUS_TASK_RECEIPT_FILENAME,
             "task execution receipt",
         )
@@ -633,6 +894,8 @@ def _write_ferebus_task_artefact_layout(
     )
     manifest_path = committed_dir / FEREBUS_TASK_ARTEFACTS_MANIFEST
     atomic_write_json(manifest_path, payload)
+    if digest_tracker is not None:
+        digest_tracker.digest(manifest_path)
     return manifest_path
 
 
@@ -5843,7 +6106,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             next_version = int(expected_next)
             committed_dir = v_models.iteration_path(next_version)
             try:
-                from .model_contract import validate_ferebus_model_contract
+                from .model_contract import (
+                    CommittedAdmissionUnavailable,
+                    model_validation_context_from_committed_admissions,
+                    validate_ferebus_model_contract,
+                )
 
                 if artifact_snapshot is None:
                     resolved_model_set = v_models.resolve(
@@ -5857,11 +6124,27 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         parent_model_version=int(next_version),
                     )
                     resolved_model_set = artifact_snapshot.model_set(next_version)
+                recovery_validation_context = None
+                if artifact_snapshot is not None:
+                    try:
+                        recovery_validation_context = (
+                            model_validation_context_from_committed_admissions(
+                                committed_dir,
+                                trained_model_set=resolved_model_set,
+                            )
+                        )
+                    except CommittedAdmissionUnavailable:
+                        recovery_validation_context = None
+                self._report_runtime_progress(
+                    "model_commit_validation",
+                    strict_fallback=recovery_validation_context is None,
+                )
                 validate_ferebus_model_contract(
                     committed_dir,
                     committed=True,
                     expected_version=next_version,
                     trained_model_set=resolved_model_set,
+                    validation_context=recovery_validation_context,
                 )
                 newest_version = max(committed)
                 if newest_version != next_version and artifact_snapshot is None:
@@ -5921,7 +6204,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 assert_ferebus_model_admission_context_unchanged,
                 build_ferebus_model_admission_context,
             )
-            from .ferebus_quality import build_ferebus_quality_context
+            from .ferebus_quality import (
+                build_ferebus_quality_context,
+                build_ferebus_quality_context_from_admission,
+            )
 
             if artifact_snapshot is not None:
                 from ..versioning.reference_data import ReferenceDataVersioning
@@ -5968,12 +6254,16 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 admission_context,
                 progress_callback=admission_progress,
             )
+            self._report_runtime_progress(
+                "ferebus_quality_context_binding",
+                completed=0,
+                total=1,
+                unit="contracts",
+            )
             if artifact_snapshot is not None:
-                quality_context = build_ferebus_quality_context(
-                    staging,
+                quality_context = build_ferebus_quality_context_from_admission(
+                    admission_context,
                     incumbent_set=parent_model_set,
-                    task_manifest=admission_context.task_manifest,
-                    task_execution=admission_context.task_execution,
                 )
             else:
                 quality_context = build_ferebus_quality_context(
@@ -5982,6 +6272,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     task_execution=admission_context.task_execution,
                 )
                 parent_model_set = quality_context.incumbent_set
+            self._report_runtime_progress(
+                "ferebus_quality_context_binding",
+                completed=1,
+                total=1,
+                unit="contracts",
+            )
             self._report_runtime_progress(
                 "ferebus_model_admission",
                 completed=int(admission_context.statistics["total"]),
@@ -6272,6 +6568,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             model_validation_context_from_admission,
             validate_ferebus_model_contract,
         )
+        from .ferebus_snapshot_publication import (
+            assert_committed_ferebus_snapshot,
+            capture_ferebus_snapshot_publication,
+            commit_prevalidated_ferebus_snapshot,
+            publish_ferebus_snapshot_manifest,
+            synchronise_ferebus_snapshot_directories,
+        )
         from ..versioning.trained_models import (
             trained_models_commit_lock,
             validate_trained_model_snapshot,
@@ -6359,7 +6662,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                             source = staging.joinpath(
                                 *str(binding["path"]).split("/")
                             )
-                            expected_source_sha256[str(source.resolve())] = str(
+                            expected_source_sha256[str(source)] = str(
                                 binding["sha256"]
                             )
                     _write_ferebus_task_artefact_layout(
@@ -6370,6 +6673,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         parent_model_set=parent_model_set,
                         digest_tracker=digest_tracker,
                         expected_source_sha256=expected_source_sha256,
+                        source_anchors={
+                            anchor.relative_path: anchor
+                            for anchor in admission_context.anchors
+                            if anchor.kind == "file"
+                        },
                     )
                     self._report_runtime_progress(
                         "model_snapshot_build",
@@ -6377,7 +6685,32 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         total=int(len(manifest.get("tasks") or [])),
                         unit="models",
                     )
-                    self._report_runtime_progress("model_snapshot_validation")
+                    self._report_runtime_progress(
+                        "model_snapshot_inventory",
+                        completed=0,
+                        total=1,
+                        unit="inventories",
+                    )
+                    publication_context = capture_ferebus_snapshot_publication(
+                        staged,
+                        digest_for_identity=(
+                            digest_tracker.digest_for_captured_identity
+                        ),
+                    )
+                    publish_ferebus_snapshot_manifest(publication_context)
+                    self._report_runtime_progress(
+                        "model_snapshot_inventory",
+                        completed=len(publication_context.files),
+                        total=len(publication_context.files),
+                        unit="files",
+                        bytes_hashed=sum(
+                            entry.size for entry in publication_context.files
+                        ),
+                        reused_digests=len(publication_context.files),
+                    )
+                    self._report_runtime_progress(
+                        "model_snapshot_semantic_validation"
+                    )
                 except Exception as exc:
                     return PhaseResult(
                         is_complete=True,
@@ -6400,9 +6733,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         staged,
                         next_version,
                         parent=parent_model_set,
-                        verification="deep",
+                        verification="authority",
                         reference_view=reference_view,
                         digest_file=digest_tracker.digest,
+                        require_directory_manifest=True,
                     )
                     staged_validation_context = model_validation_context_from_admission(
                         staged,
@@ -6415,7 +6749,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                             "staged FEREBUS validation did not bind its model set"
                         )
                     self._report_runtime_progress(
-                        "model_snapshot_validation",
+                        "model_snapshot_semantic_validation",
                         completed=int(len(manifest.get("tasks") or [])),
                         total=int(len(manifest.get("tasks") or [])),
                         unit="models",
@@ -6437,23 +6771,81 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                             + str(exc)
                         ),
                     )
-                rename_capture = digest_tracker.capture_rename_tree(staged)
-                self._report_runtime_progress("model_commit")
-                v_models.commit(next_version)
+                self._report_runtime_progress(
+                    "model_snapshot_durability",
+                    completed=0,
+                    total=len(publication_context.directories),
+                    unit="directories",
+                )
+                fsync_count = synchronise_ferebus_snapshot_directories(
+                    publication_context
+                )
+                self._report_runtime_progress(
+                    "model_snapshot_durability",
+                    completed=len(publication_context.directories),
+                    total=len(publication_context.directories),
+                    unit="directories",
+                    fsync_count=fsync_count,
+                )
+                assert_ferebus_model_admission_context_unchanged(
+                    admission_context,
+                    progress_callback=admission_progress,
+                )
+                self._report_runtime_progress("model_commit_publication")
                 committed_dir = v_models.iteration_path(next_version)
-                digest_tracker.bind_renamed_tree(
-                    rename_capture,
+                commit_prevalidated_ferebus_snapshot(
+                    publication_context,
                     committed_dir,
                 )
                 try:
+                    reusable_hashes = assert_committed_ferebus_snapshot(
+                        publication_context,
+                        committed_dir,
+                    )
+                    self._report_runtime_progress(
+                        "model_commit_publication",
+                        completed=1,
+                        total=1,
+                        unit="versions",
+                    )
+                    self._report_runtime_progress(
+                        "model_commit_validation",
+                        strict_fallback=not reusable_hashes,
+                    )
+                    committed_digest_file = None
+                    if reusable_hashes:
+
+                        def committed_digest_file(
+                            path: Path,
+                            unused_payload: bool = False,
+                        ) -> str:
+                            del unused_payload
+                            try:
+                                relative = Path(path).relative_to(
+                                    committed_dir
+                                ).as_posix()
+                            except ValueError as exc:
+                                raise ValueError(
+                                    "committed FEREBUS digest path escapes its publication"
+                                ) from exc
+                            digest = publication_context.manifest.get(relative)
+                            if digest is None:
+                                raise ValueError(
+                                    "committed FEREBUS digest path is not in its publication: "
+                                    + relative
+                                )
+                            return str(digest)
+
                     committed_model_set = validate_trained_model_snapshot(
                         self.campaign_dir,
                         committed_dir,
                         next_version,
                         parent=parent_model_set,
-                        verification="deep",
+                        verification=(
+                            "authority" if reusable_hashes else "deep"
+                        ),
                         reference_view=reference_view,
-                        digest_file=digest_tracker.digest,
+                        digest_file=committed_digest_file,
                         require_directory_manifest=True,
                     )
                     validate_ferebus_model_contract(
@@ -6462,13 +6854,15 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         expected_version=next_version,
                         trained_model_set=committed_model_set,
                         validation_context=staged_validation_context,
+                        digest_file=committed_digest_file,
                     )
                     v_models.update_current(next_version)
                     self._report_runtime_progress(
-                        "model_commit",
+                        "model_commit_validation",
                         completed=int(len(manifest.get("tasks") or [])),
                         total=int(len(manifest.get("tasks") or [])),
                         unit="models",
+                        strict_fallback=not reusable_hashes,
                     )
                 except Exception as exc:
                     self._journal_event(

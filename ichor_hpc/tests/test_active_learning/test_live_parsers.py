@@ -6,6 +6,7 @@ materialising a campaign filesystem.
 """
 import hashlib
 import json
+import os
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -68,7 +69,11 @@ from ichor.hpc.active_learning.versioning.versioned_directory import VersionedDi
 from ichor.hpc.active_learning.versioning.reference_data import (
     ReferenceDataVersioning,
 )
-from ichor.hpc.active_learning.versioning.manifest import ManifestMismatchError
+from ichor.hpc.active_learning.versioning.manifest import (
+    ManifestMismatchError,
+    compute_directory_manifest,
+    read_manifest,
+)
 from ichor.hpc.active_learning.versioning.trained_models import (
     TrainedModelVersioning,
 )
@@ -1558,6 +1563,9 @@ def test_ferebus_parser_happy_path_commits_models_version(tmp_path):
         task_dir / "datasets" / "WATER_O1_TRAINING_SET.csv"
     ).is_file()
     assert (task_dir / "WATER_iqa_O1.opt").read_text(encoding="utf-8") == "opt\n"
+    assert read_manifest(committed_dir) == compute_directory_manifest(
+        committed_dir
+    )
     assert not (committed_dir / "task_artefacts").exists()
     artefact_manifest = json.loads(
         (committed_dir / FEREBUS_TASK_ARTEFACTS_MANIFEST)
@@ -1585,6 +1593,124 @@ def test_ferebus_parser_happy_path_commits_models_version(tmp_path):
     assert os.access(task_dir / "WATER_iqa_O1.model", os.W_OK)
     events = _read_journal_events(tmp_path / "campaign")
     assert any(e.get("event") == "models_committed" for e in events)
+
+    from ichor.hpc.active_learning.daemon.artifact_snapshot import (
+        build_committed_artifact_snapshot,
+    )
+
+    ex._committed_artifact_snapshot = build_committed_artifact_snapshot(
+        ex.campaign_dir,
+        verification_level="authority",
+    )
+    replay = ex._parse_ferebus_postprocess(
+        state,
+        CampaignPhase("FEREBUS"),
+        observations=[],
+    )
+    assert replay.failure_reason is None
+
+
+def test_committed_ferebus_replay_rejects_receipt_tamper(tmp_path):
+    from ichor.hpc.active_learning.daemon.artifact_snapshot import (
+        build_committed_artifact_snapshot,
+    )
+    from ichor.hpc.active_learning.daemon.ferebus_model_admission import (
+        enrich_task_receipt_with_model_admission,
+    )
+    from ichor.hpc.active_learning.daemon.ferebus_quality import (
+        enrich_task_receipt_with_quality,
+    )
+
+    ex = _make_executor(tmp_path)
+    _commit_bootstrap_reference_data(ex.campaign_dir)
+    staging = _seed_models_staging(ex.campaign_dir)
+    enrich_task_receipt_with_quality(staging, 0)
+    enrich_task_receipt_with_model_admission(staging, 0)
+    state = SimpleNamespace(
+        iteration=0,
+        campaign_uid="m16-test",
+        reference_data_version=0,
+    )
+    result = ex._parse_ferebus_postprocess(
+        state,
+        CampaignPhase("FEREBUS"),
+        observations=[],
+    )
+    assert result.failure_reason is None
+    ex._committed_artifact_snapshot = build_committed_artifact_snapshot(
+        ex.campaign_dir,
+        verification_level="authority",
+    )
+    receipt = (
+        ex.campaign_dir
+        / "TRAINED_MODELS/iteration-000000/iqa/O1/FEREBUS_TASK_RECEIPT.json"
+    )
+    receipt.write_text(
+        receipt.read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+
+    replay = ex._parse_ferebus_postprocess(
+        state,
+        CampaignPhase("FEREBUS"),
+        observations=[],
+    )
+    assert "committed_ferebus_receipt_hash_mismatch" in str(
+        replay.failure_reason
+    )
+
+
+def test_committed_ferebus_replay_rejects_invalid_admission_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon.artifact_snapshot import (
+        build_committed_artifact_snapshot,
+    )
+    import ichor.hpc.active_learning.daemon.ferebus_model_admission as admission
+    from ichor.hpc.active_learning.daemon.ferebus_model_admission import (
+        FerebusModelAdmissionError,
+        enrich_task_receipt_with_model_admission,
+    )
+    from ichor.hpc.active_learning.daemon.ferebus_quality import (
+        enrich_task_receipt_with_quality,
+    )
+
+    ex = _make_executor(tmp_path)
+    _commit_bootstrap_reference_data(ex.campaign_dir)
+    staging = _seed_models_staging(ex.campaign_dir)
+    enrich_task_receipt_with_quality(staging, 0)
+    enrich_task_receipt_with_model_admission(staging, 0)
+    state = SimpleNamespace(
+        iteration=0,
+        campaign_uid="m16-test",
+        reference_data_version=0,
+    )
+    result = ex._parse_ferebus_postprocess(
+        state,
+        CampaignPhase("FEREBUS"),
+        observations=[],
+    )
+    assert result.failure_reason is None
+    ex._committed_artifact_snapshot = build_committed_artifact_snapshot(
+        ex.campaign_dir,
+        verification_level="authority",
+    )
+    monkeypatch.setattr(
+        admission,
+        "validate_ferebus_task_model_admission",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            FerebusModelAdmissionError("contradictory admission")
+        ),
+    )
+
+    replay = ex._parse_ferebus_postprocess(
+        state,
+        CampaignPhase("FEREBUS"),
+        observations=[],
+    )
+
+    assert "committed_ferebus_admission_invalid" in str(replay.failure_reason)
 
 
 def test_ariadne_task_model_loader_avoids_historical_chain_resolution(
@@ -1666,6 +1792,7 @@ def test_ferebus_postprocess_snapshot_avoids_historical_chain_resolution(
         enrich_task_receipt_with_model_admission,
     )
     import ichor.hpc.active_learning.daemon.ferebus_model_admission as admission_module
+    import ichor.hpc.active_learning.daemon.live_executor as live_executor_module
     import ichor.hpc.active_learning.daemon.model_contract as model_contract_module
     import ichor.hpc.active_learning.daemon.ferebus_quality as quality_module
     import ichor.hpc.active_learning.versioning.trained_models as models_module
@@ -1718,15 +1845,39 @@ def test_ferebus_postprocess_snapshot_avoids_historical_chain_resolution(
             "FEREBUS hot path must use its narrow reference/incumbent guard"
         )
 
+    def forbidden_generic_commit(*args, **kwargs):
+        raise AssertionError(
+            "FEREBUS publication must not rehash through generic commit"
+        )
+
+    def forbidden_publication_resolve(*args, **kwargs):
+        raise AssertionError(
+            "FEREBUS publication must consume canonical admission paths"
+        )
+
+    def forbidden_model_rehash(*args, **kwargs):
+        raise AssertionError(
+            "FEREBUS publication must reuse copy-time payload digests"
+        )
+
     lock_state = {"held": False}
     real_evaluate = quality_module.evaluate_ferebus_quality
     real_lock = models_module.trained_models_commit_lock
     real_model_contract = model_contract_module.validate_ferebus_model_contract
+    real_model_sha256 = models_module.sha256_file
 
     def no_legacy_admission(*args, **kwargs):
         if kwargs.get("validation_context") is None:
             raise AssertionError(
                 "inline task admission must avoid full login-node model replay"
+            )
+        context = kwargs["validation_context"]
+        if (
+            "committed_task" not in context.admission_sources
+            and kwargs.get("digest_file") is None
+        ):
+            raise AssertionError(
+                "committed admission must reuse publication digests"
             )
         return real_model_contract(*args, **kwargs)
 
@@ -1744,7 +1895,28 @@ def test_ferebus_postprocess_snapshot_avoids_historical_chain_resolution(
                 lock_state["held"] = False
 
     monkeypatch.setattr(TrainedModelVersioning, "resolve", forbidden_resolve)
+    monkeypatch.setattr(TrainedModelVersioning, "commit", forbidden_generic_commit)
     monkeypatch.setattr(ReferenceDataVersioning, "resolve", forbidden_resolve)
+    if os.name == "nt":
+        from ichor.hpc.active_learning.daemon import (
+            ferebus_snapshot_publication as snapshot_publication_module,
+        )
+
+        monkeypatch.setattr(
+            snapshot_publication_module,
+            "assert_committed_ferebus_snapshot",
+            lambda *_args, **_kwargs: True,
+        )
+    monkeypatch.setattr(
+        live_executor_module,
+        "_resolve_ferebus_staging_path",
+        forbidden_publication_resolve,
+    )
+    monkeypatch.setattr(
+        live_executor_module,
+        "_resolve_ferebus_destination",
+        forbidden_publication_resolve,
+    )
     monkeypatch.setattr(
         quality_module,
         "_local_incumbent_metric",
@@ -1752,6 +1924,7 @@ def test_ferebus_postprocess_snapshot_avoids_historical_chain_resolution(
     )
     monkeypatch.setattr(quality_module, "evaluate_ferebus_quality", checked_evaluate)
     monkeypatch.setattr(models_module, "trained_models_commit_lock", observed_lock)
+    monkeypatch.setattr(models_module, "sha256_file", forbidden_model_rehash)
     monkeypatch.setattr(
         model_contract_module,
         "validate_ferebus_model_contract",
@@ -1781,6 +1954,22 @@ def test_ferebus_postprocess_snapshot_avoids_historical_chain_resolution(
 
     assert result.failure_reason is None
     assert result.state_updates["models_version"] == 1
+    monkeypatch.setattr(models_module, "sha256_file", real_model_sha256)
+    ex._committed_artifact_snapshot = build_committed_artifact_snapshot(
+        ex.campaign_dir,
+        verification_level="authority",
+    )
+    replay = ex._parse_ferebus_postprocess(
+        SimpleNamespace(
+            iteration=1,
+            campaign_uid="m16-test",
+            reference_data_version=1,
+        ),
+        CampaignPhase("FEREBUS"),
+        observations=[],
+    )
+    assert replay.failure_reason is None
+    assert replay.state_updates["models_version"] == 1
     summary = next(
         event
         for event in reversed(_read_journal_events(ex.campaign_dir))
