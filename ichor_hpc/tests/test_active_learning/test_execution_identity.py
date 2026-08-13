@@ -1019,6 +1019,60 @@ def test_phase_b_transition_accepts_jobless_and_terminal_scheduler_retry_intents
         )
 
 
+def test_phase_b_transition_accepts_complete_publication_adoption(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.handoff_manifests import phase_b_selection_path
+    from ichor.hpc.active_learning.layout import active_iteration_dir
+
+    campaign, _config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.PHASE_B_DIVERSITY
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    _patch_phase_b_transition(monkeypatch)
+    publication = phase_b_selection_path(active_iteration_dir(campaign, 1))
+    publication.parent.mkdir(parents=True)
+    publication.write_text('{"status":"complete"}\n', encoding="utf-8")
+    source = {
+        "attempt_id": "1" * 32,
+        "submission_identity": "r0000-a0001-test",
+        "job_id": "13923834",
+    }
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.recovery_contracts."
+        "scalar_diversity_publication_recovery_summary",
+        lambda *_args, **_kwargs: {
+            "state": "postprocess_only",
+            "producer_submission_identity": source["submission_identity"],
+            "producer_job_id": source["job_id"],
+            "selected_count": 75,
+            "ordering_classification": "legacy_final_rank_permutation",
+            "postprocess_source": source,
+        },
+    )
+    intent = {
+        "campaign_uid": str(state.campaign_uid),
+        "phase": CampaignPhase.PHASE_B_DIVERSITY.value,
+        "iteration": 1,
+        "replacement_round": 0,
+        "status": "SUPERSEDED",
+        "reason": "reconcile_apply_retry",
+    }
+
+    result = execution_identity_module._validate_phase_b_transition_boundary(
+        campaign,
+        state,
+        intent_records=[intent],
+    )
+
+    assert result["transition_kind"] == "phase_b_complete_publication_adoption"
+    assert result["selected_count"] == 75
+    assert result["scheduler_jobs_submitted"] == 0
+    assert result["postprocess_source"] == source
+
+
 def _active_pending_replacement_allocation(campaign, state):
     from ichor.hpc.active_learning.point_allocation import (
         allocate_replacements,

@@ -1255,6 +1255,70 @@ def test_ariadne_postprocess_intent_copies_original_decision_contract(
     assert captured[0]["environment_generation"] == 7
 
 
+def test_phase_b_postprocess_intent_is_jobless_and_scalar(
+    tmp_path,
+    monkeypatch,
+):
+    class LocalPostprocessExecutor(MockPhaseExecutor):
+        def submit_or_run(self, state, phase):
+            return PhaseResult(is_complete=True)
+
+    d = _make_daemon(tmp_path, executor=LocalPostprocessExecutor())
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.PHASE_B_DIVERSITY
+    state.iteration = 1
+    d._last_environment_binding = {
+        "generation": 7,
+        "generation_digest_sha256": "7" * 64,
+    }
+    d._environment_binding_mode = "bound"
+    source = {
+        "decision_contract": {
+            "failure_threshold_fraction": 0.125,
+            "config_sha256": "6" * 64,
+        },
+        "source_sha256": "5" * 64,
+    }
+    monkeypatch.setattr(
+        d,
+        "_diversity_postprocess_source_if_complete",
+        lambda _state, _phase: source,
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "load_active_intent",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(d, "_verify_environment_boundary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        d,
+        "_validate_submission_environment_binding",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        d,
+        "_verify_committed_artifacts_if_enabled",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(d, "_checkpoint_before_seed_selection", lambda *_args: None)
+    captured = []
+    monkeypatch.setattr(
+        submission_intent,
+        "write_pre_submit_intent",
+        lambda *_args, **kwargs: captured.append(kwargs) or {},
+    )
+    monkeypatch.setattr(d, "_advance", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(d, "_complete_intent_after_advance", lambda *_args, **_kwargs: None)
+
+    status = d._on_phase_entry(state, CampaignPhase.PHASE_B_DIVERSITY)
+
+    assert status == TickStatus.ADVANCED
+    assert len(captured) == 1
+    assert captured[0]["expected_tasks"] == 1
+    assert captured[0]["postprocess_source"] == source
+    assert captured[0]["decision_contract"] == source["decision_contract"]
+
+
 def test_scheduler_retry_intent_retains_original_decision_contract(
     tmp_path,
     monkeypatch,

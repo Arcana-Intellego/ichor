@@ -75,8 +75,10 @@ from .state import (
 
 __all__ = [
     "ReconciliationReport",
+    "archive_incomplete_scalar_diversity_publication",
     "data_staging_inventory",
     "inspect_aimall_postprocess_recovery",
+    "inspect_scalar_diversity_postprocess_recovery",
     "propose_recovery",
     "restore_archived_bootstrap_handoff",
     "stateful_campaign_artifacts",
@@ -86,6 +88,116 @@ __all__ = [
 
 
 RECONCILE_SUFFIX = ".proposed"
+
+
+def archive_incomplete_scalar_diversity_publication(
+    campaign_dir: Union[str, Path],
+    recovery: Mapping[str, Any],
+    *,
+    archive_identity: str,
+) -> Dict[str, Any]:
+    """Quarantine one incomplete scalar publication for an idempotent retry."""
+    from ..layout import (
+        active_iteration_dir,
+        active_phase_b_dir,
+        bootstrap_selection_dir,
+    )
+    from .recovery_contracts import classify_scalar_diversity_publication
+
+    campaign = Path(campaign_dir).resolve()
+    phase = CampaignPhase(str(recovery.get("phase") or ""))
+    iteration = int(recovery.get("iteration", -1))
+    retry_task_ids = recovery.get("retry_task_ids")
+    if retry_task_ids is None:
+        retry_task_ids = recovery.get("retry_task_ids_sample")
+    if (
+        str(recovery.get("state") or "") != "retry"
+        or str(recovery.get("publication_disposition") or "")
+        != "archive_and_retry"
+        or int(recovery.get("n_retry") or 0) != 1
+        or bool(recovery.get("retry_task_ids_truncated", False))
+        or list(retry_task_ids or []) != [0]
+    ):
+        raise ValueError("scalar diversity archive recovery contract is invalid")
+    if phase is CampaignPhase.PHASE_A_DIVERSITY:
+        if iteration != 0:
+            raise ValueError("Phase A diversity archive iteration must be zero")
+        output_dir = bootstrap_selection_dir(campaign)
+    elif phase is CampaignPhase.PHASE_B_DIVERSITY:
+        if iteration < 1:
+            raise ValueError("Phase B diversity archive iteration must be positive")
+        output_dir = active_phase_b_dir(
+            active_iteration_dir(campaign, iteration)
+        )
+    else:
+        raise ValueError("scalar diversity archive phase is unsupported")
+
+    expected_output = campaign_owned_path(campaign, output_dir)
+    reported_output = campaign_owned_path(
+        campaign,
+        str(recovery.get("output_dir") or ""),
+    )
+    if reported_output != expected_output:
+        raise ValueError("scalar diversity archive source is noncanonical")
+    identity = str(archive_identity or "")
+    if (
+        len(identity) != 32
+        or any(character not in "0123456789abcdef" for character in identity.lower())
+    ):
+        raise ValueError("scalar diversity archive identity is invalid")
+    archive_root = campaign_owned_path(
+        campaign,
+        Path(".DATA")
+        / "ACTIVE_LEARNING"
+        / "diversity_retry_quarantine",
+    )
+    archive_name = phase.value + "-" + f"{iteration:06d}" + "-" + identity
+    archive_dir = campaign_owned_path(campaign, archive_root / archive_name)
+
+    source_exists = expected_output.exists() or expected_output.is_symlink()
+    archive_exists = archive_dir.exists() or archive_dir.is_symlink()
+    if source_exists and archive_exists:
+        raise ValueError(
+            "scalar diversity publication exists at both source and archive target"
+        )
+    changed = False
+    if source_exists:
+        current = classify_scalar_diversity_publication(
+            campaign,
+            phase=phase,
+            iteration=iteration,
+        )
+        if str(current.get("state") or "") != "incomplete":
+            raise ValueError(
+                "scalar diversity publication is no longer an incomplete retry candidate"
+            )
+        if expected_output.is_symlink() or not expected_output.is_dir():
+            raise ValueError(
+                "incomplete scalar diversity publication is not a regular directory"
+            )
+        archive_root.mkdir(parents=True, exist_ok=True)
+        archive_root = campaign_owned_path(campaign, archive_root)
+        if archive_root.is_symlink() or not archive_root.is_dir():
+            raise ValueError("scalar diversity archive root is unsafe")
+        os.replace(expected_output, archive_dir)
+        _fsync_parent_dir(expected_output)
+        _fsync_parent_dir(archive_dir)
+        changed = True
+    elif not archive_exists:
+        raise ValueError(
+            "scalar diversity publication is missing at source and archive target"
+        )
+
+    if archive_dir.is_symlink() or not archive_dir.is_dir():
+        raise ValueError("scalar diversity recovery archive is invalid")
+    return {
+        "changed": changed,
+        "phase": phase.value,
+        "iteration": iteration,
+        "archive_dir": str(archive_dir),
+        "source_dir": str(expected_output),
+        "publication_disposition": "archive_and_retry",
+    }
 
 _RECOVERY_PHASE_PROGRESS = {
     phase: rank
@@ -519,6 +631,61 @@ def _inspect_gaussian_postprocess_recovery(
         "scheduler_jobs_submitted": 0,
         "validation": "local_postprocess_required",
     }
+
+
+def _inspect_scalar_diversity_postprocess_recovery(
+    campaign: Path,
+    *,
+    campaign_uid: str,
+    phase_name: str,
+    iteration: int,
+) -> Optional[Dict[str, Any]]:
+    """Classify a complete scalar publication without parsing coordinates."""
+    phase = str(phase_name)
+    if phase not in {
+        CampaignPhase.PHASE_A_DIVERSITY.value,
+        CampaignPhase.PHASE_B_DIVERSITY.value,
+    }:
+        return None
+    from .recovery_contracts import (
+        classify_scalar_diversity_publication,
+        scalar_diversity_publication_recovery_summary,
+    )
+
+    shape = classify_scalar_diversity_publication(
+        campaign,
+        phase=phase,
+        iteration=int(iteration),
+    )
+    if str(shape.get("state") or "") == "missing":
+        return None
+    summary = scalar_diversity_publication_recovery_summary(
+        campaign,
+        phase=phase,
+        iteration=int(iteration),
+        expected_campaign_uid=str(campaign_uid),
+    )
+    if str(summary.get("state") or "") not in {"postprocess_only", "retry"}:
+        return None
+    return dict(summary)
+
+
+def inspect_scalar_diversity_postprocess_recovery(
+    campaign_dir: Union[str, Path],
+    state: CampaignState,
+) -> Optional[Dict[str, Any]]:
+    """Inspect the current scalar postprocess-only boundary for status."""
+    if state.phase not in {
+        CampaignPhase.PHASE_A_DIVERSITY,
+        CampaignPhase.PHASE_B_DIVERSITY,
+    }:
+        return None
+    return _inspect_scalar_diversity_postprocess_recovery(
+        Path(campaign_dir),
+        campaign_uid=str(state.campaign_uid),
+        phase_name=state.phase.value,
+        iteration=int(state.iteration),
+    )
 
 
 def inspect_aimall_postprocess_recovery(
@@ -2468,6 +2635,7 @@ def propose_recovery(
         blocking_artifacts.append("active-learning handoff inventory")
 
     partial_array_recovery: Optional[Dict[str, Any]] = None
+    scalar_postprocess_recovery: Optional[Dict[str, Any]] = None
     aimall_postprocess_recovery: Optional[Dict[str, Any]] = None
     gaussian_postprocess_recovery: Optional[Dict[str, Any]] = None
     ariadne_publication_recovery: Optional[Dict[str, Any]] = None
@@ -2504,6 +2672,26 @@ def propose_recovery(
             )
             blocking_artifacts.append("AIMAll-to-Gaussian task recovery")
     if preferred_phase is not None and preferred_iteration is not None:
+        try:
+            scalar_postprocess_recovery = (
+                _inspect_scalar_diversity_postprocess_recovery(
+                    campaign,
+                    campaign_uid=str(recovered.campaign_uid),
+                    phase_name=str(preferred_phase),
+                    iteration=int(preferred_iteration),
+                )
+            )
+        except FileNotFoundError:
+            scalar_postprocess_recovery = None
+        except Exception as exc:
+            unsafe_reasons.append(
+                "complete scalar publication recovery evidence is invalid: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:180]
+            )
+            blocking_artifacts.append("scalar postprocess producer evidence")
+            scalar_postprocess_recovery = None
         try:
             gaussian_postprocess_recovery = _inspect_gaussian_postprocess_recovery(
                 campaign,
@@ -2546,7 +2734,9 @@ def propose_recovery(
                 blocking_artifacts.append("AIMAll postprocess producer evidence")
                 aimall_postprocess_recovery = None
     postprocess_only_recovery = (
-        gaussian_postprocess_recovery
+        scalar_postprocess_recovery
+        if isinstance(scalar_postprocess_recovery, dict)
+        else gaussian_postprocess_recovery
         if isinstance(gaussian_postprocess_recovery, dict)
         else aimall_postprocess_recovery
     )
@@ -2577,51 +2767,62 @@ def propose_recovery(
         try:
             partial_phase = CampaignPhase(str(partial_array_recovery["phase"]))
             partial_iteration = int(partial_array_recovery["iteration"])
+            scalar_recovery = isinstance(
+                scalar_postprocess_recovery,
+                dict,
+            )
+            scalar_postprocess_only = bool(
+                scalar_recovery
+                and str(
+                    scalar_postprocess_recovery.get("state") or ""
+                )
+                == "postprocess_only"
+            )
+            if scalar_recovery:
+                scalar_label = (
+                    "Phase B diversity"
+                    if partial_phase is CampaignPhase.PHASE_B_DIVERSITY
+                    else "Phase A diversity"
+                )
+                recovery_reason = (
+                    "scheduler-complete "
+                    + scalar_label
+                    + " publication requires local postprocessing; no "
+                    "scheduler tasks will be submitted"
+                    if scalar_postprocess_only
+                    else "incomplete "
+                    + scalar_label
+                    + " publication will be archived before one scalar retry"
+                )
+            elif isinstance(gaussian_postprocess_recovery, dict):
+                recovery_reason = (
+                    "scheduler-complete Gaussian outputs require local "
+                    "postprocessing; no array tasks will be resubmitted"
+                )
+            elif isinstance(aimall_postprocess_recovery, dict):
+                recovery_reason = (
+                    "scheduler-complete AIMAll outputs require local "
+                    "postprocessing; no array tasks will be resubmitted"
+                )
+            elif str(
+                partial_array_recovery.get("upstream_rewind") or ""
+            ) == "missing_aimall_pointdir":
+                recovery_reason = (
+                    "missing AIMAll task output requires its Gaussian producer "
+                    "to be rerun; completed Gaussian siblings will be reused"
+                )
+            else:
+                recovery_reason = (
+                    "partial array recovery available: "
+                    + str(int(partial_array_recovery.get("n_complete") or 0))
+                    + "/"
+                    + str(int(partial_array_recovery.get("logical_total") or 0))
+                    + " logical tasks already complete"
+                )
             partial_array_decision = RecoveryDecision(
                 phase=partial_phase,
                 iteration=partial_iteration,
-                reason=(
-                    (
-                        "scheduler-complete "
-                        + (
-                            "Gaussian"
-                            if isinstance(
-                                gaussian_postprocess_recovery,
-                                dict,
-                            )
-                            else "AIMAll"
-                        )
-                        + " outputs require local "
-                        "postprocessing; no array tasks will be resubmitted"
-                    )
-                    if isinstance(postprocess_only_recovery, dict)
-                    else (
-                        "missing AIMAll task output requires its Gaussian "
-                        "producer to be rerun; completed Gaussian siblings "
-                        "will be reused"
-                    )
-                    if str(
-                        partial_array_recovery.get("upstream_rewind") or ""
-                    )
-                    == "missing_aimall_pointdir"
-                    else (
-                        "partial array recovery available: "
-                        + str(
-                            int(
-                                partial_array_recovery.get("n_complete")
-                                or 0
-                            )
-                        )
-                        + "/"
-                        + str(
-                            int(
-                                partial_array_recovery.get("logical_total")
-                                or 0
-                            )
-                        )
-                        + " logical tasks already complete"
-                    )
-                ),
+                reason=recovery_reason,
                 trusted_artifact=str(partial_array_recovery.get("path") or ""),
                 replacement_round=int(
                     partial_array_recovery.get("replacement_round") or 0
@@ -2630,7 +2831,11 @@ def propose_recovery(
             _append_recovery_candidate(recovery_candidates, partial_array_decision)
             trusted_artifacts.append(
                 (
-                    "scheduler-complete quantum producer for "
+                    (
+                        "incomplete scalar publication for "
+                        if scalar_recovery and not scalar_postprocess_only
+                        else "scheduler-complete producer for "
+                    )
                     if isinstance(postprocess_only_recovery, dict)
                     else "partial array recovery ledger for "
                 )
@@ -2638,15 +2843,16 @@ def propose_recovery(
                 + "@"
                 + str(partial_iteration)
             )
-            bucket = "initial" if partial_phase.value.startswith("INITIAL_") else (
-                "iter_" + str(partial_iteration)
-            )
-            partial_staging = (campaign / ".DATA" / "STAGING" / bucket).resolve(strict=False)
-            unexpected_staging_children = [
-                p
-                for p in unexpected_staging_children
-                if str(p.resolve(strict=False)) != str(partial_staging)
-            ]
+            if not scalar_recovery:
+                bucket = "initial" if partial_phase.value.startswith("INITIAL_") else (
+                    "iter_" + str(partial_iteration)
+                )
+                partial_staging = (campaign / ".DATA" / "STAGING" / bucket).resolve(strict=False)
+                unexpected_staging_children = [
+                    p
+                    for p in unexpected_staging_children
+                    if str(p.resolve(strict=False)) != str(partial_staging)
+                ]
         except Exception as exc:
             notes.append(
                 "partial array recovery candidate was ignored: "

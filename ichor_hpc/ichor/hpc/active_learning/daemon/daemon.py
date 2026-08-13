@@ -1883,7 +1883,27 @@ class Daemon:
         if checkpoint_status is not None:
             return checkpoint_status
         postprocess_source = None
-        if phase is CampaignPhase.ARIADNE_ARRAY:
+        if phase in {
+            CampaignPhase.PHASE_A_DIVERSITY,
+            CampaignPhase.PHASE_B_DIVERSITY,
+        }:
+            try:
+                postprocess_source = (
+                    self._diversity_postprocess_source_if_complete(
+                        state,
+                        phase,
+                    )
+                )
+            except Exception as exc:
+                return self._halt(
+                    state,
+                    phase,
+                    "diversity_postprocess_source_invalid: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)[:180],
+                )
+        elif phase is CampaignPhase.ARIADNE_ARRAY:
             try:
                 postprocess_source = self._ariadne_postprocess_source_if_complete(
                     state
@@ -3374,6 +3394,80 @@ class Daemon:
         if not isinstance(source, dict):
             raise ValueError(
                 "all-complete ARIADNE recovery has no producer source contract"
+            )
+        return dict(source)
+
+    def _diversity_postprocess_source_if_complete(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve a complete scalar publication for scheduler-free replay."""
+        from ..handoff_manifests import (
+            phase_a_sample_manifest_path,
+            phase_b_selection_path,
+        )
+        from ..layout import active_iteration_dir, bootstrap_selection_dir
+        from .recovery_contracts import (
+            scalar_diversity_publication_recovery_summary,
+        )
+        from .submission_intent import ACTIVE_STATUSES, load_intent
+
+        current = load_intent(
+            self.campaign_dir,
+            phase.value,
+            int(state.iteration),
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        if not isinstance(current, dict):
+            return None
+        if (
+            str(current.get("status") or "") in ACTIVE_STATUSES
+            and not isinstance(current.get("postprocess_source"), Mapping)
+        ):
+            return None
+        if phase is CampaignPhase.PHASE_B_DIVERSITY:
+            publication = phase_b_selection_path(
+                active_iteration_dir(
+                    self.campaign_dir,
+                    int(state.iteration),
+                )
+            )
+            if not publication.is_file() or publication.is_symlink():
+                return None
+            try:
+                payload = json.loads(publication.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise ValueError(
+                    "Phase B publication is unreadable"
+                ) from exc
+            if not isinstance(payload, Mapping) or str(
+                payload.get("status") or ""
+            ) != "complete":
+                return None
+        else:
+            publication = phase_a_sample_manifest_path(
+                bootstrap_selection_dir(self.campaign_dir)
+            )
+            if not publication.is_file() or publication.is_symlink():
+                return None
+        summary = scalar_diversity_publication_recovery_summary(
+            self.campaign_dir,
+            phase=phase,
+            iteration=int(state.iteration),
+            expected_campaign_uid=str(state.campaign_uid),
+            artifact_snapshot=getattr(
+                self,
+                "_committed_artifact_snapshot",
+                None,
+            ),
+        )
+        if str(summary.get("state") or "") == "completed":
+            return None
+        source = summary.get("postprocess_source")
+        if not isinstance(source, dict):
+            raise ValueError(
+                "complete scalar publication has no producer source contract"
             )
         return dict(source)
 

@@ -136,6 +136,7 @@ from .daemon.recovery_contracts import (
     validate_phase_recovery_contract,
 )
 from .daemon.reconcile import (
+    archive_incomplete_scalar_diversity_publication,
     data_staging_inventory,
     propose_recovery,
     restore_archived_bootstrap_handoff,
@@ -2715,6 +2716,7 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
     aimall_recovery = payload.get(
         "_presentation_aimall_postprocess_recovery"
     )
+    partial_recovery = payload.get("partial_array_recovery")
     scheduler_recovery = payload.get(
         "_presentation_scheduler_recovery"
     )
@@ -2744,6 +2746,23 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
             job_id = str(
                 diversity_transition.get("producer_job_id") or ""
             )
+            transition_kind = str(
+                diversity_transition.get("transition_kind") or ""
+            )
+            if transition_kind.endswith("complete_publication_adoption"):
+                selected = int(
+                    diversity_transition.get("selected_count") or 0
+                )
+                return (
+                    "The previous diversity job"
+                    + (" " + job_id if job_id else "")
+                    + " is terminal; "
+                    + str(selected)
+                    + " existing selected geometr"
+                    + ("y" if selected == 1 else "ies")
+                    + " await local validation, and no diversity job will be "
+                    "submitted."
+                )
             if phase == CampaignPhase.PHASE_B_DIVERSITY.value:
                 return (
                     "The previous Phase B job"
@@ -2860,6 +2879,31 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
             + ("" if total == 1 else "s")
             + " are ready for local validation; no AIMAll array will be "
             "resubmitted."
+        )
+    if (
+        isinstance(partial_recovery, Mapping)
+        and phase
+        in {
+            CampaignPhase.PHASE_A_DIVERSITY.value,
+            CampaignPhase.PHASE_B_DIVERSITY.value,
+        }
+        and partial_recovery.get("selected_count") is not None
+        and int(partial_recovery.get("n_retry") or 0) == 0
+    ):
+        selected = int(partial_recovery.get("selected_count") or 0)
+        if daemon_active:
+            return (
+                "The daemon is validating "
+                + str(selected)
+                + " existing diversity geometr"
+                + ("y" if selected == 1 else "ies")
+                + " locally; no scheduler job is being submitted."
+            )
+        return (
+            str(selected)
+            + " existing diversity geometr"
+            + ("y is" if selected == 1 else "ies are")
+            + " ready for local validation; no scheduler job will be submitted."
         )
     if runtime_progress is not None:
         if str(runtime_progress.get("producer_kind") or "") == "scheduler":
@@ -4954,6 +4998,36 @@ def _journal_operator_summary(
                 + " applied"
             )
 
+        diversity_selected = _event_int(
+            event,
+            "diversity_selected_geometries",
+        )
+        diversity_retry = _event_int(event, "diversity_retry_tasks")
+        diversity_submitted = _event_int(
+            event,
+            "diversity_tasks_resubmitted",
+        )
+        if (
+            diversity_selected is not None
+            and diversity_retry is not None
+            and diversity_submitted is not None
+        ):
+            if diversity_retry:
+                return _with_config_changes(
+                    "reconcile applied; archived an incomplete diversity "
+                    "publication, prepared "
+                    + str(diversity_retry)
+                    + " scalar task"
+                    + ("" if diversity_retry == 1 else "s")
+                    + " for retry after resume, no scheduler job submitted"
+                )
+            return _with_config_changes(
+                "reconcile applied; preserving "
+                + str(diversity_selected)
+                + " selected diversity geometr"
+                + ("y" if diversity_selected == 1 else "ies")
+                + " for local validation, no diversity job resubmitted"
+            )
         scheduler_completed = _event_int(
             event,
             "scheduler_completed_task_candidates",
@@ -8541,6 +8615,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         None,
     )
     aimall_postprocess_recovery_status = None
+    scalar_postprocess_recovery_status = None
     try:
         if supports_partial_array_recovery(state.phase):
             ledger = read_array_ledger(campaign, state.phase, int(state.iteration))
@@ -8569,6 +8644,27 @@ def cmd_status(args: argparse.Namespace) -> int:
     if isinstance(aimall_postprocess_recovery_status, Mapping):
         payload["partial_array_recovery"] = compact_array_recovery_summary(
             dict(aimall_postprocess_recovery_status)
+        )
+        payload.pop("partial_array_recovery_error", None)
+    try:
+        from .daemon.reconcile import (
+            inspect_scalar_diversity_postprocess_recovery,
+        )
+
+        scalar_postprocess_recovery_status = (
+            inspect_scalar_diversity_postprocess_recovery(campaign, state)
+        )
+    except Exception as exc:
+        scalar_postprocess_recovery_status = None
+        payload["partial_array_recovery_error"] = (
+            "scalar publication recovery evidence is invalid: "
+            + type(exc).__name__
+            + ": "
+            + str(exc)
+        )
+    if isinstance(scalar_postprocess_recovery_status, Mapping):
+        payload["partial_array_recovery"] = compact_array_recovery_summary(
+            dict(scalar_postprocess_recovery_status)
         )
         payload.pop("partial_array_recovery_error", None)
     config_review_status: Dict[str, Any]
@@ -10681,6 +10777,7 @@ def _perform_reconcile_apply_mutations(
         "archived_reference_data_staging": [],
         "archived_reentry_staging": [],
         "archived_ariadne_publication": [],
+        "archived_scalar_diversity_publication": [],
         "aimall_upstream_gaussian_recovery": None,
         "retired_completed_staging": {
             "retired": [],
@@ -10692,6 +10789,31 @@ def _perform_reconcile_apply_mutations(
             "n_preserved": 0,
         },
     }
+    if (
+        isinstance(partial_array, Mapping)
+        and str(partial_array.get("phase") or "")
+        in {
+            CampaignPhase.PHASE_A_DIVERSITY.value,
+            CampaignPhase.PHASE_B_DIVERSITY.value,
+        }
+        and str(partial_array.get("publication_disposition") or "")
+        == "archive_and_retry"
+    ):
+        if archive_identity is None:
+            raise ValueError(
+                "scalar diversity publication archival requires a transaction identity"
+            )
+        scalar_archive = archive_incomplete_scalar_diversity_publication(
+            campaign,
+            partial_array,
+            archive_identity=archive_identity,
+        )
+        archive_paths = [str(scalar_archive["archive_dir"])]
+        result["archived_scalar_diversity_publication"] = archive_paths
+        transaction.record_paths(
+            "archive_scalar_diversity_publication",
+            archive_paths,
+        )
     upstream_evidence = _aimall_upstream_gaussian_recovery_evidence(report)
     if upstream_evidence is not None:
         upstream_recovery = prepare_aimall_upstream_gaussian_recovery(
@@ -12498,14 +12620,48 @@ def _reconcile_presentation(
     ):
         reuse = int(partial.get("n_reuse") or partial.get("n_complete") or 0)
         retry = int(partial.get("n_retry") or 0)
-        planned.append(
-            (
-                "array recovery",
-                "reuse " + str(reuse) + " completed task" + ("" if reuse == 1 else "s")
-                + " and prepare " + str(retry) + " for retry",
+        if str(partial.get("phase") or "") in {
+            CampaignPhase.PHASE_A_DIVERSITY.value,
+            CampaignPhase.PHASE_B_DIVERSITY.value,
+        }:
+            if (
+                str(partial.get("publication_disposition") or "")
+                == "archive_and_retry"
+            ):
+                planned.append(
+                    (
+                        "diversity recovery",
+                        "archive the incomplete publication and prepare one "
+                        "scalar diversity task for retry after resume",
+                    )
+                )
+                reason_parts.append(
+                    "an incomplete diversity publication requires a guarded retry"
+                )
+            else:
+                selected = int(partial.get("selected_count") or 0)
+                planned.append(
+                    (
+                        "diversity recovery",
+                        "validate "
+                        + str(selected)
+                        + " existing selected geometr"
+                        + ("y" if selected == 1 else "ies")
+                        + " locally; submit zero diversity tasks",
+                    )
+                )
+                reason_parts.append(
+                    "a completed diversity publication awaits local validation"
+                )
+        else:
+            planned.append(
+                (
+                    "array recovery",
+                    "reuse " + str(reuse) + " completed task" + ("" if reuse == 1 else "s")
+                    + " and prepare " + str(retry) + " for retry",
+                )
             )
-        )
-        reason_parts.append("an interrupted array has recoverable task results")
+            reason_parts.append("an interrupted array has recoverable task results")
 
     ariadne = getattr(report, "ariadne_results_recovery", None)
     if isinstance(ariadne, Mapping) and ariadne:
@@ -13296,29 +13452,69 @@ def _print_reconcile_partial_array(campaign: Path, report: Any) -> None:
     partial = getattr(report, "partial_array_recovery", None)
     if not isinstance(partial, dict) or not partial:
         return
-    print("Partial Array Recovery")
     phase = str(partial.get("phase") or "UNKNOWN")
+    scalar_publication = phase in {
+        CampaignPhase.PHASE_A_DIVERSITY.value,
+        CampaignPhase.PHASE_B_DIVERSITY.value,
+    }
+    print(
+        "Scalar Publication Recovery"
+        if scalar_publication
+        else "Partial Array Recovery"
+    )
     iteration = str(partial.get("iteration") if partial.get("iteration") is not None else "?")
     total = int(partial.get("logical_total") or 0)
     reuse = int(partial.get("n_reuse") or partial.get("n_complete") or 0)
     retry = int(partial.get("n_retry") or 0)
-    mode = "full resubmission requested" if bool(partial.get("force_resubmit")) else "reuse completed outputs"
+    scalar_retry = (
+        scalar_publication
+        and str(partial.get("publication_disposition") or "")
+        == "archive_and_retry"
+    )
+    mode = (
+        "archive incomplete publication and retry scalar task"
+        if scalar_retry
+        else (
+            "full resubmission requested"
+            if bool(partial.get("force_resubmit"))
+            else "reuse completed outputs"
+        )
+    )
     publication = getattr(report, "ariadne_publication_recovery", None)
     publication_state = (
         str(publication.get("state"))
         if isinstance(publication, Mapping)
         else None
     )
-    _print_reconcile_key_values(
-        [
-            ("phase", phase + " iteration " + iteration),
-            ("tasks", "total=" + str(total) + ", reusable=" + str(reuse) + ", retry=" + str(retry)),
-            ("ledger", _reconcile_relative_path(campaign, partial.get("ledger"))),
-            ("retry task file", _reconcile_relative_path(campaign, partial.get("retry_task_file")) or "none"),
-            ("mode", mode),
-            ("batch publication", publication_state),
-        ]
-    )
+    rows = [
+        ("phase", phase + " iteration " + iteration),
+        ("tasks", "total=" + str(total) + ", reusable=" + str(reuse) + ", retry=" + str(retry)),
+        ("ledger", _reconcile_relative_path(campaign, partial.get("ledger"))),
+        ("retry task file", _reconcile_relative_path(campaign, partial.get("retry_task_file")) or "none"),
+        ("mode", mode),
+        ("batch publication", publication_state),
+    ]
+    if scalar_publication:
+        if scalar_retry:
+            rows.extend(
+                [
+                    ("publication", "incomplete; archive during apply"),
+                    ("scheduler tasks after resume", 1),
+                    ("reason", str(partial.get("reason") or "incomplete output")),
+                ]
+            )
+        else:
+            rows.extend(
+                [
+                    ("selected geometries", int(partial.get("selected_count") or 0)),
+                    ("scheduler tasks to submit", 0),
+                    (
+                        "ordering",
+                        str(partial.get("ordering_classification") or "canonical"),
+                    ),
+                ]
+            )
+    _print_reconcile_key_values(rows)
     print("")
 
 
@@ -13698,6 +13894,7 @@ def _print_reconcile_applied_operator_report(
     restored_bootstrap_handoff: Sequence[str],
     retired_completed_staging: Optional[Mapping[str, Any]] = None,
     archived_ariadne_publication: Sequence[str] = (),
+    archived_scalar_diversity_publication: Sequence[str] = (),
     ferebus_retrain_archive: Sequence[str] = (),
     archived_array_outputs: Sequence[str] = (),
     refreshed_array_ledger: Optional[Mapping[str, Any]] = None,
@@ -13761,6 +13958,13 @@ def _print_reconcile_applied_operator_report(
     applied_rows.extend(
         ("ARIADNE publication", "archived " + _reconcile_relative_path(campaign, item))
         for item in archived_ariadne_publication
+    )
+    applied_rows.extend(
+        (
+            "diversity publication",
+            "archived " + _reconcile_relative_path(campaign, item),
+        )
+        for item in archived_scalar_diversity_publication
     )
     applied_rows.extend(
         ("FEREBUS output", "archived " + _reconcile_relative_path(campaign, item))
@@ -15355,6 +15559,16 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         except Exception:
             force_array_phase = report.proposed_state.phase
             force_array_iteration = int(report.proposed_state.iteration)
+    scalar_archive_required = bool(
+        isinstance(partial_array, Mapping)
+        and str(partial_array.get("phase") or "")
+        in {
+            CampaignPhase.PHASE_A_DIVERSITY.value,
+            CampaignPhase.PHASE_B_DIVERSITY.value,
+        }
+        and str(partial_array.get("publication_disposition") or "")
+        == "archive_and_retry"
+    )
     if force_resubmit_array:
         if not (
             isinstance(partial_array, dict)
@@ -15455,6 +15669,8 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             item for item in cleanable_now if not item.startswith(".DATA/STAGING")
         ]
         cleanable_now.append("archive .DATA/STAGING")
+    if scalar_archive_required:
+        cleanable_now.append("archive incomplete scalar diversity publication")
     if cleanable_now:
         print(
             "Applying reconcile plan: cleaning reviewed temporary data...",
@@ -15486,6 +15702,8 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     )
     if completed_staging_records or completed_staging_tombstones:
         planned_operations.insert(0, "retire_completed_staging")
+    if scalar_archive_required:
+        planned_operations.insert(0, "archive_scalar_diversity_publication")
     if cleanable_now or retrain_ferebus or force_resubmit_array:
         planned_operations.insert(0, "archive_reconcile_evidence")
     transaction_id = secrets.token_hex(16)
@@ -15553,6 +15771,9 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     archived_ariadne_publication = list(
         mutation_result["archived_ariadne_publication"]
     )
+    archived_scalar_diversity_publication = list(
+        mutation_result["archived_scalar_diversity_publication"]
+    )
     retired_completed_staging = dict(
         mutation_result["retired_completed_staging"]
     )
@@ -15560,6 +15781,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         (
             retired_completed_staging.get("retired"),
             archived_ariadne_publication,
+            archived_scalar_diversity_publication,
             ferebus_retrain_archive,
             refreshed,
         )
@@ -15578,6 +15800,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         + list(ferebus_retrain_archive)
         + list(removed)
         + list(archived_ariadne_publication)
+        + list(archived_scalar_diversity_publication)
         + list(retired_completed_staging.get("retired") or [])
         + list(retired_completed_staging.get("preserved") or [])
     )
@@ -16119,6 +16342,40 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             if isinstance(aimall_recovery, Mapping)
             else {}
         )
+        partial_recovery = getattr(report, "partial_array_recovery", None)
+        scalar_event_fields = (
+            {
+                "diversity_selected_geometries": int(
+                    partial_recovery.get("selected_count") or 0
+                ),
+                "diversity_tasks_resubmitted": 0,
+                "diversity_retry_tasks": int(
+                    partial_recovery.get("n_retry") or 0
+                ),
+                "diversity_publication_disposition": str(
+                    partial_recovery.get("publication_disposition") or "adopt"
+                ),
+                "diversity_ordering_classification": str(
+                    partial_recovery.get("ordering_classification")
+                    or "canonical"
+                ),
+                "diversity_producer_job_id": str(
+                    partial_recovery.get("producer_job_id") or ""
+                ),
+                "diversity_publication_archive_path": (
+                    archived_scalar_diversity_publication[0]
+                    if archived_scalar_diversity_publication
+                    else None
+                ),
+            }
+            if isinstance(partial_recovery, Mapping)
+            and str(partial_recovery.get("phase") or "")
+            in {
+                CampaignPhase.PHASE_A_DIVERSITY.value,
+                CampaignPhase.PHASE_B_DIVERSITY.value,
+            }
+            else {}
+        )
         scheduler_recoveries = [
             dict(item)
             for item in (
@@ -16204,6 +16461,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             ),
             **ariadne_event_fields,
             **aimall_event_fields,
+            **scalar_event_fields,
             **scheduler_event_fields,
         )
     except Exception:
@@ -16276,6 +16534,9 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         retired_completed_staging=retired_completed_staging,
         restored_bootstrap_handoff=restored_bootstrap_handoff,
         archived_ariadne_publication=archived_ariadne_publication,
+        archived_scalar_diversity_publication=(
+            archived_scalar_diversity_publication
+        ),
         ferebus_retrain_archive=ferebus_retrain_archive,
         archived_array_outputs=archived_array_outputs,
         refreshed_array_ledger=refreshed,
@@ -17710,11 +17971,26 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
         and bool(diversity_transition.get("safe", False))
     ):
         job_id = str(diversity_transition.get("producer_job_id") or "")
-        detail = (
-            "ready; terminal scheduler evidence"
-            + (" for job " + job_id if job_id else "")
-            + " permits a clean scalar retry"
+        transition_kind = str(
+            diversity_transition.get("transition_kind") or ""
         )
+        if transition_kind.endswith("complete_publication_adoption"):
+            selected = int(diversity_transition.get("selected_count") or 0)
+            detail = (
+                "ready; terminal scheduler evidence"
+                + (" for job " + job_id if job_id else "")
+                + " permits local validation of "
+                + str(selected)
+                + " existing geometr"
+                + ("y" if selected == 1 else "ies")
+                + " with zero scheduler submissions"
+            )
+        else:
+            detail = (
+                "ready; terminal scheduler evidence"
+                + (" for job " + job_id if job_id else "")
+                + " permits a clean scalar retry"
+            )
         lines.append(
             _preflight_check_line(
                 "diversity retry boundary",

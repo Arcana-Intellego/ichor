@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from ..strict_json import strict_json as json
 from ..acquisition.trajectory_pool import TrajectoryPool
@@ -125,7 +125,12 @@ def _require_pool(campaign: Path, *, verification: str = "metadata") -> None:
         raise RecoveryContractError("trajectory pool atom count is not positive")
 
 
-def _require_phase_a(campaign: Path, *, verification: str = "metadata") -> None:
+def _require_phase_a(
+    campaign: Path,
+    *,
+    verification: str = "metadata",
+    expected_campaign_uid: Optional[str] = None,
+) -> None:
     from ..layout import bootstrap_selection_dir
 
     root = bootstrap_selection_dir(campaign)
@@ -134,7 +139,9 @@ def _require_phase_a(campaign: Path, *, verification: str = "metadata") -> None:
             PHASE_A_SAMPLE_SCHEMA_VERSION,
             phase_a_sample_manifest_path,
         )
+        from ..point_allocation import point_allocation_path, read_point_allocation
         from ..sampling.diversity_contract import selector_contract_matches
+        from .filesystem import campaign_owned_path
 
         path = phase_a_sample_manifest_path(root)
         payload = json.loads(path.read_text(encoding="utf-8"), source=path)
@@ -151,10 +158,63 @@ def _require_phase_a(campaign: Path, *, verification: str = "metadata") -> None:
             or not selector_contract_matches(payload.get("selector"))
         ):
             raise RecoveryContractError("Phase A sample authority is invalid")
+        campaign_uid = str(payload.get("campaign_uid") or "")
+        if not campaign_uid or (
+            expected_campaign_uid is not None
+            and campaign_uid != str(expected_campaign_uid)
+        ):
+            raise RecoveryContractError("Phase A sample campaign UID mismatch")
+        allocation = payload.get("point_allocation")
+        if not isinstance(allocation, dict):
+            raise RecoveryContractError(
+                "Phase A sample point-allocation binding is missing"
+            )
+        allocation_raw = allocation.get("manifest")
+        if not isinstance(allocation_raw, str) or not allocation_raw:
+            raise RecoveryContractError(
+                "Phase A sample point-allocation path is missing"
+            )
+        allocation_path = campaign_owned_path(
+            campaign,
+            root.parent / allocation_raw,
+        )
+        expected_allocation_path = campaign_owned_path(
+            campaign,
+            point_allocation_path(
+                campaign,
+                context="bootstrap",
+                iteration=0,
+            ),
+        )
+        if allocation_path != expected_allocation_path:
+            raise RecoveryContractError(
+                "Phase A sample point-allocation path is noncanonical"
+            )
+        allocation_payload = read_point_allocation(
+            allocation_path,
+            expected_campaign_uid=campaign_uid,
+            expected_context="bootstrap",
+            expected_iteration=0,
+        )
+        if str(allocation.get("slot_assignment_sha256") or "") != str(
+            allocation_payload.get("slot_assignment_sha256") or ""
+        ):
+            raise RecoveryContractError(
+                "Phase A sample point-allocation assignment mismatch"
+            )
+        primary = allocation.get("primary")
+        if not isinstance(primary, list) or len(primary) != int(n_select):
+            raise RecoveryContractError(
+                "Phase A sample primary allocation count mismatch"
+            )
         return
     if verification not in {"metadata", "deep"}:
         raise RecoveryContractError("Phase A verification level is invalid")
-    read_phase_a_sample_manifest(root, require_nonempty=True)
+    read_phase_a_sample_manifest(
+        root,
+        require_nonempty=True,
+        expected_campaign_uid=expected_campaign_uid,
+    )
 
 
 def _require_quantum_acceptance_authority(
@@ -953,11 +1013,43 @@ def _require_phase_b_authority(
         allocation_payload.get("slot_assignment_sha256") or ""
     ):
         raise RecoveryContractError("Phase B point-allocation assignment mismatch")
+    allocation_slots = {}
+    for slot in allocation_payload.get("slots") or []:
+        attempts = slot.get("attempts") if isinstance(slot, dict) else None
+        if not isinstance(attempts, list) or not attempts:
+            raise RecoveryContractError(
+                "Phase B point-allocation slot has no primary attempt"
+            )
+        primary = attempts[0]
+        candidate_id = (
+            str(primary.get("candidate_id") or "")
+            if isinstance(primary, dict)
+            else ""
+        )
+        if not candidate_id or candidate_id in allocation_slots:
+            raise RecoveryContractError(
+                "Phase B point-allocation primary candidates are invalid"
+            )
+        allocation_slots[candidate_id] = (
+            _authority_integer(
+                slot.get("slot_id"),
+                "Phase B allocation slot_id",
+                minimum=0,
+            ),
+            str(slot.get("split") or ""),
+        )
     if not selector_contract_matches(payload.get("selector")):
         raise RecoveryContractError("Phase B selector contract is invalid")
 
     considered_kept = set()
     considered_seeds = set()
+    considered_candidate_ids = set()
+    source_path_fields = {
+        "seed_dir",
+        "result_json",
+        "provenance_json",
+        "output_manifest",
+    }
     for rank, record in enumerate(considered, start=1):
         if not isinstance(record, dict):
             raise RecoveryContractError("Phase B considered record must be an object")
@@ -976,6 +1068,34 @@ def _require_phase_b_authority(
             source_record.get("seed_uid") or ""
         ):
             raise RecoveryContractError("Phase B considered seed UID mismatch")
+        for key in source_path_fields:
+            observed_path = _authority_handoff_reference(
+                idir,
+                record.get(key),
+                "Phase B considered " + key,
+            )
+            source_path = _authority_handoff_reference(
+                source.parent,
+                source_record.get(key),
+                "accepted ARIADNE " + key,
+            )
+            if observed_path != source_path:
+                raise RecoveryContractError(
+                    "Phase B considered " + key + " source mismatch"
+                )
+        for key, value in source_record.items():
+            if key in source_path_fields or key == "provenance_sha256":
+                continue
+            if key not in record or record[key] != value:
+                raise RecoveryContractError(
+                    "Phase B considered " + key + " source identity mismatch"
+                )
+        candidate_id = str(record.get("candidate_id") or "")
+        if not candidate_id or candidate_id in considered_candidate_ids:
+            raise RecoveryContractError(
+                "Phase B considered candidate identities are invalid"
+            )
+        considered_candidate_ids.add(candidate_id)
         kept = record.get("kept_after_dedup")
         if kept is not True and kept is not False:
             raise RecoveryContractError("Phase B kept_after_dedup must be Boolean")
@@ -991,8 +1111,13 @@ def _require_phase_b_authority(
                 "dropped Phase B considered record has a final rank"
             )
 
+    considered_by_rank = {
+        int(record["considered_rank"]): record for record in considered
+    }
     final_ranks = set()
     final_considered = set()
+    final_candidate_ids = set()
+    serialized_final_ranks = []
     for record in final:
         if not isinstance(record, dict):
             raise RecoveryContractError("Phase B final record must be an object")
@@ -1008,8 +1133,35 @@ def _require_phase_b_authority(
             raise RecoveryContractError("Phase B final ranks are duplicated")
         final_ranks.add(final_rank)
         final_considered.add(considered_rank)
+        serialized_final_ranks.append(final_rank)
         if record.get("kept_after_dedup") is not True:
             raise RecoveryContractError("Phase B final record is not marked kept")
+        considered_record = considered_by_rank.get(considered_rank)
+        if (
+            considered_record is None
+            or considered_record.get("kept_after_dedup") is not True
+        ):
+            raise RecoveryContractError(
+                "Phase B final record does not identify a kept considered record"
+            )
+        allocation_only_fields = {"slot_id", "split"}
+        if set(considered_record) - set(record) or not (
+            set(record) - set(considered_record)
+        ).issubset(allocation_only_fields):
+            raise RecoveryContractError(
+                "Phase B final record fields differ from its considered record"
+            )
+        if not allocation_only_fields.issubset(record):
+            raise RecoveryContractError(
+                "Phase B final record lacks its allocation slot or split"
+            )
+        if any(
+            record.get(key) != value
+            for key, value in considered_record.items()
+        ):
+            raise RecoveryContractError(
+                "Phase B final record identity differs from its considered record"
+            )
         seed_id = _authority_integer(
             record.get("seed_id"), "Phase B final seed_id", minimum=1
         )
@@ -1018,6 +1170,25 @@ def _require_phase_b_authority(
             source_record.get("seed_uid") or ""
         ):
             raise RecoveryContractError("Phase B final seed mapping is invalid")
+        candidate_id = str(record.get("candidate_id") or "")
+        expected_slot = allocation_slots.get(candidate_id)
+        if (
+            not candidate_id
+            or candidate_id in final_candidate_ids
+            or expected_slot
+            != (
+                _authority_integer(
+                    record.get("slot_id"),
+                    "Phase B final slot_id",
+                    minimum=0,
+                ),
+                str(record.get("split") or ""),
+            )
+        ):
+            raise RecoveryContractError(
+                "Phase B final point-allocation identity mismatch"
+            )
+        final_candidate_ids.add(candidate_id)
     expected_ranks = set(range(1, len(final) + 1))
     if final_ranks != expected_ranks or considered_kept != expected_ranks:
         raise RecoveryContractError("Phase B final rank coverage is invalid")
@@ -1027,7 +1198,456 @@ def _require_phase_b_authority(
         if record.get("kept_after_dedup") is True
     }:
         raise RecoveryContractError("Phase B final/considered mapping is invalid")
-    return payload
+    if final_candidate_ids != set(allocation_slots):
+        raise RecoveryContractError(
+            "Phase B final records do not cover allocated primary candidates"
+        )
+    out = dict(payload)
+    out["_ordering_classification"] = (
+        "canonical_final_rank_order"
+        if serialized_final_ranks == list(range(1, len(final) + 1))
+        else "legacy_final_rank_permutation"
+    )
+    return out
+
+
+def _completion_receipt_for_phase_publication(
+    campaign: Path,
+    *,
+    phase: CampaignPhase,
+    iteration: int,
+    expected_campaign_uid: str,
+    publication_path: Path,
+    next_phase: CampaignPhase,
+    artifact_snapshot: Optional[Any] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return the one receipt that commits a scalar publication lifecycle."""
+    from ..versioning.manifest import sha256_file
+    from .completion_receipts import inventory_completion_receipts
+
+    if artifact_snapshot is not None:
+        records = tuple(getattr(artifact_snapshot, "completion_receipts", ()))
+        errors = tuple(
+            getattr(artifact_snapshot, "completion_receipt_errors", ())
+        )
+    else:
+        inventory = inventory_completion_receipts(
+            campaign,
+            expected_campaign_uid=str(expected_campaign_uid),
+        )
+        records = tuple(inventory.get("records", ()))
+        errors = tuple(inventory.get("errors", ()))
+    if errors:
+        first = errors[0]
+        raise RecoveryContractError(
+            "completion-receipt inventory is invalid: "
+            + str(first.get("path") or "unknown")
+            + ": "
+            + str(first.get("error") or "invalid receipt")
+        )
+    publication = publication_path.resolve()
+    try:
+        relative = publication.relative_to(campaign.resolve()).as_posix()
+    except ValueError as exc:
+        raise RecoveryContractError(
+            "scalar publication path escapes the campaign"
+        ) from exc
+    publication_size = int(publication.stat().st_size)
+    publication_sha = sha256_file(publication)
+    matches = []
+    for record in records:
+        payload = record.get("payload") if isinstance(record, Mapping) else None
+        if not isinstance(payload, Mapping):
+            continue
+        if (
+            str(payload.get("campaign_uid") or "")
+            != str(expected_campaign_uid)
+            or str(payload.get("phase") or "") != phase.value
+            or payload.get("iteration") != int(iteration)
+            or payload.get("replacement_round") != 0
+            or str(payload.get("next_phase") or "") != next_phase.value
+            or payload.get("next_iteration") != int(iteration)
+        ):
+            continue
+        evidence = payload.get("evidence")
+        if not isinstance(evidence, list):
+            continue
+        bound = [
+            item
+            for item in evidence
+            if isinstance(item, Mapping)
+            and str(item.get("path") or "") == relative
+            and item.get("size") == publication_size
+            and str(item.get("sha256") or "") == publication_sha
+        ]
+        if len(bound) == 1:
+            matches.append(dict(record))
+    if len(matches) > 1:
+        raise RecoveryContractError(
+            "multiple completion receipts claim the same scalar publication"
+        )
+    return matches[0] if matches else None
+
+
+def classify_scalar_diversity_publication(
+    campaign_dir: Union[str, Path],
+    *,
+    phase: Union[CampaignPhase, str],
+    iteration: int,
+) -> Dict[str, Any]:
+    """Classify scalar output shape without reading scientific coordinates."""
+    from ..handoff_manifests import (
+        PHASE_A_SAMPLE_SCHEMA_VERSION,
+        PHASE_B_SELECTION_SCHEMA_VERSION,
+        phase_a_sample_manifest_path,
+        phase_b_selection_path,
+    )
+    from ..layout import (
+        active_iteration_dir,
+        active_phase_b_dir,
+        bootstrap_selection_dir,
+    )
+
+    campaign = Path(campaign_dir)
+    phase_value = CampaignPhase(phase)
+    iteration_value = int(iteration)
+    if phase_value is CampaignPhase.PHASE_A_DIVERSITY:
+        if iteration_value != 0:
+            raise RecoveryContractError("Phase A publication iteration must be zero")
+        output_dir = bootstrap_selection_dir(campaign)
+        manifest_path = phase_a_sample_manifest_path(output_dir)
+        expected_files = {
+            "sample_xyz": output_dir / "selected.xyz",
+            "index_path": output_dir / "selected_indices.dat",
+        }
+    elif phase_value is CampaignPhase.PHASE_B_DIVERSITY:
+        if iteration_value < 1:
+            raise RecoveryContractError("Phase B publication iteration must be positive")
+        iter_dir = active_iteration_dir(campaign, iteration_value)
+        output_dir = active_phase_b_dir(iter_dir)
+        manifest_path = phase_b_selection_path(iter_dir)
+        expected_files = {
+            "considered_candidates_xyz": output_dir / "considered_candidates.xyz",
+            "selected_xyz": output_dir / "selected.xyz",
+        }
+    else:
+        raise RecoveryContractError(
+            "scalar publication phase is unsupported: " + phase_value.value
+        )
+
+    if output_dir.is_symlink() or (output_dir.exists() and not output_dir.is_dir()):
+        raise RecoveryContractError(
+            "scalar diversity output root is not a regular directory: "
+            + str(output_dir)
+        )
+    entries = tuple(output_dir.iterdir()) if output_dir.is_dir() else ()
+    if not entries:
+        return {
+            "state": "missing",
+            "phase": phase_value.value,
+            "iteration": iteration_value,
+            "output_dir": str(output_dir),
+            "publication": str(manifest_path),
+        }
+    if not manifest_path.exists() and not manifest_path.is_symlink():
+        return {
+            "state": "incomplete",
+            "phase": phase_value.value,
+            "iteration": iteration_value,
+            "output_dir": str(output_dir),
+            "publication": str(manifest_path),
+            "reason": "selection manifest is missing",
+        }
+    payload = _authority_json_object(
+        manifest_path,
+        phase_value.value + " publication manifest",
+    )
+    if phase_value is CampaignPhase.PHASE_A_DIVERSITY:
+        if (
+            payload.get("schema_version") != PHASE_A_SAMPLE_SCHEMA_VERSION
+            or payload.get("phase") != phase_value.value
+            or payload.get("iteration") != 0
+        ):
+            raise RecoveryContractError("Phase A publication identity is contradictory")
+    else:
+        if (
+            payload.get("schema_version") != PHASE_B_SELECTION_SCHEMA_VERSION
+            or payload.get("iteration") != iteration_value
+        ):
+            raise RecoveryContractError("Phase B publication identity is contradictory")
+        if str(payload.get("status") or "") != "complete":
+            raise RecoveryContractError(
+                "Phase B publication records terminal non-success: "
+                + str(payload.get("failure_reason") or "unknown failure")
+            )
+
+    for field_name, expected_path in expected_files.items():
+        binding = payload.get(field_name)
+        raw_path = binding.get("path") if isinstance(binding, Mapping) else binding
+        if not isinstance(raw_path, str) or not raw_path:
+            raise RecoveryContractError(
+                phase_value.value + " publication " + field_name + " binding is invalid"
+            )
+        observed_path = Path(raw_path)
+        if not observed_path.is_absolute():
+            observed_path = output_dir.parent / observed_path
+        if Path(os.path.abspath(os.path.normpath(str(observed_path)))) != Path(
+            os.path.abspath(os.path.normpath(str(expected_path)))
+        ):
+            raise RecoveryContractError(
+                phase_value.value + " publication " + field_name + " path is noncanonical"
+            )
+        if not expected_path.exists() and not expected_path.is_symlink():
+            return {
+                "state": "incomplete",
+                "phase": phase_value.value,
+                "iteration": iteration_value,
+                "output_dir": str(output_dir),
+                "publication": str(manifest_path),
+                "reason": field_name + " is missing",
+            }
+        if expected_path.is_symlink() or not expected_path.is_file():
+            raise RecoveryContractError(
+                phase_value.value + " publication " + field_name + " is not regular"
+            )
+        if isinstance(binding, Mapping) and binding.get("size") != int(
+            expected_path.stat().st_size
+        ):
+            raise RecoveryContractError(
+                phase_value.value + " publication " + field_name + " size is contradictory"
+            )
+    return {
+        "state": "complete_candidate",
+        "phase": phase_value.value,
+        "iteration": iteration_value,
+        "output_dir": str(output_dir),
+        "publication": str(manifest_path),
+    }
+
+
+def scalar_diversity_publication_recovery_summary(
+    campaign_dir: Union[str, Path],
+    *,
+    phase: Union[CampaignPhase, str],
+    iteration: int,
+    expected_campaign_uid: str,
+    artifact_snapshot: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Classify a complete scalar publication using control evidence only."""
+    from ..handoff_manifests import (
+        phase_a_sample_manifest_path,
+        phase_b_selection_path,
+    )
+    from ..layout import active_iteration_dir, bootstrap_selection_dir
+    from .cluster_profile import profile_value
+    from .submission_intent import (
+        load_intent,
+        resolve_scalar_diversity_postprocess_source,
+    )
+
+    campaign = Path(campaign_dir)
+    phase_value = CampaignPhase(phase)
+    publication_shape = classify_scalar_diversity_publication(
+        campaign,
+        phase=phase_value,
+        iteration=int(iteration),
+    )
+    shape_state = str(publication_shape.get("state") or "")
+    if shape_state == "missing":
+        raise FileNotFoundError(
+            "scalar diversity publication is absent: "
+            + str(publication_shape["output_dir"])
+        )
+    if shape_state == "incomplete":
+        intent = load_intent(
+            campaign,
+            phase_value.value,
+            int(iteration),
+            expected_campaign_uid=str(expected_campaign_uid),
+        )
+        from .submission_intent import classify_scalar_diversity_retry_intent
+
+        scheduler_kind = str(
+            profile_value("hpc", "scheduler", default="slurm") or "slurm"
+        ).strip().lower()
+        if not isinstance(intent, Mapping):
+            raise RecoveryContractError(
+                "incomplete scalar publication has no authenticated producer intent"
+            )
+        try:
+            retry = classify_scalar_diversity_retry_intent(
+                intent,
+                expected_campaign_uid=str(expected_campaign_uid),
+                expected_phase=phase_value.value,
+                expected_iteration=int(iteration),
+                expected_replacement_round=0,
+                expected_scheduler_kind=scheduler_kind,
+            )
+        except Exception as exc:
+            raise RecoveryContractError(
+                "incomplete scalar publication producer evidence is invalid: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)
+            ) from exc
+        return {
+            "state": "retry",
+            "phase": phase_value.value,
+            "iteration": int(iteration),
+            "selected_count": None,
+            "ordering_classification": "unpublished",
+            "publication": str(publication_shape["publication"]),
+            "output_dir": str(publication_shape["output_dir"]),
+            "path": str(publication_shape["output_dir"]),
+            "logical_total": 1,
+            "n_complete": 0,
+            "n_reuse": 0,
+            "n_retry": 1,
+            "retry_task_ids": [0],
+            "retry_task_file": None,
+            "force_resubmit": False,
+            "producer_job_id": retry.get("producer_job_id"),
+            "producer_submission_identity": str(
+                retry["producer_submission_identity"]
+            ),
+            "scheduler_jobs_submitted": 0,
+            "publication_disposition": "archive_and_retry",
+            "validation": "incomplete_publication",
+            "reason": str(publication_shape.get("reason") or "incomplete output"),
+        }
+    if shape_state != "complete_candidate":
+        raise RecoveryContractError("scalar diversity publication state is invalid")
+    if phase_value is CampaignPhase.PHASE_B_DIVERSITY:
+        manifest = _require_phase_b_authority(
+            campaign,
+            int(iteration),
+            str(expected_campaign_uid),
+        )
+        publication = phase_b_selection_path(
+            active_iteration_dir(campaign, int(iteration))
+        )
+        selected_count = len(list(manifest.get("final") or []))
+        ordering = str(
+            manifest.get("_ordering_classification")
+            or "canonical_final_rank_order"
+        )
+        next_phase = CampaignPhase.SPLIT
+    elif phase_value is CampaignPhase.PHASE_A_DIVERSITY:
+        _require_phase_a(
+            campaign,
+            verification="authority",
+            expected_campaign_uid=str(expected_campaign_uid),
+        )
+        publication = phase_a_sample_manifest_path(
+            bootstrap_selection_dir(campaign)
+        )
+        manifest = _authority_json_object(
+            publication,
+            "Phase A sample manifest",
+        )
+        selected_count = _authority_integer(
+            manifest.get("n_select"),
+            "Phase A n_select",
+            minimum=1,
+        )
+        ordering = "canonical"
+        next_phase = CampaignPhase.INITIAL_GAUSSIAN
+    else:
+        raise RecoveryContractError(
+            "scalar publication recovery phase is unsupported: "
+            + phase_value.value
+        )
+    receipt = _completion_receipt_for_phase_publication(
+        campaign,
+        phase=phase_value,
+        iteration=int(iteration),
+        expected_campaign_uid=str(expected_campaign_uid),
+        publication_path=publication,
+        next_phase=next_phase,
+        artifact_snapshot=artifact_snapshot,
+    )
+    if receipt is not None:
+        return {
+            "state": "completed",
+            "phase": phase_value.value,
+            "iteration": int(iteration),
+            "selected_count": int(selected_count),
+            "ordering_classification": ordering,
+            "publication": str(publication),
+            "completion_receipt": dict(receipt),
+            "scheduler_jobs_submitted": 0,
+        }
+    intent = load_intent(
+        campaign,
+        phase_value.value,
+        int(iteration),
+        expected_campaign_uid=str(expected_campaign_uid),
+    )
+    scheduler_kind = str(
+        profile_value("hpc", "scheduler", default="slurm") or "slurm"
+    ).strip().lower()
+    try:
+        source = resolve_scalar_diversity_postprocess_source(
+            campaign,
+            campaign_uid=str(expected_campaign_uid),
+            phase_name=phase_value.value,
+            iteration=int(iteration),
+            replacement_round=0,
+            scheduler_identity_kind=scheduler_kind,
+            intent=intent,
+        )
+    except Exception as exc:
+        raise RecoveryContractError(
+            "complete scalar publication lacks an authenticated terminal "
+            "producer: "
+            + type(exc).__name__
+            + ": "
+            + str(exc)
+        ) from exc
+    return {
+        "state": "postprocess_only",
+        "phase": phase_value.value,
+        "iteration": int(iteration),
+        "selected_count": int(selected_count),
+        "ordering_classification": ordering,
+        "publication": str(publication),
+        "path": str(publication),
+        "logical_total": 1,
+        "n_complete": 1,
+        "n_reuse": 1,
+        "n_retry": 0,
+        "retry_task_ids": [],
+        "retry_task_file": None,
+        "force_resubmit": False,
+        "producer_job_id": str(source["job_id"]),
+        "producer_submission_identity": str(source["submission_identity"]),
+        "source_sha256": str(source["source_sha256"]),
+        "scheduler_jobs_submitted": 0,
+        "validation": "local_postprocess_required",
+        "postprocess_source": dict(source),
+    }
+
+
+def _require_scalar_diversity_lifecycle_completed(
+    campaign: Path,
+    *,
+    phase: CampaignPhase,
+    iteration: int,
+    expected_campaign_uid: str,
+    artifact_snapshot: Optional[Any] = None,
+) -> None:
+    summary = scalar_diversity_publication_recovery_summary(
+        campaign,
+        phase=phase,
+        iteration=int(iteration),
+        expected_campaign_uid=str(expected_campaign_uid),
+        artifact_snapshot=artifact_snapshot,
+    )
+    if str(summary.get("state") or "") != "completed":
+        raise RecoveryContractError(
+            phase.value
+            + " publication cannot be consumed before its completion receipt"
+        )
 
 
 def _phase_b_final_count(
@@ -1504,59 +2124,157 @@ def _best_active_iteration_handoff(
     verification: str = "metadata",
     artifact_snapshot: Optional[Any] = None,
 ) -> Optional[RecoveryHandoff]:
-    allocation_decision = _allocation_recovery_decision(
-        campaign,
-        context="active",
-        iteration=int(iteration),
-        expected_campaign_uid=expected_campaign_uid,
-        verification=verification,
-        artifact_snapshot=artifact_snapshot,
-    )
-    if allocation_decision is not None:
-        return RecoveryHandoff(
-            allocation_decision,
-            50,
-            "point_allocation",
-        )
-    if _ok(
+    from ..handoff_manifests import phase_b_selection_path
+    from ..layout import active_allocation_dir
+    from ..point_allocation import point_allocation_path
+
+    idir = iteration_dir(campaign, int(iteration))
+    phase_b_path = phase_b_selection_path(idir)
+    split_path = active_allocation_dir(idir) / "SPLIT_RECEIPT.json"
+    split_exists = split_path.exists() or split_path.is_symlink()
+    split_valid = _ok(
         _require_split,
         campaign,
         int(iteration),
         expected_campaign_uid=expected_campaign_uid,
-    ):
-        from ..layout import active_allocation_dir
+    )
+    phase_b_summary: Optional[Dict[str, Any]] = None
+    phase_b_shape = classify_scalar_diversity_publication(
+        campaign,
+        phase=CampaignPhase.PHASE_B_DIVERSITY,
+        iteration=int(iteration),
+    )
+    if str(phase_b_shape.get("state") or "") != "missing":
+        try:
+            raw_phase_b = (
+                _authority_json_object(
+                    phase_b_path,
+                    "Phase B selection manifest",
+                )
+                if phase_b_path.exists() or phase_b_path.is_symlink()
+                else None
+            )
+        except Exception:
+            raw_phase_b = None
+        if isinstance(raw_phase_b, Mapping) and str(
+            raw_phase_b.get("status") or ""
+        ) == "complete":
+            if expected_campaign_uid is None:
+                raise RecoveryContractError(
+                    "Phase B lifecycle recovery requires a campaign UID"
+                )
+            phase_b_summary = scalar_diversity_publication_recovery_summary(
+                campaign,
+                phase=CampaignPhase.PHASE_B_DIVERSITY,
+                iteration=int(iteration),
+                expected_campaign_uid=str(expected_campaign_uid),
+                artifact_snapshot=artifact_snapshot,
+            )
+        elif str(phase_b_shape.get("state") or "") == "incomplete":
+            if expected_campaign_uid is None:
+                raise RecoveryContractError(
+                    "Phase B lifecycle recovery requires a campaign UID"
+                )
+            phase_b_summary = scalar_diversity_publication_recovery_summary(
+                campaign,
+                phase=CampaignPhase.PHASE_B_DIVERSITY,
+                iteration=int(iteration),
+                expected_campaign_uid=str(expected_campaign_uid),
+                artifact_snapshot=artifact_snapshot,
+            )
+        elif split_exists:
+            raise RecoveryContractError(
+                "SPLIT evidence exists without a complete Phase B publication"
+            )
+    elif split_exists:
+        raise RecoveryContractError(
+            "SPLIT evidence exists without its prerequisite Phase B publication"
+        )
 
+    phase_b_completed = bool(
+        isinstance(phase_b_summary, Mapping)
+        and str(phase_b_summary.get("state") or "") == "completed"
+    )
+    if phase_b_completed:
+        allocation_decision = _allocation_recovery_decision(
+            campaign,
+            context="active",
+            iteration=int(iteration),
+            expected_campaign_uid=expected_campaign_uid,
+            verification=verification,
+            artifact_snapshot=artifact_snapshot,
+        )
+        if allocation_decision is not None:
+            return RecoveryHandoff(
+                allocation_decision,
+                50,
+                "point_allocation",
+            )
+
+    if split_exists:
+        if not split_valid:
+            raise RecoveryContractError(
+                "active SPLIT publication is present but invalid"
+            )
+        if not isinstance(phase_b_summary, Mapping) or str(
+            phase_b_summary.get("state") or ""
+        ) != "completed":
+            raise RecoveryContractError(
+                "SPLIT publication cannot bypass a missing Phase B completion receipt"
+            )
         return RecoveryHandoff(
             RecoveryDecision(
                 CampaignPhase.GAUSSIAN,
                 int(iteration),
-                "GAUSSIAN: valid split handoff exists",
-                str(
-                    active_allocation_dir(iteration_dir(campaign, iteration))
-                    / "SPLIT_RECEIPT.json"
-                ),
+                "GAUSSIAN: valid Phase B completion receipt and split handoff exist",
+                str(split_path),
             ),
             40,
             "split",
         )
-    if _ok(
-        _require_phase_b,
-        campaign,
-        int(iteration),
-        expected_campaign_uid=expected_campaign_uid,
-        verification=verification,
-    ):
-        from ..handoff_manifests import phase_b_selection_path
-
+    if isinstance(phase_b_summary, Mapping):
+        if phase_b_completed:
+            return RecoveryHandoff(
+                RecoveryDecision(
+                    CampaignPhase.SPLIT,
+                    int(iteration),
+                    "SPLIT: Phase B lifecycle and publication are complete",
+                    str(phase_b_path),
+                ),
+                30,
+                "phase_b",
+            )
+        if str(phase_b_summary.get("state") or "") == "retry":
+            return RecoveryHandoff(
+                RecoveryDecision(
+                    CampaignPhase.PHASE_B_DIVERSITY,
+                    int(iteration),
+                    "PHASE_B_DIVERSITY: incomplete scalar publication requires "
+                    "guarded archival and retry",
+                    str(phase_b_summary.get("output_dir") or phase_b_path.parent),
+                ),
+                30,
+                "phase_b_retry",
+            )
         return RecoveryHandoff(
             RecoveryDecision(
-                CampaignPhase.SPLIT,
+                CampaignPhase.PHASE_B_DIVERSITY,
                 int(iteration),
-                "SPLIT: valid Phase B handoff exists",
-                str(phase_b_selection_path(iteration_dir(campaign, iteration))),
+                "PHASE_B_DIVERSITY: complete scheduler publication awaits local validation",
+                str(phase_b_path),
             ),
             30,
-            "phase_b",
+            "phase_b_postprocess_only",
+        )
+    allocation_path = point_allocation_path(
+        campaign,
+        context="active",
+        iteration=int(iteration),
+    )
+    if allocation_path.exists() or allocation_path.is_symlink():
+        raise RecoveryContractError(
+            "active point allocation cannot bypass a missing Phase B "
+            "publication and completion receipt"
         )
     if _ok(
         _require_ariadne_results,
@@ -1660,8 +2378,14 @@ def _phase_contract_checks(
         ],
         CampaignPhase.INITIAL_GAUSSIAN: [
             (
-                "Phase A sample",
-                lambda: _require_phase_a(campaign, verification=verification),
+                "Phase A completion receipt and sample",
+                lambda: _require_scalar_diversity_lifecycle_completed(
+                    campaign,
+                    phase=CampaignPhase.PHASE_A_DIVERSITY,
+                    iteration=0,
+                    expected_campaign_uid=str(state.campaign_uid),
+                    artifact_snapshot=artifact_snapshot,
+                ),
             ),
         ],
         CampaignPhase.INITIAL_AIMALL: [
@@ -1778,23 +2502,25 @@ def _phase_contract_checks(
         ],
         CampaignPhase.SPLIT: [
             (
-                "Phase B selection/sample",
-                lambda: _require_phase_b(
+                "Phase B completion receipt and selection",
+                lambda: _require_scalar_diversity_lifecycle_completed(
                     campaign,
-                    iteration,
-                    str(state.campaign_uid),
-                    verification=verification,
+                    phase=CampaignPhase.PHASE_B_DIVERSITY,
+                    iteration=iteration,
+                    expected_campaign_uid=str(state.campaign_uid),
+                    artifact_snapshot=artifact_snapshot,
                 ),
             ),
         ],
         CampaignPhase.GAUSSIAN: [
             (
-                "Phase B selection/sample",
-                lambda: _require_phase_b(
+                "Phase B completion receipt and selection",
+                lambda: _require_scalar_diversity_lifecycle_completed(
                     campaign,
-                    iteration,
-                    str(state.campaign_uid),
-                    verification=verification,
+                    phase=CampaignPhase.PHASE_B_DIVERSITY,
+                    iteration=iteration,
+                    expected_campaign_uid=str(state.campaign_uid),
+                    artifact_snapshot=artifact_snapshot,
                 ),
             ),
             (
@@ -1982,11 +2708,38 @@ def select_recovery_phase(
                 "INITIAL_AIMALL: valid initial Gaussian handoff exists without committed models",
                 ".DATA/STAGING/initial",
             )
-        if _ok(_require_phase_a, campaign, verification=verification):
+        phase_a_shape = classify_scalar_diversity_publication(
+            campaign,
+            phase=CampaignPhase.PHASE_A_DIVERSITY,
+            iteration=0,
+        )
+        if str(phase_a_shape.get("state") or "") != "missing":
+            phase_a_summary = scalar_diversity_publication_recovery_summary(
+                campaign,
+                phase=CampaignPhase.PHASE_A_DIVERSITY,
+                iteration=0,
+                expected_campaign_uid=str(state.campaign_uid),
+                artifact_snapshot=artifact_snapshot,
+            )
+            if str(phase_a_summary.get("state") or "") == "completed":
+                return RecoveryDecision(
+                    CampaignPhase.INITIAL_GAUSSIAN,
+                    iteration,
+                    "INITIAL_GAUSSIAN: Phase A lifecycle and publication are complete",
+                    ".DATA/BOOTSTRAP/selection/SELECTION.json",
+                )
+            if str(phase_a_summary.get("state") or "") == "retry":
+                return RecoveryDecision(
+                    CampaignPhase.PHASE_A_DIVERSITY,
+                    iteration,
+                    "PHASE_A_DIVERSITY: incomplete scalar publication requires "
+                    "guarded archival and retry",
+                    str(phase_a_summary.get("output_dir") or ""),
+                )
             return RecoveryDecision(
-                CampaignPhase.INITIAL_GAUSSIAN,
+                CampaignPhase.PHASE_A_DIVERSITY,
                 iteration,
-                "INITIAL_GAUSSIAN: valid Phase A sample exists without committed models",
+                "PHASE_A_DIVERSITY: complete scheduler publication awaits local validation",
                 ".DATA/BOOTSTRAP/selection/SELECTION.json",
             )
         if (

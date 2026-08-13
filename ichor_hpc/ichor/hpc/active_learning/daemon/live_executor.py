@@ -4083,6 +4083,76 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             )
             if diversity_recovery is not None:
                 return diversity_recovery
+            from . import submission_intent as _submission_intent
+
+            postprocess_intent = _submission_intent.load_active_intent(
+                self.campaign_dir,
+                phase_name,
+                int(getattr(state, "iteration", 0)),
+                expected_campaign_uid=str(state.campaign_uid),
+            )
+            if (
+                isinstance(postprocess_intent, dict)
+                and isinstance(
+                    postprocess_intent.get("postprocess_source"),
+                    Mapping,
+                )
+            ):
+                source = (
+                    _submission_intent.resolve_scalar_diversity_postprocess_source(
+                        self.campaign_dir,
+                        campaign_uid=str(state.campaign_uid),
+                        phase_name=phase_name,
+                        iteration=int(getattr(state, "iteration", 0)),
+                        replacement_round=int(
+                            getattr(state, "replacement_round", 0)
+                        ),
+                        scheduler_identity_kind=self.scheduler_identity_kind,
+                        intent=postprocess_intent,
+                    )
+                )
+                from .recovery_contracts import (
+                    scalar_diversity_publication_recovery_summary,
+                )
+
+                recovery = scalar_diversity_publication_recovery_summary(
+                    self.campaign_dir,
+                    phase=phase_name,
+                    iteration=int(getattr(state, "iteration", 0)),
+                    expected_campaign_uid=str(state.campaign_uid),
+                    artifact_snapshot=getattr(
+                        self,
+                        "_committed_artifact_snapshot",
+                        None,
+                    ),
+                )
+                self._journal_event(
+                    "partial_array_recovery_postprocess_only",
+                    phase=phase_name,
+                    iteration=int(getattr(state, "iteration", 0)),
+                    logical_total=1,
+                    n_complete=1,
+                    n_retry=0,
+                    producer_job_id=str(source["job_id"]),
+                    producer_submission_identity=str(
+                        source["submission_identity"]
+                    ),
+                    source_attempt_id=str(source["attempt_id"]),
+                    recovery_source="terminal_scalar_publication",
+                    scalar_publication="adopted",
+                    selected_count=int(recovery.get("selected_count") or 0),
+                    ordering_classification=str(
+                        recovery.get("ordering_classification") or "canonical"
+                    ),
+                    scheduler_jobs_submitted=0,
+                )
+                self._report_runtime_progress(
+                    "output_visibility",
+                    completed=0,
+                    total=1,
+                    unit="tasks",
+                )
+                return self.postprocess(state, phase, [])
         if "AIMALL" in phase_name or "GAUSSIAN" in phase_name:
             from . import submission_intent as _submission_intent
 

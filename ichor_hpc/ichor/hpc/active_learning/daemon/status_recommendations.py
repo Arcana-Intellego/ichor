@@ -1328,7 +1328,7 @@ def build_status_recommendations(
             StatusRecommendation(
                 code="partial_array_recovery_invalid",
                 severity="required",
-                primary="run reconcile and inspect the malformed partial-array ledger",
+                primary="run reconcile and inspect the invalid recovery evidence",
                 why=_short_error(payload.get("partial_array_recovery_error")),
                 command=_reconcile_cmd(campaign),
             )

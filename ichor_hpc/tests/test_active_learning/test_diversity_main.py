@@ -534,6 +534,9 @@ def test_phase_b_writes_sample_and_dedup(tmp_path):
     assert "distance_to_nearest_angstrom" in manifest["considered"][0]
     assert "scaled_distance_to_nearest" in manifest["considered"][0]
     assert "novelty_score" in manifest["considered"][0]
+    assert [record["final_rank"] for record in manifest["final"]] == list(
+        range(1, len(manifest["final"]) + 1)
+    )
 
 
 def test_phase_b_rejects_unsafe_accepted_landing_before_fps(tmp_path):

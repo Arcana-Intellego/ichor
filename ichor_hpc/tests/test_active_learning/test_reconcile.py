@@ -237,12 +237,38 @@ def _write_pending_allocation(campaign, *, context, iteration, n):
 
 
 def _complete_handoff_allocation(campaign, *, context, iteration, pointdirs):
-    allocation_path, allocation, records = _write_pending_allocation(
+    allocation_path = point_allocation_path(
         campaign,
         context=context,
         iteration=iteration,
-        n=len(pointdirs),
     )
+    if allocation_path.is_file():
+        allocation = read_point_allocation(allocation_path)
+        records = []
+        pending_by_candidate = {
+            str(attempt["candidate_id"]): attempt
+            for attempt in pending_attempts(allocation)
+        }
+        for slot in allocation["slots"]:
+            candidate_id = str(slot["attempts"][-1]["candidate_id"])
+            attempt = pending_by_candidate.get(candidate_id)
+            if attempt is not None:
+                records.append(
+                    {
+                        **attempt,
+                        "slot_id": int(slot["slot_id"]),
+                        "split": str(slot["split"]),
+                    }
+                )
+        if len(records) != len(pointdirs):
+            raise ValueError("existing point allocation does not match pointdirs")
+    else:
+        allocation_path, allocation, records = _write_pending_allocation(
+            campaign,
+            context=context,
+            iteration=iteration,
+            n=len(pointdirs),
+        )
     results = []
     campaign_uid = str(allocation["campaign_uid"])
     for pointdir, record in zip(pointdirs, records):
@@ -584,7 +610,7 @@ def _write_ariadne_handoff(
     return iter_dir
 
 
-def _write_phase_b_handoff(campaign, iteration, *, n=2):
+def _write_phase_b_handoff(campaign, iteration, *, n=2, n_select=None):
     from types import SimpleNamespace
 
     from ichor.hpc.active_learning.config import CampaignConfig
@@ -593,8 +619,12 @@ def _write_phase_b_handoff(campaign, iteration, *, n=2):
     iter_dir = _write_ariadne_handoff(campaign, iteration, n=n)
     config = CampaignConfig()
     config.phase_b.descriptor = "rmsd_massweight"
+    selected = int(n if n_select is None else n_select)
+    if selected < 1 or selected > int(n):
+        raise ValueError("Phase B fixture selection count is invalid")
+    config.seed_selection.n_seeds_per_iteration = int(n)
     config.point_allocation.batch_training_size = 1
-    config.point_allocation.batch_internal_validation_size = int(n) - 1
+    config.point_allocation.batch_internal_validation_size = selected - 1
     config.to_yaml(Path(campaign) / "campaign.yaml")
     from ichor.hpc.active_learning.daemon.config_lock import (
         canonical_config,
@@ -669,6 +699,100 @@ def _write_split(campaign, iteration):
         ],
     })
     return split_path
+
+
+def _write_scalar_completion_receipt(campaign, phase, iteration, publication):
+    from ichor.hpc.active_learning.daemon.completion_receipts import (
+        evidence_records,
+        write_completion_receipt,
+    )
+
+    campaign = Path(campaign)
+    before = read_state(
+        campaign / ".DATA" / "ACTIVE_LEARNING" / DEFAULT_STATE_FILENAME
+    )
+    before.phase = CampaignPhase(phase)
+    before.iteration = int(iteration)
+    before.replacement_round = 0
+    after = type(before).from_dict(before.to_dict())
+    if before.phase is CampaignPhase.PHASE_A_DIVERSITY:
+        after.phase = CampaignPhase.INITIAL_GAUSSIAN
+    else:
+        after.phase = CampaignPhase.SPLIT
+    return write_completion_receipt(
+        campaign,
+        campaign_uid=str(before.campaign_uid),
+        phase=before.phase.value,
+        iteration=int(iteration),
+        replacement_round=0,
+        config_sha256="c" * 64,
+        state_before=before,
+        state_after=after,
+        next_phase=after.phase.value,
+        next_iteration=int(after.iteration),
+        state_updates={},
+        evidence=evidence_records(campaign, [publication]),
+        job_id="12345",
+        expected_tasks=1,
+        submission_identity="r0000-a0001-test",
+    )
+
+
+def _write_failed_terminal_scalar_intent(
+    campaign,
+    state,
+    phase,
+    iteration,
+    *,
+    job_id="13923834",
+):
+    from ichor.hpc.active_learning.daemon.submission_intent import (
+        load_intent,
+        mark_failed,
+        mark_submitted,
+        record_queue_lifecycle,
+        write_pre_submit_intent,
+    )
+
+    phase_value = CampaignPhase(phase).value
+    write_pre_submit_intent(
+        campaign,
+        campaign_uid=str(state.campaign_uid),
+        phase_name=phase_value,
+        iteration=int(iteration),
+        expected_tasks=1,
+        scheduler_identity_kind="slurm",
+    )
+    mark_submitted(
+        campaign,
+        phase_value,
+        int(iteration),
+        str(job_id),
+        expected_tasks=1,
+    )
+    record_queue_lifecycle(
+        campaign,
+        phase_value,
+        int(iteration),
+        "terminal",
+        job_id=str(job_id),
+        status="COMPLETED",
+        n_expected=1,
+        n_observed=1,
+        n_missing=0,
+    )
+    mark_failed(
+        campaign,
+        phase_value,
+        int(iteration),
+        "local scalar publication validation failed",
+    )
+    return load_intent(
+        campaign,
+        phase_value,
+        int(iteration),
+        expected_campaign_uid=str(state.campaign_uid),
+    )
 
 
 def _commit_reference_versions(campaign, versions):
@@ -849,50 +973,31 @@ def test_reconcile_prefers_scheduler_complete_gaussian_postprocessing(
 
 def test_active_replacement_recovery_advances_only_with_durable_handoffs(tmp_path):
     from ichor.hpc.active_learning.config import CampaignConfig
+    from ichor.hpc.active_learning.handoff_manifests import phase_b_selection_path
 
-    campaign, _, _, _ = _campaign_dirs(tmp_path)
+    campaign, data, _, _ = _campaign_dirs(tmp_path)
     CampaignConfig().to_yaml(campaign / "campaign.yaml")
-    iter_dir = _write_ariadne_handoff(campaign, 1, n=2)
-    from ichor.hpc.active_learning.handoff_manifests import (
-        read_ariadne_results_manifest,
+    state = fresh_campaign_state(max_iterations=3)
+    state.campaign_uid = _FIXTURE_CAMPAIGN_UID
+    state.phase = CampaignPhase.PHASE_B_DIVERSITY
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    iter_dir = _write_phase_b_handoff(campaign, 1, n=2, n_select=1)
+    _write_scalar_completion_receipt(
+        campaign,
+        CampaignPhase.PHASE_B_DIVERSITY,
+        1,
+        phase_b_selection_path(iter_dir),
     )
-    accepted = read_ariadne_results_manifest(
-        iter_dir,
-        expected_iteration=1,
-    )["accepted"]
-
-    def allocation_candidate(record, candidate_id):
-        return {
-            "candidate_id": candidate_id,
-            "seed_id": int(record["seed_id"]),
-            "seed_uid": str(record["seed_uid"]),
-            "seed_frame_id": int(record["seed_frame_id"]),
-            "result_json": str(record["result_json"]),
-            "result_sha256": str(record["result_sha256"]),
-            "landing_safety": dict(record["landing_safety"]),
-        }
-
+    _write_split(campaign, 1)
     allocation_path = point_allocation_path(
         campaign,
         context="active",
         iteration=1,
     )
-    allocation = create_point_allocation(
-        allocation_path,
-        campaign_uid=_FIXTURE_CAMPAIGN_UID,
-        context="active",
-        iteration=1,
-        targets={"train": 1, "int_val": 0, "ext_val": 0, "total": 1},
-        primary_candidates=[
-            allocation_candidate(accepted[0], "candidate-primary")
-        ],
-        reserve_candidates=[
-            {
-                **allocation_candidate(accepted[1], "candidate-reserve"),
-                "reserve_rank": 0,
-            }
-        ],
-    )
+    allocation = read_point_allocation(allocation_path)
     initial_attempt = pending_attempts(allocation)[0]
     record_quantum_results(
         allocation_path,
@@ -905,12 +1010,6 @@ def test_active_replacement_recovery_advances_only_with_durable_handoffs(tmp_pat
             }
         ],
     )
-    state = fresh_campaign_state(max_iterations=3)
-    state.campaign_uid = _FIXTURE_CAMPAIGN_UID
-    state.iteration = 1
-    state.reference_data_version = 0
-    state.models_version = 0
-
     decisions = active_iteration_handoff_decisions(campaign, state)
     assert [decision.phase for decision in decisions] == [CampaignPhase.ALLOCATION_CHECK]
 
@@ -1027,7 +1126,7 @@ def test_propose_recovery_phase_a_sample_reenters_initial_gaussian(tmp_path):
         iteration=0,
         n=1,
     )
-    write_phase_a_sample_manifest(initial, {
+    phase_a_manifest = write_phase_a_sample_manifest(initial, {
         "phase": "PHASE_A_DIVERSITY",
         "iteration": 0,
         "sample_xyz": str(sample.resolve()),
@@ -1047,6 +1146,12 @@ def test_propose_recovery_phase_a_sample_reenters_initial_gaussian(tmp_path):
         },
         "source_pool_manifest": ".DATA/TRAJECTORY/pool.manifest.json",
     })
+    _write_scalar_completion_receipt(
+        campaign,
+        CampaignPhase.PHASE_A_DIVERSITY,
+        0,
+        phase_a_manifest,
+    )
 
     report = propose_recovery(campaign)
 
@@ -1054,7 +1159,137 @@ def test_propose_recovery_phase_a_sample_reenters_initial_gaussian(tmp_path):
     assert report.proposed_state.reference_data_version == -1
     assert report.proposed_state.models_version == -1
     assert report.phase_a_handoff is not None
-    assert "valid Phase A sample" in report.decision
+    assert "Phase A lifecycle" in report.decision
+
+
+def test_propose_recovery_phase_a_terminal_publication_requires_local_adoption(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon.submission_intent import (
+        load_intent,
+        mark_failed,
+        mark_submitted,
+        record_queue_lifecycle,
+        write_pre_submit_intent,
+    )
+    from ichor.hpc.active_learning.handoff_manifests import (
+        write_phase_a_sample_manifest,
+    )
+    from ichor.hpc.active_learning.layout import bootstrap_selection_dir
+    from ichor.hpc.active_learning.sampling.diversity_contract import (
+        diversity_selector_contract,
+    )
+
+    campaign, data, _, _ = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    state = fresh_campaign_state(campaign_uid="reconcile-test")
+    state.phase = CampaignPhase.HALTED
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    initial = bootstrap_selection_dir(campaign)
+    initial.mkdir(parents=True)
+    sample = initial / "selected.xyz"
+    index = initial / "selected_indices.dat"
+    sample.write_text("1\nframe 0\nH 0.0 0.0 0.0\n", encoding="utf-8")
+    index.write_text("0\n", encoding="utf-8")
+    allocation_path, allocation, allocation_records = _write_pending_allocation(
+        campaign,
+        context="bootstrap",
+        iteration=0,
+        n=1,
+    )
+    manifest_path = write_phase_a_sample_manifest(
+        initial,
+        {
+            "phase": CampaignPhase.PHASE_A_DIVERSITY.value,
+            "iteration": 0,
+            "sample_xyz": str(sample.resolve()),
+            "index_path": str(index.resolve()),
+            "n_select": 1,
+            "n_frames": 1,
+            "selected_indices": [0],
+            "descriptor": "mass_weighted_rmsd",
+            "selector": diversity_selector_contract(),
+            "n_pool_frames": 1,
+            "point_allocation": {
+                "manifest": str(allocation_path.resolve()),
+                "targets": dict(allocation["targets"]),
+                "primary": allocation_records,
+                "reserve_frame_ids": [],
+                "reserve_count": 0,
+            },
+            "source_pool_manifest": ".DATA/TRAJECTORY/pool.manifest.json",
+        },
+    )
+    write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=CampaignPhase.PHASE_A_DIVERSITY.value,
+        iteration=0,
+        expected_tasks=1,
+        scheduler_identity_kind="slurm",
+    )
+    mark_submitted(
+        campaign,
+        CampaignPhase.PHASE_A_DIVERSITY.value,
+        0,
+        "13923835",
+        expected_tasks=1,
+    )
+    record_queue_lifecycle(
+        campaign,
+        CampaignPhase.PHASE_A_DIVERSITY.value,
+        0,
+        "terminal",
+        job_id="13923835",
+        status="COMPLETED",
+        n_expected=1,
+        n_observed=1,
+        n_missing=0,
+    )
+    mark_failed(
+        campaign,
+        CampaignPhase.PHASE_A_DIVERSITY.value,
+        0,
+        "local Phase A validation failed",
+    )
+    intent = load_intent(
+        campaign,
+        CampaignPhase.PHASE_A_DIVERSITY.value,
+        0,
+        expected_campaign_uid=state.campaign_uid,
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.submission_intent."
+        "resolve_scalar_diversity_postprocess_source",
+        lambda *args, **kwargs: {
+            "job_id": "13923835",
+            "submission_identity": str(intent["submission_identity"]),
+            "source_sha256": "5" * 64,
+        },
+    )
+    append_event(
+        data / "journal.ndjson",
+        "halt",
+        from_phase=CampaignPhase.PHASE_A_DIVERSITY.value,
+        iteration=0,
+        reason="phase_a_sample_manifest_invalid",
+    )
+    publication_bytes = manifest_path.read_bytes()
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.PHASE_A_DIVERSITY
+    assert report.partial_array_recovery is not None, (
+        report.decision,
+        report.notes,
+        report.unsafe_reasons,
+    )
+    assert report.partial_array_recovery["selected_count"] == 1
+    assert report.partial_array_recovery["n_retry"] == 0
+    assert report.partial_array_recovery["scheduler_jobs_submitted"] == 0
+    assert manifest_path.read_bytes() == publication_bytes
+    assert not report.unsafe_reasons
 
 
 def test_propose_recovery_never_trusts_stop_check_without_committed_versions(tmp_path):
@@ -2209,13 +2444,414 @@ def test_propose_recovery_prefers_phase_b_over_stale_seed_select(tmp_path, monke
     state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
-    _write_phase_b_handoff(campaign, 1, n=2)
+    iter_dir = _write_phase_b_handoff(campaign, 1, n=2)
+    from ichor.hpc.active_learning.handoff_manifests import phase_b_selection_path
+
+    _write_scalar_completion_receipt(
+        campaign,
+        CampaignPhase.PHASE_B_DIVERSITY,
+        1,
+        phase_b_selection_path(iter_dir),
+    )
 
     report = propose_recovery(campaign)
 
-    assert report.proposed_state.phase is CampaignPhase.SPLIT
+    assert report.proposed_state.phase is CampaignPhase.SPLIT, (
+        report.unsafe_reasons,
+        report.notes,
+        report.decision,
+    )
     assert report.proposed_state.iteration == 1
-    assert "valid Phase B handoff" in report.decision
+    assert "Phase B lifecycle" in report.decision
+
+
+def test_reconcile_recovers_terminal_phase_b_publication_for_local_adoption(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon.submission_intent import (
+        load_intent,
+        mark_failed,
+        mark_submitted,
+        record_queue_lifecycle,
+        write_pre_submit_intent,
+    )
+    from ichor.hpc.active_learning.handoff_manifests import phase_b_selection_path
+
+    _trust_marker_models(monkeypatch)
+    monkeypatch.setattr(
+        recovery_contracts_mod,
+        "verify_committed_model_version",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        reconcile_mod,
+        "_validate_recovered_state_contract",
+        lambda *args, **kwargs: None,
+    )
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0])
+    state = fresh_campaign_state(max_iterations=3, campaign_uid="reconcile-test")
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    iter_dir = _write_phase_b_handoff(campaign, 1, n=3)
+    manifest_path = phase_b_selection_path(iter_dir)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["final"] = [payload["final"][0], *reversed(payload["final"][1:])]
+    atomic_write_json(manifest_path, payload)
+    publication_bytes = manifest_path.read_bytes()
+
+    write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=CampaignPhase.PHASE_B_DIVERSITY.value,
+        iteration=1,
+        expected_tasks=1,
+        scheduler_identity_kind="slurm",
+    )
+    mark_submitted(
+        campaign,
+        CampaignPhase.PHASE_B_DIVERSITY.value,
+        1,
+        "13923834",
+        expected_tasks=1,
+    )
+    record_queue_lifecycle(
+        campaign,
+        CampaignPhase.PHASE_B_DIVERSITY.value,
+        1,
+        "terminal",
+        job_id="13923834",
+        status="COMPLETED",
+        n_expected=1,
+        n_observed=1,
+        n_missing=0,
+    )
+    mark_failed(
+        campaign,
+        CampaignPhase.PHASE_B_DIVERSITY.value,
+        1,
+        "legacy final-record ordering mismatch",
+    )
+    intent = load_intent(
+        campaign,
+        CampaignPhase.PHASE_B_DIVERSITY.value,
+        1,
+        expected_campaign_uid=state.campaign_uid,
+    )
+    source = {
+        "job_id": "13923834",
+        "submission_identity": str(intent["submission_identity"]),
+        "source_sha256": "4" * 64,
+    }
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.submission_intent."
+        "resolve_scalar_diversity_postprocess_source",
+        lambda *args, **kwargs: dict(source),
+    )
+    append_event(
+        data / "journal.ndjson",
+        "halt",
+        from_phase=CampaignPhase.PHASE_B_DIVERSITY.value,
+        iteration=1,
+        reason="phase_b_handoff_invalid",
+    )
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.PHASE_B_DIVERSITY
+    assert report.partial_array_recovery["selected_count"] == 3
+    assert report.partial_array_recovery["n_complete"] == 1
+    assert report.partial_array_recovery["n_retry"] == 0
+    assert report.partial_array_recovery["scheduler_jobs_submitted"] == 0
+    assert (
+        report.partial_array_recovery["ordering_classification"]
+        == "legacy_final_rank_permutation"
+    )
+    assert manifest_path.read_bytes() == publication_bytes
+    assert not report.unsafe_reasons
+
+
+def test_ammonia_shaped_phase_b_permutation_normalises_without_rewriting(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.handoff_manifests import (
+        phase_b_selection_path,
+        read_phase_b_selection_manifest,
+        validate_phase_b_handoff,
+    )
+
+    _trust_marker_models(monkeypatch)
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0])
+    state = fresh_campaign_state(max_iterations=3, campaign_uid="reconcile-test")
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    iter_dir = _write_phase_b_handoff(campaign, 1, n=100, n_select=75)
+    manifest_path = phase_b_selection_path(iter_dir)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    canonical = list(payload["final"])
+    assert len(canonical) == 75
+    payload["final"] = canonical[:9] + list(reversed(canonical[9:]))
+    atomic_write_json(manifest_path, payload)
+    legacy_bytes = manifest_path.read_bytes()
+
+    normalised = read_phase_b_selection_manifest(
+        iter_dir,
+        expected_iteration=1,
+        expected_campaign_uid=state.campaign_uid,
+    )
+    validated = validate_phase_b_handoff(
+        iter_dir,
+        expected_iteration=1,
+        expected_campaign_uid=state.campaign_uid,
+    )
+
+    expected_ranks = list(range(1, 76))
+    assert [record["final_rank"] for record in normalised["final"]] == expected_ranks
+    assert [record["final_rank"] for record in validated["final"]] == expected_ranks
+    assert manifest_path.read_bytes() == legacy_bytes
+
+
+def test_reconcile_archives_incomplete_phase_b_publication_for_scalar_retry(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.handoff_manifests import phase_b_selection_path
+    from ichor.hpc.active_learning.point_allocation import point_allocation_path
+
+    _trust_marker_models(monkeypatch)
+    monkeypatch.setattr(
+        recovery_contracts_mod,
+        "verify_committed_model_version",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        reconcile_mod,
+        "_validate_recovered_state_contract",
+        lambda *args, **kwargs: None,
+    )
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0])
+    state = fresh_campaign_state(max_iterations=3, campaign_uid="reconcile-test")
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    iter_dir = _write_phase_b_handoff(campaign, 1, n=3)
+    manifest_path = phase_b_selection_path(iter_dir)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    selected = iter_dir / str(manifest["selected_xyz"]["path"])
+    selected.unlink()
+    _write_failed_terminal_scalar_intent(
+        campaign,
+        state,
+        CampaignPhase.PHASE_B_DIVERSITY,
+        1,
+    )
+    append_event(
+        data / "journal.ndjson",
+        "halt",
+        from_phase=CampaignPhase.PHASE_B_DIVERSITY.value,
+        iteration=1,
+        reason="phase_b_handoff_invalid",
+    )
+
+    report = propose_recovery(campaign)
+
+    recovery = report.partial_array_recovery
+    assert report.proposed_state.phase is CampaignPhase.PHASE_B_DIVERSITY
+    assert recovery["state"] == "retry"
+    assert recovery["publication_disposition"] == "archive_and_retry"
+    assert recovery["n_complete"] == 0
+    assert recovery["n_retry"] == 1
+    assert recovery["retry_task_ids_sample"] == [0]
+    assert not report.unsafe_reasons
+    allocation = point_allocation_path(campaign, context="active", iteration=1)
+    allocation_bytes = allocation.read_bytes()
+
+    archived = reconcile_mod.archive_incomplete_scalar_diversity_publication(
+        campaign,
+        recovery,
+        archive_identity="1" * 32,
+    )
+
+    output_dir = Path(recovery["output_dir"])
+    archive_dir = Path(archived["archive_dir"])
+    assert archived["changed"] is True
+    assert not output_dir.exists()
+    assert archive_dir.is_dir()
+    assert allocation.read_bytes() == allocation_bytes
+
+    replay = reconcile_mod.archive_incomplete_scalar_diversity_publication(
+        campaign,
+        recovery,
+        archive_identity="1" * 32,
+    )
+    assert replay["changed"] is False
+    assert Path(replay["archive_dir"]) == archive_dir
+    with pytest.raises(ValueError, match="archive identity is invalid"):
+        reconcile_mod.archive_incomplete_scalar_diversity_publication(
+            campaign,
+            recovery,
+            archive_identity="1" * 31,
+        )
+
+
+def test_phase_a_incomplete_publication_is_retryable_and_archivable(
+    tmp_path,
+):
+    from ichor.hpc.active_learning.daemon.recovery_contracts import (
+        scalar_diversity_publication_recovery_summary,
+    )
+    from ichor.hpc.active_learning.layout import bootstrap_selection_dir
+
+    campaign, data, _, _ = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    state = fresh_campaign_state(campaign_uid="reconcile-test")
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    output_dir = bootstrap_selection_dir(campaign)
+    output_dir.mkdir(parents=True)
+    (output_dir / "selected.xyz").write_text(
+        "1\npartial\nH 0.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    _write_failed_terminal_scalar_intent(
+        campaign,
+        state,
+        CampaignPhase.PHASE_A_DIVERSITY,
+        0,
+        job_id="10001",
+    )
+
+    recovery = scalar_diversity_publication_recovery_summary(
+        campaign,
+        phase=CampaignPhase.PHASE_A_DIVERSITY,
+        iteration=0,
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+    archived = reconcile_mod.archive_incomplete_scalar_diversity_publication(
+        campaign,
+        recovery,
+        archive_identity="2" * 32,
+    )
+
+    assert recovery["state"] == "retry"
+    assert recovery["reason"] == "selection manifest is missing"
+    assert archived["changed"] is True
+    assert not output_dir.exists()
+    assert Path(archived["archive_dir"]).is_dir()
+
+
+def test_active_allocation_cannot_bypass_missing_phase_b_lifecycle(tmp_path):
+    from ichor.hpc.active_learning.daemon.recovery_contracts import (
+        RecoveryContractError,
+    )
+
+    campaign, data, _, _ = _campaign_dirs(tmp_path)
+    state = fresh_campaign_state(max_iterations=3, campaign_uid="reconcile-test")
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 1
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    _write_ariadne_handoff(campaign, 1, n=2)
+    _write_pending_allocation(campaign, context="active", iteration=1, n=2)
+
+    with pytest.raises(
+        RecoveryContractError,
+        match="cannot bypass a missing Phase B publication and completion receipt",
+    ):
+        active_iteration_handoff_decisions(campaign, state)
+
+
+@pytest.mark.parametrize(
+    "downstream_phase",
+    [CampaignPhase.SPLIT, CampaignPhase.GAUSSIAN],
+)
+def test_downstream_phase_contract_requires_phase_b_completion_receipt(
+    tmp_path,
+    downstream_phase,
+):
+    from ichor.hpc.active_learning.daemon.recovery_contracts import (
+        phase_recovery_contract_error,
+    )
+
+    campaign, data, _, _ = _campaign_dirs(tmp_path)
+    state = fresh_campaign_state(max_iterations=3, campaign_uid="reconcile-test")
+    state.phase = downstream_phase
+    state.iteration = 1
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    _write_phase_b_handoff(campaign, 1, n=2)
+    _write_failed_terminal_scalar_intent(
+        campaign,
+        state,
+        CampaignPhase.PHASE_B_DIVERSITY,
+        1,
+    )
+
+    error = phase_recovery_contract_error(
+        campaign,
+        state,
+        verification="authority",
+    )
+
+    assert error is not None
+    assert "completion receipt" in error
+
+
+def test_phase_b_control_recovery_rejects_source_identity_tampering(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon.recovery_contracts import (
+        RecoveryContractError,
+        scalar_diversity_publication_recovery_summary,
+    )
+    from ichor.hpc.active_learning.daemon.state import atomic_write_json
+    from ichor.hpc.active_learning.handoff_manifests import phase_b_selection_path
+
+    _trust_marker_models(monkeypatch)
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0])
+    state = fresh_campaign_state(max_iterations=3, campaign_uid="reconcile-test")
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    iter_dir = _write_phase_b_handoff(campaign, 1, n=2)
+    manifest_path = phase_b_selection_path(iter_dir)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    considered_rank = payload["final"][0]["considered_rank"]
+    considered = next(
+        record
+        for record in payload["considered"]
+        if record["considered_rank"] == considered_rank
+    )
+    considered["selection_origin"] = "tampered"
+    payload["final"][0]["selection_origin"] = "tampered"
+    atomic_write_json(manifest_path, payload)
+
+    with pytest.raises(RecoveryContractError, match="source identity mismatch"):
+        scalar_diversity_publication_recovery_summary(
+            campaign,
+            phase=CampaignPhase.PHASE_B_DIVERSITY,
+            iteration=1,
+            expected_campaign_uid=state.campaign_uid,
+        )
 
 
 def test_phase_b_geometry_drift_requires_deep_reconcile_verification(
@@ -2251,15 +2887,20 @@ def test_phase_b_geometry_drift_requires_deep_reconcile_verification(
     manifest["selected_xyz"]["size"] = int(selected.stat().st_size)
     manifest["selected_xyz"]["sha256"] = sha256_file(selected)
     atomic_write_json(manifest_path, manifest)
+    _write_scalar_completion_receipt(
+        campaign,
+        CampaignPhase.PHASE_B_DIVERSITY,
+        1,
+        manifest_path,
+    )
 
     authority_report = propose_recovery(campaign)
     deep_report = propose_recovery(campaign, verification_level="deep")
 
     assert authority_report.proposed_state.phase is CampaignPhase.SPLIT
-    assert "valid Phase B handoff" in authority_report.decision
-    assert deep_report.proposed_state.phase is CampaignPhase.PHASE_B_DIVERSITY
-    assert "valid Phase B handoff" not in deep_report.decision
-    assert "valid ARIADNE results handoff" in deep_report.decision
+    assert "Phase B lifecycle" in authority_report.decision
+    assert deep_report.proposed_state.phase is CampaignPhase.SPLIT
+    assert "Phase B lifecycle" in deep_report.decision
 
 
 def test_propose_recovery_prefers_split_over_stale_phase_b(tmp_path, monkeypatch):
@@ -2275,14 +2916,22 @@ def test_propose_recovery_prefers_split_over_stale_phase_b(tmp_path, monkeypatch
     state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
-    _write_phase_b_handoff(campaign, 1, n=2)
+    iter_dir = _write_phase_b_handoff(campaign, 1, n=2)
+    from ichor.hpc.active_learning.handoff_manifests import phase_b_selection_path
+
+    _write_scalar_completion_receipt(
+        campaign,
+        CampaignPhase.PHASE_B_DIVERSITY,
+        1,
+        phase_b_selection_path(iter_dir),
+    )
     _write_split(campaign, 1)
 
     report = propose_recovery(campaign)
 
     assert report.proposed_state.phase is CampaignPhase.GAUSSIAN
     assert report.proposed_state.iteration == 1
-    assert "valid split handoff" in report.decision
+    assert "split handoff" in report.decision
 
 
 def test_propose_recovery_invalid_split_reenters_split(tmp_path, monkeypatch):
@@ -2298,7 +2947,15 @@ def test_propose_recovery_invalid_split_reenters_split(tmp_path, monkeypatch):
     state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
-    _write_phase_b_handoff(campaign, 1, n=2)
+    iter_dir = _write_phase_b_handoff(campaign, 1, n=2)
+    from ichor.hpc.active_learning.handoff_manifests import phase_b_selection_path
+
+    _write_scalar_completion_receipt(
+        campaign,
+        CampaignPhase.PHASE_B_DIVERSITY,
+        1,
+        phase_b_selection_path(iter_dir),
+    )
     split_path = _write_split(campaign, 1)
     split_payload = json.loads(split_path.read_text(encoding="utf-8"))
     split_payload["slots"][0]["candidate_id"] = "wrong-candidate"
@@ -2306,9 +2963,11 @@ def test_propose_recovery_invalid_split_reenters_split(tmp_path, monkeypatch):
 
     report = propose_recovery(campaign)
 
-    assert report.proposed_state.phase is CampaignPhase.SPLIT
-    assert report.proposed_state.iteration == 1
-    assert "valid Phase B handoff" in report.decision
+    assert report.proposed_state.phase is CampaignPhase.HALTED
+    assert any(
+        "SPLIT publication is present but invalid" in reason
+        for reason in report.unsafe_reasons
+    )
 
 
 def test_propose_recovery_cross_iteration_partial_handoff_beats_stop_check(
@@ -2337,6 +2996,8 @@ def test_propose_recovery_cross_iteration_partial_handoff_beats_stop_check(
 
 
 def test_propose_recovery_protects_active_gaussian_handoff(tmp_path, monkeypatch):
+    from ichor.hpc.active_learning.handoff_manifests import phase_b_selection_path
+
     _trust_marker_models(monkeypatch)
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, data, training, models = _campaign_dirs(tmp_path)
@@ -2353,6 +3014,14 @@ def test_propose_recovery_protects_active_gaussian_handoff(tmp_path, monkeypatch
     state.reference_data_version = 0
     state.models_version = 0
     write_state(data / DEFAULT_STATE_FILENAME, state)
+    iter_dir = _write_phase_b_handoff(campaign, 1, n=1)
+    _write_scalar_completion_receipt(
+        campaign,
+        CampaignPhase.PHASE_B_DIVERSITY,
+        1,
+        phase_b_selection_path(iter_dir),
+    )
+    _write_split(campaign, 1)
     staging = campaign / ".DATA" / "STAGING" / "iter_1"
     pointdir = staging / "POINT_0000.pointdir"
     pointdir.mkdir(parents=True, exist_ok=True)
@@ -2364,13 +3033,6 @@ def test_propose_recovery_protects_active_gaussian_handoff(tmp_path, monkeypatch
         accepted=[pointdir],
         rejected=[],
     )
-    _write_pending_allocation(
-        campaign,
-        context="active",
-        iteration=1,
-        n=1,
-    )
-
     report = propose_recovery(campaign)
 
     assert report.proposed_state.phase is CampaignPhase.AIMALL
@@ -2522,6 +3184,8 @@ def test_propose_recovery_reuses_scheduler_complete_aimall_outputs(
 
 
 def test_propose_recovery_finds_staging_handoff_in_later_iteration(tmp_path, monkeypatch):
+    from ichor.hpc.active_learning.handoff_manifests import phase_b_selection_path
+
     _trust_marker_models(monkeypatch)
     monkeypatch.setattr(reconcile_mod, "_validate_recovered_state_contract", lambda *a, **k: None)
     campaign, data, training, models = _campaign_dirs(tmp_path)
@@ -2534,6 +3198,14 @@ def test_propose_recovery_finds_staging_handoff_in_later_iteration(tmp_path, mon
     state.reference_data_version = 1
     state.models_version = 1
     write_state(data / DEFAULT_STATE_FILENAME, state)
+    iter_dir = _write_phase_b_handoff(campaign, 2, n=1)
+    _write_scalar_completion_receipt(
+        campaign,
+        CampaignPhase.PHASE_B_DIVERSITY,
+        2,
+        phase_b_selection_path(iter_dir),
+    )
+    _write_split(campaign, 2)
     staging = campaign / ".DATA" / "STAGING" / "iter_2"
     pointdir = staging / "POINT_0000.pointdir"
     pointdir.mkdir(parents=True, exist_ok=True)

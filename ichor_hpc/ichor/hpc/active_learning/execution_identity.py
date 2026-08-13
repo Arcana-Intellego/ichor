@@ -716,6 +716,7 @@ def _validate_scalar_diversity_transition_boundary(
     from .daemon.recovery_contracts import (
         ariadne_results_recovery_summary,
         phase_recovery_contract_error,
+        scalar_diversity_publication_recovery_summary,
     )
     from .daemon.cluster_profile import profile_value
     from .daemon.submission_intent import (
@@ -747,6 +748,31 @@ def _validate_scalar_diversity_transition_boundary(
     model_versions = TrainedModelVersioning(trained_models_dir(campaign))
     reference_current = reference_versions.current_version()
     model_current = model_versions.current_version()
+    if any(value is not None for value in state.pending_jobs.values()):
+        raise ExecutionIdentityError(
+            phase.value
+            + " environment transition is blocked by pending scheduler ownership"
+        )
+    records = list(intent_records)
+    if any(
+        str(record.get("status") or "") in ACTIVE_STATUSES
+        for record in records
+    ):
+        raise ExecutionIdentityError(
+            phase.value
+            + " environment transition is blocked by active submission intents"
+        )
+    matching_intents = [
+        record
+        for record in records
+        if str(record.get("phase") or "") == phase.value
+        and int(record.get("iteration", -1)) == iteration
+    ]
+    if len(matching_intents) > 1:
+        raise ExecutionIdentityError(
+            phase.value
+            + " environment transition found multiple current retry intents"
+        )
     if phase is CampaignPhase.PHASE_B_DIVERSITY:
         expected_version = iteration - 1
         if iteration < 1 or (
@@ -770,6 +796,99 @@ def _validate_scalar_diversity_transition_boundary(
         allocation_path = (
             active_allocation_dir(iteration_root) / "POINT_ALLOCATION.json"
         )
+        from .handoff_manifests import phase_b_selection_path
+
+        publication_path = phase_b_selection_path(iteration_root)
+        if publication_path.is_file() and not publication_path.is_symlink():
+            try:
+                publication_payload = json.loads(
+                    publication_path.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError) as exc:
+                raise ExecutionIdentityError(
+                    "PHASE_B_DIVERSITY environment transition found an "
+                    "unreadable publication"
+                ) from exc
+            if isinstance(publication_payload, Mapping) and str(
+                publication_payload.get("status") or ""
+            ) == "complete":
+                try:
+                    adoption = scalar_diversity_publication_recovery_summary(
+                        campaign,
+                        phase=phase,
+                        iteration=iteration,
+                        expected_campaign_uid=str(state.campaign_uid),
+                    )
+                except Exception as exc:
+                    raise ExecutionIdentityError(
+                        "PHASE_B_DIVERSITY complete-publication adoption "
+                        "evidence is invalid: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc)
+                    ) from exc
+                if str(adoption.get("state") or "") != "postprocess_only":
+                    raise ExecutionIdentityError(
+                        "PHASE_B_DIVERSITY publication lifecycle is already "
+                        "complete and must recover to SPLIT"
+                    )
+                split_path = active_allocation_dir(iteration_root) / (
+                    "SPLIT_RECEIPT.json"
+                )
+                from .layout import staging_phase_dir
+
+                quantum_staging = staging_phase_dir(
+                    campaign,
+                    CampaignPhase.GAUSSIAN.value,
+                    iteration,
+                )
+                downstream_intents = [
+                    record
+                    for record in records
+                    if int(record.get("iteration", -1)) == iteration
+                    and str(record.get("phase") or "")
+                    in {
+                        CampaignPhase.GAUSSIAN.value,
+                        CampaignPhase.AIMALL.value,
+                    }
+                ]
+                if (
+                    split_path.exists()
+                    or split_path.is_symlink()
+                    or downstream_intents
+                    or (
+                        quantum_staging.exists()
+                        and (
+                            quantum_staging.is_symlink()
+                            or not quantum_staging.is_dir()
+                            or any(quantum_staging.iterdir())
+                        )
+                    )
+                ):
+                    raise ExecutionIdentityError(
+                        "PHASE_B_DIVERSITY complete-publication adoption is "
+                        "blocked by downstream split or quantum evidence"
+                    )
+                return {
+                    "transition_kind": (
+                        "phase_b_complete_publication_adoption"
+                    ),
+                    "diversity_retry_evidence_kind": (
+                        "terminal_scheduler_publication"
+                    ),
+                    "producer_submission_identity": str(
+                        adoption["producer_submission_identity"]
+                    ),
+                    "producer_job_id": str(adoption["producer_job_id"]),
+                    "selected_count": int(adoption["selected_count"]),
+                    "ordering_classification": str(
+                        adoption["ordering_classification"]
+                    ),
+                    "postprocess_source": dict(
+                        adoption["postprocess_source"]
+                    ),
+                    "scheduler_jobs_submitted": 0,
+                }
         if allocation_path.exists() or allocation_path.is_symlink():
             raise ExecutionIdentityError(
                 "PHASE_B_DIVERSITY environment transition refuses an existing "
@@ -798,6 +917,73 @@ def _validate_scalar_diversity_transition_boundary(
                 "committed reference-data or model versions"
             )
         output_root = bootstrap_selection_dir(campaign)
+        from .handoff_manifests import phase_a_sample_manifest_path
+
+        publication_path = phase_a_sample_manifest_path(output_root)
+        if (
+            publication_path.is_file()
+            and not publication_path.is_symlink()
+            and matching_intents
+        ):
+            try:
+                adoption = scalar_diversity_publication_recovery_summary(
+                    campaign,
+                    phase=phase,
+                    iteration=iteration,
+                    expected_campaign_uid=str(state.campaign_uid),
+                )
+            except Exception as exc:
+                raise ExecutionIdentityError(
+                    "PHASE_A_DIVERSITY complete-publication adoption "
+                    "evidence is invalid: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                ) from exc
+            if str(adoption.get("state") or "") != "postprocess_only":
+                raise ExecutionIdentityError(
+                    "PHASE_A_DIVERSITY publication lifecycle is already "
+                    "complete and must recover to INITIAL_GAUSSIAN"
+                )
+            initial_staging = campaign / ".DATA" / "STAGING" / "initial"
+            downstream_intents = [
+                record
+                for record in records
+                if int(record.get("iteration", -1)) == 0
+                and str(record.get("phase") or "")
+                in {
+                    CampaignPhase.INITIAL_GAUSSIAN.value,
+                    CampaignPhase.INITIAL_AIMALL.value,
+                }
+            ]
+            if downstream_intents or (
+                initial_staging.exists()
+                and (
+                    initial_staging.is_symlink()
+                    or not initial_staging.is_dir()
+                    or any(initial_staging.iterdir())
+                )
+            ):
+                raise ExecutionIdentityError(
+                    "PHASE_A_DIVERSITY complete-publication adoption is "
+                    "blocked by downstream quantum evidence"
+                )
+            return {
+                "transition_kind": "phase_a_complete_publication_adoption",
+                "diversity_retry_evidence_kind": (
+                    "terminal_scheduler_publication"
+                ),
+                "producer_submission_identity": str(
+                    adoption["producer_submission_identity"]
+                ),
+                "producer_job_id": str(adoption["producer_job_id"]),
+                "selected_count": int(adoption["selected_count"]),
+                "ordering_classification": str(
+                    adoption["ordering_classification"]
+                ),
+                "postprocess_source": dict(adoption["postprocess_source"]),
+                "scheduler_jobs_submitted": 0,
+            }
 
     contract_error = phase_recovery_contract_error(
         campaign,
@@ -847,32 +1033,6 @@ def _validate_scalar_diversity_transition_boundary(
                 + (", ..." if len(entries) > 5 else "")
                 + ")"
             )
-    if any(value is not None for value in state.pending_jobs.values()):
-        raise ExecutionIdentityError(
-            phase.value
-            + " environment transition is blocked by pending scheduler ownership"
-        )
-
-    records = list(intent_records)
-    if any(
-        str(record.get("status") or "") in ACTIVE_STATUSES
-        for record in records
-    ):
-        raise ExecutionIdentityError(
-            phase.value
-            + " environment transition is blocked by active submission intents"
-        )
-    matching_intents = [
-        record
-        for record in records
-        if str(record.get("phase") or "") == phase.value
-        and int(record.get("iteration", -1)) == iteration
-    ]
-    if len(matching_intents) > 1:
-        raise ExecutionIdentityError(
-            phase.value
-            + " environment transition found multiple current retry intents"
-        )
     retry_evidence: Optional[Dict[str, Any]] = None
     if matching_intents:
         scheduler_kind = str(

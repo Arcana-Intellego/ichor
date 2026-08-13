@@ -2019,7 +2019,7 @@ def prepare_retry_submission(
 def compact_array_recovery_summary(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
-    return {
+    summary = {
         "phase": payload.get("phase"),
         "iteration": payload.get("iteration"),
         "logical_total": int(payload.get("logical_total") or 0),
@@ -2032,6 +2032,28 @@ def compact_array_recovery_summary(payload: Optional[Dict[str, Any]]) -> Dict[st
         "ledger": payload.get("path"),
         "retry_task_file": payload.get("retry_task_file"),
     }
+    if payload.get("selected_count") is not None:
+        summary["selected_count"] = int(payload["selected_count"])
+    if payload.get("ordering_classification") is not None:
+        summary["ordering_classification"] = str(
+            payload["ordering_classification"]
+        )
+    if payload.get("producer_job_id") is not None:
+        summary["producer_job_id"] = str(payload["producer_job_id"])
+    if payload.get("scheduler_jobs_submitted") is not None:
+        summary["scheduler_jobs_submitted"] = int(
+            payload["scheduler_jobs_submitted"]
+        )
+    for key in (
+        "state",
+        "publication_disposition",
+        "validation",
+        "reason",
+        "output_dir",
+    ):
+        if payload.get(key) is not None:
+            summary[key] = str(payload[key])
+    return summary
 
 
 def discover_partial_array_recovery(

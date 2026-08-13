@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -17,6 +18,7 @@ from ichor.hpc.active_learning.daemon.submission_intent import (
     mark_failed,
     mark_superseded,
     resolve_gaussian_postprocess_source,
+    resolve_scalar_diversity_postprocess_source,
     write_pre_submit_intent,
 )
 from ichor.hpc.active_learning.daemon import input_staging
@@ -123,6 +125,140 @@ def test_scalar_diversity_retry_accepts_jobless_failed_attempt():
 
     assert result["retry_evidence_kind"] == "jobless_pre_submit_retry"
     assert result["producer_job_id"] is None
+
+
+def test_scalar_diversity_postprocess_source_requires_completed_producer(
+    tmp_path,
+    monkeypatch,
+):
+    intent = _scalar_retry_intent(terminal_status="COMPLETED")
+    intent.update(
+        attempt_id="1" * 32,
+        environment_generation=3,
+        environment_generation_digest_sha256="2" * 64,
+        decision_contract={
+            "config_sha256": "3" * 64,
+            "failure_threshold_fraction": 0.2,
+        },
+    )
+    monkeypatch.setattr(
+        intent_module,
+        "_validate_postprocess_source_environment",
+        lambda *_args, **_kwargs: None,
+    )
+
+    source = resolve_scalar_diversity_postprocess_source(
+        tmp_path,
+        campaign_uid="intent-test",
+        phase_name="PHASE_B_DIVERSITY",
+        iteration=17,
+        scheduler_identity_kind="slurm",
+        intent=intent,
+    )
+
+    assert source["job_id"] == "17997698"
+    assert source["logical_total"] == 1
+    assert source["logical_task_set_sha256"] == hashlib.sha256(b"0").hexdigest()
+
+    intent["queue_lifecycle"]["terminal_status"] = "FAILED"
+    with pytest.raises(ValueError, match="scheduler task did not complete"):
+        resolve_scalar_diversity_postprocess_source(
+            tmp_path,
+            campaign_uid="intent-test",
+            phase_name="PHASE_B_DIVERSITY",
+            iteration=17,
+            scheduler_identity_kind="slurm",
+            intent=intent,
+        )
+
+
+def test_phase_a_postprocess_source_uses_same_scalar_contract(tmp_path, monkeypatch):
+    intent = _scalar_retry_intent(terminal_status="COMPLETED")
+    intent.update(
+        phase="PHASE_A_DIVERSITY",
+        iteration=0,
+        attempt_id="1" * 32,
+        environment_generation=3,
+        environment_generation_digest_sha256="2" * 64,
+        decision_contract={
+            "config_sha256": "3" * 64,
+            "failure_threshold_fraction": 0.2,
+        },
+    )
+    monkeypatch.setattr(
+        intent_module,
+        "_validate_postprocess_source_environment",
+        lambda *_args, **_kwargs: None,
+    )
+
+    source = resolve_scalar_diversity_postprocess_source(
+        tmp_path,
+        campaign_uid="intent-test",
+        phase_name="PHASE_A_DIVERSITY",
+        iteration=0,
+        scheduler_identity_kind="slurm",
+        intent=intent,
+    )
+
+    assert source["phase"] == "PHASE_A_DIVERSITY"
+    assert source["iteration"] == 0
+    assert source["logical_task_set_sha256"] == hashlib.sha256(b"0").hexdigest()
+
+
+def test_scalar_diversity_postprocess_source_survives_local_failure_wrapper(
+    tmp_path,
+    monkeypatch,
+):
+    producer = _scalar_retry_intent(terminal_status="COMPLETED")
+    producer.update(
+        attempt_id="1" * 32,
+        environment_generation=3,
+        environment_generation_digest_sha256="2" * 64,
+        decision_contract={
+            "config_sha256": "3" * 64,
+            "failure_threshold_fraction": 0.2,
+        },
+    )
+    monkeypatch.setattr(
+        intent_module,
+        "_validate_postprocess_source_environment",
+        lambda *_args, **_kwargs: None,
+    )
+    source = resolve_scalar_diversity_postprocess_source(
+        tmp_path,
+        campaign_uid="intent-test",
+        phase_name="PHASE_B_DIVERSITY",
+        iteration=17,
+        scheduler_identity_kind="slurm",
+        intent=producer,
+    )
+    wrapper = {
+        **producer,
+        "attempt_id": "4" * 32,
+        "submission_identity": "r0000-a0002-test",
+        "status": "FAILED",
+        "reason": "local Phase B validation failed",
+        "job_id": None,
+        "job_ids_seen": [],
+        "queue_lifecycle": None,
+        "postprocess_source": source,
+    }
+    monkeypatch.setattr(
+        intent_module,
+        "intent_attempt_records",
+        lambda *_args, **_kwargs: [producer],
+    )
+
+    repeated = resolve_scalar_diversity_postprocess_source(
+        tmp_path,
+        campaign_uid="intent-test",
+        phase_name="PHASE_B_DIVERSITY",
+        iteration=17,
+        scheduler_identity_kind="slurm",
+        intent=wrapper,
+    )
+
+    assert repeated == source
 
 
 @pytest.mark.parametrize(

@@ -709,6 +709,34 @@ def test_campaign_preflight_allows_and_reports_pending_boundary_stop(
     assert "retain and honour this request" in output
 
 
+def test_preflight_reports_scheduler_free_phase_b_publication_adoption():
+    payload = {
+        "ready": True,
+        "all_backends_present": True,
+        "backend_availability": {},
+        "campaign_config": {"ok": True},
+        "pool_feasibility": {"ok": True},
+        "campaign_state": {
+            "ok": True,
+            "condition": "ready",
+            "phase": CampaignPhase.PHASE_B_DIVERSITY.value,
+            "iteration": 1,
+        },
+        "_presentation_diversity_transition": {
+            "safe": True,
+            "transition_kind": "phase_b_complete_publication_adoption",
+            "producer_job_id": "13923834",
+            "selected_count": 75,
+        },
+    }
+
+    output = cli_mod._format_preflight(payload)
+
+    assert "diversity retry boundary" in output
+    assert "75 existing geometries" in output
+    assert "zero scheduler submissions" in output
+
+
 def test_campaign_preflight_does_not_treat_its_background_child_as_an_owner(
     tmp_path,
     monkeypatch,
@@ -4518,6 +4546,45 @@ def test_journal_reconcile_summary_reports_aimall_local_reuse():
     ) in output
 
 
+def test_journal_reconcile_summary_reports_diversity_local_adoption():
+    event = {
+        "event": "reconcile_applied",
+        "phase": CampaignPhase.PHASE_B_DIVERSITY.value,
+        "iteration": 1,
+        "diversity_selected_geometries": 75,
+        "diversity_retry_tasks": 0,
+        "diversity_tasks_resubmitted": 0,
+    }
+
+    output = cli_mod._format_journal_events([event], verbose=False)
+
+    assert "RECONCILE" in output
+    assert "iter=1" in output
+    assert (
+        "reconcile applied; preserving 75 selected diversity geometries for "
+        "local validation, no diversity job resubmitted"
+    ) in output
+
+
+def test_journal_reconcile_summary_reports_incomplete_diversity_retry():
+    event = {
+        "event": "reconcile_applied",
+        "phase": CampaignPhase.PHASE_A_DIVERSITY.value,
+        "iteration": 0,
+        "diversity_selected_geometries": 0,
+        "diversity_retry_tasks": 1,
+        "diversity_tasks_resubmitted": 0,
+    }
+
+    output = cli_mod._format_journal_events([event], verbose=False)
+
+    assert (
+        "reconcile applied; archived an incomplete diversity publication, "
+        "prepared 1 scalar task for retry after resume, no scheduler job "
+        "submitted"
+    ) in output
+
+
 def test_reconcile_human_summary_reports_phase_b_ariadne_reuse(capsys):
     report = SimpleNamespace(
         ariadne_results_recovery={
@@ -7087,3 +7154,139 @@ def test_reconcile_terminal_scheduler_recovery_without_changes_uses_resume(
         presentation.next_effect
     )
     assert "retry 196 unfinished tasks" in presentation.next_effect
+
+
+def test_reconcile_presents_incomplete_scalar_publication_as_archive_and_retry(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from ichor.hpc.active_learning.daemon.reconcile import ReconciliationReport
+
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=4, campaign_uid="cli-test")
+    state.phase = CampaignPhase.PHASE_B_DIVERSITY
+    state.iteration = 1
+    report = ReconciliationReport(
+        proposed_state=state,
+        partial_array_recovery={
+            "state": "retry",
+            "phase": CampaignPhase.PHASE_B_DIVERSITY.value,
+            "iteration": 1,
+            "logical_total": 1,
+            "n_complete": 0,
+            "n_reuse": 0,
+            "n_retry": 1,
+            "retry_task_ids_sample": [0],
+            "retry_task_ids_truncated": False,
+            "publication_disposition": "archive_and_retry",
+            "output_dir": str(
+                campaign / "ACTIVE_LEARNING" / "iteration-000001" / "phase_b"
+            ),
+            "reason": "selected_xyz is missing",
+        },
+    )
+    report.source_state_phase = CampaignPhase.HALTED.value
+    monkeypatch.setattr(
+        cli_mod,
+        "_reconcile_environment_config_binding_repair",
+        lambda *_args, **_kwargs: {
+            "disposition": "current",
+            "launchable": True,
+            "generation": 0,
+        },
+    )
+
+    presentation = cli_mod._reconcile_presentation(
+        campaign,
+        report,
+        {
+            "contract_ok": True,
+            "missing_or_invalid_inputs": [],
+            "protected_artifacts": [],
+        },
+        config_review=SimpleNamespace(allowed_changes=[], blocked_changes=[]),
+        runtime_status={},
+    )
+    cli_mod._print_reconcile_partial_array(campaign, report)
+    output = capsys.readouterr().out
+
+    assert any(
+        label == "diversity recovery"
+        and "archive the incomplete publication" in value
+        for label, value in presentation.planned_changes
+    )
+    assert "Scalar Publication Recovery" in output
+    assert "incomplete; archive during apply" in output
+    assert "scheduler tasks after resume" in output
+
+
+def test_reconcile_apply_mutation_archives_incomplete_scalar_publication(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = tmp_path / "campaign"
+    output_dir = (
+        campaign / "ACTIVE_LEARNING" / "iteration-000001" / "phase_b"
+    )
+    output_dir.mkdir(parents=True)
+    (output_dir / "selected.xyz").write_text(
+        "1\npartial\nH 0.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+    state = fresh_campaign_state(max_iterations=4, campaign_uid="cli-test")
+    state.phase = CampaignPhase.PHASE_B_DIVERSITY
+    state.iteration = 1
+    partial = {
+        "state": "retry",
+        "phase": CampaignPhase.PHASE_B_DIVERSITY.value,
+        "iteration": 1,
+        "logical_total": 1,
+        "n_complete": 0,
+        "n_reuse": 0,
+        "n_retry": 1,
+        "retry_task_ids_sample": [0],
+        "retry_task_ids_truncated": False,
+        "publication_disposition": "archive_and_retry",
+        "output_dir": str(output_dir),
+    }
+    report = SimpleNamespace(
+        proposed_state=state,
+        partial_array_recovery=partial,
+        aimall_upstream_gaussian_recovery=None,
+        ariadne_publication_recovery=None,
+        completed_staging_retirement=None,
+        unsafe_reasons=[],
+    )
+    recorded = []
+
+    class Transaction:
+        payload = {"transaction_id": "a" * 32}
+
+        def record_paths(self, operation, paths):
+            values = list(paths)
+            if values:
+                recorded.append((str(operation), values))
+
+    monkeypatch.setattr(cli_mod, "clean_reentry_staging", lambda *a, **k: [])
+
+    result = cli_mod._perform_reconcile_apply_mutations(
+        campaign,
+        report,
+        transaction=Transaction(),
+        retrain_ferebus=False,
+        force_resubmit_array=False,
+        partial_array=partial,
+        force_array_phase=CampaignPhase.PHASE_B_DIVERSITY,
+        force_array_iteration=1,
+        archive_existing_array_outputs=False,
+        data_staging_archive_mode=None,
+    )
+
+    archives = result["archived_scalar_diversity_publication"]
+    assert len(archives) == 1
+    assert not output_dir.exists()
+    assert Path(archives[0]).is_dir()
+    assert recorded == [
+        ("archive_scalar_diversity_publication", archives)
+    ]

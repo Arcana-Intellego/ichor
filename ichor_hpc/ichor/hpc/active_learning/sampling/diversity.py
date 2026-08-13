@@ -960,6 +960,7 @@ def _run_phase_b(args, campaign, config, *, progress_reporter: Any = None):
     from ..handoff_manifests import (
         PHASE_B_SELECTION_SCHEMA_VERSION,
         ariadne_results_path,
+        validate_phase_b_handoff,
         write_phase_b_selection_manifest,
     )
     import sys as _sys
@@ -1417,7 +1418,6 @@ def _run_phase_b(args, campaign, config, *, progress_reporter: Any = None):
 
     kept_lookup = {int(considered_index): final_index for final_index, considered_index in enumerate(report.kept_indices)}
     considered_records = []
-    final_records = []
     for considered_index, rec in enumerate(selected_records):
         out_rec = dict(rec)
         out_rec["candidate_pool_index_zero_based"] = int(
@@ -1446,8 +1446,10 @@ def _run_phase_b(args, campaign, config, *, progress_reporter: Any = None):
             else None
         )
         considered_records.append(dict(out_rec))
-        if out_rec["kept_after_dedup"]:
-            final_records.append(dict(out_rec))
+    final_records = [
+        dict(considered_records[int(considered_index)])
+        for considered_index in report.kept_indices
+    ]
 
     reserve = _phase_b_build_reserve(
         ordered_indices=ordered_sel.indices,
@@ -1696,6 +1698,21 @@ def _run_phase_b(args, campaign, config, *, progress_reporter: Any = None):
         iter_dir,
         _phase_b_json_safe(phase_b_manifest),
     )
+    try:
+        validate_phase_b_handoff(
+            iter_dir,
+            expected_iteration=int(args.iteration),
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+    except Exception as exc:
+        print(
+            "Phase B publication self-validation failed: "
+            + type(exc).__name__
+            + ": "
+            + str(exc),
+            file=_sys.stderr,
+        )
+        return 3
     if progress_reporter is not None:
         progress_reporter.update(
             stage="split_publication",

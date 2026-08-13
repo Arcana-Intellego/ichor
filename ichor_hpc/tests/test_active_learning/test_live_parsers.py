@@ -151,6 +151,78 @@ def test_aimall_postprocess_source_bypasses_staging_and_scheduler_submission(
     assert result is expected
 
 
+def test_phase_b_postprocess_source_bypasses_scheduler_submission(
+    tmp_path,
+    monkeypatch,
+):
+    executor = _make_executor(tmp_path)
+    state = SimpleNamespace(
+        campaign_uid="phase-b-postprocess-test",
+        iteration=1,
+        replacement_round=0,
+    )
+    source = {
+        "attempt_id": "1" * 32,
+        "submission_identity": "r0000-a0001-test",
+        "job_id": "13923834",
+    }
+    monkeypatch.setattr(
+        executor,
+        "_recover_cancelled_diversity_phase",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "load_active_intent",
+        lambda *_args, **_kwargs: {"postprocess_source": {"source": "fixture"}},
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "resolve_scalar_diversity_postprocess_source",
+        lambda *_args, **_kwargs: dict(source),
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.recovery_contracts."
+        "scalar_diversity_publication_recovery_summary",
+        lambda *_args, **_kwargs: {
+            "state": "postprocess_only",
+            "selected_count": 75,
+            "ordering_classification": "legacy_final_rank_permutation",
+        },
+    )
+    expected = PhaseResult(is_complete=True)
+    monkeypatch.setattr(
+        executor,
+        "postprocess",
+        lambda observed_state, observed_phase, observations: (
+            expected
+            if (
+                observed_state is state
+                and observed_phase is CampaignPhase.PHASE_B_DIVERSITY
+                and observations == []
+            )
+            else (_ for _ in ()).throw(
+                AssertionError("unexpected postprocess invocation")
+            )
+        ),
+    )
+    executor.sbatch_runner = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("scheduler submission must not run")
+    )
+    monkeypatch.setattr(
+        executor,
+        "_stage_phase_inputs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Phase B input staging must not run")
+        ),
+        raising=False,
+    )
+
+    result = executor.submit_or_run(state, CampaignPhase.PHASE_B_DIVERSITY)
+
+    assert result is expected
+
+
 def _bind_staging(ex, fixture_subdir):
     source = Path(fixture_subdir)
     if source.is_dir():
@@ -3973,6 +4045,118 @@ def test_polus_phase_b_happy_path(tmp_path):
     succeeded = [e for e in events if e.get("event") == "phase_succeeded_live"]
     assert succeeded
     assert succeeded[-1]["phase"] == "PHASE_B_DIVERSITY"
+
+
+def test_phase_b_reader_normalises_legacy_final_rank_permutation(tmp_path):
+    from ichor.hpc.active_learning.daemon.state import atomic_write_json
+    from ichor.hpc.active_learning.handoff_manifests import (
+        phase_b_selection_path,
+        read_phase_b_selection_manifest,
+        validate_phase_b_handoff,
+    )
+
+    (tmp_path / "campaign").mkdir()
+    iter_dir = _seed_phase_b_sample(tmp_path / "campaign", iteration=5)
+    _write_phase_b_manifest(iter_dir, n_final=3)
+    manifest_path = phase_b_selection_path(iter_dir)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["final"] = list(reversed(payload["final"]))
+    atomic_write_json(manifest_path, payload)
+    legacy_bytes = manifest_path.read_bytes()
+
+    normalised = read_phase_b_selection_manifest(
+        iter_dir,
+        expected_iteration=5,
+        expected_campaign_uid="m16-test",
+    )
+    validated = validate_phase_b_handoff(
+        iter_dir,
+        expected_iteration=5,
+        expected_campaign_uid="m16-test",
+    )
+
+    assert [record["final_rank"] for record in normalised["final"]] == [1, 2, 3]
+    assert [record["final_rank"] for record in validated["final"]] == [1, 2, 3]
+    assert manifest_path.read_bytes() == legacy_bytes
+
+
+def test_phase_b_reader_rejects_final_considered_identity_conflict(tmp_path):
+    from ichor.hpc.active_learning.daemon.state import atomic_write_json
+    from ichor.hpc.active_learning.handoff_manifests import (
+        HandoffManifestError,
+        phase_b_selection_path,
+        read_phase_b_selection_manifest,
+    )
+
+    (tmp_path / "campaign").mkdir()
+    iter_dir = _seed_phase_b_sample(tmp_path / "campaign", iteration=5)
+    _write_phase_b_manifest(iter_dir, n_final=2)
+    manifest_path = phase_b_selection_path(iter_dir)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["final"][0]["candidate_id"] = "contradictory-candidate"
+    atomic_write_json(manifest_path, payload)
+
+    with pytest.raises(HandoffManifestError, match="differs from its considered"):
+        read_phase_b_selection_manifest(
+            iter_dir,
+            expected_iteration=5,
+            expected_campaign_uid="m16-test",
+        )
+
+
+def test_phase_b_reader_rejects_consistent_source_identity_tampering(tmp_path):
+    from ichor.hpc.active_learning.daemon.state import atomic_write_json
+    from ichor.hpc.active_learning.handoff_manifests import (
+        HandoffManifestError,
+        phase_b_selection_path,
+        read_phase_b_selection_manifest,
+    )
+
+    (tmp_path / "campaign").mkdir()
+    iter_dir = _seed_phase_b_sample(tmp_path / "campaign", iteration=5)
+    _write_phase_b_manifest(iter_dir, n_final=2)
+    manifest_path = phase_b_selection_path(iter_dir)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    considered_rank = payload["final"][0]["considered_rank"]
+    considered = next(
+        record
+        for record in payload["considered"]
+        if record["considered_rank"] == considered_rank
+    )
+    considered["selection_origin"] = "tampered"
+    payload["final"][0]["selection_origin"] = "tampered"
+    atomic_write_json(manifest_path, payload)
+
+    with pytest.raises(HandoffManifestError, match="source identity mismatch"):
+        read_phase_b_selection_manifest(
+            iter_dir,
+            expected_iteration=5,
+            expected_campaign_uid="m16-test",
+        )
+
+
+def test_phase_b_reader_rejects_final_allocation_identity_conflict(tmp_path):
+    from ichor.hpc.active_learning.daemon.state import atomic_write_json
+    from ichor.hpc.active_learning.handoff_manifests import (
+        HandoffManifestError,
+        phase_b_selection_path,
+        read_phase_b_selection_manifest,
+    )
+
+    (tmp_path / "campaign").mkdir()
+    iter_dir = _seed_phase_b_sample(tmp_path / "campaign", iteration=5)
+    _write_phase_b_manifest(iter_dir, n_final=2)
+    manifest_path = phase_b_selection_path(iter_dir)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["final"][0]["slot_id"] = payload["final"][1]["slot_id"]
+    atomic_write_json(manifest_path, payload)
+
+    with pytest.raises(HandoffManifestError, match="point-allocation identity"):
+        read_phase_b_selection_manifest(
+            iter_dir,
+            expected_iteration=5,
+            expected_campaign_uid="m16-test",
+        )
 
 
 def test_polus_phase_b_recovery_defers_success_reporting_until_adoption(

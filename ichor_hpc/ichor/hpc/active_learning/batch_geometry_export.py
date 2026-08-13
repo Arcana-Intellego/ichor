@@ -39,6 +39,7 @@ from .handoff_manifests import (
     ariadne_results_path,
     load_seeds_picked,
     read_authoritative_ariadne_batch_decision,
+    read_phase_b_selection_manifest,
     resolve_handoff_path,
     validate_ariadne_result,
 )
@@ -457,7 +458,12 @@ def _read_phase_b_candidate_records(
         sampling_manifest,
         "phase_b/SELECTION.json",
     )
-    payload = _read_json_object(path, "Phase B selection manifest")
+    payload = read_phase_b_selection_manifest(
+        iteration_dir,
+        expected_iteration=int(iteration),
+        expected_campaign_uid=str(campaign_uid),
+        require_nonempty=True,
+    )
     if (
         _exact_int(payload.get("schema_version"), "Phase B schema")
         != PHASE_B_SELECTION_SCHEMA_VERSION
@@ -471,8 +477,13 @@ def _read_phase_b_candidate_records(
         sampling_manifest,
         "ariadne/RESULTS.json",
     )
+    source_manifest = resolve_handoff_path(
+        iteration_dir,
+        payload.get("source_ariadne_manifest", ""),
+        kind="Phase B source ARIADNE manifest",
+    )
     if (
-        str(payload.get("source_ariadne_manifest") or "") != "ariadne/RESULTS.json"
+        source_manifest != source_path.resolve()
         or str(payload.get("source_ariadne_manifest_sha256") or "")
         != sha256_file(source_path)
     ):
@@ -480,9 +491,14 @@ def _read_phase_b_candidate_records(
     allocation_binding = payload.get("point_allocation")
     if not isinstance(allocation_binding, Mapping):
         raise BatchGeometryExportError("Phase B point-allocation binding is missing")
+    allocation_manifest = resolve_handoff_path(
+        iteration_dir,
+        allocation_binding.get("manifest", ""),
+        kind="Phase B point-allocation manifest",
+    )
     if (
-        str(allocation_binding.get("manifest") or "")
-        != "allocation/POINT_ALLOCATION.json"
+        allocation_manifest
+        != (iteration_dir / "allocation" / "POINT_ALLOCATION.json").resolve()
         or str(allocation_binding.get("slot_assignment_sha256") or "")
         != str(allocation.get("slot_assignment_sha256") or "")
         or dict(allocation_binding.get("targets") or {})

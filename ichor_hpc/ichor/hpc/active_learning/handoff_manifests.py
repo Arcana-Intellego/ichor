@@ -2076,6 +2076,22 @@ def read_phase_b_selection_manifest(
         for key in ("result_sha256", "output_manifest_sha256"):
             if str(record.get(key) or "") != str(source.get(key) or ""):
                 raise HandoffManifestError(label + " " + key + " source mismatch")
+        # Phase B enriches provenance in place, so its provenance hash is
+        # expected to change. Every other producer field remains immutable and
+        # must survive the handoff exactly, including selection diagnostics.
+        source_path_fields = {
+            "seed_dir",
+            "result_json",
+            "provenance_json",
+            "output_manifest",
+        }
+        for key, value in source.items():
+            if key in source_path_fields or key == "provenance_sha256":
+                continue
+            if key not in record or record[key] != value:
+                raise HandoffManifestError(
+                    label + " " + key + " source identity mismatch"
+                )
         safety = source.get("landing_safety")
         if not isinstance(safety, dict) or safety.get("accepted") is not True:
             raise HandoffManifestError(label + " source landing safety is not accepted")
@@ -2105,6 +2121,22 @@ def read_phase_b_selection_manifest(
         allocation_payload.get("slot_assignment_sha256") or ""
     ):
         raise HandoffManifestError("Phase B point-allocation assignment mismatch")
+    allocation_slots = {}
+    for slot in allocation_payload.get("slots") or []:
+        attempts = slot.get("attempts") if isinstance(slot, dict) else None
+        if not isinstance(attempts, list) or not attempts:
+            raise HandoffManifestError(
+                "Phase B point-allocation slot has no primary attempt"
+            )
+        candidate_id = str(attempts[0].get("candidate_id") or "")
+        if not candidate_id or candidate_id in allocation_slots:
+            raise HandoffManifestError(
+                "Phase B point-allocation primary candidates are invalid"
+            )
+        allocation_slots[candidate_id] = (
+            _required_int(slot.get("slot_id"), "Phase B allocation slot_id"),
+            str(slot.get("split") or ""),
+        )
     from .sampling.diversity_contract import selector_contract_matches
 
     if not selector_contract_matches(data.get("selector")):
@@ -2236,6 +2268,65 @@ def read_phase_b_selection_manifest(
         raise HandoffManifestError(
             "Phase B final considered_rank set does not match kept considered records"
         )
+    considered_by_rank = {
+        _required_int(
+            record.get("considered_rank"),
+            "Phase B considered_rank",
+        ): record
+        for record in normalised_considered
+    }
+    allocation_only_fields = {"slot_id", "split"}
+    final_candidate_ids = set()
+    for record in normalised_final:
+        considered_rank = _required_int(
+            record.get("considered_rank"),
+            "Phase B final considered_rank",
+        )
+        source = considered_by_rank.get(considered_rank)
+        if source is None or source.get("kept_after_dedup") is not True:
+            raise HandoffManifestError(
+                "Phase B final record does not identify one kept considered record"
+            )
+        missing = sorted(set(source) - set(record))
+        unexpected = sorted(set(record) - set(source) - allocation_only_fields)
+        if missing or unexpected:
+            raise HandoffManifestError(
+                "Phase B final record fields differ from its considered record; "
+                + "missing="
+                + repr(missing)
+                + ", unexpected="
+                + repr(unexpected)
+            )
+        for key, value in source.items():
+            if record.get(key) != value:
+                raise HandoffManifestError(
+                    "Phase B final record differs from its considered record for "
+                    + key
+                )
+        if not allocation_only_fields.issubset(record):
+            raise HandoffManifestError(
+                "Phase B final record lacks its allocation slot or split"
+            )
+        candidate_id = str(record.get("candidate_id") or "")
+        expected_slot = allocation_slots.get(candidate_id)
+        if (
+            not candidate_id
+            or candidate_id in final_candidate_ids
+            or expected_slot
+            != (
+                _required_int(record.get("slot_id"), "Phase B final slot_id"),
+                str(record.get("split") or ""),
+            )
+        ):
+            raise HandoffManifestError(
+                "Phase B final record point-allocation identity mismatch"
+            )
+        final_candidate_ids.add(candidate_id)
+    if final_candidate_ids != set(allocation_slots):
+        raise HandoffManifestError(
+            "Phase B final records do not cover the allocated primary candidates"
+        )
+    normalised_final.sort(key=lambda record: int(record["final_rank"]))
     out = dict(data)
     out["considered"] = normalised_considered
     out["final"] = normalised_final

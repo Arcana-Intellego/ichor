@@ -70,9 +70,11 @@ _GAUSSIAN_POSTPROCESS_PHASES = frozenset({
 })
 _POSTPROCESS_SOURCE_PHASES = (
     frozenset({CampaignPhase.ARIADNE_ARRAY.value})
+    | _SCALAR_SUBMISSION_PHASES
     | _AIMALL_POSTPROCESS_PHASES
     | _GAUSSIAN_POSTPROCESS_PHASES
 )
+_SCALAR_LOGICAL_TASK_SET_SHA256 = hashlib.sha256(b"0").hexdigest()
 
 
 def submission_kind_for_phase(phase_name: str) -> str:
@@ -534,6 +536,193 @@ def _validate_postprocess_source_environment(
         raise ValueError(
             "postprocess source environment generation digest mismatch"
         )
+
+
+def resolve_scalar_diversity_postprocess_source(
+    campaign_dir: Union[str, Path],
+    *,
+    campaign_uid: str,
+    phase_name: str,
+    iteration: int,
+    replacement_round: int = 0,
+    scheduler_identity_kind: str,
+    intent: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Resolve one scheduler-complete scalar producer for local adoption."""
+    phase = str(phase_name)
+    if phase not in _SCALAR_SUBMISSION_PHASES:
+        raise ValueError(
+            "scalar diversity postprocess phase is unsupported: " + phase
+        )
+    iteration_value = _exact_int(
+        iteration,
+        "scalar diversity postprocess iteration",
+    )
+    round_value = _exact_int(
+        replacement_round,
+        "scalar diversity postprocess replacement round",
+    )
+    scheduler_kind = str(scheduler_identity_kind).strip().lower()
+    current = (
+        dict(intent)
+        if isinstance(intent, Mapping)
+        else load_intent(
+            campaign_dir,
+            phase,
+            iteration_value,
+            expected_campaign_uid=str(campaign_uid),
+        )
+    )
+    if not current:
+        raise ValueError(
+            "scheduler-complete scalar diversity producer intent is unavailable"
+        )
+    observed_identity = (
+        str(current.get("campaign_uid") or ""),
+        str(current.get("phase") or ""),
+        current.get("iteration"),
+        current.get("replacement_round"),
+        str(current.get("scheduler_identity_kind") or "").strip().lower(),
+    )
+    expected_identity = (
+        str(campaign_uid),
+        phase,
+        iteration_value,
+        round_value,
+        scheduler_kind,
+    )
+    if observed_identity != expected_identity:
+        raise ValueError(
+            "scheduler-complete scalar diversity producer identity mismatch"
+        )
+
+    status = str(current.get("status") or "")
+    reason = str(current.get("reason") or "")
+    nested = current.get("postprocess_source")
+    if nested is not None:
+        if status not in {"PRE_SUBMIT", "FAILED", "SUPERSEDED"}:
+            raise ValueError(
+                "scalar diversity postprocess wrapper has an unsupported status"
+            )
+        if status == "SUPERSEDED" and reason != "reconcile_apply_retry":
+            raise ValueError(
+                "superseded scalar diversity postprocess wrapper has an "
+                "unsupported reason"
+            )
+        if current.get("job_id") is not None:
+            raise ValueError(
+                "scalar diversity postprocess wrapper unexpectedly owns a JobID"
+            )
+        source = _validated_postprocess_source(nested)
+        producers = []
+        for record in intent_attempt_records(
+            campaign_dir,
+            phase,
+            iteration_value,
+            expected_campaign_uid=str(campaign_uid),
+        ):
+            if isinstance(record.get("postprocess_source"), Mapping):
+                continue
+            if (
+                str(record.get("attempt_id") or "")
+                == str(source["attempt_id"])
+                and str(record.get("submission_identity") or "")
+                == str(source["submission_identity"])
+                and str(record.get("job_id") or "") == str(source["job_id"])
+            ):
+                producers.append(record)
+        if len(producers) != 1:
+            raise ValueError(
+                "scalar diversity postprocess source does not resolve to one "
+                "original scheduler attempt"
+            )
+        producer = producers[0]
+        terminal = classify_scalar_diversity_retry_intent(
+            producer,
+            expected_campaign_uid=str(campaign_uid),
+            expected_phase=phase,
+            expected_iteration=iteration_value,
+            expected_replacement_round=round_value,
+            expected_scheduler_kind=scheduler_kind,
+        )
+        if terminal.get("scheduler_terminal_status") != "COMPLETED":
+            raise ValueError(
+                "scalar diversity postprocess source scheduler task did not complete"
+            )
+        producer_binding = (
+            producer.get("environment_generation"),
+            producer.get("environment_generation_digest_sha256"),
+            producer.get("decision_contract"),
+        )
+        source_binding = (
+            source.get("environment_generation"),
+            source.get("environment_generation_digest_sha256"),
+            source.get("decision_contract"),
+        )
+        if producer_binding != source_binding:
+            raise ValueError(
+                "scalar diversity postprocess source producer binding mismatch"
+            )
+    else:
+        terminal = classify_scalar_diversity_retry_intent(
+            current,
+            expected_campaign_uid=str(campaign_uid),
+            expected_phase=phase,
+            expected_iteration=iteration_value,
+            expected_replacement_round=round_value,
+            expected_scheduler_kind=scheduler_kind,
+        )
+        if terminal.get("scheduler_terminal_status") != "COMPLETED":
+            raise ValueError(
+                "scalar diversity postprocess source scheduler task did not complete"
+            )
+        source = {
+            "campaign_uid": str(campaign_uid),
+            "phase": phase,
+            "iteration": iteration_value,
+            "attempt_id": str(current.get("attempt_id") or ""),
+            "submission_identity": str(
+                current.get("submission_identity") or ""
+            ),
+            "job_id": str(current.get("job_id") or ""),
+            "environment_generation": current.get("environment_generation"),
+            "environment_generation_digest_sha256": current.get(
+                "environment_generation_digest_sha256"
+            ),
+            "logical_total": 1,
+            "logical_task_set_sha256": _SCALAR_LOGICAL_TASK_SET_SHA256,
+            "decision_contract": current.get("decision_contract"),
+        }
+        source["source_sha256"] = _canonical_postprocess_source_sha256(source)
+        source = _validated_postprocess_source(source)
+
+    source_identity = (
+        str(source["campaign_uid"]),
+        str(source["phase"]),
+        int(source["iteration"]),
+        int(source["logical_total"]),
+        str(source["logical_task_set_sha256"]),
+    )
+    if source_identity != (
+        str(campaign_uid),
+        phase,
+        iteration_value,
+        1,
+        _SCALAR_LOGICAL_TASK_SET_SHA256,
+    ):
+        raise ValueError(
+            "scalar diversity postprocess source does not match its logical task"
+        )
+    if current.get("expected_tasks") != 1:
+        raise ValueError(
+            "scalar diversity postprocess wrapper task count mismatch"
+        )
+    if current.get("decision_contract") != source["decision_contract"]:
+        raise ValueError(
+            "scalar diversity postprocess wrapper decision contract mismatch"
+        )
+    _validate_postprocess_source_environment(campaign_dir, source)
+    return source
 
 
 def resolve_ariadne_postprocess_source(

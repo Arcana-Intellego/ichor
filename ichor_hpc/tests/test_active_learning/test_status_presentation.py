@@ -974,6 +974,32 @@ def test_terminal_phase_b_retry_overrides_stale_startup_failure(tmp_path):
     assert "ready for one Phase B retry" in cli._status_current_activity(payload)
 
 
+def test_terminal_phase_b_publication_reports_local_adoption(tmp_path):
+    campaign = tmp_path / "campaign"
+    payload = {
+        "phase": CampaignPhase.PHASE_B_DIVERSITY.value,
+        "iteration": 1,
+        "background_startup_state": "failed",
+        "background_startup_stage": "environment_transition",
+        "_presentation_diversity_transition": {
+            "safe": True,
+            "transition_kind": "phase_b_complete_publication_adoption",
+            "producer_job_id": "13923834",
+            "selected_count": 75,
+            "ordering_classification": "legacy_final_rank_permutation",
+        },
+    }
+
+    result = recommendations.build_status_recommendations(campaign, payload)
+    payload["recommendations"] = [result[0].to_dict()]
+
+    assert result[0].code == "phase_phase_b_diversity_ready"
+    assert str(result[0].command).startswith("ichor-al-daemon resume")
+    activity = cli._status_current_activity(payload)
+    assert "75 existing selected geometries await local validation" in activity
+    assert "no diversity job will be submitted" in activity
+
+
 def test_halted_legacy_config_generation_split_recommends_reconcile(tmp_path):
     campaign = tmp_path / "campaign"
     payload = {
