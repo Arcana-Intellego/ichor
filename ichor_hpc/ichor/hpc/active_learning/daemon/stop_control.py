@@ -431,6 +431,52 @@ def read_resume_transaction(
     return _validate_resume_transaction(payload)
 
 
+def read_resume_transaction_history(
+    campaign_dir: Union[str, Path],
+) -> Tuple[Tuple[Path, Dict[str, Any]], ...]:
+    """Read every immutable resume transaction without ignoring bad evidence."""
+    root = resume_transaction_history_dir(campaign_dir)
+    if not root.exists() and not root.is_symlink():
+        return ()
+    if root.is_symlink() or not root.is_dir():
+        raise StopControlError(
+            "resume-transaction history is not a regular directory: " + str(root)
+        )
+    records = []
+    for path in sorted(root.iterdir(), key=lambda item: item.name):
+        if path.suffix != ".json":
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise StopControlError(
+                "resume-transaction history entry is not a regular file: "
+                + str(path)
+            )
+        try:
+            transaction_id = str(uuid.UUID(path.stem))
+        except (ValueError, AttributeError) as exc:
+            raise StopControlError(
+                "resume-transaction history filename is invalid: " + str(path)
+            ) from exc
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise StopControlError(
+                "resume-transaction history entry is unreadable: " + str(path)
+            ) from exc
+        validated = _validate_resume_transaction(payload)
+        if str(validated["transaction_id"]) != transaction_id:
+            raise StopControlError(
+                "resume-transaction history filename differs from its identity: "
+                + str(path)
+            )
+        if str(validated["status"]) != "state_written":
+            raise StopControlError(
+                "resume-transaction history entry is incomplete: " + str(path)
+            )
+        records.append((path, validated))
+    return tuple(records)
+
+
 def prepare_resume_transaction(
     campaign_dir: Union[str, Path],
     *,
@@ -1145,6 +1191,7 @@ __all__ = [
     "matching_stop_boundary_receipt",
     "prepare_resume_transaction",
     "read_resume_transaction",
+    "read_resume_transaction_history",
     "read_stop_request",
     "stop_control_lock",
     "stop_request_history_dir",

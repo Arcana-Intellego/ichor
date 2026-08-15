@@ -1794,6 +1794,33 @@ def propose_recovery(
             int(item.get("iteration") or 0),
         )
     )
+    preserved_repoll = None
+    if existing is not None:
+        try:
+            from .preserved_scheduler_repoll import (
+                resolve_preserved_scheduler_repoll_authority,
+            )
+
+            preserved_repoll = resolve_preserved_scheduler_repoll_authority(
+                campaign,
+                existing,
+            )
+        except Exception as exc:
+            unsafe_reasons.append(
+                "preserved scheduler re-poll evidence is contradictory: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:180]
+            )
+            blocking_artifacts.append("preserved scheduler re-poll evidence")
+    blocking_active_intents = [
+        intent
+        for intent in active_intents
+        if preserved_repoll is None
+        or str(intent.get("submission_identity") or "")
+        != preserved_repoll.submission_identity
+        or str(intent.get("job_id") or "") != preserved_repoll.job_id
+    ]
     scratch_inventory = [
         {
             "status": "prepared",
@@ -1916,7 +1943,15 @@ def propose_recovery(
         record for record in scratch_inventory if record.get("status") == "invalid"
     ]
     prepared_scratch = [
-        record for record in scratch_inventory if record.get("status") == "prepared"
+        record
+        for record in scratch_inventory
+        if record.get("status") == "prepared"
+        and (
+            preserved_repoll is None
+            or str(record.get("submission_identity") or "")
+            != preserved_repoll.submission_identity
+            or str(record.get("job_id") or "") != preserved_repoll.job_id
+        )
     ]
     retained_scratch = [
         record
@@ -1944,6 +1979,12 @@ def propose_recovery(
         recommended_actions.append(
             "Inspect the recorded scratch JobIDs with the configured scheduler "
             "before recovery."
+        )
+    elif preserved_repoll is not None:
+        notes.append(
+            "scheduler-owned scratch for job "
+            + preserved_repoll.job_id
+            + " is protected for resume re-polling"
         )
     if retained_scratch:
         unsafe_reasons.append(
@@ -2044,6 +2085,18 @@ def propose_recovery(
     has_model_iteration_staging = model_iteration_staging.is_dir()
     recoverable_ferebus_staging = False
     recoverable_ferebus_reason = ""
+    if (
+        has_model_iteration_staging
+        and not model_iteration_staging.is_symlink()
+        and preserved_repoll is not None
+        and preserved_repoll.phase
+        in {CampaignPhase.INITIAL_FEREBUS.value, CampaignPhase.FEREBUS.value}
+    ):
+        recoverable_ferebus_staging = True
+        recoverable_ferebus_reason = (
+            "FEREBUS iteration-staging is protected by preserved scheduler job "
+            + preserved_repoll.job_id
+        )
     if has_model_iteration_staging and not model_iteration_staging.is_symlink():
         try:
             from .ferebus_candidate_recovery import read_recovery_request
@@ -2072,6 +2125,8 @@ def propose_recovery(
                 else None
             )
             if (
+                not recoverable_ferebus_staging
+                and
                 isinstance(recovery_request, dict)
                 and str(recovery_request.get("status")) in {
                     "prepared",
@@ -2113,20 +2168,20 @@ def propose_recovery(
             )
         except Exception as exc:
             recoverable_ferebus_reason = type(exc).__name__ + ": " + str(exc)[:180]
-    elif has_model_iteration_staging:
+    elif has_model_iteration_staging and not recoverable_ferebus_staging:
         recoverable_ferebus_reason = (
             "unpublished FEREBUS staging is non-authoritative and will be "
             "archived before retry"
         )
 
-    if active_intents:
+    if blocking_active_intents:
         unsafe_reasons.append(
             "active submission intent(s) present: "
             + ", ".join(
                 str(i.get("phase")) + "@" + str(i.get("iteration"))
                 + " job_id=" + str(i.get("job_id"))
                 + " expected_job_name=" + str(i.get("expected_job_name"))
-                for i in active_intents
+                for i in blocking_active_intents
             )
         )
         blocking_artifacts.append("active submission intent(s)")
@@ -2134,6 +2189,12 @@ def propose_recovery(
             "If these jobs should be cancelled, run: ichor-al-daemon stop --campaign-dir "
             + str(campaign)
             + " --cancel-jobs"
+        )
+    elif preserved_repoll is not None:
+        notes.append(
+            "submission intent for job "
+            + preserved_repoll.job_id
+            + " remains active only so resume can re-poll it"
         )
     if existing is not None:
         covered_pending = {
@@ -2164,9 +2225,14 @@ def propose_recovery(
                 "Inspect pending_jobs in state.json and the configured scheduler "
                 "before applying recovery."
             )
-    if script_files:
+    if script_files and preserved_repoll is None:
         unsafe_reasons.append(".DATA/SCRIPTS contains sbatch scripts")
         trusted_artifacts.append(".DATA/SCRIPTS can be archived by reconcile --apply")
+    elif script_files and preserved_repoll is not None:
+        trusted_artifacts.append(
+            ".DATA/SCRIPTS is protected by preserved scheduler job "
+            + preserved_repoll.job_id
+        )
     protected_reference_staging_paths = {
         str(
             ReferenceDataVersioning(training_dir).staging_path(
@@ -2922,7 +2988,9 @@ def propose_recovery(
     }
     existing_contract_valid = False
     if existing is not None and (
-        existing.phase is CampaignPhase.DONE or existing.shutdown_requested
+        existing.phase is CampaignPhase.DONE
+        or existing.shutdown_requested
+        or preserved_repoll is not None
     ):
         try:
             verify_state_referenced_artifacts(
@@ -2964,13 +3032,23 @@ def propose_recovery(
         and not non_cleanup_blockers
         and not active_intents
     )
+    preserve_scheduler_repoll_state = bool(
+        preserved_repoll is not None
+        and existing is not None
+        and existing_contract_valid
+        and not non_cleanup_blockers
+    )
     identity_recovery_blocked = any(
         str(blocker).startswith("campaign identity")
         for blocker in blocking_artifacts
     )
 
     phase_recovery = None
-    if not active_intents and not unsafe_reasons:
+    if (
+        preserved_repoll is None
+        and not active_intents
+        and not unsafe_reasons
+    ):
         handoff_recovery = None
         if combined_handoffs:
             handoff_recovery = max(
@@ -3009,7 +3087,22 @@ def propose_recovery(
     # choose a safe re-entry phase. If we have NOTHING committed, start at
     #  INIT; otherwise rewind to STOP_CHECK so the next tick decides whether
     # to loop or terminate.
-    if preserve_completed_state:
+    if preserve_scheduler_repoll_state:
+        recovered = CampaignState.from_dict(existing.to_dict())
+        decision = (
+            existing.phase.value
+            + ": preserved scheduler job "
+            + preserved_repoll.job_id
+            + " requires resume re-polling"
+        )
+        notes.append(
+            "reconcile will not mutate scheduler-owned state; resume will "
+            "re-poll the preserved job"
+        )
+        recommended_actions.append(
+            "Run: ichor-al-daemon resume --campaign-dir " + str(campaign)
+        )
+    elif preserve_completed_state:
         recovered.phase = CampaignPhase.DONE
         recovered.iteration = int(existing.iteration)
         decision = "DONE: existing completed lifecycle and artefact chain are trusted"
@@ -3194,9 +3287,14 @@ def propose_recovery(
         recovered.phase = CampaignPhase.STOP_CHECK
         decision = "STOP_CHECK: latest coherent committed reference-data/model pair is trusted"
         notes.append("re-entry at STOP_CHECK (next tick decides loop/terminate)")
-    recovered.pending_jobs = {}
+    if not preserve_scheduler_repoll_state:
+        recovered.pending_jobs = {}
     recovered.shutdown_requested = bool(preserve_stopped_state)
-    if recovered.phase is not CampaignPhase.HALTED and not active_intents:
+    if (
+        recovered.phase is not CampaignPhase.HALTED
+        and not active_intents
+        and not preserve_scheduler_repoll_state
+    ):
         try:
             _validate_recovered_state_contract(
                 campaign,

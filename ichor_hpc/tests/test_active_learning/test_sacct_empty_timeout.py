@@ -71,7 +71,7 @@ def test_default_poll_sacct_empty_max_ticks_is_ten():
     assert CampaignConfig().runtime.poll_sacct_missing_max_ticks == 12
 
 
-def test_repeated_sacct_command_errors_halt_scheduler_uncertain(tmp_path):
+def test_repeated_sacct_command_errors_wait_while_scheduler_job_is_active(tmp_path):
     def broken_poller(job_id):
         raise RuntimeError("sacct unavailable")
 
@@ -88,18 +88,43 @@ def test_repeated_sacct_command_errors_halt_scheduler_uncertain(tmp_path):
     )
     daemon.config.runtime.poll_sacct_error_max_ticks = 2
 
-    assert daemon.tick() == TickStatus.POLLING
-    assert daemon.tick() == TickStatus.HALTED
+    for _ in range(5):
+        assert daemon.tick() == TickStatus.POLLING
 
     state = read_state(state_path)
-    assert state.phase is CampaignPhase.HALTED
+    assert state.phase is CampaignPhase.GAUSSIAN
     assert state.pending_jobs[CampaignPhase.GAUSSIAN.value] == "99999"
+    assert "99999:ERROR" not in state.sacct_empty_streak
     events = [
         json.loads(line)
         for line in daemon.journal_path().read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    assert any(event.get("event") == "sacct_error_timeout" for event in events)
+    assert not any(
+        event.get("event") == "sacct_error_timeout" for event in events
+    )
+
+
+def test_repeated_sacct_command_errors_halt_after_job_is_retired(tmp_path):
+    def broken_poller(job_id):
+        raise RuntimeError("sacct unavailable")
+
+    daemon, state_path = _setup_daemon_with_pending_job(
+        tmp_path,
+        broken_poller,
+        max_ticks=10,
+        job_liveness_checker=lambda job_id: SimpleNamespace(
+            active=False,
+            inconclusive=False,
+            rows=[],
+            error=None,
+        ),
+    )
+    daemon.config.runtime.poll_sacct_error_max_ticks = 2
+
+    assert daemon.tick() == TickStatus.POLLING
+    assert daemon.tick() == TickStatus.HALTED
+    assert read_state(state_path).phase is CampaignPhase.HALTED
 
 
 def test_empty_sacct_increments_streak(tmp_path):
@@ -161,7 +186,7 @@ def test_empty_sacct_keeps_polling_when_squeue_active(tmp_path):
     st = read_state(state_path)
     assert st.phase is CampaignPhase.GAUSSIAN
     assert st.pending_jobs[CampaignPhase.GAUSSIAN.value] == "99999"
-    assert st.sacct_empty_streak.get("99999") == 2
+    assert "99999" not in st.sacct_empty_streak
     events = [
         json.loads(line) for line in (tmp_path / "campaign" / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson").read_text(encoding="utf-8").splitlines()
         if line.strip()
@@ -190,7 +215,8 @@ def test_empty_sacct_keeps_polling_when_squeue_inconclusive(tmp_path):
     st = read_state(state_path)
     assert st.phase is CampaignPhase.GAUSSIAN
     assert st.pending_jobs[CampaignPhase.GAUSSIAN.value] == "99999"
-    assert st.sacct_empty_streak.get("99999") == 2
+    assert "99999" not in st.sacct_empty_streak
+    assert st.sacct_empty_streak["99999:SQUEUE_INCONCLUSIVE:empty"] == 2
     events = [
         json.loads(line) for line in (tmp_path / "campaign" / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson").read_text(encoding="utf-8").splitlines()
         if line.strip()
@@ -278,3 +304,73 @@ def test_missing_expected_array_rows_halt_after_bounded_ticks(tmp_path):
     assert missing[-1]["n_expected"] == 3
     assert missing[-1]["n_observed"] == 1
     assert missing[-1]["n_missing"] == 2
+
+
+def test_unknown_accounting_waits_while_exact_job_remains_active(tmp_path):
+    def unknown_poller(job_id):
+        return [
+            JobObservation(
+                job_id=str(job_id),
+                status=JobStatus.UNKNOWN,
+                exit_code=None,
+                elapsed_seconds=None,
+            )
+        ]
+
+    daemon, state_path = _setup_daemon_with_pending_job(
+        tmp_path,
+        unknown_poller,
+        max_ticks=10,
+        job_liveness_checker=lambda job_id: SimpleNamespace(
+            active=True,
+            inconclusive=False,
+            rows=[(str(job_id), "RUNNING")],
+            error=None,
+        ),
+    )
+    daemon.config.runtime.poll_sacct_unknown_max_ticks = 3
+
+    for _ in range(6):
+        assert daemon.tick() == TickStatus.POLLING
+    state = read_state(state_path)
+    assert state.phase is CampaignPhase.GAUSSIAN
+    assert "99999:UNKNOWN" not in state.sacct_empty_streak
+
+
+def test_unknown_grace_starts_only_after_exact_job_retires(tmp_path):
+    liveness_calls = {"count": 0}
+
+    def unknown_poller(job_id):
+        return [
+            JobObservation(
+                job_id=str(job_id),
+                status=JobStatus.UNKNOWN,
+                exit_code=None,
+                elapsed_seconds=None,
+            )
+        ]
+
+    def liveness(job_id):
+        liveness_calls["count"] += 1
+        active = liveness_calls["count"] <= 3
+        return SimpleNamespace(
+            active=active,
+            inconclusive=False,
+            rows=[(str(job_id), "RUNNING")] if active else [],
+            error=None,
+        )
+
+    daemon, state_path = _setup_daemon_with_pending_job(
+        tmp_path,
+        unknown_poller,
+        max_ticks=10,
+        job_liveness_checker=liveness,
+    )
+    daemon.config.runtime.poll_sacct_unknown_max_ticks = 2
+
+    for _ in range(3):
+        assert daemon.tick() == TickStatus.POLLING
+    assert "99999:UNKNOWN" not in read_state(state_path).sacct_empty_streak
+    assert daemon.tick() == TickStatus.POLLING
+    assert read_state(state_path).sacct_empty_streak["99999:UNKNOWN"] == 1
+    assert daemon.tick() == TickStatus.HALTED

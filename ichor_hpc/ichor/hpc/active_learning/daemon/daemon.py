@@ -337,6 +337,9 @@ class Daemon:
     _last_environment_binding: Optional[Dict[str, Any]] = field(
         default=None, init=False, repr=False
     )
+    _preserved_scheduler_repoll_authority: Optional[Any] = field(
+        default=None, init=False, repr=False
+    )
     _environment_binding_mode: Optional[str] = field(
         default=None, init=False, repr=False
     )
@@ -1619,12 +1622,29 @@ class Daemon:
 
         if self._verify_execution_identity_binding(state) == "unbound":
             return
+        from .preserved_scheduler_repoll import (
+            resolve_preserved_scheduler_repoll_authority,
+            validate_preserved_scheduler_repoll_continuation,
+        )
+
+        preserved_repoll = resolve_preserved_scheduler_repoll_authority(
+            self.campaign_dir,
+            state,
+        )
         advance_environment_generation(
             self.campaign_dir,
             config=self.config,
             live_preflight_ok=bool(self.environment_preflight_ok),
             scheduler_ownership_clear=True,
         )
+        refreshed_state = read_state(self.state_path())
+        if preserved_repoll is not None:
+            validate_preserved_scheduler_repoll_continuation(
+                self.campaign_dir,
+                refreshed_state,
+                preserved_repoll,
+            )
+        self._preserved_scheduler_repoll_authority = preserved_repoll
         active = read_active_environment_generation(
             self.campaign_dir,
             expected_campaign_uid=str(state.campaign_uid),
@@ -1681,6 +1701,46 @@ class Daemon:
                 raise ValueError("submission intent is missing")
             if self._last_environment_binding is None:
                 raise ValueError("active environment binding is unavailable")
+            if self._preserved_scheduler_repoll_authority is not None:
+                from .preserved_scheduler_repoll import (
+                    validate_preserved_scheduler_repoll_continuation,
+                )
+
+                authority = self._preserved_scheduler_repoll_authority
+                validate_preserved_scheduler_repoll_continuation(
+                    self.campaign_dir,
+                    state,
+                    authority,
+                )
+                observed_source = (
+                    str(bound_intent.get("phase") or ""),
+                    int(bound_intent.get("iteration", -1)),
+                    int(bound_intent.get("replacement_round", -1)),
+                    str(bound_intent.get("job_id") or ""),
+                    str(bound_intent.get("submission_identity") or ""),
+                    int(bound_intent.get("environment_generation", -1)),
+                    str(
+                        bound_intent.get(
+                            "environment_generation_digest_sha256"
+                        )
+                        or ""
+                    ),
+                )
+                expected_source = (
+                    authority.phase,
+                    authority.iteration,
+                    authority.replacement_round,
+                    authority.job_id,
+                    authority.submission_identity,
+                    authority.environment_generation,
+                    authority.environment_generation_digest_sha256,
+                )
+                if observed_source != expected_source:
+                    raise ValueError(
+                        "submission intent differs from preserved scheduler "
+                        "producer authority"
+                    )
+                return None
             intent_generation = bound_intent.get("environment_generation")
             intent_digest = bound_intent.get(
                 "environment_generation_digest_sha256"
@@ -2798,6 +2858,26 @@ class Daemon:
 
     def _on_pending(self, state: CampaignState, phase: CampaignPhase, job_id: str) -> str:
         """Called while a SLURM job for `phase` is in flight."""
+        if self._preserved_scheduler_repoll_authority is not None:
+            try:
+                from .preserved_scheduler_repoll import (
+                    validate_preserved_scheduler_repoll_continuation,
+                )
+
+                validate_preserved_scheduler_repoll_continuation(
+                    self.campaign_dir,
+                    state,
+                    self._preserved_scheduler_repoll_authority,
+                )
+            except Exception as exc:
+                return self._halt_scheduler_uncertain(
+                    state,
+                    phase,
+                    "preserved_scheduler_repoll_authority_changed: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)[:180],
+                )
         expected_tasks = self._expected_tasks_for_pending(state, phase, job_id)
         scheduler_identity = self._scheduler_identity_for_job(
             state,
@@ -2840,12 +2920,14 @@ class Daemon:
             )
         except RuntimeError as exc:
             error_key = str(job_id) + ":ERROR"
-            current = int(state.sacct_empty_streak.get(error_key, 0)) + 1
-            state.sacct_empty_streak[error_key] = current
-            self._persist(state)
-            liveness = self._check_job_liveness(
-                job_id,
-                **scheduler_identity,
+            status, current, liveness = self._accounting_liveness_gate(
+                state,
+                phase,
+                str(job_id),
+                kind="error",
+                streak_key=error_key,
+                scheduler_identity=scheduler_identity,
+                summary=None,
             )
             max_errors = int(
                 getattr(self.config.runtime, "poll_sacct_error_max_ticks", 10)
@@ -2862,6 +2944,8 @@ class Daemon:
                     None if liveness is None else bool(getattr(liveness, "inconclusive", False))
                 ),
             )
+            if status is not None:
+                return status
             if current >= max_errors:
                 self._journal(
                     "sacct_error_timeout",
@@ -2972,34 +3056,17 @@ class Daemon:
         #we want to escalate after a streak. is_terminal is False for n=0
         #so without this gate the streak path is unreachable.
         if not observations or summary.n_tasks == 0:
-            current = state.sacct_empty_streak.get(job_id, 0) + 1
-            state.sacct_empty_streak[job_id] = current
-            self._persist(state)
-            liveness = self._check_job_liveness(
-                job_id,
-                **scheduler_identity,
+            status, current, liveness = self._accounting_liveness_gate(
+                state,
+                phase,
+                str(job_id),
+                kind="empty",
+                streak_key=str(job_id),
+                scheduler_identity=scheduler_identity,
+                summary=summary,
             )
-            if self._liveness_blocks_accounting_timeout(liveness):
-                self._journal_sparse_accounting_liveness(
-                    phase=phase,
-                    job_id=job_id,
-                    streak=current,
-                    liveness=liveness,
-                    kind="empty",
-                    summary=summary,
-                    iteration=state.iteration,
-                )
-                return TickStatus.POLLING
-            if liveness is not None and bool(getattr(liveness, "inconclusive", False)):
-                return self._handle_squeue_inconclusive_liveness(
-                    state,
-                    phase,
-                    job_id,
-                    kind="empty",
-                    liveness=liveness,
-                    summary=summary,
-                    accounting_streak=current,
-                )
+            if status is not None:
+                return status
             max_ticks = int(
                 getattr(self.config.runtime, "poll_sacct_empty_max_ticks", 10)
             )
@@ -3033,17 +3100,21 @@ class Daemon:
 
         unknown_key = job_id + ":UNKNOWN"
         if int(getattr(summary, "n_unknown", 0)) > 0:
-            current = state.sacct_empty_streak.get(unknown_key, 0) + 1
-            state.sacct_empty_streak[unknown_key] = current
-            self._persist(state)
+            status, current, liveness = self._accounting_liveness_gate(
+                state,
+                phase,
+                str(job_id),
+                kind="unknown",
+                streak_key=unknown_key,
+                scheduler_identity=scheduler_identity,
+                summary=summary,
+            )
+            if status is not None:
+                return status
             max_unknown = int(
                 getattr(self.config.runtime, "poll_sacct_unknown_max_ticks", 3)
             )
             if max_unknown > 0 and current >= max_unknown:
-                liveness = self._check_job_liveness(
-                    job_id,
-                    **scheduler_identity,
-                )
                 self._journal(
                     "sacct_unknown_timeout",
                     phase=phase.value,
@@ -3076,34 +3147,17 @@ class Daemon:
 
         missing_key = job_id + ":MISSING"
         if int(getattr(summary, "n_missing", 0)) > 0:
-            current = state.sacct_empty_streak.get(missing_key, 0) + 1
-            state.sacct_empty_streak[missing_key] = current
-            self._persist(state)
-            liveness = self._check_job_liveness(
-                job_id,
-                **scheduler_identity,
+            status, current, liveness = self._accounting_liveness_gate(
+                state,
+                phase,
+                str(job_id),
+                kind="missing",
+                streak_key=missing_key,
+                scheduler_identity=scheduler_identity,
+                summary=summary,
             )
-            if self._liveness_blocks_accounting_timeout(liveness):
-                self._journal_sparse_accounting_liveness(
-                    phase=phase,
-                    job_id=job_id,
-                    streak=current,
-                    liveness=liveness,
-                    kind="missing",
-                    summary=summary,
-                    iteration=state.iteration,
-                )
-                return TickStatus.POLLING
-            if liveness is not None and bool(getattr(liveness, "inconclusive", False)):
-                return self._handle_squeue_inconclusive_liveness(
-                    state,
-                    phase,
-                    job_id,
-                    kind="missing",
-                    liveness=liveness,
-                    summary=summary,
-                    accounting_streak=current,
-                )
+            if status is not None:
+                return status
             max_missing = int(
                 getattr(self.config.runtime, "poll_sacct_missing_max_ticks", 3)
             )
@@ -3205,10 +3259,14 @@ class Daemon:
         #Job has reached terminal state(s). Decide between postprocess and
         #failure handling based on the success ratio.
         if phase == CampaignPhase.ARIADNE_ARRAY:
-            return self._postprocess(state, phase, observations, summary)
+            result = self._postprocess(state, phase, observations, summary)
+            self._preserved_scheduler_repoll_authority = None
+            return result
 
         if summary.is_fully_successful:
-            return self._postprocess(state, phase, observations, summary)
+            result = self._postprocess(state, phase, observations, summary)
+            self._preserved_scheduler_repoll_authority = None
+            return result
 
         success_ratio = summary.n_completed / summary.n_tasks
         try:
@@ -3232,8 +3290,12 @@ class Daemon:
         failure_threshold = 1.0 - failure_threshold_fraction
 
         if success_ratio >= failure_threshold:
-            return self._postprocess(state, phase, observations, summary)
-        return self._handle_failure(state, phase, observations, summary)
+            result = self._postprocess(state, phase, observations, summary)
+            self._preserved_scheduler_repoll_authority = None
+            return result
+        result = self._handle_failure(state, phase, observations, summary)
+        self._preserved_scheduler_repoll_authority = None
+        return result
 
     def _submission_decision_contract(self) -> Dict[str, Any]:
         """Snapshot decision controls that must not change in flight."""
@@ -4247,12 +4309,12 @@ class Daemon:
         )
 
     def _clear_sacct_streaks(self, state: CampaignState, job_id: str) -> None:
-        state.sacct_empty_streak.pop(str(job_id), None)
-        state.sacct_empty_streak.pop(str(job_id) + ":UNKNOWN", None)
-        state.sacct_empty_streak.pop(str(job_id) + ":MISSING", None)
-        state.sacct_empty_streak.pop(str(job_id) + ":SQUEUE_INCONCLUSIVE:empty", None)
-        state.sacct_empty_streak.pop(str(job_id) + ":SQUEUE_INCONCLUSIVE:missing", None)
-        state.sacct_empty_streak.pop(str(job_id) + ":ERROR", None)
+        prefix = str(job_id) + ":"
+        state.sacct_empty_streak = {
+            key: value
+            for key, value in state.sacct_empty_streak.items()
+            if key != str(job_id) and not str(key).startswith(prefix)
+        }
 
     def _complete_intent_after_advance(
         self,
@@ -4376,8 +4438,74 @@ class Daemon:
                     + str(exc)[:150],
                 )
 
-    def _liveness_blocks_accounting_timeout(self, liveness: Optional[Any]) -> bool:
-        return liveness is not None and bool(getattr(liveness, "active", False))
+    def _accounting_liveness_gate(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+        job_id: str,
+        *,
+        kind: str,
+        streak_key: str,
+        scheduler_identity: Mapping[str, Any],
+        summary: Optional[Any],
+    ) -> Tuple[Optional[str], int, Optional[Any]]:
+        """Apply queue liveness before consuming terminal accounting grace."""
+        liveness = self._check_job_liveness(
+            str(job_id),
+            **dict(scheduler_identity),
+        )
+        inconclusive_key = (
+            str(job_id) + ":SQUEUE_INCONCLUSIVE:" + str(kind)
+        )
+        def clear_other_job_streaks(*, keep: Sequence[str] = ()) -> bool:
+            keep_set = {str(key) for key in keep}
+            prefix = str(job_id) + ":"
+            changed = False
+            for key in tuple(state.sacct_empty_streak):
+                if (
+                    (key == str(job_id) or str(key).startswith(prefix))
+                    and key not in keep_set
+                ):
+                    state.sacct_empty_streak.pop(key, None)
+                    changed = True
+            return changed
+
+        if liveness is not None and bool(getattr(liveness, "active", False)):
+            changed = clear_other_job_streaks()
+            if changed:
+                self._persist(state)
+            if str(kind) != "error":
+                self._journal_sparse_accounting_liveness(
+                    phase=phase,
+                    job_id=str(job_id),
+                    streak=0,
+                    liveness=liveness,
+                    kind=str(kind),
+                    summary=summary,
+                    iteration=int(state.iteration),
+                )
+            return TickStatus.POLLING, 0, liveness
+        if liveness is not None and bool(
+            getattr(liveness, "inconclusive", False)
+        ):
+            if clear_other_job_streaks(keep=(inconclusive_key,)):
+                self._persist(state)
+            status = self._handle_squeue_inconclusive_liveness(
+                state,
+                phase,
+                str(job_id),
+                kind=str(kind),
+                liveness=liveness,
+                summary=summary,
+                accounting_streak=0,
+            )
+            return status, 0, liveness
+
+        clear_other_job_streaks(keep=(str(streak_key),))
+        current = int(state.sacct_empty_streak.get(str(streak_key), 0)) + 1
+        state.sacct_empty_streak[str(streak_key)] = current
+        self._persist(state)
+        return None, current, liveness
 
     def _handle_squeue_inconclusive_liveness(
         self,
@@ -4438,6 +4566,7 @@ class Daemon:
             "n_completed": int(getattr(summary, "n_completed", 0)),
             "n_failed": int(getattr(summary, "n_failed", 0)),
             "n_missing": int(getattr(summary, "n_missing", 0)),
+            "n_unknown": int(getattr(summary, "n_unknown", 0)),
             "streak": int(streak),
             "accounting_kind": str(kind),
             "iteration": int(iteration),

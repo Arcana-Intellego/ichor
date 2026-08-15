@@ -2396,15 +2396,32 @@ def _inspect_environment_transition_boundary(
 ) -> Dict[str, Any]:
     """Prove that a generation may advance without mutating campaign state."""
     transition_context: Dict[str, Any] = {"transition_kind": "idle_boundary"}
+    from .daemon.preserved_scheduler_repoll import (
+        resolve_preserved_scheduler_repoll_authority,
+    )
+
+    preserved_repoll = resolve_preserved_scheduler_repoll_authority(
+        campaign,
+        state,
+    )
     diversity_transition_pending = False
     aimall_transition_pending = False
     gaussian_transition_pending = False
     allocation_check_transition_pending = False
-    scheduler_cancel_transition = _scheduler_cancellation_transition_boundary(
-        campaign,
-        state,
-    )
-    if scheduler_cancel_transition is not None:
+    scheduler_cancel_transition = None
+    if preserved_repoll is not None:
+        transition_context = {
+            "transition_kind": "preserved_scheduler_repoll",
+            **preserved_repoll.to_evidence(),
+        }
+    else:
+        scheduler_cancel_transition = _scheduler_cancellation_transition_boundary(
+            campaign,
+            state,
+        )
+    if preserved_repoll is not None:
+        pass
+    elif scheduler_cancel_transition is not None:
         transition_context = scheduler_cancel_transition
     elif state.phase is CampaignPhase.REFERENCE_COMMIT:
         from .daemon.reference_commit import classify_reference_commit
@@ -2526,7 +2543,9 @@ def _inspect_environment_transition_boundary(
             "environment transition requires a verified safe phase boundary"
         )
 
-    if any(value is not None for value in state.pending_jobs.values()):
+    if preserved_repoll is None and any(
+        value is not None for value in state.pending_jobs.values()
+    ):
         raise ExecutionIdentityError(
             "environment transition is blocked by pending scheduler ownership"
         )
@@ -2558,12 +2577,24 @@ def _inspect_environment_transition_boundary(
         raise ExecutionIdentityError(
             "environment transition is blocked by malformed submission intents"
         )
-    if any(
-        str(record.get("status")) in ACTIVE_STATUSES
+    active_intents = [
+        record
         for record in inventory["records"]
-    ):
+        if str(record.get("status")) in ACTIVE_STATUSES
+    ]
+    if preserved_repoll is None and active_intents:
         raise ExecutionIdentityError(
             "environment transition is blocked by active submission intents"
+        )
+    if preserved_repoll is not None and (
+        len(active_intents) != 1
+        or str(active_intents[0].get("submission_identity") or "")
+        != preserved_repoll.submission_identity
+        or str(active_intents[0].get("job_id") or "")
+        != preserved_repoll.job_id
+    ):
+        raise ExecutionIdentityError(
+            "preserved scheduler re-poll intent changed during environment validation"
         )
 
     from .daemon.artifact_snapshot import build_committed_artifact_snapshot
@@ -2757,15 +2788,32 @@ def advance_environment_generation(
     transition_context: Dict[str, Any] = {
         "transition_kind": "idle_boundary",
     }
+    from .daemon.preserved_scheduler_repoll import (
+        resolve_preserved_scheduler_repoll_authority,
+    )
+
+    preserved_repoll = resolve_preserved_scheduler_repoll_authority(
+        campaign,
+        state,
+    )
     diversity_transition_pending = False
     aimall_transition_pending = False
     gaussian_transition_pending = False
     allocation_check_transition_pending = False
-    scheduler_cancel_transition = _scheduler_cancellation_transition_boundary(
-        campaign,
-        state,
-    )
-    if scheduler_cancel_transition is not None:
+    scheduler_cancel_transition = None
+    if preserved_repoll is not None:
+        transition_context = {
+            "transition_kind": "preserved_scheduler_repoll",
+            **preserved_repoll.to_evidence(),
+        }
+    else:
+        scheduler_cancel_transition = _scheduler_cancellation_transition_boundary(
+            campaign,
+            state,
+        )
+    if preserved_repoll is not None:
+        pass
+    elif scheduler_cancel_transition is not None:
         transition_context = scheduler_cancel_transition
     elif state.phase is CampaignPhase.REFERENCE_COMMIT:
         from .daemon.reference_commit import classify_reference_commit
@@ -2896,7 +2944,9 @@ def advance_environment_generation(
             "pre-submission scalar diversity recovery boundary, or a verified "
             "allocation-check recovery boundary"
         )
-    if any(value is not None for value in state.pending_jobs.values()):
+    if preserved_repoll is None and any(
+        value is not None for value in state.pending_jobs.values()
+    ):
         raise ExecutionIdentityError(
             "environment transition is blocked by pending scheduler ownership"
         )
@@ -2935,9 +2985,19 @@ def advance_environment_generation(
         for record in inventory["records"]
         if str(record.get("status")) in ACTIVE_STATUSES
     ]
-    if active_intents:
+    if preserved_repoll is None and active_intents:
         raise ExecutionIdentityError(
             "environment transition is blocked by active submission intents"
+        )
+    if preserved_repoll is not None and (
+        len(active_intents) != 1
+        or str(active_intents[0].get("submission_identity") or "")
+        != preserved_repoll.submission_identity
+        or str(active_intents[0].get("job_id") or "")
+        != preserved_repoll.job_id
+    ):
+        raise ExecutionIdentityError(
+            "preserved scheduler re-poll intent changed during environment validation"
         )
     from .daemon.artifact_snapshot import build_committed_artifact_snapshot
 
@@ -3076,6 +3136,39 @@ def advance_environment_generation(
         config,
         scheduler_ownership_clear=scheduler_ownership_clear,
     )
+    if preserved_repoll is not None:
+        refreshed_repoll = resolve_preserved_scheduler_repoll_authority(
+            campaign,
+            state,
+        )
+        if refreshed_repoll != preserved_repoll:
+            raise ExecutionIdentityError(
+                "preserved scheduler re-poll authority changed during "
+                "environment transition"
+            )
+        from .daemon.environment_equivalence import (
+            assess_preserved_scheduler_repoll_equivalence,
+        )
+
+        producer_generation = read_environment_generation(
+            campaign,
+            generation=int(preserved_repoll.environment_generation),
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        equivalence = assess_preserved_scheduler_repoll_equivalence(
+            producer_generation,
+            candidate,
+        )
+        if not bool(equivalence.get("equivalent", False)):
+            raise ExecutionIdentityError(
+                "preserved scheduler re-poll environment equivalence is "
+                "unproven: "
+                + ", ".join(str(item) for item in equivalence.get("reasons", []))
+            )
+        transition_context = {
+            **transition_context,
+            "environment_equivalence": equivalence,
+        }
     while True:
         generation_path = generations_root / (
             "generation-" + str(generation_number).zfill(6) + ".json"

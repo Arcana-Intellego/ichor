@@ -145,6 +145,50 @@ _RESOURCE_EVIDENCE_ROOTS: Dict[
     ),
 }
 
+_PRESERVED_REPOLL_CONTROL_SYMBOLS = {
+    "ichor_hpc/ichor/hpc/active_learning/cli.py": {
+        "_format_preflight",
+        "_scheduler_uncertain_resume_target",
+        "evaluate_campaign_preflight",
+    },
+    "ichor_hpc/ichor/hpc/active_learning/execution_identity.py": {
+        "_inspect_environment_transition_boundary",
+        "advance_environment_generation",
+    },
+    "ichor_hpc/ichor/hpc/active_learning/daemon/stop_control.py": {
+        "read_resume_transaction_history",
+        "__all__",
+    },
+    "ichor_hpc/ichor/hpc/active_learning/daemon/reconcile.py": {
+        "propose_recovery",
+    },
+    "ichor_hpc/ichor/hpc/active_learning/daemon/environment_equivalence.py": {
+        "_PRESERVED_REPOLL_CONTROL_SYMBOLS",
+        "_PRESERVED_REPOLL_DAEMON_METHODS",
+        "_PRESERVED_REPOLL_DAEMON_FIELDS",
+        "_PRESERVED_REPOLL_NEW_MODULE",
+        "_repoll_control_module_digest",
+        "assess_preserved_scheduler_repoll_equivalence",
+        "__all__",
+    },
+}
+_PRESERVED_REPOLL_DAEMON_METHODS = {
+    "_accounting_liveness_gate",
+    "_clear_sacct_streaks",
+    "_journal_sparse_accounting_liveness",
+    "_liveness_blocks_accounting_timeout",
+    "_on_pending",
+    "_prepare_environment_generation",
+    "_verify_intent_environment_binding",
+}
+_PRESERVED_REPOLL_DAEMON_FIELDS = {
+    "_preserved_scheduler_repoll_authority",
+}
+_PRESERVED_REPOLL_NEW_MODULE = (
+    "ichor_hpc/ichor/hpc/active_learning/daemon/"
+    "preserved_scheduler_repoll.py"
+)
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -706,6 +750,144 @@ def _producer_fingerprint(
     )
 
 
+def _repoll_control_module_digest(relative_path: str, source: str) -> str:
+    tree = ast.parse(source)
+    allowed = _PRESERVED_REPOLL_CONTROL_SYMBOLS.get(relative_path, set())
+    filtered = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in allowed:
+                continue
+        if isinstance(node, ast.ClassDef) and node.name == "Daemon":
+            node = ast.parse(ast.unparse(node)).body[0]
+            retained_children = []
+            for child in node.body:
+                if (
+                    isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and child.name in _PRESERVED_REPOLL_DAEMON_METHODS
+                ):
+                    continue
+                if isinstance(child, (ast.Assign, ast.AnnAssign)):
+                    child_targets = (
+                        child.targets
+                        if isinstance(child, ast.Assign)
+                        else [child.target]
+                    )
+                    child_names = {
+                        target.id
+                        for target in child_targets
+                        if isinstance(target, ast.Name)
+                    }
+                    if child_names and child_names.issubset(
+                        _PRESERVED_REPOLL_DAEMON_FIELDS
+                    ):
+                        continue
+                retained_children.append(child)
+            node.body = retained_children
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            names = {
+                target.id for target in targets if isinstance(target, ast.Name)
+            }
+            if names and names.issubset(allowed):
+                continue
+        filtered.append(node)
+    tree.body = filtered
+    return _module_digest(tree)
+
+
+def assess_preserved_scheduler_repoll_equivalence(
+    producer_generation: Mapping[str, Any],
+    current_generation: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Prove that an update changed scheduler control, not FEREBUS science."""
+    reasons = []
+    checks: Dict[str, bool] = {}
+    for key in (
+        "python_executable",
+        "python_version",
+        "dependencies",
+        "pyferebus",
+        "ariadne",
+        "ferebus_executable",
+        "machine_profile",
+        "loaded_modules",
+        "native_library_paths",
+        "campaign_schema_version",
+        "campaign_config_sha256",
+    ):
+        checks[key] = producer_generation.get(key) == current_generation.get(key)
+        if not checks[key]:
+            reasons.append(key + "_changed")
+
+    changed_runtime_paths = []
+    unchanged_control_symbols = True
+    try:
+        repo = _repository_root()
+        producer_commit = _require_clean_available_commit(
+            repo,
+            producer_generation,
+            label="producer",
+            require_worktree_clean=False,
+        )
+        current_commit = _require_clean_available_commit(
+            repo,
+            current_generation,
+            label="current",
+            require_worktree_clean=True,
+        )
+        producer_sources = _git_python_sources(repo, producer_commit)
+        current_sources = _git_python_sources(repo, current_commit)
+        changed_runtime_paths = [
+            path
+            for path in _changed_paths(repo, producer_commit, current_commit)
+            if not _is_non_runtime_path(path)
+        ]
+        allowed_paths = set(_PRESERVED_REPOLL_CONTROL_SYMBOLS)
+        allowed_paths.add(
+            "ichor_hpc/ichor/hpc/active_learning/daemon/daemon.py"
+        )
+        allowed_paths.add(_PRESERVED_REPOLL_NEW_MODULE)
+        unexpected = sorted(set(changed_runtime_paths) - allowed_paths)
+        if unexpected:
+            reasons.append("non_scheduler_runtime_code_changed")
+        for path in sorted(set(changed_runtime_paths) & allowed_paths):
+            if path == _PRESERVED_REPOLL_NEW_MODULE:
+                if path in producer_sources or path not in current_sources:
+                    unchanged_control_symbols = False
+                continue
+            before = producer_sources.get(path)
+            after = current_sources.get(path)
+            if before is None or after is None:
+                unchanged_control_symbols = False
+                continue
+            if _repoll_control_module_digest(
+                path,
+                before,
+            ) != _repoll_control_module_digest(path, after):
+                unchanged_control_symbols = False
+        if not unchanged_control_symbols:
+            reasons.append("non_repoll_symbols_changed")
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        unchanged_control_symbols = False
+        reasons.append(
+            "repoll_code_equivalence_unproven:"
+            + type(exc).__name__
+            + ":"
+            + str(exc)[:180]
+        )
+    checks["repoll_control_only"] = bool(
+        unchanged_control_symbols
+        and "non_scheduler_runtime_code_changed" not in reasons
+    )
+    return {
+        "equivalent": not reasons,
+        "checks": checks,
+        "changed_runtime_paths": sorted(changed_runtime_paths),
+        "reasons": list(dict.fromkeys(reasons)),
+    }
+
+
 def assess_resource_evidence_code_equivalence(
     producer_generation: Mapping[str, Any],
     current_generation: Mapping[str, Any],
@@ -1231,6 +1413,7 @@ __all__ = [
     "LEGACY_ENVIRONMENT_EQUIVALENCE_SCHEMA_VERSION",
     "SCIENTIFIC_FINGERPRINT_ALGORITHM",
     "assess_recovery_environment",
+    "assess_preserved_scheduler_repoll_equivalence",
     "assess_resource_evidence_code_equivalence",
     "environment_equivalence_path",
     "read_environment_equivalence",

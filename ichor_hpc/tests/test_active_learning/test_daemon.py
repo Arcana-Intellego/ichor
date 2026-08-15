@@ -706,7 +706,7 @@ def test_missing_sacct_rows_keep_polling_when_squeue_still_active(tmp_path):
     state = read_state(d.state_path())
     assert state.phase is CampaignPhase.INITIAL_AIMALL
     assert state.pending_jobs[CampaignPhase.INITIAL_AIMALL.value] == "777"
-    assert state.sacct_empty_streak.get("777:MISSING") == 1
+    assert "777:MISSING" not in state.sacct_empty_streak
     events = list(iter_events(d.journal_path()))
     assert any(e.get("event") == "sacct_rows_missing_but_squeue_active" for e in events)
 
@@ -714,7 +714,7 @@ def test_missing_sacct_rows_keep_polling_when_squeue_still_active(tmp_path):
     halted = read_state(d.state_path())
     assert halted.phase is CampaignPhase.INITIAL_AIMALL
     assert halted.pending_jobs[CampaignPhase.INITIAL_AIMALL.value] == "777"
-    assert halted.sacct_empty_streak.get("777:MISSING") == 2
+    assert "777:MISSING" not in halted.sacct_empty_streak
     intent = submission_intent.load_intent(d.campaign_dir, CampaignPhase.INITIAL_AIMALL.value, 0)
     assert intent["status"] == "SUBMITTED"
     events = list(iter_events(d.journal_path()))
@@ -780,7 +780,10 @@ def test_missing_sacct_rows_keep_polling_when_squeue_inconclusive(tmp_path):
     assert d.tick() == TickStatus.POLLING
     state = read_state(d.state_path())
     assert state.phase is CampaignPhase.INITIAL_AIMALL
-    assert state.sacct_empty_streak.get("777:MISSING") == 1
+    assert "777:MISSING" not in state.sacct_empty_streak
+    assert state.sacct_empty_streak.get(
+        "777:SQUEUE_INCONCLUSIVE:missing"
+    ) == 1
     events = list(iter_events(d.journal_path()))
     assert any(e.get("event") == "squeue_liveness_inconclusive" for e in events)
 
@@ -788,7 +791,10 @@ def test_missing_sacct_rows_keep_polling_when_squeue_inconclusive(tmp_path):
     halted = read_state(d.state_path())
     assert halted.phase is CampaignPhase.INITIAL_AIMALL
     assert halted.pending_jobs[CampaignPhase.INITIAL_AIMALL.value] == "777"
-    assert halted.sacct_empty_streak.get("777:MISSING") == 2
+    assert "777:MISSING" not in halted.sacct_empty_streak
+    assert halted.sacct_empty_streak.get(
+        "777:SQUEUE_INCONCLUSIVE:missing"
+    ) == 2
     intent = submission_intent.load_intent(d.campaign_dir, CampaignPhase.INITIAL_AIMALL.value, 0)
     assert intent["status"] == "SUBMITTED"
     events = list(iter_events(d.journal_path()))

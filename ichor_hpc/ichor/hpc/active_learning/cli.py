@@ -9152,15 +9152,12 @@ def _scheduler_uncertain_resume_target(
                     or "unknown disposition"
                 )
             )
-    for suffix in (
-        "",
-        ":UNKNOWN",
-        ":MISSING",
-        ":SQUEUE_INCONCLUSIVE:empty",
-        ":SQUEUE_INCONCLUSIVE:missing",
-        ":ERROR",
-    ):
-        target.sacct_empty_streak.pop(pending_job_id + suffix, None)
+    target.sacct_empty_streak = {
+        key: value
+        for key, value in target.sacct_empty_streak.items()
+        if key != pending_job_id
+        and not str(key).startswith(pending_job_id + ":")
+    }
     return target, intent
 
 
@@ -17894,6 +17891,25 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
             warn=state_warn,
         )
     )
+    scheduler_repoll = payload.get("_presentation_scheduler_repoll")
+    if isinstance(scheduler_repoll, Mapping):
+        if scheduler_repoll.get("job_id"):
+            lines.append(
+                _preflight_check_line(
+                    "preserved scheduler re-poll",
+                    True,
+                    str(scheduler_repoll.get("phase"))
+                    + " job "
+                    + str(scheduler_repoll.get("job_id"))
+                    + "; resume will poll existing work and submit no job",
+                    warn=True,
+                )
+            )
+        elif verbose and scheduler_repoll.get("error"):
+            lines.append(
+                "  preserved re-poll error: "
+                + str(scheduler_repoll.get("error"))
+            )
     environment_generation = payload.get(
         "_presentation_environment_generation"
     )
@@ -18396,6 +18412,7 @@ def evaluate_campaign_preflight(
     presentation_diversity_transition: Optional[Dict[str, Any]] = None
     presentation_environment: Optional[Dict[str, Any]] = None
     presentation_transaction: Optional[Dict[str, Any]] = None
+    presentation_scheduler_repoll: Optional[Dict[str, Any]] = None
     preflight_snapshot: Optional[Any] = None
     presentation_config_review: Dict[str, Any] = {
         "state": "unavailable",
@@ -18647,6 +18664,26 @@ def evaluate_campaign_preflight(
             ownership = assess_campaign_presentation(
                 ownership_payload
             ).scheduler
+            try:
+                from .daemon.preserved_scheduler_repoll import (
+                    resolve_preserved_scheduler_repoll_authority,
+                )
+
+                scheduler_repoll_authority = (
+                    resolve_preserved_scheduler_repoll_authority(
+                        campaign,
+                        state,
+                    )
+                )
+                if scheduler_repoll_authority is not None:
+                    presentation_scheduler_repoll = (
+                        scheduler_repoll_authority.to_evidence()
+                    )
+            except Exception as exc:
+                scheduler_repoll_authority = None
+                presentation_scheduler_repoll = {
+                    "error": type(exc).__name__ + ": " + str(exc),
+                }
             launch_ownership_payload = dict(ownership_payload)
             if _background_probe_is_current_startup_child(
                 campaign,
@@ -18660,17 +18697,25 @@ def evaluate_campaign_preflight(
             daemon_active = _status_daemon_active(launch_ownership_payload)
             scheduler_clear = bool(
                 not daemon_active
-                and not ownership.has_unresolved_scheduler_work
+                and (
+                    not ownership.has_unresolved_scheduler_work
+                    or scheduler_repoll_authority is not None
+                )
                 and not intent_errors
             )
             if daemon_active:
                 condition = "blocked"
                 issues.append("another daemon currently owns this campaign")
-            elif ownership.has_unresolved_scheduler_work or intent_errors:
+            elif (
+                ownership.has_unresolved_scheduler_work
+                and scheduler_repoll_authority is None
+            ) or intent_errors:
                 condition = "blocked"
                 issues.append(
                     "scheduler ownership is active or cannot be established safely"
                 )
+            elif scheduler_repoll_authority is not None:
+                condition = "ready"
 
             try:
                 presentation_transaction = inspect_reconcile_transaction_recovery(
@@ -18777,6 +18822,10 @@ def evaluate_campaign_preflight(
         presentation_diversity_transition
     )
     payload["_presentation_environment_generation"] = presentation_environment
+    if presentation_scheduler_repoll is not None:
+        payload["_presentation_scheduler_repoll"] = (
+            presentation_scheduler_repoll
+        )
     if isinstance(presentation_transaction, Mapping) and str(
         presentation_transaction.get("state") or ""
     ) != "none":
