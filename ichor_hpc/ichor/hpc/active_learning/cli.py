@@ -6292,6 +6292,7 @@ def _record_inactive_scheduler_terminal_evidence(
         expected_name,
         expected_task_count=int(expected_tasks),
         submission_kind=submission_kind,
+        cancellation_requested=True,
         timeout_seconds=int(timeout_seconds),
     )
     if accounted.inconclusive:
@@ -10169,11 +10170,11 @@ def _resolve_terminal_submission_intents_for_apply(
     """Classify conclusively terminal active intents before safe apply.
 
     This is intentionally fail-closed.  ``reconcile --apply`` may clear a stale
-    active intent only when ``squeue`` no longer sees the job and ``sacct``
-    reports terminal failure for the recorded JobID, or for the expected job
-    name in the PRE_SUBMIT crash window where the JobID was never persisted.
-    Missing scheduler data keeps the intent blocking so a user cannot
-    accidentally duplicate a live job.
+    active intent only when the scheduler queue no longer sees the job and
+    accounting reports terminal failure for the recorded JobID, or for the
+    expected job name in the PRE_SUBMIT crash window where the JobID was never
+    persisted. Missing scheduler data keeps the intent blocking so a user
+    cannot accidentally duplicate a live job.
     """
     from .submit import sacct_poll
 
@@ -10211,6 +10212,10 @@ def _resolve_terminal_submission_intents_for_apply(
             )
             continue
         job_id = str(intent.get("job_id") or "")
+        cancellation_owned = _intent_matches_cancel_stop_request(
+            campaign,
+            intent,
+        )
         intent_identity["intent_job_id"] = job_id
         expected_job_name = str(intent.get("expected_job_name") or "")
         status = str(intent.get("status") or "")
@@ -10258,6 +10263,7 @@ def _resolve_terminal_submission_intents_for_apply(
                     expected_job_name,
                     expected_task_count=expected_tasks,
                     submission_kind=str(intent.get("submission_kind") or ""),
+                    cancellation_requested=bool(cancellation_owned),
                 )
                 if lookup.inconclusive:
                     blocking.append({
@@ -10444,6 +10450,7 @@ def _resolve_terminal_submission_intents_for_apply(
         try:
             observations = scheduler_backend.poll_job(
                 job_id,
+                cancellation_requested=bool(cancellation_owned),
                 expected_job_name=expected_job_name,
                 expected_owner=current_scheduler_user(),
             )
@@ -10460,7 +10467,7 @@ def _resolve_terminal_submission_intents_for_apply(
                 + str(exc),
             })
             continue
-        if _intent_matches_cancel_stop_request(campaign, intent):
+        if cancellation_owned:
             try:
                 classification = classify_terminal_scheduler_evidence(
                     campaign,
@@ -13835,6 +13842,24 @@ def _print_reconcile_technical_details(
     verification_rows.append(("raw decision", str(getattr(report, "decision", "") or "-")))
     _print_reconcile_key_values(verification_rows)
     print("")
+    scheduler_terminal_blockers = list(
+        getattr(report, "scheduler_terminal_blockers", []) or []
+    )
+    if scheduler_terminal_blockers:
+        print("Scheduler terminal evidence")
+        _print_reconcile_list(
+            "blockers",
+            [
+                str(item.get("phase") or "unknown phase")
+                + "@"
+                + str(item.get("iteration") or 0)
+                + (" job=" + str(item.get("job_id")) if item.get("job_id") else "")
+                + ": "
+                + str(item.get("reason") or "unknown accounting problem")
+                for item in scheduler_terminal_blockers
+            ],
+        )
+        print("")
     _print_reconcile_last_failure_compact(report, verbose=True)
     _print_reconcile_artefacts(campaign, report, contract_status, verbose=True)
     _print_reconcile_aimall_quality_revalidation(report)
@@ -15136,6 +15161,9 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 ),
             )
         )
+        report.scheduler_terminal_blockers = [
+            dict(item) for item in terminal_blockers
+        ]
         if terminal_recoveries and not terminal_blockers:
             report = propose_recovery(
                 campaign,

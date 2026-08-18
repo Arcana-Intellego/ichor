@@ -35,6 +35,9 @@ _TASK_TOKEN_RE = re.compile(
 )
 _SGE_SAFE_JOB_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 _DURATION_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)([smhd]?)$", re.IGNORECASE)
+_FAILED_FIELD_RE = re.compile(r"^([0-9]+)(?:[ \t]*:[ \t]*(.+))?$")
+_TRANSIENT_RESCHEDULE_FAILURE_CODES = frozenset({24, 25})
+_MAX_SGE_STATUS_CODE = 2_147_483_647
 
 
 def validate_sge_parent_job_id(value: Any) -> str:
@@ -277,6 +280,90 @@ def _exact_int(record: Dict[str, str], key: str, *, minimum: int = 0) -> int:
     return parsed
 
 
+def parse_sge_failed_field(value: Any) -> Tuple[int, Optional[str]]:
+    """Parse Grid Engine's numeric ``failed`` code and optional annotation.
+
+    Grid Engine commonly renders rescheduling records as, for example,
+    ``25  : rescheduling``.  The annotation is diagnostic text; only the
+    numeric prefix participates in scheduler-state classification.
+    """
+    text = str(value or "").strip()
+    match = _FAILED_FIELD_RE.fullmatch(text)
+    if match is None:
+        raise ValueError("qacct field failed is malformed")
+    code = int(match.group(1))
+    if code > _MAX_SGE_STATUS_CODE:
+        raise ValueError("qacct field failed is out of range")
+    description = match.group(2)
+    if description is not None:
+        description = description.strip()
+        if not description or any(
+            ord(character) < 32 or ord(character) == 127
+            for character in description
+        ):
+            raise ValueError("qacct field failed annotation is malformed")
+    return code, description
+
+
+def select_qacct_task_records(
+    records: Sequence[Dict[str, str]],
+) -> List[Dict[str, str]]:
+    """Select one authoritative accounting attempt per logical SGE task.
+
+    A rescheduled task can leave one or more code-24/code-25 accounting
+    attempts before its decisive attempt.  Those transient rows may coexist
+    with exactly one decisive row.  Multiple decisive rows or inconsistent
+    scheduler identities remain ambiguous and fail closed.
+    """
+    grouped: Dict[Tuple[str, Optional[int]], List[Dict[str, str]]] = {}
+    for source in records:
+        record = dict(source)
+        parent = validate_sge_parent_job_id(record.get("jobnumber", ""))
+        task_text = str(record.get("taskid", "")).strip()
+        if task_text in {"", "undefined", "NONE"}:
+            native_task_id: Optional[int] = None
+        else:
+            native_task_id = _exact_int(record, "taskid", minimum=1)
+        parse_sge_failed_field(record.get("failed", ""))
+        grouped.setdefault((parent, native_task_id), []).append(record)
+
+    selected: List[Dict[str, str]] = []
+    for key in sorted(
+        grouped,
+        key=lambda item: (int(item[0]), -1 if item[1] is None else item[1]),
+    ):
+        attempts = grouped[key]
+        for identity_field in ("jobname", "owner"):
+            identities = {
+                str(record.get(identity_field) or "") for record in attempts
+            }
+            if len(identities) != 1:
+                raise ValueError(
+                    "qacct returned conflicting "
+                    + identity_field
+                    + " identities for one task"
+                )
+        decisive = [
+            record
+            for record in attempts
+            if parse_sge_failed_field(record.get("failed", ""))[0]
+            not in _TRANSIENT_RESCHEDULE_FAILURE_CODES
+        ]
+        if len(decisive) > 1:
+            parent, native_task_id = key
+            task_label = (
+                parent
+                if native_task_id is None
+                else parent + "." + str(native_task_id)
+            )
+            raise ValueError(
+                "qacct returned multiple decisive records for task "
+                + task_label
+            )
+        selected.append(decisive[0] if decisive else attempts[-1])
+    return selected
+
+
 def parse_sge_duration_seconds(value: Any) -> int:
     """Parse the duration forms emitted by ffluxlab's Grid Engine."""
     text = str(value or "").strip()
@@ -337,7 +424,7 @@ def qacct_observations(
     cancellation_requested: bool = False,
 ) -> List[JobObservation]:
     observations: List[JobObservation] = []
-    for record in records:
+    for record in select_qacct_task_records(records):
         parent = validate_sge_parent_job_id(record.get("jobnumber", ""))
         task_text = str(record.get("taskid", "")).strip()
         if task_text in {"", "undefined", "NONE"}:
@@ -347,10 +434,19 @@ def qacct_observations(
             native_task_id = _exact_int(record, "taskid", minimum=1)
             job_id = parent + "_" + str(native_task_id - 1)
             raw_id = parent + "." + str(native_task_id)
-        failed = _exact_int(record, "failed")
+        failed_raw = str(record.get("failed", "")).strip()
+        failed, _failed_description = parse_sge_failed_field(failed_raw)
         exit_status = _exact_int(record, "exit_status")
         if failed == 0 and exit_status == 0:
             status = JobStatus.COMPLETED
+        elif failed in _TRANSIENT_RESCHEDULE_FAILURE_CODES:
+            # Cancellation callers establish queue absence before treating a
+            # stranded reschedule record as terminal retry evidence.
+            status = (
+                JobStatus.FAILED
+                if cancellation_requested
+                else JobStatus.REQUEUED
+            )
         elif cancellation_requested and failed == 100 and exit_status == 137:
             status = JobStatus.CANCELLED
         else:
@@ -361,7 +457,9 @@ def qacct_observations(
                 status=status,
                 exit_code=(exit_status, 0),
                 elapsed_seconds=_optional_duration_seconds(record, "ru_wallclock"),
-                raw_status="failed=" + str(failed) + " exit_status=" + str(exit_status),
+                raw_status=(
+                    "failed=" + failed_raw + " exit_status=" + str(exit_status)
+                ),
                 job_id_raw=raw_id,
                 job_name=str(record.get("jobname") or "") or None,
                 owner=str(record.get("owner") or "") or None,
@@ -594,6 +692,7 @@ def find_accounted_job_by_name_detailed(
     qstat_runner: Callable[..., Any] = subprocess.run,
     use_qstat_fallback: bool = True,
     submission_kind: Optional[str] = None,
+    cancellation_requested: bool = False,
     timeout_seconds: int = 60,
 ) -> JobNameAccountingLookup:
     owner = str(getpass.getuser())
@@ -654,7 +753,23 @@ def find_accounted_job_by_name_detailed(
             error="multiple SGE jobs share expected name: " + repr(parent_ids),
         )
     parent = parent_ids[0]
-    observations = qacct_observations(records)
+    if cancellation_requested and use_qstat_fallback:
+        active = find_active_job_by_name_detailed(
+            name,
+            qstat_runner=qstat_runner,
+            timeout_seconds=int(timeout_seconds),
+        )
+        if active.job_id or active.inconclusive:
+            return JobNameAccountingLookup(
+                active.job_id,
+                inconclusive=active.inconclusive,
+                rows=list(active.rows),
+                error=active.error,
+            )
+    observations = qacct_observations(
+        records,
+        cancellation_requested=bool(cancellation_requested),
+    )
     summary = aggregate_states(
         parent,
         observations,
@@ -725,10 +840,12 @@ __all__ = [
     "parse_qstat_xml",
     "parse_qsub_terse_output",
     "parse_sge_duration_seconds",
+    "parse_sge_failed_field",
     "poll_job",
     "qacct_observations",
     "qstat_observations",
     "query_qacct",
+    "select_qacct_task_records",
     "query_qstat",
     "sge_safe_job_name",
     "validate_sge_parent_job_id",

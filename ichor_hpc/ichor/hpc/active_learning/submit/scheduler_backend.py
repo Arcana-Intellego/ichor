@@ -122,6 +122,7 @@ class SchedulerBackend:
         submission_kind: Optional[str],
         accounting_runner: Optional[Callable[..., Any]] = None,
         queue_runner: Optional[Callable[..., Any]] = None,
+        cancellation_requested: bool = False,
         timeout_seconds: int = 60,
     ):
         raise NotImplementedError
@@ -295,8 +296,10 @@ class SlurmScheduler(SchedulerBackend):
         submission_kind: Optional[str],
         accounting_runner: Optional[Callable[..., Any]] = None,
         queue_runner: Optional[Callable[..., Any]] = None,
+        cancellation_requested: bool = False,
         timeout_seconds: int = 60,
     ):
+        del cancellation_requested
         return _call_with_supported_kwargs(
             sacct_poll.find_accounted_job_by_name_detailed,
             name,
@@ -646,6 +649,7 @@ class SgeScheduler(SchedulerBackend):
         submission_kind: Optional[str],
         accounting_runner: Callable[..., Any] = subprocess.run,
         queue_runner: Callable[..., Any] = subprocess.run,
+        cancellation_requested: bool = False,
         timeout_seconds: int = 60,
     ):
         return sge.find_accounted_job_by_name_detailed(
@@ -655,6 +659,7 @@ class SgeScheduler(SchedulerBackend):
             qstat_runner=queue_runner,
             use_qstat_fallback=True,
             submission_kind=submission_kind,
+            cancellation_requested=bool(cancellation_requested),
             timeout_seconds=int(timeout_seconds),
         )
 

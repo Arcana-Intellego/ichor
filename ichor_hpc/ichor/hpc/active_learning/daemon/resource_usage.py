@@ -167,9 +167,12 @@ def parse_sge_usage_records(
     """Normalise qacct records into the existing telemetry row contract."""
     parent = sge.validate_sge_parent_job_id(job_id)
     rows: List[Dict[str, Any]] = []
-    for record in records:
-        if str(record.get("jobnumber") or "").strip() != parent:
-            continue
+    matching_records = [
+        dict(record)
+        for record in records
+        if str(record.get("jobnumber") or "").strip() == parent
+    ]
+    for record in sge.select_qacct_task_records(matching_records):
         task_text = str(record.get("taskid") or "").strip()
         if task_text in {"", "undefined", "NONE"}:
             logical_job_id = parent
@@ -181,7 +184,9 @@ def parse_sge_usage_records(
             logical_job_id = parent + "_" + str(native_task_id - 1)
             raw_job_id = parent + "." + str(native_task_id)
         try:
-            failed = int(str(record.get("failed") or ""))
+            failed, _failed_description = sge.parse_sge_failed_field(
+                record.get("failed")
+            )
             exit_status = int(str(record.get("exit_status") or ""))
             elapsed_seconds = sge.parse_sge_duration_seconds(
                 record.get("ru_wallclock") or "0"
@@ -198,6 +203,8 @@ def parse_sge_usage_records(
                 "state": (
                     "COMPLETED"
                     if failed == 0 and exit_status == 0
+                    else "REQUEUED"
+                    if failed in {24, 25}
                     else "FAILED"
                 ),
                 "exit_code": str(exit_status) + ":0",

@@ -409,6 +409,7 @@ class ReconciliationReport:
     existing_state_loaded: bool = False
     unsafe_reasons: List[str] = field(default_factory=list)
     active_submission_intents: List[Dict[str, Any]] = field(default_factory=list)
+    scheduler_terminal_blockers: List[Dict[str, Any]] = field(default_factory=list)
     receipt_backed_intent_repairs: List[Dict[str, Any]] = field(default_factory=list)
     decision: str = ""
     trusted_artifacts: List[str] = field(default_factory=list)

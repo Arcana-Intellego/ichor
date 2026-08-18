@@ -2808,6 +2808,176 @@ def test_cli_stop_cancel_jobs_records_mixed_terminal_task_evidence(
     assert item["n_retry"] == 3
 
 
+def test_reconcile_recovers_stranded_sge_ferebus_reschedule_as_one_retry(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon.scheduler_recovery import (
+        load_scheduler_terminal_receipt,
+    )
+    from ichor.hpc.active_learning.submit.sge import qacct_observations
+
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=10)
+    state.phase = CampaignPhase.FEREBUS
+    state.iteration = 8
+    state.pending_jobs[state.phase.value] = "898506"
+    _write_locked_state(campaign, state)
+    submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=state.phase.value,
+        iteration=state.iteration,
+        expected_tasks=6,
+        scheduler_identity_kind="sge",
+    )
+    submission_intent.mark_submitted(
+        campaign,
+        state.phase.value,
+        state.iteration,
+        "898506",
+        expected_tasks=6,
+    )
+    intent = submission_intent.load_intent(
+        campaign,
+        state.phase.value,
+        state.iteration,
+    )
+    request, _ = install_stop_request(
+        campaign,
+        build_stop_request(
+            state,
+            mode="immediate",
+            cancel_jobs=True,
+        ),
+    )
+    update_stop_request(
+        campaign,
+        request["request_id"],
+        status="cancelling",
+    )
+
+    owner = cli_mod.current_scheduler_user()
+    records = []
+    for native_task_id in range(1, 7):
+        records.append(
+            {
+                "jobnumber": "898506",
+                "taskid": str(native_task_id),
+                "jobname": str(intent["expected_job_name"]),
+                "owner": owner,
+                "failed": (
+                    "25  : rescheduling" if native_task_id == 5 else "0"
+                ),
+                "exit_status": "0",
+                "ru_wallclock": "300s",
+            }
+        )
+
+    cancellation_flags = []
+
+    class CapturedSgeBackend:
+        display_name = "Sun Grid Engine"
+        queue_command = "qstat"
+
+        def find_active_job_by_id(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                active=False,
+                inconclusive=False,
+                error=None,
+            )
+
+        def poll_job(self, *_args, **kwargs):
+            cancellation_requested = bool(
+                kwargs.get("cancellation_requested", False)
+            )
+            cancellation_flags.append(cancellation_requested)
+            return qacct_observations(
+                records,
+                cancellation_requested=cancellation_requested,
+            )
+
+    monkeypatch.setattr(
+        cli_mod,
+        "get_scheduler_backend",
+        lambda _kind: CapturedSgeBackend(),
+    )
+
+    preview, blockers = cli_mod._resolve_terminal_submission_intents_for_apply(
+        campaign,
+        [intent],
+        persist_terminal_receipts=False,
+    )
+
+    assert blockers == []
+    assert len(preview) == 1
+    assert preview[0]["scheduler_recovery"] is True
+    assert preview[0]["n_completed"] == 5
+    assert preview[0]["n_retry"] == 1
+    assert load_scheduler_terminal_receipt(campaign, intent) is None
+
+    applied, blockers = cli_mod._resolve_terminal_submission_intents_for_apply(
+        campaign,
+        [intent],
+        persist_terminal_receipts=True,
+    )
+
+    assert blockers == []
+    assert len(applied) == 1
+    assert cancellation_flags == [True, True]
+    receipt = load_scheduler_terminal_receipt(campaign, intent)
+    assert receipt is not None
+    assert receipt["completed_logical_task_ids"] == [0, 1, 2, 3, 5]
+    assert receipt["retry_logical_task_ids"] == [4]
+
+
+def test_verbose_reconcile_reports_exact_scheduler_accounting_blocker(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    campaign = _campaign_with_config(tmp_path)
+    report = SimpleNamespace(
+        artifact_snapshot=None,
+        decision="HALTED: unsafe artefacts need user review",
+        scheduler_terminal_blockers=[
+            {
+                "phase": CampaignPhase.FEREBUS.value,
+                "iteration": 8,
+                "job_id": "898506",
+                "reason": (
+                    "Sun Grid Engine accounting lookup failed: "
+                    "ValueError: qacct field failed is malformed"
+                ),
+            }
+        ],
+    )
+    for helper_name in (
+        "_print_reconcile_last_failure_compact",
+        "_print_reconcile_artefacts",
+        "_print_reconcile_aimall_quality_revalidation",
+        "_print_reconcile_ariadne_reuse",
+        "_print_reconcile_partial_array",
+        "_print_reconcile_intent_repairs",
+        "_print_reconcile_config_changes",
+        "_print_reconcile_contract_compact",
+    ):
+        monkeypatch.setattr(cli_mod, helper_name, lambda *_args, **_kwargs: None)
+
+    cli_mod._print_reconcile_technical_details(
+        campaign,
+        report,
+        {},
+        proposed_state_path=None,
+        config_review=None,
+    )
+
+    output = capsys.readouterr().out
+    assert "Scheduler terminal evidence" in output
+    assert "FEREBUS@8 job=898506" in output
+    assert "qacct field failed is malformed" in output
+
+
 def test_pre_submit_stop_records_no_scheduler_acceptance_receipt(
     tmp_path,
     monkeypatch,

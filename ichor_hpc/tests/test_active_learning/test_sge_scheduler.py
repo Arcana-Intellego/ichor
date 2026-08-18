@@ -35,10 +35,12 @@ from ichor.hpc.active_learning.submit.sge import (
     parse_qacct_output,
     parse_qstat_xml,
     parse_sge_duration_seconds,
+    parse_sge_failed_field,
     parse_qsub_terse_output,
     poll_job,
     qacct_observations,
     qstat_observations,
+    select_qacct_task_records,
 )
 
 
@@ -90,6 +92,16 @@ maxvmem      14.570MB
 
 def _completed(stdout="", stderr="", returncode=0):
     return SimpleNamespace(stdout=stdout, stderr=stderr, returncode=returncode)
+
+
+def _qacct_stdout(records):
+    return (
+        "\n==============================================================\n".join(
+            "\n".join(str(key) + " " + str(value) for key, value in record.items())
+            for record in records
+        )
+        + "\n"
+    )
 
 
 def test_slurm_queue_diagnostics_records_reason_and_partition():
@@ -289,6 +301,84 @@ def test_qacct_success_and_failure_contracts():
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
+        ("0", (0, None)),
+        ("24 : migrated", (24, "migrated")),
+        ("25  : rescheduling", (25, "rescheduling")),
+        ("100 : assumedly after job", (100, "assumedly after job")),
+    ],
+)
+def test_sge_failed_field_accepts_numeric_code_with_diagnostic_annotation(
+    value,
+    expected,
+):
+    assert parse_sge_failed_field(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "rescheduling", "25:", "-1", "25 : bad\nannotation", "9999999999"],
+)
+def test_sge_failed_field_rejects_malformed_or_out_of_range_values(value):
+    with pytest.raises(ValueError):
+        parse_sge_failed_field(value)
+
+
+@pytest.mark.parametrize("failed", ["24 : migrated", "25  : rescheduling"])
+def test_sge_reschedule_accounting_is_live_until_cancellation_owns_it(failed):
+    record = dict(parse_qacct_output(QACCT)[0], failed=failed)
+
+    ordinary = qacct_observations([record])[0]
+    cancelled = qacct_observations(
+        [record],
+        cancellation_requested=True,
+    )[0]
+
+    assert ordinary.status is JobStatus.REQUEUED
+    assert cancelled.status is JobStatus.FAILED
+    assert ordinary.raw_status == "failed=" + failed + " exit_status=0"
+
+
+def test_qacct_reschedule_history_selects_one_decisive_attempt():
+    base = parse_qacct_output(QACCT)[0]
+    transient = dict(base, failed="25 : rescheduling", hostname="compute-0-6")
+    completed = dict(base, failed="0", hostname="compute-0-7")
+
+    selected = select_qacct_task_records([transient, completed])
+    observations = qacct_observations([transient, completed])
+
+    assert selected == [completed]
+    assert len(observations) == 1
+    assert observations[0].status is JobStatus.COMPLETED
+
+
+def test_qacct_all_transient_history_remains_one_requeued_task():
+    base = parse_qacct_output(QACCT)[0]
+    first = dict(base, failed="24 : migrated", hostname="compute-0-6")
+    second = dict(base, failed="25 : rescheduling", hostname="compute-0-7")
+
+    observations = qacct_observations([first, second])
+
+    assert len(observations) == 1
+    assert observations[0].status is JobStatus.REQUEUED
+    assert observations[0].raw_status.startswith("failed=25 : rescheduling")
+
+
+def test_qacct_duplicate_decisive_or_conflicting_identity_fails_closed():
+    base = parse_qacct_output(QACCT)[0]
+    with pytest.raises(ValueError, match="multiple decisive"):
+        qacct_observations([base, dict(base)])
+    with pytest.raises(ValueError, match="conflicting owner"):
+        qacct_observations(
+            [
+                dict(base, failed="25 : rescheduling"),
+                dict(base, failed="24 : migrated", owner="another-user"),
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
         ("26s", 26),
         ("12.6", 13),
         ("2m", 120),
@@ -321,6 +411,20 @@ def test_sge_resource_usage_parses_ffluxlab_units():
             "total_cpu": "",
         }
     ]
+
+
+def test_sge_resource_usage_accepts_annotated_reschedule_record():
+    record = dict(
+        parse_qacct_output(QACCT)[0],
+        failed="25  : rescheduling",
+        exit_status="0",
+    )
+
+    rows = parse_sge_usage_records([record], job_id="898176")
+
+    assert len(rows) == 1
+    assert rows[0]["job_id"] == "898176_0"
+    assert rows[0]["state"] == "REQUEUED"
 
 
 def test_sge_resource_usage_queries_through_recorded_scheduler(tmp_path):
@@ -377,6 +481,56 @@ def test_poll_merges_finished_accounting_with_live_queue_rows():
     assert summary.n_completed == 1
     assert summary.n_pending_or_running == 4
     assert summary.n_missing == 0
+
+
+def test_poll_classifies_exact_ffluxlab_stranded_ferebus_array_for_retry():
+    base = parse_qacct_output(QACCT)[0]
+    records = [
+        dict(
+            base,
+            taskid=str(native_task_id),
+            failed=(
+                "25  : rescheduling" if native_task_id == 5 else "0"
+            ),
+        )
+        for native_task_id in range(1, 7)
+    ]
+    accounting = _qacct_stdout(records)
+    empty_queue = "<job_info><queue_info/><job_info/></job_info>"
+
+    ordinary = poll_job(
+        "898176",
+        qstat_runner=lambda *_args, **_kwargs: _completed(empty_queue),
+        qacct_runner=lambda *_args, **_kwargs: _completed(accounting),
+    )
+    cancellation = poll_job(
+        "898176",
+        qstat_runner=lambda *_args, **_kwargs: _completed(empty_queue),
+        qacct_runner=lambda *_args, **_kwargs: _completed(accounting),
+        cancellation_requested=True,
+    )
+
+    ordinary_summary = aggregate_states(
+        "898176",
+        ordinary,
+        expected_task_count=6,
+        submission_kind="array",
+        strict_parent_job_id=False,
+    )
+    cancellation_summary = aggregate_states(
+        "898176",
+        cancellation,
+        expected_task_count=6,
+        submission_kind="array",
+        strict_parent_job_id=False,
+    )
+    assert ordinary_summary.n_completed == 5
+    assert ordinary_summary.n_pending_or_running == 1
+    assert ordinary_summary.is_terminal is False
+    assert cancellation_summary.n_completed == 5
+    assert cancellation_summary.n_failed == 1
+    assert cancellation_summary.failure_indices == [4]
+    assert cancellation_summary.is_terminal is True
 
 
 def test_qstat_held_and_error_states_remain_fail_closed():
@@ -468,6 +622,64 @@ def test_accounted_name_adoption_waits_for_complete_array(monkeypatch):
     )
     assert lookup.job_id == "898176"
     assert not lookup.terminal
+
+
+def test_accounted_name_treats_stranded_reschedule_as_terminal_only_for_cancel(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.submit.sge.getpass.getuser",
+        lambda: "q81036tb",
+    )
+    captured = QACCT.replace("failed       0", "failed       25  : rescheduling")
+
+    def qacct_runner(command, **kwargs):
+        return _completed(captured)
+
+    def empty_qstat_runner(command, **kwargs):
+        return _completed("<job_info><queue_info/><job_info/></job_info>")
+
+    ordinary = find_accounted_job_by_name_detailed(
+        "ichor-campaign-ariadne",
+        expected_task_count=1,
+        submission_kind="array",
+        qacct_runner=qacct_runner,
+        qstat_runner=empty_qstat_runner,
+    )
+    cancellation = find_accounted_job_by_name_detailed(
+        "ichor-campaign-ariadne",
+        expected_task_count=1,
+        submission_kind="array",
+        qacct_runner=qacct_runner,
+        qstat_runner=empty_qstat_runner,
+        cancellation_requested=True,
+    )
+
+    assert ordinary.job_id == "898176"
+    assert ordinary.terminal is False
+    assert cancellation.job_id == "898176"
+    assert cancellation.terminal is True
+    assert cancellation.failed is True
+
+
+def test_accounted_cancel_lookup_keeps_live_rescheduled_job_active(monkeypatch):
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.submit.sge.getpass.getuser",
+        lambda: "q81036tb",
+    )
+    captured = QACCT.replace("failed       0", "failed       25 : rescheduling")
+
+    lookup = find_accounted_job_by_name_detailed(
+        "ichor-campaign-ariadne",
+        expected_task_count=5,
+        submission_kind="array",
+        qacct_runner=lambda *_args, **_kwargs: _completed(captured),
+        qstat_runner=lambda *_args, **_kwargs: _completed(QSTAT_XML),
+        cancellation_requested=True,
+    )
+
+    assert lookup.job_id == "898176"
+    assert lookup.terminal is False
 
 
 def test_sge_submit_exports_binding_and_parses_parent_id():
