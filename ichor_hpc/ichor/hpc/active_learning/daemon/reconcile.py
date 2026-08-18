@@ -538,8 +538,8 @@ def _inspect_aimall_postprocess_recovery(
         "iteration": int(iteration),
         "replacement_round": int(replacement_round),
         "logical_total": logical_total,
-        "n_complete": logical_total,
-        "n_reuse": logical_total,
+        "n_complete": 0,
+        "n_reuse": 0,
         "n_retry": 0,
         "retry_task_ids": [],
         "retry_task_file": None,
@@ -549,7 +549,10 @@ def _inspect_aimall_postprocess_recovery(
         "producer_submission_identity": str(source["submission_identity"]),
         "source_sha256": str(source["source_sha256"]),
         "scheduler_jobs_submitted": 0,
-        "validation": "local_postprocess_required",
+        "scheduler_completed_candidates": logical_total,
+        "validation": (
+            "scheduler_completed_candidates_await_local_validation"
+        ),
     }
 
 
@@ -2868,7 +2871,8 @@ def propose_recovery(
             elif isinstance(aimall_postprocess_recovery, dict):
                 recovery_reason = (
                     "scheduler-complete AIMAll outputs require local "
-                    "postprocessing; no array tasks will be resubmitted"
+                    "structural validation; only invalid or unfinished "
+                    "tasks may be retried"
                 )
             elif str(
                 partial_array_recovery.get("upstream_rewind") or ""

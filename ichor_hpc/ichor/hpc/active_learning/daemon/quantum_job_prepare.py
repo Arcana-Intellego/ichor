@@ -27,6 +27,17 @@ _AIMALL_STALE_FILES = frozenset(
         "QUANTUM_ACCEPTANCE_RECEIPT.json",
     }
 )
+_AIMALL_STALE_PATTERNS = (
+    "*.aim",
+    "*.agp",
+    "*.agpviz",
+    "*.extout",
+    "*.int",
+    "*.mgp",
+    "*.mgpviz",
+    "*.sum",
+    "*.sumviz",
+)
 
 
 def _reject_symlink_tree(root: Path) -> None:
@@ -86,6 +97,8 @@ def prepare_quantum_task(
         stale_files.extend(root.glob("*.gau"))
         stale_files.extend(root.glob("*.gaussianoutput"))
         stale_files.extend(root.glob("*.wfn"))
+    for pattern in _AIMALL_STALE_PATTERNS:
+        stale_files.extend(root.glob(pattern))
     _remove_files(stale_files)
     if selected_backend == "aimall":
         task_path = root / "AIMALL_TASK.json"

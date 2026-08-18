@@ -684,6 +684,88 @@ def test_ariadne_retry_archive_replay_rejects_recreated_source(
         )
 
 
+def test_aimall_retry_archives_only_aimall_derived_outputs(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = tmp_path / "campaign"
+    pointdir = (
+        campaign
+        / ".DATA"
+        / "STAGING"
+        / "initial"
+        / "POINT_0000.pointdir"
+    )
+    pointdir.mkdir(parents=True)
+    monkeypatch.setattr(
+        array_recovery,
+        "_bound_array_recovery_scan_context",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        array_recovery,
+        "_pointdir_for_task",
+        lambda *_args, **_kwargs: pointdir,
+    )
+
+    preserved = (
+        "input.gjf",
+        "input.wfn",
+        "input.gaussianoutput",
+        "provenance.json",
+        "GAUSSIAN_TASK_RECEIPT.json",
+        "WFN_METHOD_RECEIPT.json",
+        "AIMALL_TASK.json",
+    )
+    for name in preserved:
+        (pointdir / name).write_text("preserved\n", encoding="utf-8")
+
+    derived = (
+        "input.aim",
+        "input.agp",
+        "input.agpviz",
+        "input.extout",
+        "input.int",
+        "input.mgp",
+        "input.mgpviz",
+        "input.sum",
+        "input.sumviz",
+        "AIMALL_COMPLETION_RECEIPT.json",
+        "QUANTUM_ACCEPTANCE_RECEIPT.json",
+    )
+    for name in derived:
+        (pointdir / name).write_text("stale\n", encoding="utf-8")
+    atomic = pointdir / "input_atomicfiles"
+    atomic.mkdir()
+    (atomic / "h1.int").write_text("truncated\n", encoding="utf-8")
+
+    archived = array_recovery.archive_existing_array_task_outputs(
+        campaign,
+        "INITIAL_AIMALL",
+        0,
+        task_ids=[0],
+        archive_identity="aimall-structural-retry",
+    )
+
+    assert all((pointdir / name).is_file() for name in preserved)
+    assert all(not (pointdir / name).exists() for name in derived)
+    assert not atomic.exists()
+    assert {Path(path).name for path in archived} == {
+        *derived,
+        "input_atomicfiles",
+    }
+    assert all(Path(path).exists() for path in archived)
+
+    replayed = array_recovery.archive_existing_array_task_outputs(
+        campaign,
+        "INITIAL_AIMALL",
+        0,
+        task_ids=[0],
+        archive_identity="aimall-structural-retry",
+    )
+    assert replayed == archived
+
+
 def test_replacement_phases_support_round_specific_partial_recovery(
     tmp_path,
     monkeypatch,

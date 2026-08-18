@@ -340,6 +340,9 @@ class Daemon:
     _preserved_scheduler_repoll_authority: Optional[Any] = field(
         default=None, init=False, repr=False
     )
+    _aimall_terminal_classification: Optional[Dict[str, Any]] = field(
+        default=None, init=False, repr=False
+    )
     _environment_binding_mode: Optional[str] = field(
         default=None, init=False, repr=False
     )
@@ -2034,7 +2037,27 @@ class Daemon:
         local_postprocess_intent = bool(
             isinstance(active_intent, Mapping)
             and isinstance(active_intent.get("postprocess_source"), Mapping)
-            and postprocess_source is not None
+            and (
+                postprocess_source is not None
+                or (
+                    phase
+                    in {
+                        CampaignPhase.INITIAL_AIMALL,
+                        CampaignPhase.AIMALL,
+                        CampaignPhase.INITIAL_REPLACEMENT_AIMALL,
+                        CampaignPhase.REPLACEMENT_AIMALL,
+                    }
+                    and isinstance(
+                        self._aimall_terminal_classification,
+                        Mapping,
+                    )
+                    and bool(
+                        self._aimall_terminal_classification.get(
+                            "invalid_completed_tasks"
+                        )
+                    )
+                )
+            )
         )
         if active_intent is not None:
             recorded_scheduler = str(
@@ -2423,6 +2446,22 @@ class Daemon:
                     "_submission_resource_authority_guard",
                     None,
                 )
+                setattr(
+                    self.executor,
+                    "_aimall_terminal_classification",
+                    None,
+                )
+                setattr(
+                    self.executor,
+                    "_aimall_terminal_rejection_task_ids",
+                    [],
+                )
+                setattr(
+                    self.executor,
+                    "_aimall_terminal_rejection_reasons",
+                    {},
+                )
+                self._aimall_terminal_classification = None
         except SubmissionCancelledBeforeSchedulerAcceptance as exc:
             if phase_reporter is not None:
                 phase_reporter.fail(
@@ -3268,6 +3307,108 @@ class Daemon:
             self._preserved_scheduler_repoll_authority = None
             return result
 
+        if phase in {
+            CampaignPhase.INITIAL_AIMALL,
+            CampaignPhase.AIMALL,
+            CampaignPhase.INITIAL_REPLACEMENT_AIMALL,
+            CampaignPhase.REPLACEMENT_AIMALL,
+        }:
+            try:
+                failure_threshold_fraction = (
+                    _submission_intent.snapshotted_failure_threshold_fraction(
+                        self.campaign_dir,
+                        phase.value,
+                        int(state.iteration),
+                        expected_campaign_uid=str(state.campaign_uid),
+                    )
+                )
+            except Exception as exc:
+                return self._halt(
+                    state,
+                    phase,
+                    "submission_decision_contract_invalid: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)[:180],
+                )
+            from .aimall_output_validation import (
+                AIMALL_STRUCTURAL_INVALID_EXIT_CODE,
+            )
+
+            validator_contract = False
+            if any(
+                observation.exit_code
+                == (AIMALL_STRUCTURAL_INVALID_EXIT_CODE, 0)
+                for observation in summary.observations
+            ):
+                structural_intent = _submission_intent.load_intent(
+                    self.campaign_dir,
+                    phase.value,
+                    int(state.iteration),
+                    expected_campaign_uid=str(state.campaign_uid),
+                )
+                if isinstance(structural_intent, Mapping):
+                    try:
+                        from .aimall_terminal_recovery import (
+                            aimall_intent_has_structural_validator_contract,
+                        )
+
+                        validator_contract = (
+                            aimall_intent_has_structural_validator_contract(
+                                self.campaign_dir,
+                                structural_intent,
+                            )
+                        )
+                    except Exception as exc:
+                        return self._halt(
+                            state,
+                            phase,
+                            "submission_decision_contract_invalid: "
+                            + type(exc).__name__
+                            + ": "
+                            + str(exc)[:180],
+                        )
+            structural_failures = 0
+            infrastructure_failures = 0
+            for observation in summary.observations:
+                successful = bool(
+                    str(
+                        getattr(
+                            observation.status,
+                            "value",
+                            observation.status,
+                        )
+                    ).upper()
+                    == "COMPLETED"
+                    and observation.exit_code == (0, 0)
+                )
+                if successful:
+                    continue
+                if (
+                    observation.exit_code
+                    == (AIMALL_STRUCTURAL_INVALID_EXIT_CODE, 0)
+                    and validator_contract
+                ):
+                    structural_failures += 1
+                else:
+                    infrastructure_failures += 1
+            infrastructure_fraction = (
+                float(infrastructure_failures) / float(summary.n_tasks)
+                if int(summary.n_tasks) > 0
+                else 1.0
+            )
+            if infrastructure_fraction <= float(failure_threshold_fraction):
+                result = self._record_terminal_aimall_recovery(
+                    state,
+                    phase,
+                    observations,
+                    summary,
+                    structural_failures=int(structural_failures),
+                    infrastructure_failures=int(infrastructure_failures),
+                )
+                self._preserved_scheduler_repoll_authority = None
+                return result
+
         success_ratio = summary.n_completed / summary.n_tasks
         try:
             failure_threshold_fraction = (
@@ -3296,6 +3437,134 @@ class Daemon:
         result = self._handle_failure(state, phase, observations, summary)
         self._preserved_scheduler_repoll_authority = None
         return result
+
+    def _record_terminal_aimall_recovery(
+        self,
+        state: CampaignState,
+        phase: CampaignPhase,
+        observations: Sequence[JobObservation],
+        summary: Any,
+        *,
+        structural_failures: int,
+        infrastructure_failures: int,
+    ) -> str:
+        """Retire exact terminal AIMAll ownership for local task recovery."""
+        intent = _submission_intent.load_intent(
+            self.campaign_dir,
+            phase.value,
+            int(state.iteration),
+            expected_campaign_uid=str(state.campaign_uid),
+        )
+        if not isinstance(intent, Mapping):
+            return self._halt_scheduler_uncertain(
+                state,
+                phase,
+                "terminal AIMAll scheduler work has no submission intent",
+            )
+        if str(intent.get("job_id") or "") != str(summary.parent_job_id):
+            return self._halt_scheduler_uncertain(
+                state,
+                phase,
+                "terminal AIMAll scheduler JobID differs from its intent",
+            )
+        liveness = self._check_job_liveness(
+            str(summary.parent_job_id),
+            expected_job_name=str(intent.get("expected_job_name") or ""),
+            expected_owner=getpass.getuser(),
+        )
+        if liveness is None:
+            if self._strict_artifact_checks_enabled():
+                return self._halt_scheduler_uncertain(
+                    state,
+                    phase,
+                    "terminal AIMAll queue ownership could not be checked",
+                )
+            queue_active = False
+            queue_inconclusive = False
+            queue_error = None
+        else:
+            queue_active = bool(getattr(liveness, "active", False))
+            queue_inconclusive = bool(
+                getattr(liveness, "inconclusive", False)
+            )
+            queue_error = getattr(liveness, "error", None)
+        if queue_active or queue_inconclusive:
+            self._journal(
+                "queue_lifecycle_update",
+                phase=phase.value,
+                iteration=int(state.iteration),
+                job_id=str(summary.parent_job_id),
+                queue_event="terminal_recovery_wait",
+                status="RUNNING" if queue_active else "UNKNOWN",
+                reason=(
+                    "scheduler job remains visible"
+                    if queue_active
+                    else str(queue_error or "queue ownership is inconclusive")
+                ),
+            )
+            return TickStatus.POLLING
+        try:
+            from .scheduler_recovery import (
+                classify_terminal_scheduler_evidence,
+                scheduler_terminal_receipt_path,
+                write_scheduler_terminal_receipt,
+            )
+
+            classification = classify_terminal_scheduler_evidence(
+                self.campaign_dir,
+                intent,
+                observations,
+                queue_active=False,
+                queue_inconclusive=False,
+            )
+            receipt = write_scheduler_terminal_receipt(
+                self.campaign_dir,
+                intent,
+                classification,
+            )
+            receipt_path = scheduler_terminal_receipt_path(
+                self.campaign_dir,
+                phase=phase.value,
+                iteration=int(state.iteration),
+                replacement_round=int(
+                    getattr(state, "replacement_round", 0)
+                ),
+                submission_identity=str(intent["submission_identity"]),
+                schema_version=int(receipt["schema_version"]),
+            )
+            if str(intent.get("status") or "") != "FAILED":
+                _submission_intent.mark_failed(
+                    self.campaign_dir,
+                    phase.value,
+                    int(state.iteration),
+                    "terminal_aimall_tasks_require_local_recovery",
+                )
+        except Exception as exc:
+            return self._halt_scheduler_uncertain(
+                state,
+                phase,
+                "terminal AIMAll recovery evidence is invalid: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:180],
+            )
+        self._clear_sacct_streaks(state, str(summary.parent_job_id))
+        state.pending_jobs[phase.value] = None
+        self._persist(state)
+        self._journal(
+            "failure_action",
+            phase=phase.value,
+            iteration=int(state.iteration),
+            action=FailureAction.RETRY.value,
+            n_tasks=int(summary.n_tasks),
+            n_completed=int(summary.n_completed),
+            n_failed=int(summary.n_failed),
+            structural_failures=int(structural_failures),
+            infrastructure_failures=int(infrastructure_failures),
+            terminal_receipt=str(receipt_path),
+            terminal_receipt_sha256=str(receipt["receipt_sha256"]),
+        )
+        return TickStatus.RETRYING
 
     def _submission_decision_contract(self) -> Dict[str, Any]:
         """Snapshot decision controls that must not change in flight."""
@@ -3546,6 +3815,9 @@ class Daemon:
             resolve_aimall_postprocess_source,
         )
 
+        self._aimall_terminal_classification = None
+        setattr(self.executor, "_aimall_terminal_classification", None)
+
         current = load_intent(
             self.campaign_dir,
             phase.value,
@@ -3569,33 +3841,103 @@ class Daemon:
             replacement_round=int(getattr(state, "replacement_round", 0)),
             intent=current,
         )
-        from .quantum_task_contracts import quantum_task_contract
-        from .quantum_task_receipts import AIMALL_TASK_RECEIPT
-
-        contract = quantum_task_contract(
-            self.campaign_dir,
-            phase.value,
-            int(state.iteration),
-            replacement_round=int(getattr(state, "replacement_round", 0)),
-            expected_campaign_uid=str(state.campaign_uid),
-            validate_points_file=False,
+        from .aimall_terminal_recovery import (
+            classify_aimall_postprocess_source_outputs,
         )
-        receipt_count = sum(
-            1
-            for task in contract.tasks
-            if (task.pointdir / AIMALL_TASK_RECEIPT).is_file()
-            and not (task.pointdir / AIMALL_TASK_RECEIPT).is_symlink()
-        )
-        if receipt_count:
-            from .live_executor import _aimall_visibility_issue
 
-            unsettled = any(
-                _aimall_visibility_issue(task.pointdir) is not None
-                for task in contract.tasks
+        attempts = max(
+            1,
+            int(
+                getattr(
+                    self.config.runtime,
+                    "postprocess_settle_attempts",
+                    3,
+                )
+            ),
+        )
+        settle_seconds = max(
+            0,
+            int(
+                getattr(
+                    self.config.runtime,
+                    "postprocess_settle_seconds",
+                    10,
+                )
+            ),
+        )
+        fingerprints: List[tuple[tuple[int, str], ...]] = []
+        for attempt in range(attempts):
+            classification = classify_aimall_postprocess_source_outputs(
+                self.campaign_dir,
+                campaign_uid=str(state.campaign_uid),
+                phase_name=phase.value,
+                iteration=int(state.iteration),
+                replacement_round=int(
+                    getattr(state, "replacement_round", 0)
+                ),
+                source=source,
+                expected_method=str(self.config.gaussian.method),
+                publish_valid_receipts=True,
             )
-            if unsettled:
-                return None
-        return source
+            invalid = list(
+                classification.get("invalid_completed_tasks") or []
+            )
+            if not invalid:
+                self._aimall_terminal_classification = None
+                return source
+            fingerprint = []
+            for record in invalid:
+                if not isinstance(record, Mapping):
+                    raise ValueError(
+                        "AIMAll local output classification is malformed"
+                    )
+                task_id = record.get("task_id")
+                digest = record.get("fingerprint_sha256")
+                if (
+                    isinstance(task_id, bool)
+                    or not isinstance(task_id, int)
+                    or task_id < 0
+                    or not isinstance(digest, str)
+                    or len(digest) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in digest
+                    )
+                ):
+                    raise ValueError(
+                        "AIMAll local output fingerprint is invalid"
+                    )
+                fingerprint.append((int(task_id), digest))
+            fingerprints.append(tuple(sorted(fingerprint)))
+            if attempt + 1 < attempts:
+                self._journal(
+                    "postprocess_settle_retry",
+                    phase=phase.value,
+                    iteration=int(state.iteration),
+                    attempt=int(attempt + 1),
+                    reason=(
+                        "scheduler-completed AIMAll outputs are still "
+                        "changing or require a second stability observation"
+                    ),
+                )
+                self._write_lease_heartbeat(state)
+                if settle_seconds:
+                    self.sleep_fn(float(settle_seconds))
+        if (
+            len(fingerprints) >= 2
+            and fingerprints[-1] == fingerprints[-2]
+        ):
+            self._aimall_terminal_classification = dict(classification)
+            setattr(
+                self.executor,
+                "_aimall_terminal_classification",
+                dict(classification),
+            )
+            return None
+        raise ValueError(
+            "scheduler-completed AIMAll output evidence did not stabilise "
+            "across configured settle attempts"
+        )
 
     def _gaussian_postprocess_source_if_complete(
         self,
@@ -3969,6 +4311,7 @@ class Daemon:
         attempts = max(1, int(getattr(self.config.runtime, "postprocess_settle_attempts", 3)))
         settle_seconds = max(0, int(getattr(self.config.runtime, "postprocess_settle_seconds", 10)))
         result = None
+        aimall_settle_fingerprints: List[tuple[tuple[int, str], ...]] = []
         self._record_queue_lifecycle(
             state,
             phase,
@@ -4033,6 +4376,41 @@ class Daemon:
                 self._bind_executor_progress(None)
                 return self._halt(state, phase, reason)
             if (
+                phase in {
+                    CampaignPhase.INITIAL_AIMALL,
+                    CampaignPhase.AIMALL,
+                    CampaignPhase.INITIAL_REPLACEMENT_AIMALL,
+                    CampaignPhase.REPLACEMENT_AIMALL,
+                }
+                and result.retry_disposition
+                is PostprocessRetryDisposition.FILESYSTEM_SETTLE
+            ):
+                candidates = (result.postprocess_metadata or {}).get(
+                    "aimall_structural_candidates"
+                )
+                if isinstance(candidates, list) and candidates:
+                    fingerprint = []
+                    for record in candidates:
+                        if not isinstance(record, Mapping):
+                            fingerprint = []
+                            break
+                        task_id = record.get("task_id")
+                        digest = record.get("fingerprint_sha256")
+                        if (
+                            isinstance(task_id, bool)
+                            or not isinstance(task_id, int)
+                            or task_id < 0
+                            or not isinstance(digest, str)
+                            or len(digest) != 64
+                        ):
+                            fingerprint = []
+                            break
+                        fingerprint.append((int(task_id), digest))
+                    if fingerprint:
+                        aimall_settle_fingerprints.append(
+                            tuple(sorted(fingerprint))
+                        )
+            if (
                 result.failure_reason
                 and attempt + 1 < attempts
                 and result.retry_disposition
@@ -4065,6 +4443,20 @@ class Daemon:
             postprocess_reporter.fail("postprocess failed without a result")
             return self._halt(state, phase, "postprocess_failed_without_result")
         if result.failure_reason:
+            stable_aimall_structural_failure = bool(
+                phase
+                in {
+                    CampaignPhase.INITIAL_AIMALL,
+                    CampaignPhase.AIMALL,
+                    CampaignPhase.INITIAL_REPLACEMENT_AIMALL,
+                    CampaignPhase.REPLACEMENT_AIMALL,
+                }
+                and result.retry_disposition
+                is PostprocessRetryDisposition.FILESYSTEM_SETTLE
+                and len(aimall_settle_fingerprints) >= 2
+                and aimall_settle_fingerprints[-1]
+                == aimall_settle_fingerprints[-2]
+            )
             self._record_queue_lifecycle(
                 state,
                 phase,
@@ -4076,6 +4468,17 @@ class Daemon:
                 n_missing=int(getattr(summary, "n_missing", 0)),
             )
             postprocess_reporter.fail(str(result.failure_reason))
+            if stable_aimall_structural_failure:
+                return self._record_terminal_aimall_recovery(
+                    state,
+                    phase,
+                    observations,
+                    summary,
+                    structural_failures=len(
+                        aimall_settle_fingerprints[-1]
+                    ),
+                    infrastructure_failures=0,
+                )
             return self._halt(state, phase, result.failure_reason)
         self._clear_sacct_streaks(state, str(summary.parent_job_id))
         contract_error = self._transition_output_contract_error(

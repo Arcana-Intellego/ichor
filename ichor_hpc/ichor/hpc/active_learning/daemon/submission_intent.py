@@ -2128,6 +2128,13 @@ def update_intent_status(
         )
     if submission_metadata:
         metadata = dict(submission_metadata)
+        existing_metadata = data.get("submission_metadata")
+        if isinstance(existing_metadata, Mapping):
+            for key, value in existing_metadata.items():
+                if key not in metadata or metadata[key] != value:
+                    raise ValueError(
+                        "submitted metadata contradicts its PRE_SUBMIT binding"
+                    )
         data["submission_metadata"] = metadata
         array_recovery = metadata.get("array_recovery")
         if isinstance(array_recovery, dict):
@@ -2283,6 +2290,40 @@ def mark_submitted(
         campaign_dir, phase_name=phase_name, iteration=iteration,
         status="SUBMITTED", job_id=str(job_id), expected_tasks=expected_tasks,
         submission_metadata=submission_metadata,
+    )
+
+
+def bind_pre_submit_metadata(
+    campaign_dir: Union[str, Path],
+    phase_name: str,
+    iteration: int,
+    metadata: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Bind crash-critical metadata before output archival or submission."""
+    intent = load_active_intent(campaign_dir, phase_name, int(iteration))
+    if intent is None or str(intent.get("status")) != "PRE_SUBMIT":
+        raise ValueError("metadata binding requires an active PRE_SUBMIT intent")
+    if not isinstance(metadata, Mapping) or not metadata:
+        raise ValueError("PRE_SUBMIT metadata binding must be a non-empty object")
+    existing = intent.get("submission_metadata")
+    merged = dict(existing) if isinstance(existing, Mapping) else {}
+    for key, value in metadata.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError("PRE_SUBMIT metadata key is invalid")
+        if key in merged and merged[key] != value:
+            raise ValueError(
+                "submission metadata " + key + " is already bound differently"
+            )
+        merged[key] = value
+    intent["submission_metadata"] = merged
+    target = intent_path(campaign_dir, phase_name, int(iteration))
+    updated = _write_payload(target, intent)
+    return _validate_intent_payload(
+        updated,
+        path=target,
+        phase_name=str(phase_name),
+        iteration=int(iteration),
+        expected_campaign_uid=None,
     )
 
 

@@ -497,6 +497,9 @@ def test_sge_submit_exports_binding_and_parses_parent_id():
     [
         ("INITIAL_GAUSSIAN", 2, "g09 < input.gjf"),
         ("INITIAL_AIMALL", 2, "aimall -nogui"),
+        ("AIMALL", 2, "aimall -nogui"),
+        ("INITIAL_REPLACEMENT_AIMALL", 2, "aimall -nogui"),
+        ("REPLACEMENT_AIMALL", 2, "aimall -nogui"),
         ("ARIADNE_ARRAY", 2, "ariadne_runner"),
         ("PHASE_A_DIVERSITY", None, "diversity"),
         ("INITIAL_FEREBUS", 2, "ferebus"),
@@ -550,8 +553,16 @@ def test_sge_scripts_use_native_directives_and_generic_task_identity(
     ) in body
     if phase == "INITIAL_GAUSSIAN":
         assert "module load apps/gaussian/g09" in body
-    if phase == "INITIAL_AIMALL":
+    if "AIMALL" in phase:
         assert "module load apps/aimall/19.02.13" in body
+        command = body.index("aimall -nogui")
+        validation = body.index(
+            "ichor.hpc.active_learning.daemon.aimall_output_validation"
+        )
+        row_cache = body.index(
+            "ichor.hpc.active_learning.daemon.ferebus_row_cache"
+        )
+        assert command < validation < row_cache
     scoped_preload = (
         'env LD_PRELOAD="$ICHOR_ARIADNE_LD_PRELOAD'
         '${LD_PRELOAD:+:$LD_PRELOAD}" '

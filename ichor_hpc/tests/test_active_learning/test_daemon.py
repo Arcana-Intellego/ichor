@@ -33,7 +33,11 @@ from ichor.hpc.active_learning.daemon.state import (
     write_state,
 )
 from ichor.hpc.active_learning.daemon import submission_intent
-from ichor.hpc.active_learning.submit.sacct_poll import JobObservation, JobStatus
+from ichor.hpc.active_learning.submit.sacct_poll import (
+    JobObservation,
+    JobStatus,
+    aggregate_states,
+)
 
 
 _SBATCH_PHASES = (
@@ -822,6 +826,89 @@ def test_missing_sacct_rows_halt_when_squeue_confirms_job_gone(tmp_path):
     assert any(e.get("event") == "sacct_missing_timeout" for e in events)
 
 
+def test_terminal_aimall_structural_failure_becomes_exact_recovery(
+    tmp_path,
+):
+    d = _make_daemon(
+        tmp_path,
+        job_liveness_checker=lambda *_args, **_kwargs: SimpleNamespace(
+            active=False,
+            inconclusive=False,
+            rows=[],
+            error=None,
+        ),
+    )
+    d.data_dir().mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.INITIAL_AIMALL
+    state.pending_jobs[state.phase.value] = "777"
+    write_state(d.state_path(), state)
+    submission_intent.write_pre_submit_intent(
+        d.campaign_dir,
+        campaign_uid=state.campaign_uid,
+        phase_name=state.phase.value,
+        iteration=0,
+        expected_tasks=2,
+    )
+    intent = submission_intent.mark_submitted(
+        d.campaign_dir,
+        state.phase.value,
+        0,
+        "777",
+        expected_tasks=2,
+    )
+    observations = [
+        JobObservation(
+            job_id="777_0",
+            status=JobStatus.COMPLETED,
+            exit_code=(0, 0),
+            elapsed_seconds=1,
+            job_name=intent["expected_job_name"],
+            owner=getpass.getuser(),
+        ),
+        JobObservation(
+            job_id="777_1",
+            status=JobStatus.FAILED,
+            exit_code=(86, 0),
+            elapsed_seconds=1,
+            job_name=intent["expected_job_name"],
+            owner=getpass.getuser(),
+        ),
+    ]
+    summary = aggregate_states(
+        "777",
+        observations,
+        expected_task_count=2,
+        submission_kind="array",
+    )
+
+    status = d._record_terminal_aimall_recovery(
+        state,
+        state.phase,
+        observations,
+        summary,
+        structural_failures=1,
+        infrastructure_failures=0,
+    )
+
+    assert status == TickStatus.RETRYING
+    persisted = read_state(d.state_path())
+    assert persisted.pending_jobs[state.phase.value] is None
+    retired = submission_intent.load_intent(
+        d.campaign_dir,
+        state.phase.value,
+        0,
+    )
+    assert retired["status"] == "FAILED"
+    from ichor.hpc.active_learning.daemon.scheduler_recovery import (
+        load_scheduler_terminal_receipt,
+    )
+
+    receipt = load_scheduler_terminal_receipt(d.campaign_dir, retired)
+    assert receipt["completed_logical_task_ids"] == [0]
+    assert receipt["retry_logical_task_ids"] == [1]
+
+
 def test_tick_scrubs_when_failure_below_threshold(tmp_path):
     # Default threshold is 0.5 -> tolerate up to 50% failures.
     # With one task and one failure, success_ratio = 0 < (1 - 0.5) = 0.5, so HALT.
@@ -1056,6 +1143,132 @@ def test_postprocess_settle_retries_initially_missing_artifacts(tmp_path):
     assert sleeps == [5.0]
     events = list(iter_events(d.journal_path()))
     assert any(e.get("event") == "postprocess_settle_retry" for e in events)
+
+
+def test_stable_aimall_structural_output_enters_terminal_recovery(
+    tmp_path,
+    monkeypatch,
+):
+    class StructurallyInvalidExecutor(MockPhaseExecutor):
+        def __init__(self):
+            super().__init__(treat_as_sbatch=set(_SBATCH_PHASES))
+            self.calls = 0
+
+        def postprocess(self, state, phase, observations):
+            self.calls += 1
+            return PhaseResult(
+                is_complete=True,
+                failure_reason="aimall output is incomplete",
+                retry_disposition=(
+                    PostprocessRetryDisposition.FILESYSTEM_SETTLE
+                ),
+                postprocess_metadata={
+                    "aimall_structural_candidates": [
+                        {
+                            "task_id": 88,
+                            "pointdir": "POINT_0088.pointdir",
+                            "reason": "int_file_incomplete:h3.int",
+                            "fingerprint_sha256": "a" * 64,
+                        }
+                    ]
+                },
+            )
+
+    executor = StructurallyInvalidExecutor()
+    d = _make_daemon(tmp_path, executor=executor)
+    d.config.runtime.postprocess_settle_attempts = 2
+    d.config.runtime.postprocess_settle_seconds = 0
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.AIMALL
+    state.iteration = 8
+    summary = SimpleNamespace(
+        parent_job_id="898504",
+        n_expected=150,
+        n_observed=150,
+        n_missing=0,
+        n_completed=150,
+        n_failed=0,
+        n_tasks=150,
+    )
+    recovered = []
+
+    def record(*args, **kwargs):
+        recovered.append(kwargs)
+        return TickStatus.RETRYING
+
+    monkeypatch.setattr(d, "_record_terminal_aimall_recovery", record)
+
+    status = d._postprocess(state, state.phase, [], summary)
+
+    assert status == TickStatus.RETRYING
+    assert executor.calls == 2
+    assert recovered == [
+        {
+            "structural_failures": 1,
+            "infrastructure_failures": 0,
+        }
+    ]
+
+
+def test_changing_aimall_structural_output_does_not_become_recovery(
+    tmp_path,
+    monkeypatch,
+):
+    class ChangingExecutor(MockPhaseExecutor):
+        def __init__(self):
+            super().__init__(treat_as_sbatch=set(_SBATCH_PHASES))
+            self.calls = 0
+
+        def postprocess(self, state, phase, observations):
+            self.calls += 1
+            return PhaseResult(
+                is_complete=True,
+                failure_reason="aimall output is incomplete",
+                retry_disposition=(
+                    PostprocessRetryDisposition.FILESYSTEM_SETTLE
+                ),
+                postprocess_metadata={
+                    "aimall_structural_candidates": [
+                        {
+                            "task_id": 88,
+                            "pointdir": "POINT_0088.pointdir",
+                            "reason": "int_file_incomplete:h3.int",
+                            "fingerprint_sha256": (
+                                ("a" if self.calls == 1 else "b") * 64
+                            ),
+                        }
+                    ]
+                },
+            )
+
+    executor = ChangingExecutor()
+    d = _make_daemon(tmp_path, executor=executor)
+    d.config.runtime.postprocess_settle_attempts = 2
+    d.config.runtime.postprocess_settle_seconds = 0
+    state = fresh_campaign_state(max_iterations=1)
+    state.phase = CampaignPhase.AIMALL
+    state.iteration = 8
+    summary = SimpleNamespace(
+        parent_job_id="898504",
+        n_expected=150,
+        n_observed=150,
+        n_missing=0,
+        n_completed=150,
+        n_failed=0,
+        n_tasks=150,
+    )
+    monkeypatch.setattr(
+        d,
+        "_record_terminal_aimall_recovery",
+        lambda *_args, **_kwargs: pytest.fail(
+            "changing output must not be terminally classified"
+        ),
+    )
+
+    status = d._postprocess(state, state.phase, [], summary)
+
+    assert status == TickStatus.HALTED
+    assert executor.calls == 2
 
 
 def test_postprocess_failure_text_does_not_implicitly_retry(tmp_path):
@@ -1477,6 +1690,200 @@ def test_active_completed_aimall_intent_stays_on_normal_adoption_path(
         )
         is None
     )
+
+
+def test_aimall_postprocess_source_requires_stable_invalid_output(
+    tmp_path,
+    monkeypatch,
+):
+    d = _make_daemon(tmp_path)
+    d.config.runtime.postprocess_settle_attempts = 3
+    d.config.runtime.postprocess_settle_seconds = 7
+    state = fresh_campaign_state(max_iterations=10)
+    state.phase = CampaignPhase.AIMALL
+    state.iteration = 8
+    intent = {
+        "phase": CampaignPhase.AIMALL.value,
+        "status": "FAILED",
+        "expected_tasks": 150,
+        "queue_lifecycle": {
+            "terminal_status": "COMPLETED",
+            "n_expected": 150,
+            "n_observed": 150,
+            "n_missing": 0,
+        },
+    }
+    source = {"job_id": "898504", "logical_total": 150}
+    monkeypatch.setattr(
+        submission_intent,
+        "load_intent",
+        lambda *_args, **_kwargs: dict(intent),
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "resolve_aimall_postprocess_source",
+        lambda *_args, **_kwargs: dict(source),
+    )
+    calls = []
+
+    def classify(*_args, **_kwargs):
+        calls.append(dict(_kwargs))
+        return {
+            "invalid_completed_tasks": [
+                {
+                    "task_id": 88,
+                    "reason": "int_file_incomplete:h3.int",
+                    "fingerprint_sha256": "a" * 64,
+                }
+            ]
+        }
+
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.aimall_terminal_recovery."
+        "classify_aimall_postprocess_source_outputs",
+        classify,
+    )
+    monkeypatch.setattr(d, "_write_lease_heartbeat", lambda *_args: None)
+    sleeps = []
+    d.sleep_fn = lambda seconds: sleeps.append(seconds)
+
+    result = d._aimall_postprocess_source_if_complete(
+        state,
+        CampaignPhase.AIMALL,
+    )
+
+    assert result is None
+    assert len(calls) == 3
+    assert sleeps == [7.0, 7.0]
+    assert d._aimall_terminal_classification[
+        "invalid_completed_tasks"
+    ][0]["task_id"] == 88
+
+
+def test_aimall_postprocess_source_adopts_output_that_settles_valid(
+    tmp_path,
+    monkeypatch,
+):
+    d = _make_daemon(tmp_path)
+    d.config.runtime.postprocess_settle_attempts = 3
+    d.config.runtime.postprocess_settle_seconds = 0
+    state = fresh_campaign_state(max_iterations=10)
+    state.phase = CampaignPhase.AIMALL
+    state.iteration = 8
+    intent = {
+        "phase": CampaignPhase.AIMALL.value,
+        "status": "FAILED",
+        "expected_tasks": 150,
+        "queue_lifecycle": {
+            "terminal_status": "COMPLETED",
+            "n_expected": 150,
+            "n_observed": 150,
+            "n_missing": 0,
+        },
+    }
+    source = {"job_id": "898504", "logical_total": 150}
+    monkeypatch.setattr(
+        submission_intent,
+        "load_intent",
+        lambda *_args, **_kwargs: dict(intent),
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "resolve_aimall_postprocess_source",
+        lambda *_args, **_kwargs: dict(source),
+    )
+    classifications = iter(
+        [
+            {
+                "invalid_completed_tasks": [
+                    {
+                        "task_id": 88,
+                        "reason": "int_file_incomplete:h3.int",
+                        "fingerprint_sha256": "a" * 64,
+                    }
+                ]
+            },
+            {"invalid_completed_tasks": []},
+        ]
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.aimall_terminal_recovery."
+        "classify_aimall_postprocess_source_outputs",
+        lambda *_args, **_kwargs: next(classifications),
+    )
+    monkeypatch.setattr(d, "_write_lease_heartbeat", lambda *_args: None)
+
+    result = d._aimall_postprocess_source_if_complete(
+        state,
+        CampaignPhase.AIMALL,
+    )
+
+    assert result == source
+    assert d._aimall_terminal_classification is None
+
+
+def test_invalid_aimall_postprocess_wrapper_stays_local_for_partial_retry(
+    tmp_path,
+    monkeypatch,
+):
+    d = _make_daemon(tmp_path)
+    state = fresh_campaign_state(max_iterations=10)
+    state.phase = CampaignPhase.AIMALL
+    state.iteration = 8
+    wrapper = {
+        "status": "PRE_SUBMIT",
+        "phase": CampaignPhase.AIMALL.value,
+        "iteration": 8,
+        "replacement_round": 0,
+        "expected_job_name": "fixture-local-wrapper",
+        "job_id": None,
+        "postprocess_source": {"source": "fixture"},
+    }
+
+    def classify_locally(*_args, **_kwargs):
+        classification = {
+            "invalid_completed_tasks": [
+                {
+                    "task_id": 88,
+                    "reason": "int_file_incomplete:h3.int",
+                    "fingerprint_sha256": "a" * 64,
+                }
+            ]
+        }
+        d._aimall_terminal_classification = classification
+        setattr(
+            d.executor,
+            "_aimall_terminal_classification",
+            classification,
+        )
+        return None
+
+    monkeypatch.setattr(
+        d,
+        "_aimall_postprocess_source_if_complete",
+        classify_locally,
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "load_active_intent",
+        lambda *_args, **_kwargs: dict(wrapper),
+    )
+    monkeypatch.setattr(
+        d,
+        "_verify_intent_environment_binding",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        d,
+        "_recover_pre_submit_intent_without_job_id",
+        lambda *_args, **_kwargs: pytest.fail(
+            "local AIMAll recovery wrapper was treated as scheduler ownership"
+        ),
+    )
+
+    status = d._on_phase_entry(state, CampaignPhase.AIMALL)
+
+    assert status == TickStatus.SUBMITTED
 
 
 def test_scheduler_free_completion_retires_pre_submit_intent(tmp_path):

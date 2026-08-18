@@ -10,12 +10,14 @@ import pytest
 import ichor.hpc.active_learning.daemon.submission_intent as intent_module
 from ichor.hpc.active_learning.daemon.submission_intent import (
     aimall_postprocess_task_contract,
+    bind_pre_submit_metadata,
     classify_completed_unsubmitted_intents,
     classify_scalar_diversity_retry_intent,
     intent_path,
     load_intent,
     mark_completed,
     mark_failed,
+    mark_submitted,
     mark_superseded,
     resolve_gaussian_postprocess_source,
     resolve_scalar_diversity_postprocess_source,
@@ -43,6 +45,74 @@ def test_submission_intent_rejects_fractional_task_count(tmp_path):
             phase_name="GAUSSIAN",
             iteration=1,
             expected_tasks=1.5,
+        )
+
+
+def test_pre_submit_metadata_binding_is_preserved_at_scheduler_acceptance(
+    tmp_path,
+):
+    write_pre_submit_intent(
+        tmp_path,
+        campaign_uid="intent-test",
+        phase_name="AIMALL",
+        iteration=8,
+        expected_tasks=1,
+    )
+    marker = {"kind": "fixture", "digest": "a" * 64}
+
+    bound = bind_pre_submit_metadata(
+        tmp_path,
+        "AIMALL",
+        8,
+        {"aimall_structural_retry": marker},
+    )
+    submitted = mark_submitted(
+        tmp_path,
+        "AIMALL",
+        8,
+        "898505",
+        expected_tasks=1,
+        submission_metadata={
+            "aimall_structural_retry": marker,
+            "script_bundle": str(tmp_path / "bundle"),
+        },
+    )
+
+    assert bound["submission_metadata"] == {
+        "aimall_structural_retry": marker
+    }
+    assert submitted["submission_metadata"][
+        "aimall_structural_retry"
+    ] == marker
+
+
+def test_scheduler_acceptance_cannot_replace_bound_pre_submit_metadata(
+    tmp_path,
+):
+    write_pre_submit_intent(
+        tmp_path,
+        campaign_uid="intent-test",
+        phase_name="AIMALL",
+        iteration=8,
+        expected_tasks=1,
+    )
+    bind_pre_submit_metadata(
+        tmp_path,
+        "AIMALL",
+        8,
+        {"aimall_structural_retry": {"task_ids": [0]}},
+    )
+
+    with pytest.raises(ValueError, match="contradicts"):
+        mark_submitted(
+            tmp_path,
+            "AIMALL",
+            8,
+            "898505",
+            expected_tasks=1,
+            submission_metadata={
+                "aimall_structural_retry": {"task_ids": [1]},
+            },
         )
 
 

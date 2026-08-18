@@ -3152,11 +3152,17 @@ def test_propose_recovery_reuses_scheduler_complete_aimall_outputs(
     assert report.proposed_state.phase is CampaignPhase.AIMALL
     assert report.proposed_state.iteration == 1
     assert report.aimall_postprocess_recovery is not None
-    assert report.aimall_postprocess_recovery["n_reuse"] == 149
+    assert report.aimall_postprocess_recovery["n_reuse"] == 0
     assert report.aimall_postprocess_recovery["n_retry"] == 0
-    assert report.partial_array_recovery["n_reuse"] == 149
+    assert (
+        report.aimall_postprocess_recovery[
+            "scheduler_completed_candidates"
+        ]
+        == 149
+    )
+    assert report.partial_array_recovery["n_reuse"] == 0
     assert report.partial_array_recovery["n_retry"] == 0
-    assert "no array tasks will be resubmitted" in report.decision
+    assert "only invalid or unfinished tasks may be retried" in report.decision
     assert ".DATA/STAGING is non-empty" not in report.unsafe_reasons
 
     stg.write_quantum_acceptance_manifest(

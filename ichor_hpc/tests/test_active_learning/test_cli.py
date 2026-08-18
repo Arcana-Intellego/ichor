@@ -4541,9 +4541,26 @@ def test_journal_reconcile_summary_reports_aimall_local_reuse():
     assert "RECONCILE" in output
     assert "iter=14" in output
     assert (
-        "reconcile applied; reusing 149 completed AIMAll outputs for local "
-        "validation, no AIMAll tasks resubmitted"
+        "reconcile applied; preserving 149 scheduler-completed AIMAll output "
+        "candidates for local validation; reconcile submitted no work"
     ) in output
+
+
+def test_status_aimall_recovery_does_not_promise_zero_retries():
+    outcome = cli_mod._status_phase_outcome(
+        {
+            "phase": "AIMALL",
+            "iteration": 8,
+            "max_iterations": 40,
+            "_presentation_aimall_postprocess_recovery": {
+                "logical_total": 150,
+                "scheduler_completed_candidates": 150,
+            },
+        }
+    )
+
+    assert "validate the scheduler-completed AIMAll output candidates" in outcome
+    assert "submit only structurally invalid or unfinished AIMAll tasks" in outcome
 
 
 def test_journal_reconcile_summary_reports_diversity_local_adoption():

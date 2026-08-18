@@ -576,13 +576,22 @@ def test_csf4_backend_modules_cannot_recontaminate_venv_python(
     assert body.rindex("unset PYTHONPATH PYTHONHOME") < backend_python_position
 
 
-def test_build_sbatch_script_renders_aimall_directives():
+@pytest.mark.parametrize(
+    "phase",
+    (
+        "INITIAL_AIMALL",
+        "AIMALL",
+        "INITIAL_REPLACEMENT_AIMALL",
+        "REPLACEMENT_AIMALL",
+    ),
+)
+def test_build_sbatch_script_renders_aimall_directives(phase):
     cfg = CampaignConfig()
     cfg.aimall.boaq = "auto_gs2"
     cfg.aimall.iasmesh = "medium"
     cfg.resources.aimall_cpus_per_task = 8
     body = build_sbatch_script(
-        phase_name="INITIAL_AIMALL",
+        phase_name=phase,
         iteration=0,
         campaign_dir=Path("/scratch/campaign"),
         config=cfg,
@@ -600,8 +609,18 @@ def test_build_sbatch_script_renders_aimall_directives():
     command_line = next(line for line in body.splitlines() if "aimqb.ish" in line)
     assert command_line.endswith(" input.wfn")
     preparation = "ichor.hpc.active_learning.daemon.quantum_job_prepare"
+    structural_validation = (
+        "ichor.hpc.active_learning.daemon.aimall_output_validation"
+    )
+    row_cache = "ichor.hpc.active_learning.daemon.ferebus_row_cache"
     assert preparation in body
     assert body.index(preparation) < body.index(command_line)
+    assert structural_validation in body
+    assert body.index(command_line) < body.index(structural_validation)
+    assert body.index(structural_validation) < body.index(row_cache)
+    assert "ICHOR_AIMALL_BACKEND_STATUS=$?" in body
+    assert '[[ "$ICHOR_AIMALL_BACKEND_STATUS" -eq 86 ]]' in body
+    assert "then exit 85; fi" in body
 
 
 def test_gaussian_memory_uses_environment_contract(monkeypatch):

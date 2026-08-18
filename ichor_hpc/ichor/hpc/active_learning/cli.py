@@ -2869,16 +2869,18 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
             return (
                 "The daemon is validating "
                 + str(total)
-                + " existing AIMAll output"
+                + " scheduler-completed AIMAll output candidate"
                 + ("" if total == 1 else "s")
-                + " locally; no AIMAll array is being resubmitted."
+                + " locally; only structurally invalid or unfinished tasks "
+                "will be submitted."
             )
         return (
             str(total)
-            + " completed AIMAll output"
+            + " scheduler-completed AIMAll output candidate"
             + ("" if total == 1 else "s")
-            + " are ready for local validation; no AIMAll array will be "
-            "resubmitted."
+            + (" is" if total == 1 else " are")
+            + " ready for local validation; resume will submit only "
+            "structurally invalid or unfinished tasks."
         )
     if (
         isinstance(partial_recovery, Mapping)
@@ -3540,9 +3542,9 @@ def _status_phase_outcome(payload: Dict[str, Any]) -> str:
         Mapping,
     ):
         return (
-            "after validating the existing AIMAll outputs locally, the daemon "
-            "will update point allocation; only genuinely vacant slots may "
-            "require replacement calculations"
+            "the daemon will validate the scheduler-completed AIMAll output "
+            "candidates locally, submit only structurally invalid or "
+            "unfinished AIMAll tasks, then update point allocation"
         )
     if phase == CampaignPhase.REFERENCE_COMMIT.value and iteration == 0:
         return (
@@ -5084,18 +5086,12 @@ def _journal_operator_summary(
         aimall_completed = _event_int(event, "aimall_completed_outputs")
         aimall_resubmitted = _event_int(event, "aimall_tasks_resubmitted")
         if aimall_completed is not None and aimall_resubmitted is not None:
-            resubmission = (
-                "no AIMAll tasks resubmitted"
-                if aimall_resubmitted == 0
-                else str(aimall_resubmitted) + " AIMAll tasks resubmitted"
-            )
             return _with_config_changes(
-                "reconcile applied; reusing "
+                "reconcile applied; preserving "
                 + str(aimall_completed)
-                + " completed AIMAll output"
+                + " scheduler-completed AIMAll output candidate"
                 + ("" if aimall_completed == 1 else "s")
-                + " for local validation, "
-                + resubmission
+                + " for local validation; reconcile submitted no work"
             )
         if config_changes:
             return _with_config_changes("reconcile applied")
@@ -12597,15 +12593,17 @@ def _reconcile_presentation(
         planned.append(
             (
                 "AIMAll results",
-                "reuse "
+                "preserve "
                 + str(completed)
-                + " completed output"
+                + " scheduler-completed output candidate"
                 + ("" if completed == 1 else "s")
-                + " for local validation after resume; resubmit none",
+                + " for local validation after resume; only structurally "
+                "invalid or unfinished tasks may be retried",
             )
         )
         reason_parts.append(
-            "completed AIMAll outputs are awaiting local validation"
+            "scheduler-completed AIMAll output candidates are awaiting local "
+            "validation"
         )
 
     partial = getattr(report, "partial_array_recovery", None)
@@ -13988,10 +13986,9 @@ def _print_reconcile_applied_operator_report(
                 "AIMAll results",
                 "retained "
                 + str(completed)
-                + " completed output"
+                + " scheduler-completed output candidate"
                 + ("" if completed == 1 else "s")
-                + " for local validation; no AIMAll tasks prepared for "
-                "resubmission",
+                + " for local validation; reconcile submitted no work",
             )
         )
     applied_rows.extend(("array output", "archived " + _reconcile_relative_path(campaign, item)) for item in archived_array_outputs)
@@ -14081,8 +14078,9 @@ def _print_reconcile_applied_operator_report(
             (
                 "validate "
                 + str(int(aimall_postprocess.get("logical_total") or 0))
-                + " existing AIMAll outputs locally without resubmitting "
-                "their array, then continue from "
+                + " scheduler-completed AIMAll output candidates locally, "
+                "submit only invalid or unfinished tasks if required, then "
+                "continue from "
             )
             if isinstance(aimall_postprocess, Mapping)
             else (
@@ -16335,6 +16333,9 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                     aimall_recovery.get("logical_total") or 0
                 ),
                 "aimall_tasks_resubmitted": 0,
+                "aimall_validation_disposition": str(
+                    aimall_recovery.get("validation") or ""
+                ),
             }
             if isinstance(aimall_recovery, Mapping)
             else {}

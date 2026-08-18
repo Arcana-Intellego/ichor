@@ -104,6 +104,8 @@ from .cluster_profile import (
     profile_value,
 )
 from .state import CampaignPhase, atomic_write_json
+from .aimall_output_validation import AIMALL_STRUCTURAL_INVALID_EXIT_CODE
+from .aimall_terminal_recovery import AIMALL_NATIVE_EXIT_CODE_REMAP
 from .job_names import live_job_name
 from .scheduler_recovery import (
     SCHEDULER_TERMINAL_RECEIPT_SCHEMA_VERSION,
@@ -113,9 +115,11 @@ from .scheduler_recovery import (
 from .environment_equivalence import assess_recovery_environment
 from .array_recovery import (
     archive_existing_array_task_outputs,
+    clear_retry_task_file,
     compact_array_recovery_summary,
     prepare_retry_submission,
     supports_partial_array_recovery,
+    write_retry_task_file,
 )
 from .runtime_environment import (
     DEFAULT_DAEMON_ARIADNE_RUNTIME_MODULES,
@@ -1540,82 +1544,16 @@ def validate_aimall_completed(pdir) -> tuple:
     """Return (True, "") if the pointdir contains a complete AIMAll output;
     (False, reason_tag) otherwise. Validates: *_atomicfiles/ directory
     exists; each .int file parses without raising."""
-    ints = getattr(pdir, "ints", None)
-    if ints is None or not getattr(ints, "path", None):
-        return False, "missing_atomicfiles_dir"
-    int_path = Path(ints.path)
-    if not int_path.is_dir():
-        return False, "atomicfiles_not_a_dir"
-    #IntDirectory auto discovers .int files; iterate + trigger parse on each.
-    try:
-        n_int = 0
-        for int_file in ints.ints:
-         #int_file is an Int instance; touching net_charge triggers the
-         # lazy parse and raises on malformed input.
-            _ = int_file.net_charge
-            n_int += 1
-    except Exception:
-        return False, "int_parse_failure"
-    if n_int == 0:
-        return False, "no_int_files"
-    # one .int per atom. a partial AIMAll (crashed after a few atoms, or one atom whose integration
-    # failed) leaves fewer .int than there are atoms -- the old n_int>=1 check waved that through and
-    # then the FEREBUS feature export later choked on the point missing IQA for some atoms (A36). so
-    # demand one per atom and reject unreadable geometry rather than accepting a point we cannot
-    # count.
-    try:
-        n_atoms = len(pdir.atoms)
-    except Exception:
-        return False, "aimall_geometry_unreadable"
-    if n_int != n_atoms:
-        return False, "aimall_partial_" + str(n_int) + "_of_" + str(n_atoms) + "_int"
-    return True, ""
+    from .aimall_output_validation import validate_parsed_aimall_pointdir
+
+    return validate_parsed_aimall_pointdir(pdir)
 
 
 def _aimall_visibility_issue(pointdir: Path) -> Optional[str]:
     """Return a non-mutating shared-filesystem readiness problem, if any."""
-    root = Path(pointdir)
-    try:
-        from ichor.core.files.point_directory import PointDirectory
+    from .aimall_output_validation import aimall_visibility_issue
 
-        n_atoms = len(PointDirectory(root).atoms)
-    except Exception:
-        return "geometry_unreadable"
-    try:
-        atomic_directories = [
-            child
-            for child in root.iterdir()
-            if child.name.endswith("_atomicfiles")
-        ]
-    except OSError:
-        return "atomicfiles_directory_unreadable"
-    if len(atomic_directories) != 1:
-        return "missing_or_ambiguous_atomicfiles_directory"
-    atomic_directory = atomic_directories[0]
-    if atomic_directory.is_symlink() or not atomic_directory.is_dir():
-        return "atomicfiles_directory_missing_or_symlinked"
-    int_paths = sorted(
-        path
-        for path in atomic_directory.glob("*.int")
-        if "_" not in path.name
-    )
-    if len(int_paths) != int(n_atoms):
-        return (
-            "missing_or_partial_int_set_"
-            + str(len(int_paths))
-            + "_of_"
-            + str(n_atoms)
-        )
-    for int_path in int_paths:
-        if int_path.is_symlink() or not int_path.is_file():
-            return "int_file_missing_or_symlinked:" + int_path.name
-        try:
-            text = int_path.read_text(encoding="utf-8", errors="strict")
-        except (OSError, UnicodeError):
-            return "int_file_unreadable:" + int_path.name
-        if "Total time" not in text:
-            return "int_file_incomplete:" + int_path.name
-    return None
+    return aimall_visibility_issue(Path(pointdir))
 
 
 def _pointdir_index(name: str) -> Optional[int]:
@@ -2519,10 +2457,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         assessments: Mapping[str, Mapping[str, Any]],
     ) -> Dict[str, Any]:
         """Validate scheduler-completed quantum outputs and bind receipts."""
-        from ichor.core.files.point_directory import PointDirectory
-
         from .quantum_task_contracts import quantum_task_contract
         from .quantum_task_receipts import (
+            AIMALL_TASK_RECEIPT,
             read_quantum_task_receipt,
             write_quantum_task_receipt_from_scheduler_terminal_receipt,
         )
@@ -2535,6 +2472,28 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             replacement_round=replacement_round,
             validate_points_file=True,
         )
+        if "AIMALL" in phase_name:
+            from .input_staging import (
+                validate_existing_aimall_task_authorities,
+            )
+
+            try:
+                validate_existing_aimall_task_authorities(
+                    self.campaign_dir,
+                    phase_name=phase_name,
+                    iteration=int(state.iteration),
+                    replacement_round=replacement_round,
+                    expected_campaign_uid=str(state.campaign_uid),
+                    expected_method=str(self.config.gaussian.method),
+                    task_contract=contract,
+                )
+            except Exception as exc:
+                raise BackendSubmissionError(
+                    "AIMAll inherited Gaussian/WFN authority is invalid: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)[:180]
+                ) from exc
         latest = self._latest_scheduler_recovery_by_task(recoveries)
 
         validators = self._validators_for(phase_name)
@@ -2553,6 +2512,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     {
                         "task_id": logical_id,
                         "reason": "environment_equivalence_unproven",
+                        "classification": "environment",
                     }
                 )
                 continue
@@ -2567,9 +2527,38 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     "outside the canonical task contract"
                 )
             pointdir = Path(contract.tasks[logical_id].pointdir)
-            valid = bool(pointdir.is_dir() and not pointdir.is_symlink())
-            reason = "pointdir_missing_or_invalid"
-            if valid:
+            classification = "structural"
+            fingerprint_sha256 = None
+            if "AIMALL" in phase_name:
+                from .aimall_output_validation import (
+                    AIMALL_AUTHORITY_INVALID,
+                    assess_aimall_output,
+                )
+
+                assessment = assess_aimall_output(pointdir)
+                if assessment.category == AIMALL_AUTHORITY_INVALID:
+                    raise BackendSubmissionError(
+                        "AIMAll recovery authority is invalid for logical "
+                        "task "
+                        + str(logical_id)
+                        + ": "
+                        + str(assessment.reason)
+                    )
+                valid = bool(assessment.valid)
+                reason = str(
+                    assessment.reason or "structural_validation_failed"
+                )
+                fingerprint_sha256 = str(
+                    assessment.fingerprint_sha256
+                )
+            else:
+                from ichor.core.files.point_directory import PointDirectory
+
+                valid = bool(
+                    pointdir.is_dir() and not pointdir.is_symlink()
+                )
+                reason = "pointdir_missing_or_invalid"
+            if valid and "AIMALL" not in phase_name:
                 try:
                     candidate = PointDirectory(pointdir)
                     for validator in validators:
@@ -2584,7 +2573,22 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     valid = False
                     reason = type(exc).__name__ + ": " + str(exc)[:160]
             if not valid:
-                invalid.append({"task_id": logical_id, "reason": reason})
+                if "AIMALL" in phase_name:
+                    receipt_path = pointdir / AIMALL_TASK_RECEIPT
+                    if receipt_path.exists() or receipt_path.is_symlink():
+                        raise BackendSubmissionError(
+                            "AIMAll output contradicts its published task "
+                            "receipt for logical task "
+                            + str(logical_id)
+                        )
+                record = {
+                    "task_id": logical_id,
+                    "reason": reason,
+                    "classification": classification,
+                }
+                if fingerprint_sha256 is not None:
+                    record["fingerprint_sha256"] = fingerprint_sha256
+                invalid.append(record)
                 continue
             try:
                 read_quantum_task_receipt(
@@ -2629,6 +2633,159 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             "validated_reusable_task_ids": reusable,
             "invalid_completed_tasks": invalid,
         }
+
+    def _apply_aimall_structural_recovery_policy(
+        self,
+        state,
+        phase_name: str,
+        result: Dict[str, Any],
+        *,
+        recoveries: Sequence[Mapping[str, Any]],
+        validation: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Remove exhausted structural tasks from the runnable retry map."""
+        if "AIMALL" not in str(phase_name):
+            return result
+        from .aimall_terminal_recovery import (
+            build_aimall_structural_retry_metadata,
+            resolve_aimall_structural_recovery_policy,
+            validate_aimall_structural_retry_metadata,
+        )
+        from . import submission_intent as _submission_intent
+
+        local_classification = getattr(
+            self,
+            "_aimall_terminal_classification",
+            None,
+        )
+        policy = resolve_aimall_structural_recovery_policy(
+            self.campaign_dir,
+            campaign_uid=str(state.campaign_uid),
+            phase_name=str(phase_name),
+            iteration=int(state.iteration),
+            replacement_round=int(
+                getattr(state, "replacement_round", 0)
+            ),
+            recoveries=recoveries,
+            local_classification=(
+                local_classification
+                if isinstance(local_classification, Mapping)
+                else None
+            ),
+            invalid_completed_tasks=list(
+                validation.get("invalid_completed_tasks") or []
+            ),
+        )
+        ledger_retry_ids = sorted(
+            int(value) for value in result.get("retry_task_ids") or []
+        )
+        retry_set = set(ledger_retry_ids)
+        structural_ids = sorted(
+            set(int(value) for value in policy["structural_retry_task_ids"])
+            & retry_set
+        )
+        terminal_ids = sorted(
+            set(int(value) for value in policy["terminal_rejection_task_ids"])
+            & retry_set
+        )
+        classified_ids = set(structural_ids) | set(terminal_ids)
+        policy_ids = set(
+            int(value) for value in policy["structural_retry_task_ids"]
+        ) | set(
+            int(value) for value in policy["terminal_rejection_task_ids"]
+        )
+        if policy_ids.difference(retry_set):
+            raise BackendSubmissionError(
+                "AIMAll structural recovery contradicts a reusable task"
+            )
+        runnable_ids = sorted(retry_set.difference(terminal_ids))
+        replacement_round = int(getattr(state, "replacement_round", 0))
+        if runnable_ids:
+            retry_file = write_retry_task_file(
+                self.campaign_dir,
+                phase_name,
+                int(state.iteration),
+                runnable_ids,
+                replacement_round=replacement_round,
+            )
+            result["retry_task_file"] = str(retry_file)
+        else:
+            clear_retry_task_file(
+                self.campaign_dir,
+                phase_name,
+                int(state.iteration),
+                replacement_round=replacement_round,
+            )
+            result["retry_task_file"] = None
+        structural_metadata = None
+        if structural_ids:
+            from .aimall_terminal_recovery import (
+                AIMALL_STRUCTURAL_RETRY_METADATA_KEY,
+            )
+
+            active_intent = _submission_intent.load_active_intent(
+                self.campaign_dir,
+                phase_name,
+                int(state.iteration),
+                expected_campaign_uid=str(state.campaign_uid),
+            )
+            existing_value = None
+            if isinstance(active_intent, Mapping):
+                existing_submission_metadata = active_intent.get(
+                    "submission_metadata"
+                )
+                if isinstance(existing_submission_metadata, Mapping):
+                    existing_value = existing_submission_metadata.get(
+                        AIMALL_STRUCTURAL_RETRY_METADATA_KEY
+                    )
+            if existing_value is not None:
+                structural_metadata = (
+                    validate_aimall_structural_retry_metadata(
+                        existing_value,
+                        expected_campaign_uid=str(state.campaign_uid),
+                        expected_phase=str(phase_name),
+                        expected_iteration=int(state.iteration),
+                        expected_replacement_round=replacement_round,
+                    )
+                )
+                if structural_metadata["task_ids"] != structural_ids:
+                    raise BackendSubmissionError(
+                        "bound AIMAll structural retry task set changed"
+                    )
+            else:
+                structural_metadata = build_aimall_structural_retry_metadata(
+                    campaign_uid=str(state.campaign_uid),
+                    phase_name=str(phase_name),
+                    iteration=int(state.iteration),
+                    replacement_round=replacement_round,
+                    task_ids=structural_ids,
+                    source_records=policy["source_records"],
+                )
+        result["_ledger_retry_task_ids"] = ledger_retry_ids
+        result["retry_task_ids"] = runnable_ids
+        result["n_retry"] = len(runnable_ids)
+        result["n_terminal_rejection"] = len(terminal_ids)
+        result["terminal_rejection_task_ids"] = terminal_ids
+        result["structural_retry_task_ids"] = structural_ids
+        result["_aimall_structural_retry_metadata"] = structural_metadata
+        result["_aimall_terminal_rejection_reasons"] = {
+            str(task_id): str(
+                policy["terminal_rejection_reasons"].get(
+                    str(task_id),
+                    "aimall_structural_retry_exhausted",
+                )
+            )
+            for task_id in terminal_ids
+        }
+        result["all_complete"] = bool(
+            int(result.get("logical_total") or 0) > 0
+            and not runnable_ids
+        )
+        if not classified_ids and policy_ids:
+            raise BackendSubmissionError(
+                "AIMAll structural recovery lost its logical task identity"
+            )
+        return result
 
     def _prepare_scheduler_cancelled_array_recovery(
         self,
@@ -2687,53 +2844,72 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             if bool(task.get("complete", False))
         ]
         retry_ids = [int(value) for value in result.get("retry_task_ids", [])]
-        ledger = write_phase_recovery_ledger(
-            self.campaign_dir,
-            {
-                "campaign_uid": str(state.campaign_uid),
-                "phase": phase_name,
-                "iteration": int(state.iteration),
-                "replacement_round": int(
-                    getattr(state, "replacement_round", 0)
-                ),
-                "source_receipt_sha256": source_digest,
-                "source_terminal_receipts": [
-                    {
-                        "path": str(item["path"]),
-                        "receipt_sha256": str(
-                            item["receipt"]["receipt_sha256"]
-                        ),
-                        "job_id": str(item["receipt"].get("job_id") or ""),
-                        "submission_identity": str(
-                            item["receipt"]["submission_identity"]
-                        ),
-                    }
-                    for item in recoveries
-                ],
-                "environment_equivalences": (
-                    self._environment_proof_records(assessments)
-                ),
-                "scheduler_completed_candidates": int(
-                    validation["scheduler_completed_candidates"]
-                ),
-                "reusable_logical_task_ids": reusable_ids,
-                "retry_logical_task_ids": retry_ids,
-                "invalid_completed_tasks": list(
-                    validation["invalid_completed_tasks"]
-                ),
-                "recovery_lineage": self._task_recovery_lineage(
-                    reusable_ids,
-                    latest,
-                    assessments,
-                    reuse_basis=(
-                        "self_authenticating_output"
-                        if phase_name == "ARIADNE_ARRAY"
-                        else "scheduler_completed_validated_output"
-                    ),
-                ),
-            },
+        recovery_lineage = self._task_recovery_lineage(
+            reusable_ids,
+            latest,
+            assessments,
+            reuse_basis=(
+                "self_authenticating_output"
+                if phase_name == "ARIADNE_ARRAY"
+                else "scheduler_completed_validated_output"
+            ),
         )
+        ledger_payload = {
+            "campaign_uid": str(state.campaign_uid),
+            "phase": phase_name,
+            "iteration": int(state.iteration),
+            "replacement_round": int(
+                getattr(state, "replacement_round", 0)
+            ),
+            "source_receipt_sha256": source_digest,
+            "source_terminal_receipts": [
+                {
+                    "path": str(item["path"]),
+                    "receipt_sha256": str(
+                        item["receipt"]["receipt_sha256"]
+                    ),
+                    "job_id": str(item["receipt"].get("job_id") or ""),
+                    "submission_identity": str(
+                        item["receipt"]["submission_identity"]
+                    ),
+                }
+                for item in recoveries
+            ],
+            "environment_equivalences": self._environment_proof_records(
+                assessments
+            ),
+            "scheduler_completed_candidates": int(
+                validation["scheduler_completed_candidates"]
+            ),
+            "reusable_logical_task_ids": reusable_ids,
+            "retry_logical_task_ids": retry_ids,
+            "invalid_completed_tasks": list(
+                validation["invalid_completed_tasks"]
+            ),
+            "recovery_lineage": recovery_lineage,
+        }
+        if len(recovery_lineage) == len(reusable_ids):
+            ledger = write_phase_recovery_ledger(
+                self.campaign_dir,
+                ledger_payload,
+            )
+        else:
+            # Reused tasks can legitimately be bound to an older
+            # postprocess-source receipt that has no scheduler-terminal
+            # receipt.  The ordinary array ledger already authenticates those
+            # receipts; do not invent scheduler lineage merely to satisfy the
+            # phase-ledger schema.
+            ledger = dict(ledger_payload)
+            ledger["path"] = result.get("path")
+            ledger["ledger_sha256"] = None
         result["_scheduler_cancel_recovery"] = ledger
+        result = self._apply_aimall_structural_recovery_policy(
+            state,
+            phase_name,
+            result,
+            recoveries=recoveries,
+            validation=validation,
+        )
         return result
 
     def _prepare_scheduler_cancelled_ferebus_recovery(
@@ -4162,12 +4338,23 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 int(getattr(state, "iteration", 0)),
                 expected_campaign_uid=str(state.campaign_uid),
             )
+            aimall_classification = getattr(
+                self,
+                "_aimall_terminal_classification",
+                None,
+            )
+            aimall_requires_partial_recovery = bool(
+                "AIMALL" in phase_name
+                and isinstance(aimall_classification, Mapping)
+                and aimall_classification.get("invalid_completed_tasks")
+            )
             if (
                 isinstance(postprocess_intent, dict)
                 and isinstance(
                     postprocess_intent.get("postprocess_source"),
                     Mapping,
                 )
+                and not aimall_requires_partial_recovery
             ):
                 resolver = (
                     _submission_intent.resolve_aimall_postprocess_source
@@ -4219,18 +4406,40 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             submission_metadata: Dict[str, Any] = {}
             array_task_map: Optional[Path] = None
             if supports_partial_array_recovery(phase_name):
-                recovery = (
+                scheduler_recovery_result = (
                     self._prepare_scheduler_cancelled_array_recovery(
                         state,
                         phase_name,
                     )
-                    or _prepare_retry_submission_with_progress(
+                )
+                recovery = scheduler_recovery_result
+                if recovery is None:
+                    recovery = _prepare_retry_submission_with_progress(
                         self.campaign_dir,
                         phase_name,
                         int(getattr(state, "iteration", 0)),
                         progress_callback=self._report_runtime_progress,
                     )
-                )
+                    if "AIMALL" in phase_name:
+                        terminal_classification = getattr(
+                            self,
+                            "_aimall_terminal_classification",
+                            None,
+                        )
+                        recovery = self._apply_aimall_structural_recovery_policy(
+                            state,
+                            phase_name,
+                            recovery,
+                            recoveries=(),
+                            validation=(
+                                terminal_classification
+                                if isinstance(
+                                    terminal_classification,
+                                    Mapping,
+                                )
+                                else {}
+                            ),
+                        )
                 recovery_summary = compact_array_recovery_summary(recovery)
                 submission_metadata["array_recovery"] = recovery_summary
                 recovery_journal_payload = _without_keys(
@@ -4240,6 +4449,11 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 )
                 scheduler_recovery = recovery.get(
                     "_scheduler_cancel_recovery"
+                )
+                terminal_aimall_classification = getattr(
+                    self,
+                    "_aimall_terminal_classification",
+                    None,
                 )
                 if isinstance(scheduler_recovery, Mapping):
                     recovery_journal_payload.update(
@@ -4261,6 +4475,39 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                                     "ledger_sha256",
                                     "",
                                 )
+                                or ""
+                            ),
+                        }
+                    )
+                if isinstance(terminal_aimall_classification, Mapping):
+                    recovery_journal_payload.update(
+                        {
+                            "scheduler_completed_candidates": int(
+                                terminal_aimall_classification.get(
+                                    "scheduler_completed_candidates",
+                                    0,
+                                )
+                            ),
+                            "validated_reusable_tasks": len(
+                                terminal_aimall_classification.get(
+                                    "validated_reusable_task_ids",
+                                    [],
+                                )
+                            ),
+                            "invalid_completed_tasks": len(
+                                terminal_aimall_classification.get(
+                                    "invalid_completed_tasks",
+                                    [],
+                                )
+                            ),
+                            "producer_job_id": str(
+                                terminal_aimall_classification.get(
+                                    "producer_job_id",
+                                    "",
+                                )
+                            ),
+                            "recovery_source": (
+                                "terminal_aimall_output_validation"
                             ),
                         }
                     )
@@ -4271,6 +4518,50 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     **recovery_journal_payload,
                 )
                 retry_ids = list(recovery.get("retry_task_ids") or [])
+                terminal_rejection_ids = [
+                    int(value)
+                    for value in recovery.get(
+                        "terminal_rejection_task_ids",
+                        [],
+                    )
+                ]
+                setattr(
+                    self,
+                    "_aimall_terminal_rejection_task_ids",
+                    terminal_rejection_ids,
+                )
+                setattr(
+                    self,
+                    "_aimall_terminal_rejection_reasons",
+                    dict(
+                        recovery.get(
+                            "_aimall_terminal_rejection_reasons",
+                            {},
+                        )
+                    ),
+                )
+                structural_retry_metadata = recovery.get(
+                    "_aimall_structural_retry_metadata"
+                )
+                if isinstance(structural_retry_metadata, Mapping):
+                    from .aimall_terminal_recovery import (
+                        AIMALL_STRUCTURAL_RETRY_METADATA_KEY,
+                    )
+                    from . import submission_intent as _submission_intent
+
+                    submission_metadata[
+                        AIMALL_STRUCTURAL_RETRY_METADATA_KEY
+                    ] = dict(structural_retry_metadata)
+                    _submission_intent.bind_pre_submit_metadata(
+                        self.campaign_dir,
+                        phase_name,
+                        int(getattr(state, "iteration", 0)),
+                        {
+                            AIMALL_STRUCTURAL_RETRY_METADATA_KEY: dict(
+                                structural_retry_metadata
+                            )
+                        },
+                    )
                 submission_metadata["logical_task_set_sha256"] = hashlib.sha256(
                     (",".join(str(int(task_id)) for task_id in retry_ids)).encode(
                         "ascii"
@@ -4309,38 +4600,100 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         "partial_array_recovery_postprocess_only",
                         phase=phase_name,
                         iteration=int(getattr(state, "iteration", 0)),
+                        terminal_rejections=len(terminal_rejection_ids),
                         **recovery_journal_payload,
                     )
                     return self.postprocess(state, phase, [])
                 if retry_ids:
-                    if (
-                        isinstance(scheduler_recovery, Mapping)
-                        and (
-                            "GAUSSIAN" in phase_name
-                            or "AIMALL" in phase_name
-                        )
-                    ):
-                        source_digest = str(
-                            scheduler_recovery.get(
-                                "source_receipt_sha256",
-                                "",
-                            )
-                        )
-                        archived_retry_outputs = (
-                            archive_existing_array_task_outputs(
+                    if "GAUSSIAN" in phase_name or "AIMALL" in phase_name:
+                        from . import submission_intent as _submission_intent
+
+                        active_retry_intent = (
+                            _submission_intent.load_active_intent(
                                 self.campaign_dir,
                                 phase_name,
                                 int(getattr(state, "iteration", 0)),
-                                task_ids=retry_ids,
-                                archive_identity=(
-                                    "scheduler-cancel-"
-                                    + source_digest[:16]
-                                ),
+                                expected_campaign_uid=str(state.campaign_uid),
                             )
                         )
-                        submission_metadata[
-                            "scheduler_recovery_archived_outputs"
-                        ] = len(archived_retry_outputs)
+                        authenticated_recovery = bool(
+                            isinstance(scheduler_recovery, Mapping)
+                            or isinstance(
+                                terminal_aimall_classification,
+                                Mapping,
+                            )
+                            or int(recovery.get("n_complete") or 0) > 0
+                            or (
+                                isinstance(active_retry_intent, Mapping)
+                                and (
+                                    int(
+                                        active_retry_intent.get(
+                                            "attempt_sequence",
+                                            0,
+                                        )
+                                        or 0
+                                    )
+                                    > 1
+                                    or isinstance(
+                                        active_retry_intent.get(
+                                            "postprocess_source"
+                                        ),
+                                        Mapping,
+                                    )
+                                )
+                            )
+                        )
+                        if authenticated_recovery:
+                            source_digest = ""
+                            if isinstance(scheduler_recovery, Mapping):
+                                source_digest = str(
+                                    scheduler_recovery.get(
+                                        "source_receipt_sha256",
+                                        "",
+                                    )
+                                )
+                            elif isinstance(
+                                terminal_aimall_classification,
+                                Mapping,
+                            ):
+                                source_digest = str(
+                                    terminal_aimall_classification.get(
+                                        "source_sha256",
+                                        "",
+                                    )
+                                )
+                            if not source_digest:
+                                ledger_path = recovery.get("path")
+                                if ledger_path:
+                                    source_digest = hashlib.sha256(
+                                        Path(str(ledger_path)).read_bytes()
+                                    ).hexdigest()
+                            if (
+                                len(source_digest) != 64
+                                or any(
+                                    character not in "0123456789abcdef"
+                                    for character in source_digest
+                                )
+                            ):
+                                raise BackendSubmissionError(
+                                    "quantum retry output archive lacks an "
+                                    "authenticated recovery digest"
+                                )
+                            archived_retry_outputs = (
+                                archive_existing_array_task_outputs(
+                                    self.campaign_dir,
+                                    phase_name,
+                                    int(getattr(state, "iteration", 0)),
+                                    task_ids=retry_ids,
+                                    archive_identity=(
+                                        "quantum-retry-"
+                                        + source_digest[:16]
+                                    ),
+                                )
+                            )
+                            submission_metadata[
+                                "scheduler_recovery_archived_outputs"
+                            ] = len(archived_retry_outputs)
                     array_size = len(retry_ids)
                     retry_file = recovery.get("retry_task_file")
                     if retry_file:
@@ -4407,6 +4760,38 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         "script_binding_sha256"
                     ),
                 })
+            if "AIMALL" in phase_name:
+                if not isinstance(bound_intent, Mapping):
+                    raise BackendSubmissionError(
+                        "AIMAll structural validator requires a bound "
+                        "PRE_SUBMIT intent"
+                    )
+                from .aimall_terminal_recovery import (
+                    AIMALL_STRUCTURAL_VALIDATOR_METADATA_KEY,
+                    build_aimall_structural_validator_metadata,
+                )
+
+                validator_metadata = (
+                    build_aimall_structural_validator_metadata(
+                        str(
+                            bound_intent.get("submitted_script_sha256")
+                            or ""
+                        )
+                    )
+                )
+                submission_metadata[
+                    AIMALL_STRUCTURAL_VALIDATOR_METADATA_KEY
+                ] = validator_metadata
+                _submission_intent.bind_pre_submit_metadata(
+                    self.campaign_dir,
+                    phase_name,
+                    int(getattr(state, "iteration", 0)),
+                    {
+                        AIMALL_STRUCTURAL_VALIDATOR_METADATA_KEY: (
+                            validator_metadata
+                        )
+                    },
+                )
         except BackendSubmissionError:
             raise
         except Exception as exc:
@@ -5172,11 +5557,16 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         gaussian_aimall_phase = None
         if "AIMALL" in phase_name:
             from ichor.core.files.point_directory import PointDirectory
+            from .aimall_output_validation import (
+                AIMALL_AUTHORITY_INVALID,
+                assess_aimall_output,
+            )
             from .quantum_quality import (
                 evaluate_aimall_pointdir,
                 read_quantum_quality_manifest,
                 write_quantum_quality_manifest,
             )
+            from .quantum_task_receipts import AIMALL_TASK_RECEIPT
 
             expected_phase = (
                 "INITIAL_REPLACEMENT_GAUSSIAN"
@@ -5206,7 +5596,23 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         + str(exc)[:180]
                     ),
                 )
+            terminal_rejection_ids = {
+                int(value)
+                for value in getattr(
+                    self,
+                    "_aimall_terminal_rejection_task_ids",
+                    [],
+                )
+            }
+            terminal_rejection_reasons = dict(
+                getattr(
+                    self,
+                    "_aimall_terminal_rejection_reasons",
+                    {},
+                )
+            )
             unsettled = []
+            authority_failures = []
             total_accepted = len(gaussian_accepted)
             self._report_runtime_progress(
                 "output_visibility",
@@ -5215,9 +5621,48 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 unit="point directories",
             )
             for candidate_index, candidate in enumerate(gaussian_accepted, start=1):
-                issue = _aimall_visibility_issue(Path(candidate))
-                if issue is not None:
-                    unsettled.append(Path(candidate).name + ":" + issue)
+                candidate_name = Path(candidate).name
+                logical_id = task_id_by_name.get(candidate_name)
+                if logical_id is None:
+                    authority_failures.append(
+                        candidate_name + ":outside_canonical_task_membership"
+                    )
+                    continue
+                if logical_id in terminal_rejection_ids:
+                    assessment = assess_aimall_output(Path(candidate))
+                    if assessment.valid:
+                        authority_failures.append(
+                            candidate_name
+                            + ":terminal_rejection_contradicts_valid_output"
+                        )
+                    elif assessment.category == AIMALL_AUTHORITY_INVALID:
+                        authority_failures.append(
+                            candidate_name + ":" + assessment.reason
+                        )
+                else:
+                    assessment = assess_aimall_output(Path(candidate))
+                    if assessment.category == AIMALL_AUTHORITY_INVALID:
+                        authority_failures.append(
+                            candidate_name + ":" + assessment.reason
+                        )
+                    elif not assessment.valid:
+                        receipt_path = Path(candidate) / AIMALL_TASK_RECEIPT
+                        if receipt_path.exists() or receipt_path.is_symlink():
+                            authority_failures.append(
+                                candidate_name
+                                + ":published_task_receipt_contradicts_output"
+                            )
+                        else:
+                            unsettled.append(
+                                {
+                                    "task_id": int(logical_id),
+                                    "pointdir": candidate_name,
+                                    "reason": str(assessment.reason),
+                                    "fingerprint_sha256": str(
+                                        assessment.fingerprint_sha256
+                                    ),
+                                }
+                            )
                 if candidate_index == total_accepted or candidate_index % 16 == 0:
                     self._report_runtime_progress(
                         "output_visibility",
@@ -5225,16 +5670,32 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         total=int(total_accepted),
                         unit="point directories",
                     )
+            if authority_failures:
+                return PhaseResult(
+                    is_complete=True,
+                    failure_reason=(
+                        "aimall_output_authority_invalid: "
+                        + "; ".join(authority_failures[:8])
+                    ),
+                )
             if unsettled:
                 return PhaseResult(
                     is_complete=True,
                     failure_reason=(
                         "aimall_outputs_not_settled_missing_or_unreadable: "
-                        + "; ".join(unsettled[:8])
+                        + "; ".join(
+                            str(record["pointdir"])
+                            + ":"
+                            + str(record["reason"])
+                            for record in unsettled[:8]
+                        )
                     ),
                     retry_disposition=(
                         PostprocessRetryDisposition.FILESYSTEM_SETTLE
                     ),
+                    postprocess_metadata={
+                        "aimall_structural_candidates": unsettled,
+                    },
                 )
 
             structurally_complete = []
@@ -5250,11 +5711,20 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 pdir = PointDirectory(candidate)
                 pointdirs.append(pdir)
                 failure_reason = None
-                for validator in validators:
-                    ok, reason = validator(pdir)
-                    if not ok:
-                        failure_reason = reason
-                        break
+                logical_id = task_id_by_name.get(Path(candidate).name)
+                if logical_id in terminal_rejection_ids:
+                    failure_reason = str(
+                        terminal_rejection_reasons.get(
+                            str(logical_id),
+                            "aimall_structural_retry_exhausted",
+                        )
+                    )
+                else:
+                    for validator in validators:
+                        ok, reason = validator(pdir)
+                        if not ok:
+                            failure_reason = reason
+                            break
                 if failure_reason is None:
                     structurally_complete.append(pdir)
                 else:
@@ -5449,6 +5919,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         replacement_round=int(
                             getattr(state, "replacement_round", 0)
                         ),
+                        expected_method=str(self.config.gaussian.method),
                     )
             except Exception as exc:
                 return PhaseResult(
@@ -9625,7 +10096,21 @@ def _aimall_invocation_block(
         + " -m ichor.hpc.active_learning.daemon.quantum_job_prepare"
         + ' --campaign-dir "$ICHOR_CAMPAIGN_DIR"'
         + ' --pointdir "$POINT_DIR" --backend aimall',
+        "set +e",
         " ".join([_shell_quote(aimall_path)] + args + ["input.wfn"]),
+        "ICHOR_AIMALL_BACKEND_STATUS=$?",
+        "set -e",
+        'if [[ "$ICHOR_AIMALL_BACKEND_STATUS" -ne 0 ]]; then',
+        '  if [[ "$ICHOR_AIMALL_BACKEND_STATUS" -eq '
+        + str(AIMALL_STRUCTURAL_INVALID_EXIT_CODE)
+        + " ]]; then exit "
+        + str(AIMALL_NATIVE_EXIT_CODE_REMAP)
+        + "; fi",
+        '  exit "$ICHOR_AIMALL_BACKEND_STATUS"',
+        "fi",
+        python
+        + " -m ichor.hpc.active_learning.daemon.aimall_output_validation"
+        + ' --pointdir "$POINT_DIR"',
         "if ! "
         + python
         + " -m ichor.hpc.active_learning.daemon.ferebus_row_cache"

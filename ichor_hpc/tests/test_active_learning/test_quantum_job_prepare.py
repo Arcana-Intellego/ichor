@@ -34,6 +34,18 @@ def test_gaussian_preparation_removes_all_downstream_products(tmp_path):
     atomic = pointdir / "input_atomicfiles"
     atomic.mkdir()
     (atomic / "h1.int").write_text("stale\n", encoding="utf-8")
+    for name in (
+        "input.aim",
+        "input.agp",
+        "input.agpviz",
+        "input.extout",
+        "input.int",
+        "input.mgp",
+        "input.mgpviz",
+        "input.sum",
+        "input.sumviz",
+    ):
+        (pointdir / name).write_text("stale\n", encoding="utf-8")
 
     prepare_quantum_task(campaign, pointdir, backend="gaussian")
 
@@ -88,6 +100,21 @@ def test_aimall_preparation_preserves_bound_inputs(tmp_path):
     assert not atomic.exists()
     assert not (pointdir / "AIMALL_COMPLETION_RECEIPT.json").exists()
     assert not (pointdir / "QUANTUM_ACCEPTANCE_RECEIPT.json").exists()
+    assert not [
+        path
+        for pattern in (
+            "*.aim",
+            "*.agp",
+            "*.agpviz",
+            "*.extout",
+            "*.int",
+            "*.mgp",
+            "*.mgpviz",
+            "*.sum",
+            "*.sumviz",
+        )
+        for path in pointdir.glob(pattern)
+    ]
 
 
 def test_quantum_preparation_rejects_symlinked_children(tmp_path):

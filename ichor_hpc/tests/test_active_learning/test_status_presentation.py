@@ -1106,10 +1106,12 @@ def test_aimall_postprocess_recovery_explains_local_reuse_and_pending_stop(
     result = recommendations.build_status_recommendations(campaign, payload)
 
     assert result[0].code == "user_stop_draining"
-    assert "149 existing AIMAll outputs" in result[0].primary
-    assert "no AIMAll array will be resubmitted" in result[0].primary
+    assert "149 scheduler-completed AIMAll output candidates" in result[0].primary
+    assert "only structurally invalid or unfinished tasks" in result[0].primary
     assert "honoured after this iteration genuinely completes" in result[0].why
-    assert "149 completed AIMAll outputs" in cli._status_current_activity(payload)
+    assert "149 scheduler-completed AIMAll output candidates" in (
+        cli._status_current_activity(payload)
+    )
 
 
 def test_stopped_scheduler_progress_is_explicitly_historical():

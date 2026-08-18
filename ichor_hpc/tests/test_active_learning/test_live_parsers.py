@@ -151,6 +151,63 @@ def test_aimall_postprocess_source_bypasses_staging_and_scheduler_submission(
     assert result is expected
 
 
+def test_invalid_aimall_postprocess_source_enters_partial_recovery(
+    tmp_path,
+    monkeypatch,
+):
+    executor = _make_executor(tmp_path)
+    state = SimpleNamespace(
+        campaign_uid="aimall-postprocess-test",
+        iteration=8,
+        replacement_round=0,
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "load_active_intent",
+        lambda *_args, **_kwargs: {
+            "postprocess_source": {"source": "fixture"}
+        },
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "resolve_aimall_postprocess_source",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError(
+                "invalid outputs must not use postprocess-only adoption"
+            )
+        ),
+    )
+    executor._aimall_terminal_classification = {
+        "invalid_completed_tasks": [
+            {
+                "task_id": 88,
+                "reason": "int_file_incomplete:h3.int",
+                "fingerprint_sha256": "a" * 64,
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        executor,
+        "_array_size_after_staging",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("entered AIMAll partial recovery")
+        ),
+    )
+    monkeypatch.setattr(
+        executor,
+        "postprocess",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid output must not be adopted")
+        ),
+    )
+
+    with pytest.raises(
+        BackendSubmissionError,
+        match="entered AIMAll partial recovery",
+    ):
+        executor.submit_or_run(state, CampaignPhase.AIMALL)
+
+
 def test_phase_b_postprocess_source_bypasses_scheduler_submission(
     tmp_path,
     monkeypatch,
@@ -696,6 +753,130 @@ def test_aimall_visibility_lag_retries_before_publishing_scientific_evidence(
     )
 
 
+def test_aimall_invalid_output_with_existing_receipt_is_contradictory(
+    tmp_path,
+):
+    ex = _make_executor(tmp_path)
+    staging = _bind_staging(ex, FIXTURES / "initial_quantum")
+    _seed_point_allocation(
+        ex.campaign_dir,
+        staging,
+        context="bootstrap",
+        iteration=0,
+    )
+    pointdirs = sorted(staging.glob("POINT_*.pointdir"))
+    stg.write_quantum_acceptance_manifest(
+        staging,
+        phase_name="INITIAL_GAUSSIAN",
+        iteration=0,
+        accepted=pointdirs,
+        rejected=[],
+    )
+    malformed = pointdirs[0]
+    next(malformed.glob("*_atomicfiles/*.int")).unlink()
+    (malformed / "AIMALL_COMPLETION_RECEIPT.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
+
+    result = _parse_quantum_fixture(
+        ex,
+        state,
+        CampaignPhase("INITIAL_AIMALL"),
+    )
+
+    assert result.failure_reason.startswith("aimall_output_authority_invalid")
+    assert "published_task_receipt_contradicts_output" in result.failure_reason
+    assert result.retry_disposition.value == "none"
+
+
+def test_aimall_exhausted_structural_retry_becomes_allocation_rejection(
+    tmp_path,
+):
+    ex = _make_executor(tmp_path)
+    staging = _bind_staging(ex, FIXTURES / "initial_quantum")
+    _seed_point_allocation(
+        ex.campaign_dir,
+        staging,
+        context="bootstrap",
+        iteration=0,
+    )
+    pointdirs = sorted(staging.glob("POINT_*.pointdir"))
+    stg.write_quantum_acceptance_manifest(
+        staging,
+        phase_name="INITIAL_GAUSSIAN",
+        iteration=0,
+        accepted=pointdirs,
+        rejected=[],
+    )
+    malformed = pointdirs[0]
+    next(malformed.glob("*_atomicfiles/*.int")).unlink()
+    ex._aimall_terminal_rejection_task_ids = [0]
+    ex._aimall_terminal_rejection_reasons = {
+        "0": "aimall_structural_retry_exhausted",
+    }
+    state = SimpleNamespace(iteration=0, campaign_uid="m16-test")
+
+    result = _parse_quantum_fixture(
+        ex,
+        state,
+        CampaignPhase("INITIAL_AIMALL"),
+    )
+
+    assert result.is_complete is True
+    assert result.failure_reason is None
+    accepted, manifest = stg.read_quantum_acceptance_manifest(
+        staging,
+        expected_phase="INITIAL_AIMALL",
+        expected_iteration=0,
+        require_nonempty=False,
+        points_membership=stg.POINTS_MEMBERSHIP_NONE,
+    )
+    assert [Path(pointdir).name for pointdir in accepted] == [
+        pointdir.name for pointdir in pointdirs[1:]
+    ]
+    assert [record["pointdir"] for record in manifest["rejected"]] == [
+        malformed.name
+    ]
+    assert "aimall_structural_retry_exhausted" in set(
+        manifest["rejected"][0]["reason"].split(";")
+    )
+    assert not (malformed / "AIMALL_COMPLETION_RECEIPT.json").exists()
+    assert all(
+        (pointdir / "AIMALL_COMPLETION_RECEIPT.json").is_file()
+        for pointdir in pointdirs[1:]
+    )
+    quality = json.loads(
+        (staging / "quantum_quality.json").read_text(encoding="utf-8")
+    )
+    rejected = next(
+        record
+        for record in quality["records"]
+        if record["pointdir"] == malformed.name
+    )
+    assert rejected["accepted"] is False
+    assert "aimall_structural_retry_exhausted" in rejected["reasons"]
+    allocation = read_point_allocation(
+        point_allocation_path(
+            ex.campaign_dir,
+            context="bootstrap",
+            iteration=0,
+        ),
+        expected_campaign_uid="m16-test",
+        expected_context="bootstrap",
+        expected_iteration=0,
+    )
+    failed_attempt = next(
+        attempt
+        for slot in allocation["slots"]
+        for attempt in slot["attempts"]
+        if attempt["pointdir_name"] == malformed.name
+    )
+    assert failed_attempt["status"] == "rejected"
+    assert "aimall_structural_retry_exhausted" in failed_attempt["reason"]
+
+
 def test_stage_aimall_inputs_writes_resolved_naat_metadata(tmp_path, monkeypatch):
     campaign = tmp_path / "campaign"
     staging = campaign / ".DATA" / "STAGING" / "initial"
@@ -890,6 +1071,51 @@ def test_stage_aimall_inputs_writes_resolved_naat_metadata(tmp_path, monkeypatch
         ).splitlines()
         if line.strip()
     ] == [pointdir.name for pointdir in accepted]
+
+    from ichor.hpc.active_learning.daemon.quantum_task_contracts import (
+        QuantumLogicalTask,
+        QuantumTaskContract,
+    )
+
+    authority_contract = QuantumTaskContract(
+        campaign_uid="m16-test",
+        phase="INITIAL_AIMALL",
+        iteration=0,
+        replacement_round=0,
+        staging_dir=staging,
+        tasks=(
+            QuantumLogicalTask(
+                logical_task_id=0,
+                pointdir_name=accepted[0].name,
+                pointdir=accepted[0],
+                producer_logical_task_id=1,
+                candidate_id="fixture-candidate",
+            ),
+        ),
+    )
+    assert stg.validate_existing_aimall_task_authorities(
+        campaign,
+        phase_name="INITIAL_AIMALL",
+        iteration=0,
+        replacement_round=0,
+        expected_campaign_uid="m16-test",
+        expected_method="B3LYP",
+        task_contract=authority_contract,
+    ) is authority_contract
+
+    original_wfn = (accepted[0] / "input.wfn").read_bytes()
+    (accepted[0] / "input.wfn").write_bytes(original_wfn + b"tampered\n")
+    with pytest.raises(ValueError, match="differs from its method receipt"):
+        stg.validate_existing_aimall_task_authorities(
+            campaign,
+            phase_name="INITIAL_AIMALL",
+            iteration=0,
+            replacement_round=0,
+            expected_campaign_uid="m16-test",
+            expected_method="B3LYP",
+            task_contract=authority_contract,
+        )
+    (accepted[0] / "input.wfn").write_bytes(original_wfn)
 
     task_metadata_path = accepted[0] / stg.AIMALL_TASK_METADATA
     task_metadata_path.unlink()
@@ -3353,6 +3579,15 @@ def test_submission_environment_guard_runs_before_scheduler_acceptance(
         expected_tasks=1,
         scheduler_identity_kind=scheduler_kind,
     )
+    (campaign / "ledger.json").write_text("{}\n", encoding="utf-8")
+    archive_calls = []
+    monkeypatch.setattr(
+        live_executor_mod,
+        "archive_existing_array_task_outputs",
+        lambda *_args, **_kwargs: archive_calls.append(
+            (_args, _kwargs)
+        ) or [],
+    )
     monkeypatch.setattr(ex, "_array_size_after_staging", lambda *_args: 1)
 
     def write_bound_fixture_script(
@@ -3420,6 +3655,7 @@ def test_submission_environment_guard_runs_before_scheduler_acceptance(
         )
 
     assert runner.calls == []
+    assert archive_calls == []
 
 
 def test_phase_b_resource_contract_failure_has_precise_pre_submit_message(
@@ -3485,6 +3721,15 @@ def test_partial_array_recovery_journal_payload_does_not_duplicate_phase(
         phase_name="GAUSSIAN",
         iteration=4,
         expected_tasks=3,
+    )
+    (campaign / "ledger.json").write_text("{}\n", encoding="utf-8")
+    archive_calls = []
+    monkeypatch.setattr(
+        live_executor_mod,
+        "archive_existing_array_task_outputs",
+        lambda *_args, **_kwargs: archive_calls.append(
+            (_args, _kwargs)
+        ) or [],
     )
     monkeypatch.setattr(ex, "_array_size_after_staging", lambda _phase, _state: 3)
 
@@ -3560,6 +3805,8 @@ def test_partial_array_recovery_journal_payload_does_not_duplicate_phase(
     assert prepared[-1]["phase"] == "GAUSSIAN"
     assert prepared[-1]["iteration"] == 4
     assert prepared[-1]["n_retry"] == 2
+    assert len(archive_calls) == 1
+    assert archive_calls[0][1]["task_ids"] == [1, 2]
 
 
 def test_partial_array_recovery_postprocess_only_journal_payload_is_safe(

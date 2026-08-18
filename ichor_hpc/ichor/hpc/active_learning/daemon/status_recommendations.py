@@ -1192,13 +1192,15 @@ def _phase_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusReco
             primary=(
                 "resume the daemon to validate "
                 + str(total)
-                + " existing AIMAll output"
+                + " scheduler-completed AIMAll output candidate"
                 + ("" if total == 1 else "s")
-                + " locally; no AIMAll array will be resubmitted"
+                + " locally; only structurally invalid or unfinished tasks "
+                "will be submitted"
             ),
             why=(
-                "the original scheduler lifecycle proves every AIMAll task "
-                "completed, while local acceptance publication is still pending"
+                "the original scheduler lifecycle reports every AIMAll task "
+                "complete, while structural validation and local acceptance "
+                "publication remain pending"
             ),
             command=_resume_cmd(campaign),
         )
@@ -1562,9 +1564,10 @@ def build_status_recommendations(
                     primary=(
                         "resume the daemon to validate "
                         + str(total)
-                        + " existing AIMAll output"
+                        + " scheduler-completed AIMAll output candidate"
                         + ("" if total == 1 else "s")
-                        + " locally; no AIMAll array will be resubmitted"
+                        + " locally; only structurally invalid or unfinished "
+                        "tasks will be submitted"
                     ),
                     why=(
                         stop_description

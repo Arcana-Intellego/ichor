@@ -1930,11 +1930,17 @@ def archive_existing_array_task_outputs(
         elif "AIMALL" in phase:
             patterns = [
                 "*_atomicfiles",
-                "*.int",
-                "*.sum",
+                "*.aim",
+                "*.agp",
                 "*.agpviz",
+                "*.extout",
+                "*.int",
+                "*.mgp",
                 "*.mgpviz",
+                "*.sum",
+                "*.sumviz",
                 "AIMALL_COMPLETION_RECEIPT.json",
+                "QUANTUM_ACCEPTANCE_RECEIPT.json",
             ]
             for pattern in patterns:
                 for candidate in sorted(pdir.glob(pattern)):
@@ -2043,6 +2049,17 @@ def compact_array_recovery_summary(payload: Optional[Dict[str, Any]]) -> Dict[st
     if payload.get("scheduler_jobs_submitted") is not None:
         summary["scheduler_jobs_submitted"] = int(
             payload["scheduler_jobs_submitted"]
+        )
+    if payload.get("n_terminal_rejection") is not None:
+        summary["n_terminal_rejection"] = int(
+            payload["n_terminal_rejection"]
+        )
+    if payload.get("structural_retry_task_ids") is not None:
+        values = list(payload["structural_retry_task_ids"])
+        summary["n_structural_retry"] = len(values)
+        summary["structural_retry_task_ids_sample"] = values[:12]
+        summary["structural_retry_task_ids_truncated"] = bool(
+            len(values) > 12
         )
     for key in (
         "state",

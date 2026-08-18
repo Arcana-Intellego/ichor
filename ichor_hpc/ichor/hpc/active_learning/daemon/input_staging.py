@@ -512,6 +512,136 @@ def _read_existing_aimall_task_metadata(
     return dict(payload)
 
 
+def validate_existing_aimall_task_authorities(
+    campaign_dir: Path,
+    *,
+    phase_name: str,
+    iteration: int,
+    replacement_round: int,
+    expected_campaign_uid: str,
+    expected_method: str,
+    task_contract: Any = None,
+) -> Any:
+    """Validate every immutable Gaussian/WFN input consumed by AIMAll."""
+    from .quantum_quality import canonicalise_aimall_method
+    from .quantum_task_contracts import (
+        AIMALL_PHASES,
+        gaussian_phase_for_aimall,
+        quantum_task_contract,
+    )
+    from .quantum_task_receipts import GAUSSIAN_TASK_RECEIPT
+
+    phase = str(phase_name)
+    if phase not in AIMALL_PHASES:
+        raise ValueError("AIMAll input authority phase is invalid: " + phase)
+    contract = task_contract
+    if contract is None:
+        contract = quantum_task_contract(
+            campaign_dir,
+            phase,
+            int(iteration),
+            replacement_round=int(replacement_round),
+            expected_campaign_uid=str(expected_campaign_uid),
+            validate_points_file=False,
+        )
+    contract_identity = (
+        str(getattr(contract, "campaign_uid", "")),
+        str(getattr(contract, "phase", "")),
+        int(getattr(contract, "iteration", -1)),
+        int(getattr(contract, "replacement_round", -1)),
+    )
+    if contract_identity != (
+        str(expected_campaign_uid),
+        phase,
+        int(iteration),
+        int(replacement_round),
+    ):
+        raise ValueError("AIMAll input authority task contract mismatch")
+
+    gaussian_phase = gaussian_phase_for_aimall(phase)
+    accepted, _manifest = read_quantum_acceptance_manifest(
+        contract.staging_dir,
+        expected_phase=gaussian_phase,
+        expected_iteration=int(iteration),
+        require_nonempty=bool(contract.logical_total),
+        points_membership=POINTS_MEMBERSHIP_PRODUCER_OR_ACCEPTED,
+    )
+    accepted_names = tuple(Path(path).name for path in accepted)
+    if accepted_names != tuple(contract.pointdir_names):
+        raise ValueError(
+            "AIMAll task contract does not match Gaussian acceptance order"
+        )
+    acceptance_path = quantum_acceptance_manifest_path(
+        contract.staging_dir,
+        phase_name=gaussian_phase,
+    )
+    if acceptance_path.is_symlink() or not acceptance_path.is_file():
+        raise ValueError("Gaussian acceptance authority is missing or symlinked")
+    acceptance_sha256 = sha256_file(acceptance_path)
+    canonical_method = canonicalise_aimall_method(expected_method)
+
+    seen_gaussian_ids = set()
+    for task_index, task in enumerate(contract.tasks):
+        if int(task.logical_task_id) != int(task_index):
+            raise ValueError("AIMAll logical task IDs are not canonical")
+        root = Path(task.pointdir)
+        if root.is_symlink() or not root.is_dir():
+            raise ValueError(
+                "AIMAll pointdir is missing or symlinked: " + str(root)
+            )
+        gaussian_logical_task_id = int(task.producer_logical_task_id)
+        if gaussian_logical_task_id in seen_gaussian_ids:
+            raise ValueError("AIMAll Gaussian producer identity is duplicated")
+        seen_gaussian_ids.add(gaussian_logical_task_id)
+
+        method_path, method_payload = _read_existing_wfn_method_receipt(
+            root,
+            phase_name=phase,
+            iteration=int(iteration),
+            task_index=int(task_index),
+            method=canonical_method,
+            source_acceptance_sha256=acceptance_sha256,
+        )
+        gaussian_receipt_path = root / GAUSSIAN_TASK_RECEIPT
+        _read_gaussian_receipt_for_aimall_replay(
+            root,
+            phase_name=gaussian_phase,
+            iteration=int(iteration),
+            logical_task_id=gaussian_logical_task_id,
+            wfn_method_payload=method_payload,
+        )
+        try:
+            expected_atoms = list(PointDirectory(root).atoms)
+            primitive_count = int(wfn_primitive_count(root / "input.wfn"))
+        except Exception as exc:
+            raise ValueError(
+                "AIMAll inherited geometry or WFN is unreadable: " + root.name
+            ) from exc
+        expected_atom_names = [str(atom.name) for atom in expected_atoms]
+        if (
+            not expected_atom_names
+            or len(expected_atom_names) != len(set(expected_atom_names))
+        ):
+            raise ValueError(
+                "AIMAll inherited geometry atom identities are invalid: "
+                + root.name
+            )
+        _read_existing_aimall_task_metadata(
+            root,
+            phase_name=phase,
+            iteration=int(iteration),
+            task_index=int(task_index),
+            gaussian_logical_task_id=gaussian_logical_task_id,
+            atom_count=len(expected_atom_names),
+            primitive_count=primitive_count,
+            expected_atom_names=expected_atom_names,
+            wfn_method_receipt=method_path,
+            wfn_method_payload=method_payload,
+            gaussian_receipt_path=gaussian_receipt_path,
+        )
+    return contract
+
+
 def _stable_resource_resolution_for_replay(value: Any) -> Any:
     """Remove observational free-space telemetry from a resource contract."""
     if not isinstance(value, Mapping):
@@ -880,11 +1010,10 @@ def publish_completed_aimall_sibling_receipts(
     aimall_phase: str,
     iteration: int,
     replacement_round: int,
+    expected_method: str,
 ) -> int:
     """Bind reusable AIMAll siblings before a Gaussian membership replay."""
-    from ichor.core.files.point_directory import PointDirectory
-
-    from .live_executor import validate_aimall_completed
+    from .aimall_output_validation import assess_aimall_output
     from .quantum_task_contracts import quantum_task_contract
     from .quantum_task_receipts import (
         write_quantum_task_receipt_from_postprocess_source,
@@ -931,13 +1060,21 @@ def publish_completed_aimall_sibling_receipts(
         raise ValueError(
             "AIMAll postprocess source and task contract counts differ"
         )
+    validate_existing_aimall_task_authorities(
+        campaign,
+        phase_name=str(aimall_phase),
+        iteration=int(iteration),
+        replacement_round=int(replacement_round),
+        expected_campaign_uid=str(state.campaign_uid),
+        expected_method=str(expected_method),
+        task_contract=contract,
+    )
     published = 0
     for task in contract.tasks:
         pointdir = task.pointdir
         if pointdir.is_symlink() or not pointdir.is_dir():
             continue
-        ok, _reason = validate_aimall_completed(PointDirectory(pointdir))
-        if not ok:
+        if not assess_aimall_output(pointdir).valid:
             continue
         write_quantum_task_receipt_from_postprocess_source(
             pointdir,
