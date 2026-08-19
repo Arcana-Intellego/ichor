@@ -4667,6 +4667,56 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     unit="tasks",
                 )
                 return self.postprocess(state, phase, [])
+        if phase_name == "ARIADNE_ARRAY":
+            from . import submission_intent as _submission_intent
+
+            postprocess_intent = _submission_intent.load_active_intent(
+                self.campaign_dir,
+                phase_name,
+                int(getattr(state, "iteration", 0)),
+                expected_campaign_uid=str(state.campaign_uid),
+            )
+            if (
+                isinstance(postprocess_intent, dict)
+                and isinstance(
+                    postprocess_intent.get("postprocess_source"),
+                    Mapping,
+                )
+            ):
+                terminal = (
+                    _submission_intent.resolve_ariadne_terminal_postprocess_source(
+                        self.campaign_dir,
+                        campaign_uid=str(state.campaign_uid),
+                        iteration=int(getattr(state, "iteration", 0)),
+                        intent=postprocess_intent,
+                    )
+                )
+                source = terminal["postprocess_source"]
+                self._journal_event(
+                    "partial_array_recovery_postprocess_only",
+                    phase=phase_name,
+                    iteration=int(getattr(state, "iteration", 0)),
+                    logical_total=int(terminal["logical_total"]),
+                    n_complete=int(terminal["n_scheduler_completed"]),
+                    n_retry=0,
+                    scheduler_failed_candidates=int(
+                        terminal["n_scheduler_failed"]
+                    ),
+                    producer_job_id=str(source["job_id"]),
+                    producer_submission_identity=str(
+                        source["submission_identity"]
+                    ),
+                    source_attempt_id=str(source["attempt_id"]),
+                    recovery_source="terminal_ariadne_postprocess",
+                    scheduler_jobs_submitted=0,
+                )
+                self._report_runtime_progress(
+                    "output_visibility",
+                    completed=0,
+                    total=int(terminal["logical_total"]),
+                    unit="tasks",
+                )
+                return self.postprocess(state, phase, [])
         if "AIMALL" in phase_name or "GAUSSIAN" in phase_name:
             from . import submission_intent as _submission_intent
 
@@ -5157,6 +5207,17 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         )
         try:
             self._raise_if_immediate_cancel_before_submission(state)
+            if (
+                isinstance(bound_intent, Mapping)
+                and isinstance(
+                    bound_intent.get("postprocess_source"),
+                    Mapping,
+                )
+            ):
+                raise BackendSubmissionError(
+                    "scheduler submission is forbidden for a jobless "
+                    "postprocess intent"
+                )
             environment_guard = getattr(
                 self,
                 "_submission_environment_guard",

@@ -1503,6 +1503,144 @@ def test_existing_jobless_ariadne_postprocess_intent_skips_scheduler_lookup(
     assert len(completed) == 1
 
 
+def test_jobless_ariadne_postprocess_submission_violation_preserves_job(
+    tmp_path,
+    monkeypatch,
+):
+    class ViolatingExecutor(MockPhaseExecutor):
+        def __init__(self):
+            super().__init__(treat_as_sbatch=set(_SBATCH_PHASES))
+
+        def submit_or_run(self, state, phase):
+            return PhaseResult(
+                submitted_job_id="898514",
+                expected_tasks=200,
+            )
+
+    d = _make_daemon(tmp_path, executor=ViolatingExecutor())
+    d.data_dir().mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state(max_iterations=40)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 10
+    source = {
+        "decision_contract": {
+            "failure_threshold_fraction": 0.25,
+            "config_sha256": "c" * 64,
+        },
+        "source_sha256": "d" * 64,
+    }
+    active_intent = {
+        "status": "PRE_SUBMIT",
+        "job_id": None,
+        "postprocess_source": source,
+        "environment_generation": 1,
+        "environment_generation_digest_sha256": "e" * 64,
+    }
+    monkeypatch.setattr(
+        d,
+        "_ariadne_postprocess_source_if_complete",
+        lambda _state: source,
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "load_active_intent",
+        lambda *_args, **_kwargs: active_intent,
+    )
+    monkeypatch.setattr(d, "_verify_environment_boundary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        d,
+        "_verify_committed_artifacts_if_enabled",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(d, "_checkpoint_before_seed_selection", lambda *_args: None)
+    monkeypatch.setattr(d, "_verify_intent_environment_binding", lambda *_args: None)
+
+    status = d._on_phase_entry(state, CampaignPhase.ARIADNE_ARRAY)
+
+    assert status == TickStatus.HALTED
+    recovered = read_state(d.state_path())
+    assert recovered.phase is CampaignPhase.HALTED
+    assert recovered.pending_jobs[CampaignPhase.ARIADNE_ARRAY.value] == "898514"
+    halt = [
+        event for event in iter_events(d.journal_path())
+        if event.get("event") == "halt"
+    ][-1]
+    assert "postprocess_intent_scheduler_submission_violation" in halt["reason"]
+
+
+def test_scheduler_acceptance_with_failed_intent_publication_halts_safely(
+    tmp_path,
+    monkeypatch,
+):
+    class SubmittedExecutor(MockPhaseExecutor):
+        def __init__(self):
+            super().__init__(treat_as_sbatch=set(_SBATCH_PHASES))
+
+        def submit_or_run(self, state, phase):
+            return PhaseResult(
+                submitted_job_id="898514",
+                expected_tasks=3,
+            )
+
+    d = _make_daemon(tmp_path, executor=SubmittedExecutor())
+    d.data_dir().mkdir(parents=True, exist_ok=True)
+    state = fresh_campaign_state(max_iterations=40)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 10
+    monkeypatch.setattr(d, "_verify_environment_boundary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        d,
+        "_verify_committed_artifacts_if_enabled",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(d, "_checkpoint_before_seed_selection", lambda *_args: None)
+    monkeypatch.setattr(
+        d,
+        "_ariadne_postprocess_source_if_complete",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        d,
+        "_validate_submission_environment_binding",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        d,
+        "_infer_expected_tasks_from_artifacts",
+        lambda *_args, **_kwargs: 3,
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "load_active_intent",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "write_pre_submit_intent",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "mark_submitted",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("intent storage unavailable")
+        ),
+    )
+
+    status = d._on_phase_entry(state, CampaignPhase.ARIADNE_ARRAY)
+
+    assert status == TickStatus.HALTED
+    recovered = read_state(d.state_path())
+    assert recovered.pending_jobs[CampaignPhase.ARIADNE_ARRAY.value] == "898514"
+    halt = [
+        event for event in iter_events(d.journal_path())
+        if event.get("event") == "halt"
+    ][-1]
+    assert "submission_intent_publication_failed_after_scheduler_acceptance" in (
+        halt["reason"]
+    )
+
+
 def test_ariadne_postprocess_intent_copies_original_decision_contract(
     tmp_path,
     monkeypatch,
@@ -1932,6 +2070,10 @@ def test_invalid_aimall_postprocess_wrapper_stays_local_for_partial_retry(
         "expected_job_name": "fixture-local-wrapper",
         "job_id": None,
         "postprocess_source": {"source": "fixture"},
+        "decision_contract": {
+            "failure_threshold_fraction": 0.25,
+            "config_sha256": "c" * 64,
+        },
     }
 
     def classify_locally(*_args, **_kwargs):
@@ -1974,10 +2116,32 @@ def test_invalid_aimall_postprocess_wrapper_stays_local_for_partial_retry(
             "local AIMAll recovery wrapper was treated as scheduler ownership"
         ),
     )
+    retired = []
+    written = []
+    monkeypatch.setattr(
+        submission_intent,
+        "mark_superseded",
+        lambda *_args, **_kwargs: retired.append((_args, _kwargs)) or {},
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "write_pre_submit_intent",
+        lambda *_args, **kwargs: written.append(kwargs) or {},
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "mark_submitted",
+        lambda *_args, **_kwargs: {},
+    )
 
     status = d._on_phase_entry(state, CampaignPhase.AIMALL)
 
     assert status == TickStatus.SUBMITTED
+    assert len(retired) == 1
+    assert retired[0][0][3] == "reconcile_apply_retry"
+    assert len(written) == 1
+    assert written[0]["postprocess_source"] is None
+    assert written[0]["decision_contract"] == wrapper["decision_contract"]
 
 
 def test_scheduler_free_completion_retires_pre_submit_intent(tmp_path):

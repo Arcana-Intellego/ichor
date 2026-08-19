@@ -151,6 +151,86 @@ def test_aimall_postprocess_source_bypasses_staging_and_scheduler_submission(
     assert result is expected
 
 
+def test_ariadne_terminal_postprocess_bypasses_staging_and_scheduler_submission(
+    tmp_path,
+    monkeypatch,
+):
+    executor = _make_executor(tmp_path)
+    state = SimpleNamespace(
+        campaign_uid="ariadne-postprocess-test",
+        iteration=10,
+        replacement_round=0,
+    )
+    source = {
+        "attempt_id": "1" * 32,
+        "submission_identity": "r0000-a0001-source",
+        "job_id": "898513",
+    }
+    monkeypatch.setattr(
+        submission_intent,
+        "load_active_intent",
+        lambda *_args, **_kwargs: {
+            "postprocess_source": {"source": "fixture"}
+        },
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "resolve_ariadne_terminal_postprocess_source",
+        lambda *_args, **_kwargs: {
+            "postprocess_source": source,
+            "logical_total": 200,
+            "n_scheduler_completed": 199,
+            "n_scheduler_failed": 1,
+        },
+    )
+    expected = PhaseResult(is_complete=True)
+    monkeypatch.setattr(
+        executor,
+        "postprocess",
+        lambda observed_state, observed_phase, observations: (
+            expected
+            if (
+                observed_state is state
+                and observed_phase is CampaignPhase.ARIADNE_ARRAY
+                and observations == []
+            )
+            else (_ for _ in ()).throw(
+                AssertionError("unexpected postprocess invocation")
+            )
+        ),
+    )
+    executor.sbatch_runner = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("scheduler submission must not run")
+    )
+    monkeypatch.setattr(
+        executor,
+        "_stage_phase_inputs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ARIADNE input staging must not run")
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        executor,
+        "_array_size_after_staging",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ARIADNE retry classification must not run")
+        ),
+    )
+
+    result = executor.submit_or_run(state, CampaignPhase.ARIADNE_ARRAY)
+
+    assert result is expected
+    events = _read_journal_events(executor.campaign_dir)
+    recovery = [
+        event
+        for event in events
+        if event.get("event") == "partial_array_recovery_postprocess_only"
+    ]
+    assert recovery[-1]["producer_job_id"] == "898513"
+    assert recovery[-1]["scheduler_jobs_submitted"] == 0
+
+
 def test_invalid_aimall_postprocess_source_enters_partial_recovery(
     tmp_path,
     monkeypatch,

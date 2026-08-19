@@ -2059,6 +2059,7 @@ class Daemon:
                 )
             )
         )
+        local_retry_decision_contract: Optional[Dict[str, Any]] = None
         if active_intent is not None:
             recorded_scheduler = str(
                 active_intent.get("scheduler_identity_kind") or ""
@@ -2084,6 +2085,49 @@ class Daemon:
             )
             if intent_environment_status is not None:
                 return intent_environment_status
+        aimall_partial_retry_wrapper = bool(
+            local_postprocess_intent
+            and postprocess_source is None
+            and phase
+            in {
+                CampaignPhase.INITIAL_AIMALL,
+                CampaignPhase.AIMALL,
+                CampaignPhase.INITIAL_REPLACEMENT_AIMALL,
+                CampaignPhase.REPLACEMENT_AIMALL,
+            }
+            and isinstance(self._aimall_terminal_classification, Mapping)
+            and self._aimall_terminal_classification.get(
+                "invalid_completed_tasks"
+            )
+        )
+        if aimall_partial_retry_wrapper:
+            contract = active_intent.get("decision_contract")
+            if not isinstance(contract, Mapping):
+                return self._halt(
+                    state,
+                    phase,
+                    "aimall_partial_retry_intent_invalid: jobless recovery "
+                    "wrapper has no frozen decision contract",
+                )
+            local_retry_decision_contract = dict(contract)
+            try:
+                _submission_intent.mark_superseded(
+                    self.campaign_dir,
+                    phase_name,
+                    int(state.iteration),
+                    "reconcile_apply_retry",
+                )
+            except Exception as exc:
+                return self._halt(
+                    state,
+                    phase,
+                    "aimall_partial_retry_intent_retirement_failed: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)[:160],
+                )
+            active_intent = None
+            local_postprocess_intent = False
         # before submitting, check whether a job for THIS phase+iteration is already running on the
         # cluster. a crash in the submit->persist window just below, or a reconcile that cleared
         # pending_jobs, can leave a real job running that state.json has forgotten -- resubmitting
@@ -2299,9 +2343,10 @@ class Daemon:
                         phase,
                     )
                     recovery_decision_contract = (
-                        self._scheduler_recovery_decision_contract(
-                            state,
-                            phase,
+                        local_retry_decision_contract
+                        if local_retry_decision_contract is not None
+                        else self._scheduler_recovery_decision_contract(
+                            state, phase
                         )
                     )
                     submission_decision_contract = (
@@ -2315,6 +2360,7 @@ class Daemon:
                     )
                     allow_frozen_recovery_contract = bool(
                         postprocess_source is not None
+                        or local_retry_decision_contract is not None
                         or recovery_decision_contract is not None
                     )
                     self._validate_submission_environment_binding(
@@ -2536,9 +2582,33 @@ class Daemon:
                 "phase_entry_exception: "
                 + type(exc).__name__ + ": " + str(exc)[:180],
             )
+        if local_postprocess_intent and result.submitted_job_id:
+            state.pending_jobs[phase_name] = str(result.submitted_job_id)
+            self._apply_state_updates(state, result.state_updates)
+            self._persist(state)
+            self._journal(
+                "submission_intent_update_failed",
+                phase=phase_name,
+                iteration=int(state.iteration),
+                job_id=str(result.submitted_job_id),
+                error="jobless postprocess intent submitted scheduler work",
+            )
+            if phase_reporter is not None:
+                phase_reporter.fail(
+                    "jobless postprocess intent submitted scheduler work",
+                    stage="scheduler_submission",
+                )
+            return self._halt_scheduler_uncertain(
+                state,
+                phase,
+                "postprocess_intent_scheduler_submission_violation: job "
+                + str(result.submitted_job_id)
+                + " was accepted unexpectedly; scheduler ownership is preserved",
+            )
         if result.submitted_job_id and not result.is_complete:
             if phase_name in SBATCH_PHASES:
                 submitted_intent = None
+                intent_update_error = None
                 try:
                     submitted_intent = _submission_intent.mark_submitted(
                         self.campaign_dir,
@@ -2553,6 +2623,7 @@ class Daemon:
                         ),
                     )
                 except Exception as exc:
+                    intent_update_error = exc
                     self._journal(
                         "submission_intent_update_failed",
                         phase=phase_name,
@@ -2580,6 +2651,21 @@ class Daemon:
                     else None
                 ),
             )
+            if phase_name in SBATCH_PHASES and intent_update_error is not None:
+                if phase_reporter is not None:
+                    phase_reporter.fail(
+                        "submission intent publication failed after scheduler "
+                        "acceptance: " + str(intent_update_error),
+                        stage="scheduler_submission",
+                    )
+                return self._halt_scheduler_uncertain(
+                    state,
+                    phase,
+                    "submission_intent_publication_failed_after_scheduler_acceptance: "
+                    + type(intent_update_error).__name__
+                    + ": "
+                    + str(intent_update_error)[:160],
+                )
             if phase_reporter is not None:
                 phase_reporter.complete(
                     stage=(
@@ -3721,7 +3807,12 @@ class Daemon:
                     iteration=int(state.iteration),
                     intent=current,
                 )
-            except AriadneTerminalPostprocessNotApplicable:
+            except AriadneTerminalPostprocessNotApplicable as exc:
+                if isinstance(current.get("postprocess_source"), Mapping):
+                    raise ValueError(
+                        "explicit ARIADNE postprocess wrapper is not bound to "
+                        "an eligible terminal producer: " + str(exc)
+                    ) from exc
                 terminal = None
             if terminal is not None:
                 source = terminal.get("postprocess_source")

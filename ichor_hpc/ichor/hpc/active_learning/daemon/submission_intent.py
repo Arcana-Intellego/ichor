@@ -1579,6 +1579,12 @@ def load_intent(
         iteration=int(iteration),
         expected_campaign_uid=expected_campaign_uid,
     )
+    return _validate_intent_optional_bindings(data)
+
+
+def _validate_intent_optional_bindings(
+    data: Dict[str, Any],
+) -> Dict[str, Any]:
     for key in (
         "resource_resolution_path",
         "resource_formula_version",
@@ -1832,6 +1838,240 @@ def load_active_intent(
     return None
 
 
+def classify_repairable_accidental_postprocess_submission(
+    campaign_dir: Union[str, Path],
+    phase_name: str,
+    iteration: int,
+    *,
+    expected_campaign_uid: Optional[str] = None,
+    payload: Optional[Mapping[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Recognise the one invalid wrapper shape emitted by the ARIADNE bug.
+
+    The buggy path submitted a full replacement array through an existing
+    jobless postprocess wrapper and then wrote the JobID before validating the
+    resulting intent.  This classifier is deliberately narrower than normal
+    intent validation and is used only by reconcile inspection.
+    """
+    phase = str(phase_name)
+    iteration_value = int(iteration)
+    path = intent_path(campaign_dir, phase, iteration_value)
+    if payload is None:
+        if path.is_symlink() or not path.is_file():
+            return None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                "accidental postprocess submission intent is unreadable"
+            ) from exc
+    else:
+        raw = dict(payload)
+    if not isinstance(raw, dict):
+        return None
+    nested = raw.get("postprocess_source")
+    job_id = raw.get("job_id")
+    if not isinstance(nested, Mapping) or job_id is None:
+        return None
+    if phase != CampaignPhase.ARIADNE_ARRAY.value:
+        raise ValueError(
+            "job-bound postprocess intent is not an ARIADNE recovery wrapper"
+        )
+    if str(raw.get("status") or "") != "SUBMITTED":
+        raise ValueError(
+            "job-bound ARIADNE postprocess wrapper is not SUBMITTED"
+        )
+
+    source = _validated_postprocess_source(nested)
+    normalised = dict(raw)
+    normalised.pop("postprocess_source", None)
+    normalised = _validate_intent_payload(
+        normalised,
+        path=path,
+        phase_name=phase,
+        iteration=iteration_value,
+        expected_campaign_uid=expected_campaign_uid,
+    )
+    normalised = _validate_intent_optional_bindings(normalised)
+    campaign_uid = str(normalised["campaign_uid"])
+    if expected_campaign_uid is not None and campaign_uid != str(
+        expected_campaign_uid
+    ):
+        raise ValueError(
+            "accidental ARIADNE submission campaign UID mismatch"
+        )
+    if (
+        str(source["campaign_uid"]) != campaign_uid
+        or str(source["phase"]) != phase
+        or int(source["iteration"]) != iteration_value
+        or source["decision_contract"] != normalised.get("decision_contract")
+        or int(source["logical_total"])
+        != int(normalised.get("expected_tasks") or -1)
+        or str(source["job_id"]) == str(normalised["job_id"])
+    ):
+        raise ValueError(
+            "accidental ARIADNE submission differs from its frozen producer"
+        )
+
+    logical_total = int(source["logical_total"])
+    recovery = normalised.get("array_recovery")
+    metadata = normalised.get("submission_metadata")
+    if not isinstance(recovery, Mapping) or not isinstance(metadata, Mapping):
+        raise ValueError(
+            "accidental ARIADNE submission lacks full-array retry evidence"
+        )
+    expected_counts = (
+        logical_total,
+        0,
+        0,
+        logical_total,
+        logical_total,
+        logical_total,
+        logical_total,
+    )
+    observed_counts = (
+        recovery.get("logical_total"),
+        recovery.get("n_complete"),
+        recovery.get("n_reuse"),
+        recovery.get("n_retry"),
+        normalised.get("logical_expected_tasks"),
+        normalised.get("retry_expected_tasks"),
+        normalised.get("expected_tasks"),
+    )
+    if observed_counts != expected_counts:
+        raise ValueError(
+            "accidental ARIADNE submission is not one full-array retry"
+        )
+    if dict(metadata.get("array_recovery") or {}) != dict(recovery):
+        raise ValueError(
+            "accidental ARIADNE submission recovery metadata mismatch"
+        )
+    if str(metadata.get("logical_task_set_sha256") or "") != str(
+        source["logical_task_set_sha256"]
+    ):
+        raise ValueError(
+            "accidental ARIADNE submission task-set digest mismatch"
+        )
+    submitted_task_ids = tuple(
+        int(value)
+        for value in intent_submitted_logical_task_ids(
+            campaign_dir,
+            normalised,
+        )
+    )
+    if submitted_task_ids != tuple(range(logical_total)):
+        raise ValueError(
+            "accidental ARIADNE submission is not one canonical full array"
+        )
+    for key in (
+        "resource_resolution_path",
+        "resource_resolution_sha256",
+        "script_binding_path",
+        "script_binding_sha256",
+        "submitted_script_path",
+        "submitted_script_sha256",
+    ):
+        if not isinstance(normalised.get(key), str) or not str(
+            normalised[key]
+        ):
+            raise ValueError(
+                "accidental ARIADNE submission lacks " + key
+            )
+
+    history_root = intent_dir(campaign_dir) / INTENT_HISTORY_DIR_NAME
+    safe_phase = phase.replace("/", "_").replace("\\", "_")
+    prefix = safe_phase + "-" + str(iteration_value).zfill(6) + "-"
+    producers = []
+    if history_root.is_dir() and not history_root.is_symlink():
+        for history_path in sorted(history_root.glob(prefix + "*.json")):
+            if history_path.is_symlink() or not history_path.is_file():
+                raise ValueError(
+                    "ARIADNE producer intent history is missing or symlinked"
+                )
+            try:
+                history_payload = json.loads(
+                    history_path.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError) as exc:
+                raise ValueError(
+                    "ARIADNE producer intent history is unreadable"
+                ) from exc
+            record = _validate_intent_payload(
+                history_payload,
+                path=history_path,
+                phase_name=phase,
+                iteration=iteration_value,
+                expected_campaign_uid=campaign_uid,
+            )
+            record = _validate_intent_optional_bindings(record)
+            if (
+                str(record.get("attempt_id") or "")
+                == str(source["attempt_id"])
+                and str(record.get("submission_identity") or "")
+                == str(source["submission_identity"])
+                and str(record.get("job_id") or "") == str(source["job_id"])
+            ):
+                producers.append(record)
+    if len(producers) != 1:
+        raise ValueError(
+            "accidental ARIADNE submission source does not resolve to one "
+            "historical producer"
+        )
+    producer = producers[0]
+    if (
+        str(producer.get("status") or "") != "SUPERSEDED"
+        or str(producer.get("reason") or "")
+        != ARIADNE_TERMINAL_POSTPROCESS_REASON
+        or producer.get("decision_contract") != source["decision_contract"]
+        or producer.get("environment_generation")
+        != source["environment_generation"]
+        or producer.get("environment_generation_digest_sha256")
+        != source["environment_generation_digest_sha256"]
+        or int(normalised["attempt_sequence"])
+        != int(producer["attempt_sequence"]) + 1
+        or int(normalised.get("replacement_round", -1)) != 0
+        or producer.get("replacement_round") != 0
+        or normalised.get("submission_kind") != "array"
+        or producer.get("submission_kind") != "array"
+        or normalised.get("scheduler_identity_kind")
+        != producer.get("scheduler_identity_kind")
+    ):
+        raise ValueError(
+            "accidental ARIADNE submission source producer is contradictory"
+        )
+
+    from .scheduler_recovery import (
+        load_scheduler_terminal_receipt,
+        scheduler_terminal_receipt_records_cancellation,
+    )
+
+    receipt = load_scheduler_terminal_receipt(campaign_dir, producer)
+    if (
+        not isinstance(receipt, Mapping)
+        or scheduler_terminal_receipt_records_cancellation(receipt)
+        or str(receipt.get("scheduler_acceptance") or "") != "accepted"
+        or str(receipt.get("logical_task_set_sha256") or "")
+        != str(source["logical_task_set_sha256"])
+        or int(receipt.get("n_completed", -1))
+        + int(receipt.get("n_retry", -1))
+        != logical_total
+    ):
+        raise ValueError(
+            "accidental ARIADNE submission source lacks complete ordinary "
+            "terminal evidence"
+        )
+    return {
+        "intent": normalised,
+        "repair_kind": "accidental_ariadne_postprocess_submission",
+        "phase": phase,
+        "iteration": iteration_value,
+        "submission_identity": str(normalised["submission_identity"]),
+        "job_id": str(normalised["job_id"]),
+        "source_submission_identity": str(source["submission_identity"]),
+        "source_job_id": str(source["job_id"]),
+    }
+
+
 def inventory_intents(
     campaign_dir: Union[str, Path],
     *,
@@ -1841,8 +2081,9 @@ def inventory_intents(
     root = intent_dir(campaign_dir)
     records = []
     errors = []
+    repairs = []
     if not root.is_dir():
-        return {"records": records, "errors": errors}
+        return {"records": records, "errors": errors, "repairs": repairs}
     pattern = re.compile(r"^(.+)-([0-9]{6})\.json$")
     for path in sorted(root.glob("*.json")):
         match = pattern.fullmatch(path.name)
@@ -1862,11 +2103,32 @@ def inventory_intents(
                 raise ValueError("intent disappeared during inventory")
             records.append(payload)
         except Exception as exc:
-            errors.append({
-                "path": str(path),
-                "error": type(exc).__name__ + ": " + str(exc),
+            try:
+                repair = classify_repairable_accidental_postprocess_submission(
+                    campaign_dir,
+                    phase_name,
+                    iteration,
+                    expected_campaign_uid=expected_campaign_uid,
+                )
+            except Exception as repair_exc:
+                errors.append({
+                    "path": str(path),
+                    "error": type(exc).__name__ + ": " + str(exc)
+                    + "; repair classification failed: "
+                    + type(repair_exc).__name__ + ": " + str(repair_exc),
+                })
+                continue
+            if repair is None:
+                errors.append({
+                    "path": str(path),
+                    "error": type(exc).__name__ + ": " + str(exc),
+                })
+                continue
+            records.append(dict(repair["intent"]))
+            repairs.append({
+                key: value for key, value in repair.items() if key != "intent"
             })
-    return {"records": records, "errors": errors}
+    return {"records": records, "errors": errors, "repairs": repairs}
 
 
 def classify_completed_unsubmitted_intents(
@@ -2039,13 +2301,47 @@ def classify_completed_unsubmitted_intents(
     return {"repairs": repairs, "errors": errors}
 
 
-def _write_payload(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _prepare_validated_payload(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    phase_name: str,
+    iteration: int,
+    expected_campaign_uid: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Validate the exact bytes of an intent before publishing them."""
+    prepared = dict(payload)
     now = _now_iso()
-    payload["updated_iso"] = now
-    payload["updated_at_iso"] = now
-    atomic_write_json(path, payload)
-    return payload
+    prepared["updated_iso"] = now
+    prepared["updated_at_iso"] = now
+    validated = _validate_intent_payload(
+        prepared,
+        path=path,
+        phase_name=str(phase_name),
+        iteration=int(iteration),
+        expected_campaign_uid=expected_campaign_uid,
+    )
+    return _validate_intent_optional_bindings(validated)
+
+
+def _publish_validated_payload(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    phase_name: str,
+    iteration: int,
+    expected_campaign_uid: Optional[str] = None,
+) -> Dict[str, Any]:
+    prepared = _prepare_validated_payload(
+        path,
+        payload,
+        phase_name=phase_name,
+        iteration=iteration,
+        expected_campaign_uid=expected_campaign_uid,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, prepared)
+    return prepared
 
 
 def write_pre_submit_intent(
@@ -2074,6 +2370,7 @@ def write_pre_submit_intent(
     path = intent_path(campaign_dir, phase_name, iteration_value)
     previous = load_intent(campaign_dir, phase_name, iteration_value)
     previous_sequence = 0
+    history_path: Optional[Path] = None
     if previous is not None:
         if str(previous.get("status")) not in TERMINAL_STATUSES:
             raise ValueError("refusing to replace an active submission intent")
@@ -2098,8 +2395,6 @@ def write_pre_submit_intent(
                 + ".json"
             )
         )
-        history_path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(history_path, previous)
     attempt_sequence = previous_sequence + 1
     attempt_id = uuid.uuid4().hex
     identity = (
@@ -2165,7 +2460,19 @@ def write_pre_submit_intent(
                 "submission intent environment generation digest is invalid"
             )
         payload["environment_generation_digest_sha256"] = digest
-    return _write_payload(path, payload)
+    prepared = _prepare_validated_payload(
+        path,
+        payload,
+        phase_name=phase_name,
+        iteration=iteration_value,
+        expected_campaign_uid=str(campaign_uid),
+    )
+    if previous is not None and history_path is not None:
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(history_path, previous)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, prepared)
+    return prepared
 
 
 def snapshotted_failure_threshold_fraction(
@@ -2298,10 +2605,9 @@ def update_intent_status(
         data["completed_at_iso"] = str(completed_at)
         lifecycle.setdefault("completed_at_iso", str(completed_at))
     data["queue_lifecycle"] = lifecycle
-    updated = _write_payload(path, data)
-    return _validate_intent_payload(
-        updated,
-        path=path,
+    return _publish_validated_payload(
+        path,
+        data,
         phase_name=str(phase_name),
         iteration=int(iteration),
         expected_campaign_uid=None,
@@ -2391,10 +2697,9 @@ def record_queue_lifecycle(
         lifecycle["postprocess_seconds"] = postprocess_seconds
     data["queue_lifecycle"] = lifecycle
     path = intent_path(campaign_dir, phase_name, iteration)
-    updated = _write_payload(path, data)
-    updated = _validate_intent_payload(
-        updated,
-        path=path,
+    updated = _publish_validated_payload(
+        path,
+        data,
         phase_name=str(phase_name),
         iteration=int(iteration),
         expected_campaign_uid=None,
@@ -2442,10 +2747,9 @@ def bind_pre_submit_metadata(
         merged[key] = value
     intent["submission_metadata"] = merged
     target = intent_path(campaign_dir, phase_name, int(iteration))
-    updated = _write_payload(target, intent)
-    return _validate_intent_payload(
-        updated,
-        path=target,
+    return _publish_validated_payload(
+        target,
+        intent,
         phase_name=str(phase_name),
         iteration=int(iteration),
         expected_campaign_uid=None,
@@ -2492,10 +2796,9 @@ def bind_resource_resolution(
         # must snapshot the task count that Slurm will actually report.
         intent["expected_tasks"] = parsed_expected_tasks
     target = intent_path(campaign_dir, phase_name, int(iteration))
-    updated = _write_payload(target, intent)
-    return _validate_intent_payload(
-        updated,
-        path=target,
+    return _publish_validated_payload(
+        target,
+        intent,
         phase_name=str(phase_name),
         iteration=int(iteration),
         expected_campaign_uid=None,
@@ -2535,10 +2838,9 @@ def bind_submission_script(
             raise ValueError("submission intent " + key + " is already bound differently")
         intent[key] = value
     target = intent_path(campaign_dir, phase_name, int(iteration))
-    updated = _write_payload(target, intent)
-    return _validate_intent_payload(
-        updated,
-        path=target,
+    return _publish_validated_payload(
+        target,
+        intent,
         phase_name=str(phase_name),
         iteration=int(iteration),
         expected_campaign_uid=None,
@@ -2608,12 +2910,23 @@ def prepare_reconcile_terminal_transition(
 ) -> Dict[str, Any]:
     """Build the exact terminal intent payload used by reconcile commit."""
     path = intent_path(campaign_dir, phase_name, iteration)
-    data = load_intent(
-        campaign_dir,
-        phase_name,
-        iteration,
-        expected_campaign_uid=expected_campaign_uid,
-    )
+    try:
+        data = load_intent(
+            campaign_dir,
+            phase_name,
+            iteration,
+            expected_campaign_uid=expected_campaign_uid,
+        )
+    except ValueError:
+        repair = classify_repairable_accidental_postprocess_submission(
+            campaign_dir,
+            phase_name,
+            iteration,
+            expected_campaign_uid=expected_campaign_uid,
+        )
+        if repair is None:
+            raise
+        data = dict(repair["intent"])
     if not isinstance(data, dict):
         raise FileNotFoundError("submission intent does not exist")
     target = str(target_status)
@@ -2633,13 +2946,14 @@ def prepare_reconcile_terminal_transition(
     _timestamp(now, "reconcile intent update time")
     prepared["updated_iso"] = now
     prepared["updated_at_iso"] = now
-    return _validate_intent_payload(
+    validated = _validate_intent_payload(
         prepared,
         path=path,
         phase_name=str(phase_name),
         iteration=int(iteration),
         expected_campaign_uid=expected_campaign_uid,
     )
+    return _validate_intent_optional_bindings(validated)
 
 
 def publish_prepared_reconcile_transition(
@@ -2659,6 +2973,7 @@ def publish_prepared_reconcile_transition(
         iteration=int(iteration),
         expected_campaign_uid=expected_campaign_uid,
     )
+    prepared = _validate_intent_optional_bindings(prepared)
     atomic_write_json(path, prepared)
     loaded = load_intent(
         campaign_dir,

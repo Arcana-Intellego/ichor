@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import getpass
 import hashlib
 import json
 
@@ -11,14 +12,20 @@ import ichor.hpc.active_learning.daemon.submission_intent as intent_module
 from ichor.hpc.active_learning.daemon.submission_intent import (
     aimall_postprocess_task_contract,
     bind_pre_submit_metadata,
+    classify_repairable_accidental_postprocess_submission,
     classify_completed_unsubmitted_intents,
     classify_scalar_diversity_retry_intent,
+    inventory_intents,
     intent_path,
     load_intent,
     mark_completed,
     mark_failed,
     mark_submitted,
     mark_superseded,
+    prepare_reconcile_terminal_transition,
+    publish_prepared_reconcile_transition,
+    resolve_ariadne_postprocess_source,
+    resolve_ariadne_terminal_postprocess_source,
     resolve_gaussian_postprocess_source,
     resolve_scalar_diversity_postprocess_source,
     write_pre_submit_intent,
@@ -30,10 +37,21 @@ from ichor.hpc.active_learning.daemon.completion_receipts import (
     inventory_completion_receipts,
     write_completion_receipt,
 )
+from ichor.hpc.active_learning.daemon.script_bundles import (
+    prepare_attempt_bundle,
+)
+from ichor.hpc.active_learning.daemon.scheduler_recovery import (
+    classify_terminal_scheduler_evidence,
+    write_scheduler_terminal_receipt,
+)
 from ichor.hpc.active_learning.daemon.state import (
     CampaignPhase,
     CampaignState,
     fresh_campaign_state,
+)
+from ichor.hpc.active_learning.submit.sacct_poll import (
+    JobObservation,
+    JobStatus,
 )
 
 
@@ -114,6 +132,308 @@ def test_scheduler_acceptance_cannot_replace_bound_pre_submit_metadata(
                 "aimall_structural_retry": {"task_ids": [1]},
             },
         )
+
+
+def test_rejected_postprocess_submission_does_not_mutate_intent(tmp_path):
+    source = {
+        "campaign_uid": "intent-test",
+        "phase": CampaignPhase.ARIADNE_ARRAY.value,
+        "iteration": 10,
+        "attempt_id": "1" * 32,
+        "submission_identity": "r0000-a0001-source",
+        "job_id": "898513",
+        "environment_generation": 7,
+        "environment_generation_digest_sha256": "e" * 64,
+        "logical_total": 3,
+        "logical_task_set_sha256": hashlib.sha256(b"0,1,2").hexdigest(),
+        "decision_contract": {
+            "config_sha256": "c" * 64,
+            "failure_threshold_fraction": 0.25,
+        },
+    }
+    source["source_sha256"] = (
+        intent_module._canonical_postprocess_source_sha256(source)
+    )
+    write_pre_submit_intent(
+        tmp_path,
+        campaign_uid="intent-test",
+        phase_name=CampaignPhase.ARIADNE_ARRAY.value,
+        iteration=10,
+        expected_tasks=3,
+        decision_contract=source["decision_contract"],
+        postprocess_source=source,
+        scheduler_identity_kind="sge",
+        environment_generation=8,
+        environment_generation_digest_sha256="f" * 64,
+    )
+    path = intent_path(tmp_path, CampaignPhase.ARIADNE_ARRAY.value, 10)
+    before = path.read_bytes()
+
+    with pytest.raises(ValueError, match="postprocess intent must remain jobless"):
+        mark_submitted(
+            tmp_path,
+            CampaignPhase.ARIADNE_ARRAY.value,
+            10,
+            "898514",
+            expected_tasks=3,
+        )
+
+    assert path.read_bytes() == before
+    assert load_intent(
+        tmp_path,
+        CampaignPhase.ARIADNE_ARRAY.value,
+        10,
+    )["status"] == "PRE_SUBMIT"
+
+
+def test_reconcile_repairs_exact_accidental_ariadne_postprocess_submission(
+    tmp_path,
+    monkeypatch,
+):
+    phase = CampaignPhase.ARIADNE_ARRAY.value
+    decision = {
+        "config_sha256": "c" * 64,
+        "failure_threshold_fraction": 0.25,
+    }
+    task_digest = hashlib.sha256(b"0,1,2").hexdigest()
+    producer = write_pre_submit_intent(
+        tmp_path,
+        campaign_uid="intent-test",
+        phase_name=phase,
+        iteration=10,
+        expected_tasks=3,
+        decision_contract=decision,
+        scheduler_identity_kind="sge",
+        environment_generation=7,
+        environment_generation_digest_sha256="e" * 64,
+    )
+    producer_bundle = prepare_attempt_bundle(
+        tmp_path,
+        phase,
+        10,
+        str(producer["submission_identity"]),
+        array_size=3,
+        max_log_files_per_directory=100,
+        logical_task_ids=[0, 1, 2],
+    )
+    producer = mark_submitted(
+        tmp_path,
+        phase,
+        10,
+        "898513",
+        expected_tasks=3,
+        submission_metadata={
+            "array_recovery": {
+                "logical_total": 3,
+                "n_complete": 0,
+                "n_reuse": 0,
+                "n_retry": 3,
+            },
+            "logical_task_set_sha256": task_digest,
+            "script_bundle": str(producer_bundle.root),
+        },
+    )
+    observations = [
+        JobObservation(
+            job_id="898513_" + str(task_id),
+            status=(
+                JobStatus.FAILED if task_id == 2 else JobStatus.COMPLETED
+            ),
+            exit_code=((139, 0) if task_id == 2 else (0, 0)),
+            elapsed_seconds=24,
+            job_name=str(producer["expected_job_name"]),
+            owner=getpass.getuser(),
+        )
+        for task_id in range(3)
+    ]
+    terminal = classify_terminal_scheduler_evidence(
+        tmp_path,
+        producer,
+        observations,
+        queue_active=False,
+    )
+    write_scheduler_terminal_receipt(tmp_path, producer, terminal)
+    mark_failed(tmp_path, phase, 10, "qacct parser failure")
+    producer = mark_superseded(
+        tmp_path,
+        phase,
+        10,
+        intent_module.ARIADNE_TERMINAL_POSTPROCESS_REASON,
+    )
+    monkeypatch.setattr(
+        intent_module,
+        "_validate_postprocess_source_environment",
+        lambda *_args, **_kwargs: None,
+    )
+    source = resolve_ariadne_postprocess_source(
+        tmp_path,
+        campaign_uid="intent-test",
+        iteration=10,
+        logical_total=3,
+        logical_task_set_sha256=task_digest,
+        intent=producer,
+    )
+    wrapper = write_pre_submit_intent(
+        tmp_path,
+        campaign_uid="intent-test",
+        phase_name=phase,
+        iteration=10,
+        expected_tasks=3,
+        decision_contract=decision,
+        postprocess_source=source,
+        scheduler_identity_kind="sge",
+        environment_generation=8,
+        environment_generation_digest_sha256="f" * 64,
+    )
+    bundle = prepare_attempt_bundle(
+        tmp_path,
+        phase,
+        10,
+        str(wrapper["submission_identity"]),
+        array_size=3,
+        max_log_files_per_directory=100,
+        logical_task_ids=[0, 1, 2],
+    )
+
+    recovery = {
+        "logical_total": 3,
+        "n_complete": 0,
+        "n_reuse": 0,
+        "n_retry": 3,
+    }
+    malformed = dict(wrapper)
+    malformed.update(
+        status="SUBMITTED",
+        job_id="898514",
+        job_ids_seen=["898514"],
+        submitted_at_iso="2026-08-19T10:19:19+00:00",
+        queue_lifecycle={
+            "submitted_at_iso": "2026-08-19T10:19:19+00:00"
+        },
+        expected_tasks=3,
+        logical_expected_tasks=3,
+        retry_expected_tasks=3,
+        array_recovery=recovery,
+        submission_metadata={
+            "array_recovery": recovery,
+            "logical_task_set_sha256": task_digest,
+            "script_bundle": str(bundle.root),
+        },
+        resource_resolution_path="resource.json",
+        resource_resolution_sha256="1" * 64,
+        resource_formula_version="fixture-v1",
+        scratch_path_template="/tmp/ichor/{job_id}/{task_id}",
+        script_binding_path="binding.json",
+        script_binding_sha256="2" * 64,
+        submitted_script_path="job.sh",
+        submitted_script_sha256="3" * 64,
+    )
+    path = intent_path(tmp_path, phase, 10)
+    path.write_text(json.dumps(malformed), encoding="utf-8")
+    before = path.read_bytes()
+
+    with pytest.raises(ValueError, match="postprocess intent must remain jobless"):
+        load_intent(tmp_path, phase, 10)
+    repair = classify_repairable_accidental_postprocess_submission(
+        tmp_path,
+        phase,
+        10,
+        expected_campaign_uid="intent-test",
+    )
+    assert repair is not None
+    assert repair["job_id"] == "898514"
+    assert repair["source_job_id"] == "898513"
+    assert "postprocess_source" not in repair["intent"]
+    inventory = inventory_intents(
+        tmp_path,
+        expected_campaign_uid="intent-test",
+    )
+    assert inventory["errors"] == []
+    assert inventory["repairs"][0]["repair_kind"] == (
+        "accidental_ariadne_postprocess_submission"
+    )
+    assert inventory["records"][0]["job_id"] == "898514"
+    assert path.read_bytes() == before
+
+    current_observations = [
+        JobObservation(
+            job_id="898514_" + str(task_id),
+            status=JobStatus.COMPLETED,
+            exit_code=(0, 0),
+            elapsed_seconds=24,
+            job_name=str(repair["intent"]["expected_job_name"]),
+            owner=getpass.getuser(),
+        )
+        for task_id in range(3)
+    ]
+    current_terminal = classify_terminal_scheduler_evidence(
+        tmp_path,
+        repair["intent"],
+        current_observations,
+        queue_active=False,
+    )
+    current_receipt = write_scheduler_terminal_receipt(
+        tmp_path,
+        repair["intent"],
+        current_terminal,
+    )
+    assert current_receipt["n_completed"] == 3
+    assert current_receipt["n_retry"] == 0
+
+    prepared = prepare_reconcile_terminal_transition(
+        tmp_path,
+        phase,
+        10,
+        target_status="SUPERSEDED",
+        reason=intent_module.ARIADNE_TERMINAL_POSTPROCESS_REASON,
+        expected_campaign_uid="intent-test",
+    )
+    assert prepared["status"] == "SUPERSEDED"
+    assert prepared["job_id"] == "898514"
+    assert "postprocess_source" not in prepared
+    published = publish_prepared_reconcile_transition(
+        tmp_path,
+        phase,
+        10,
+        prepared,
+        expected_campaign_uid="intent-test",
+    )
+    assert published["job_id"] == "898514"
+    assert published["status"] == "SUPERSEDED"
+
+    repaired_source = resolve_ariadne_postprocess_source(
+        tmp_path,
+        campaign_uid="intent-test",
+        iteration=10,
+        logical_total=3,
+        logical_task_set_sha256=task_digest,
+        intent=published,
+    )
+    repaired_wrapper = write_pre_submit_intent(
+        tmp_path,
+        campaign_uid="intent-test",
+        phase_name=phase,
+        iteration=10,
+        expected_tasks=3,
+        decision_contract=decision,
+        postprocess_source=repaired_source,
+        scheduler_identity_kind="sge",
+        environment_generation=9,
+        environment_generation_digest_sha256="9" * 64,
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.array_recovery.logical_task_ids",
+        lambda *_args, **_kwargs: [0, 1, 2],
+    )
+    replay = resolve_ariadne_terminal_postprocess_source(
+        tmp_path,
+        campaign_uid="intent-test",
+        iteration=10,
+        intent=repaired_wrapper,
+    )
+    assert replay["postprocess_source"]["job_id"] == "898514"
+    assert replay["n_scheduler_completed"] == 3
+    assert replay["n_scheduler_failed"] == 0
 
 
 def _scalar_retry_intent(
