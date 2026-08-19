@@ -42,6 +42,7 @@ from ichor.hpc.active_learning.daemon.scheduler_recovery import (
     read_phase_recovery_ledger,
     read_scheduler_terminal_receipt,
     require_current_phase_recovery_authority,
+    scheduler_terminal_receipt_records_cancellation,
     scheduler_terminal_recoveries,
     scheduler_terminal_receipt_path,
     write_phase_recovery_ledger,
@@ -70,6 +71,51 @@ _FEREBUS_RECOVERY_PHASES = frozenset({"INITIAL_FEREBUS", "FEREBUS"})
 _DIVERSITY_RECOVERY_PHASES = frozenset(
     {"PHASE_A_DIVERSITY", "PHASE_B_DIVERSITY"}
 )
+
+
+@pytest.mark.parametrize(
+    ("receipt", "expected"),
+    [
+        (
+            {
+                "scheduler_acceptance": "accepted",
+                "outcomes": [
+                    {
+                        "status": "FAILED",
+                        "raw_status": (
+                            "failed=0 exit_status=139 (Segmentation fault)"
+                        ),
+                    }
+                ],
+            },
+            False,
+        ),
+        (
+            {
+                "scheduler_acceptance": "accepted",
+                "outcomes": [{"status": "CANCELLED", "raw_status": ""}],
+            },
+            True,
+        ),
+        (
+            {
+                "scheduler_acceptance": "accepted",
+                "outcomes": [
+                    {"status": "FAILED", "raw_status": "failed=25 : rescheduling"}
+                ],
+            },
+            True,
+        ),
+        ({"scheduler_acceptance": "not_accepted", "outcomes": []}, True),
+    ],
+)
+def test_scheduler_terminal_receipt_distinguishes_stop_cancellation(
+    receipt,
+    expected,
+):
+    assert scheduler_terminal_receipt_records_cancellation(receipt) is expected
+
+
 _SCHEDULER_RECOVERY_PHASES = frozenset(
     _QUANTUM_RECOVERY_PHASES
     | _ARIADNE_RECOVERY_PHASES

@@ -38,6 +38,7 @@ from ichor.hpc.active_learning.daemon.config_lock import (
 )
 from ichor.hpc.active_learning.daemon.reconcile import stateful_campaign_artifacts
 from ichor.hpc.active_learning.daemon.submission_intent import (
+    ARIADNE_TERMINAL_POSTPROCESS_REASON,
     load_intent,
     mark_failed,
     mark_submitted,
@@ -1063,6 +1064,50 @@ def test_schema_v2_partial_intent_commit_rolls_forward_exact_payload(tmp_path):
     intent = load_intent(campaign, state.phase.value, state.iteration)
     assert intent["status"] == "SUPERSEDED"
     assert intent["reason"] == "reconcile_apply_retry"
+
+
+def test_commit_plan_preserves_terminal_ariadne_postprocess_reason(tmp_path):
+    campaign = tmp_path / "campaign"
+    state = CampaignState()
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 10
+    state_path = campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json"
+    state_path.parent.mkdir(parents=True)
+    write_state(state_path, state)
+    write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=state.phase.value,
+        iteration=state.iteration,
+        expected_tasks=200,
+        scheduler_identity_kind="sge",
+    )
+    mark_failed(campaign, state.phase.value, state.iteration, "parser-induced halt")
+
+    plan = build_reconcile_commit_plan(
+        campaign,
+        transaction_id=uuid.uuid4().hex,
+        proposed_state=state,
+        config=None,
+        intent_transitions=[
+            {
+                "phase": state.phase.value,
+                "iteration": state.iteration,
+                "target_status": "FAILED",
+                "reason": ARIADNE_TERMINAL_POSTPROCESS_REASON,
+                "ariadne_terminal_postprocess": True,
+            }
+        ],
+        artifact_snapshot=SimpleNamespace(anchor_records=(), anchor_sha256=None),
+    )
+
+    transition = plan["intent_transitions"][0]
+    assert transition["target_status"] == "SUPERSEDED"
+    assert transition["reason"] == ARIADNE_TERMINAL_POSTPROCESS_REASON
+    assert transition["after_payload"]["status"] == "SUPERSEDED"
+    assert transition["after_payload"]["reason"] == (
+        ARIADNE_TERMINAL_POSTPROCESS_REASON
+    )
 
 
 def test_terminal_intent_classification_is_proposal_only(tmp_path, monkeypatch):

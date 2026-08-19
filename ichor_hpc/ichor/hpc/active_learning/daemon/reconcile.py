@@ -419,6 +419,7 @@ class ReconciliationReport:
     partial_array_recovery: Optional[Dict[str, Any]] = None
     aimall_upstream_gaussian_recovery: Optional[Dict[str, Any]] = None
     aimall_postprocess_recovery: Optional[Dict[str, Any]] = None
+    ariadne_terminal_postprocess_recovery: Optional[Dict[str, Any]] = None
     ariadne_results_recovery: Optional[Dict[str, Any]] = None
     ariadne_publication_recovery: Optional[Dict[str, Any]] = None
     ferebus_candidate_recovery: Optional[Dict[str, Any]] = None
@@ -1437,6 +1438,7 @@ def propose_recovery(
     recommended_actions: List[str] = []
     recovery_candidates: List[Dict[str, Any]] = []
     terminal_intent_keys = set()
+    terminal_recovery_by_key: Dict[tuple, Dict[str, Any]] = {}
     for record in _terminal_submission_intents or ():
         phase = str(record.get("phase") or "")
         submission_identity = str(
@@ -1452,19 +1454,23 @@ def propose_recovery(
             raise ValueError(
                 "terminal submission-intent recovery lacks an exact identity"
             )
-        terminal_intent_keys.add(
-            (
-                phase,
-                iteration,
-                str(
-                    record.get("intent_job_id")
-                    if "intent_job_id" in record
-                    else record.get("job_id")
-                    or ""
-                ),
-                submission_identity,
-            )
+        terminal_key = (
+            phase,
+            iteration,
+            str(
+                record.get("intent_job_id")
+                if "intent_job_id" in record
+                else record.get("job_id")
+                or ""
+            ),
+            submission_identity,
         )
+        if terminal_key in terminal_recovery_by_key:
+            raise ValueError(
+                "terminal submission-intent recovery contains duplicate identities"
+            )
+        terminal_intent_keys.add(terminal_key)
+        terminal_recovery_by_key[terminal_key] = dict(record)
 
     existing: Optional[CampaignState] = None
     existing_loaded = False
@@ -1780,6 +1786,223 @@ def propose_recovery(
             "scheduler-proven terminal submission intent changed during "
             "recovery selection"
         )
+    ariadne_terminal_postprocess_recovery: Optional[Dict[str, Any]] = None
+    ariadne_terminal_candidates = [
+        terminal_recovery_by_key[key]
+        for key in sorted(terminal_recovery_by_key)
+        if bool(
+            terminal_recovery_by_key[key].get(
+                "ariadne_terminal_postprocess",
+                False,
+            )
+        )
+    ]
+    if len(ariadne_terminal_candidates) > 1:
+        raise ValueError(
+            "multiple terminal ARIADNE postprocess recoveries are present"
+        )
+    if ariadne_terminal_candidates:
+        candidate = dict(ariadne_terminal_candidates[0])
+        key = (
+            str(candidate.get("phase") or ""),
+            int(candidate.get("iteration", -1)),
+            str(
+                candidate.get("intent_job_id")
+                if "intent_job_id" in candidate
+                else candidate.get("job_id")
+                or ""
+            ),
+            str(candidate.get("submission_identity") or ""),
+        )
+        producer = next(
+            (
+                dict(record)
+                for record in terminal_intent_records
+                if (
+                    str(record.get("phase") or ""),
+                    int(record.get("iteration", -1)),
+                    str(record.get("job_id") or ""),
+                    str(record.get("submission_identity") or ""),
+                )
+                == key
+            ),
+            None,
+        )
+        if producer is None:
+            raise ValueError(
+                "terminal ARIADNE postprocess producer intent is unavailable"
+            )
+        if (
+            key[0] != CampaignPhase.ARIADNE_ARRAY.value
+            or str(producer.get("submission_kind") or "") != "array"
+            or int(producer.get("replacement_round", -1))
+            != int(candidate.get("replacement_round", -2))
+        ):
+            raise ValueError(
+                "terminal ARIADNE postprocess producer identity is invalid"
+            )
+        logical_task_ids = tuple(
+            int(value)
+            for value in _submission_intent.intent_submitted_logical_task_ids(
+                campaign,
+                producer,
+            )
+        )
+        if logical_task_ids != tuple(range(len(logical_task_ids))):
+            raise ValueError(
+                "terminal ARIADNE postprocess requires one full canonical array"
+            )
+        n_completed = int(candidate.get("n_completed", -1))
+        n_failed = int(candidate.get("n_failed", candidate.get("n_retry", -1)))
+        if (
+            n_completed < 0
+            or n_failed < 0
+            or n_completed + n_failed != len(logical_task_ids)
+        ):
+            raise ValueError(
+                "terminal ARIADNE accounting counts do not cover the task set"
+            )
+        observation_digest = str(
+            candidate.get("scheduler_observation_sha256") or ""
+        )
+        if (
+            len(observation_digest) != 64
+            or any(character not in "0123456789abcdef" for character in observation_digest)
+        ):
+            raise ValueError(
+                "terminal ARIADNE accounting digest is invalid"
+            )
+        ariadne_terminal_postprocess_recovery = {
+            "state": "terminal_postprocess_only",
+            "phase": CampaignPhase.ARIADNE_ARRAY.value,
+            "iteration": int(key[1]),
+            "replacement_round": int(producer.get("replacement_round", 0)),
+            "logical_total": len(logical_task_ids),
+            "n_scheduler_completed": n_completed,
+            "n_scheduler_failed": n_failed,
+            "scheduler_jobs_submitted": 0,
+            "validation": "pending_local_output_validation",
+            "producer_job_id": str(
+                candidate.get("producer_job_id")
+                or candidate.get("job_id")
+                or key[2]
+            ),
+            "producer_submission_identity": str(
+                candidate.get("producer_submission_identity")
+                or key[3]
+            ),
+            "scheduler_observation_sha256": observation_digest,
+            "terminal_receipt": candidate.get("terminal_receipt"),
+            "terminal_receipt_sha256": candidate.get(
+                "terminal_receipt_sha256"
+            ),
+        }
+        trusted_artifacts.append(
+            "terminal ARIADNE scheduler evidence for "
+            + str(
+                ariadne_terminal_postprocess_recovery["producer_job_id"]
+            )
+        )
+    else:
+        persisted_terminal_contexts: List[Dict[str, Any]] = []
+        persisted_terminal_iteration: Optional[int] = None
+        persisted_terminal_round: Optional[int] = None
+        if existing is not None and (
+            existing.phase is CampaignPhase.ARIADNE_ARRAY
+            or (
+                existing.phase is CampaignPhase.HALTED
+                and last_phase == CampaignPhase.ARIADNE_ARRAY.value
+            )
+        ):
+            persisted_terminal_iteration = int(existing.iteration)
+            persisted_terminal_round = int(
+                getattr(existing, "replacement_round", 0)
+            )
+        elif (
+            existing is None
+            and last_phase == CampaignPhase.ARIADNE_ARRAY.value
+            and last_iter is not None
+        ):
+            persisted_terminal_iteration = int(last_iter)
+        for record in intent_records:
+            if str(record.get("phase") or "") != CampaignPhase.ARIADNE_ARRAY.value:
+                continue
+            if (
+                persisted_terminal_iteration is None
+                or int(record.get("iteration", -1))
+                != persisted_terminal_iteration
+                or (
+                    persisted_terminal_round is not None
+                    and int(record.get("replacement_round", 0))
+                    != persisted_terminal_round
+                )
+                or str(record.get("status") or "")
+                not in {"PRE_SUBMIT", "FAILED", "SUPERSEDED"}
+            ):
+                continue
+            if not (
+                str(record.get("reason") or "")
+                == _submission_intent.ARIADNE_TERMINAL_POSTPROCESS_REASON
+                or isinstance(record.get("postprocess_source"), Mapping)
+            ):
+                continue
+            try:
+                terminal = (
+                    _submission_intent.resolve_ariadne_terminal_postprocess_source(
+                        campaign,
+                        campaign_uid=str(record.get("campaign_uid") or ""),
+                        iteration=int(record.get("iteration", -1)),
+                        intent=record,
+                    )
+                )
+            except _submission_intent.AriadneTerminalPostprocessNotApplicable:
+                continue
+            persisted_terminal_contexts.append(dict(terminal))
+        if len(persisted_terminal_contexts) > 1:
+            raise ValueError(
+                "multiple persisted terminal ARIADNE postprocess sources are present"
+            )
+        if persisted_terminal_contexts:
+            from .scheduler_recovery import scheduler_terminal_receipt_path
+
+            terminal = persisted_terminal_contexts[0]
+            source = dict(terminal["postprocess_source"])
+            receipt = dict(terminal["terminal_receipt"])
+            receipt_path = scheduler_terminal_receipt_path(
+                campaign,
+                phase=receipt["phase"],
+                iteration=int(receipt["iteration"]),
+                replacement_round=int(receipt["replacement_round"]),
+                submission_identity=str(receipt["submission_identity"]),
+            )
+            ariadne_terminal_postprocess_recovery = {
+                "state": "terminal_postprocess_only",
+                "phase": CampaignPhase.ARIADNE_ARRAY.value,
+                "iteration": int(source["iteration"]),
+                "replacement_round": int(receipt["replacement_round"]),
+                "logical_total": int(terminal["logical_total"]),
+                "n_scheduler_completed": int(
+                    terminal["n_scheduler_completed"]
+                ),
+                "n_scheduler_failed": int(
+                    terminal["n_scheduler_failed"]
+                ),
+                "scheduler_jobs_submitted": 0,
+                "validation": "pending_local_output_validation",
+                "producer_job_id": str(source["job_id"]),
+                "producer_submission_identity": str(
+                    source["submission_identity"]
+                ),
+                "scheduler_observation_sha256": str(
+                    receipt["scheduler_observation_sha256"]
+                ),
+                "terminal_receipt": str(receipt_path),
+                "terminal_receipt_sha256": str(receipt["receipt_sha256"]),
+            }
+            trusted_artifacts.append(
+                "persisted terminal ARIADNE scheduler evidence for "
+                + str(source["job_id"])
+            )
     if receipt_backed_intent_repairs:
         notes.append(
             str(len(receipt_backed_intent_repairs))
@@ -2907,6 +3130,7 @@ def propose_recovery(
     gaussian_postprocess_recovery: Optional[Dict[str, Any]] = None
     ariadne_publication_recovery: Optional[Dict[str, Any]] = None
     partial_array_decision: Optional[RecoveryDecision] = None
+    ariadne_terminal_decision: Optional[RecoveryDecision] = None
     preferred_phase = last_phase
     preferred_iteration = last_iter
     if existing is not None and supports_partial_array_recovery(existing.phase):
@@ -3011,6 +3235,33 @@ def propose_recovery(
         partial_array_recovery = dict(aimall_upstream_recovery)
     elif isinstance(postprocess_only_recovery, dict):
         partial_array_recovery = dict(postprocess_only_recovery)
+    elif isinstance(ariadne_terminal_postprocess_recovery, dict):
+        ariadne_terminal_decision = RecoveryDecision(
+            phase=CampaignPhase.ARIADNE_ARRAY,
+            iteration=int(
+                ariadne_terminal_postprocess_recovery["iteration"]
+            ),
+            replacement_round=int(
+                ariadne_terminal_postprocess_recovery.get(
+                    "replacement_round",
+                    0,
+                )
+            ),
+            reason=(
+                "terminal ARIADNE work requires scheduler-free local "
+                "postprocessing; no array tasks will be resubmitted"
+            ),
+            trusted_artifact=str(
+                ariadne_terminal_postprocess_recovery.get(
+                    "terminal_receipt"
+                )
+                or ""
+            ),
+        )
+        _append_recovery_candidate(
+            recovery_candidates,
+            ariadne_terminal_decision,
+        )
     elif preferred_phase is not None and supports_partial_array_recovery(preferred_phase):
         try:
             partial_array_recovery = discover_partial_array_recovery(
@@ -3130,15 +3381,20 @@ def propose_recovery(
             )
             partial_array_recovery = None
             partial_array_decision = None
-    if (
-        isinstance(partial_array_recovery, dict)
+    ariadne_recovery_iteration = (
+        int(ariadne_terminal_postprocess_recovery["iteration"])
+        if isinstance(ariadne_terminal_postprocess_recovery, dict)
+        else int(partial_array_recovery["iteration"])
+        if isinstance(partial_array_recovery, dict)
         and str(partial_array_recovery.get("phase") or "")
         == CampaignPhase.ARIADNE_ARRAY.value
-    ):
+        else None
+    )
+    if ariadne_recovery_iteration is not None:
         try:
             ariadne_publication_recovery = classify_ariadne_publication(
                 campaign,
-                int(partial_array_recovery["iteration"]),
+                int(ariadne_recovery_iteration),
                 expected_campaign_uid=str(recovered.campaign_uid),
             )
         except Exception as exc:
@@ -3278,6 +3534,8 @@ def propose_recovery(
                     ferebus_staging_recovery.get("producer_path") or ""
                 ),
             )
+        elif ariadne_terminal_decision is not None:
+            phase_recovery = ariadne_terminal_decision
         else:
             handoff_recovery = None
             if combined_handoffs:
@@ -3707,6 +3965,11 @@ def propose_recovery(
         aimall_postprocess_recovery=(
             dict(aimall_postprocess_recovery)
             if isinstance(aimall_postprocess_recovery, dict)
+            else None
+        ),
+        ariadne_terminal_postprocess_recovery=(
+            dict(ariadne_terminal_postprocess_recovery)
+            if isinstance(ariadne_terminal_postprocess_recovery, dict)
             else None
         ),
         ariadne_results_recovery=ariadne_results_recovery,

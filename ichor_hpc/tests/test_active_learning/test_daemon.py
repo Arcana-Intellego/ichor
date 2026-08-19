@@ -953,6 +953,100 @@ def test_inflight_failure_threshold_uses_submission_snapshot(tmp_path):
     assert "handle_failure:PHASE_A_DIVERSITY" not in executor.operations()
 
 
+def test_mixed_terminal_ariadne_enters_postprocess_without_failure_retry(
+    tmp_path,
+    monkeypatch,
+):
+    observations = [
+        JobObservation(
+            job_id="898513_0",
+            status=JobStatus.COMPLETED,
+            exit_code=(0, 0),
+            elapsed_seconds=24,
+        ),
+        JobObservation(
+            job_id="898513_1",
+            status=JobStatus.FAILED,
+            exit_code=(139, 0),
+            elapsed_seconds=24,
+        ),
+    ]
+    daemon = _make_daemon(
+        tmp_path,
+        sacct=lambda *_args, **_kwargs: list(observations),
+    )
+    state = fresh_campaign_state(max_iterations=40)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 10
+    state.pending_jobs[state.phase.value] = "898513"
+    reporter_updates = []
+    postprocessed = []
+
+    monkeypatch.setattr(
+        daemon,
+        "_expected_tasks_for_pending",
+        lambda *_args, **_kwargs: 2,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_scheduler_progress_reporter",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            update=lambda **kwargs: reporter_updates.append(kwargs)
+        ),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_worker_publication_complete",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_read_stop_control",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_finish_scheduler_progress",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_record_queue_lifecycle",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_collect_terminal_resource_usage",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_postprocess",
+        lambda *args, **_kwargs: (
+            postprocessed.append(args),
+            TickStatus.ADVANCED,
+        )[1],
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_handle_failure",
+        lambda *_args, **_kwargs: pytest.fail(
+            "mixed terminal ARIADNE work must not enter scheduler retry"
+        ),
+    )
+
+    result = daemon._on_pending(
+        state,
+        CampaignPhase.ARIADNE_ARRAY,
+        "898513",
+    )
+
+    assert result == TickStatus.ADVANCED
+    assert len(postprocessed) == 1
+    assert reporter_updates[-1]["completed"] == 1
+    assert reporter_updates[-1]["failed"] == 1
+
+
 def test_tick_halts_when_executor_handles_failure_with_halt(tmp_path):
     executor = MockPhaseExecutor(
         treat_as_sbatch=set(_SBATCH_PHASES),

@@ -36,6 +36,7 @@ _TASK_TOKEN_RE = re.compile(
 _SGE_SAFE_JOB_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 _DURATION_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)([smhd]?)$", re.IGNORECASE)
 _FAILED_FIELD_RE = re.compile(r"^([0-9]+)(?:[ \t]*:[ \t]*(.+))?$")
+_EXIT_STATUS_FIELD_RE = re.compile(r"^([0-9]+)(?:[ \t]+\(([^()]*)\))?$")
 _TRANSIENT_RESCHEDULE_FAILURE_CODES = frozenset({24, 25})
 _MAX_SGE_STATUS_CODE = 2_147_483_647
 
@@ -287,7 +288,7 @@ def parse_sge_failed_field(value: Any) -> Tuple[int, Optional[str]]:
     ``25  : rescheduling``.  The annotation is diagnostic text; only the
     numeric prefix participates in scheduler-state classification.
     """
-    text = str(value or "").strip()
+    text = ("" if value is None else str(value)).strip()
     match = _FAILED_FIELD_RE.fullmatch(text)
     if match is None:
         raise ValueError("qacct field failed is malformed")
@@ -302,6 +303,26 @@ def parse_sge_failed_field(value: Any) -> Tuple[int, Optional[str]]:
             for character in description
         ):
             raise ValueError("qacct field failed annotation is malformed")
+    return code, description
+
+
+def parse_sge_exit_status_field(value: Any) -> Tuple[int, Optional[str]]:
+    """Parse an SGE exit code and its optional parenthesized diagnostic."""
+    text = ("" if value is None else str(value)).strip()
+    match = _EXIT_STATUS_FIELD_RE.fullmatch(text)
+    if match is None:
+        raise ValueError("qacct field exit_status is malformed")
+    code = int(match.group(1))
+    if code > _MAX_SGE_STATUS_CODE:
+        raise ValueError("qacct field exit_status is out of range")
+    description = match.group(2)
+    if description is not None:
+        description = description.strip()
+        if not description or any(
+            ord(character) < 32 or ord(character) == 127
+            for character in description
+        ):
+            raise ValueError("qacct field exit_status annotation is malformed")
     return code, description
 
 
@@ -436,7 +457,10 @@ def qacct_observations(
             raw_id = parent + "." + str(native_task_id)
         failed_raw = str(record.get("failed", "")).strip()
         failed, _failed_description = parse_sge_failed_field(failed_raw)
-        exit_status = _exact_int(record, "exit_status")
+        exit_status_raw = str(record.get("exit_status", "")).strip()
+        exit_status, _exit_status_description = parse_sge_exit_status_field(
+            exit_status_raw
+        )
         if failed == 0 and exit_status == 0:
             status = JobStatus.COMPLETED
         elif failed in _TRANSIENT_RESCHEDULE_FAILURE_CODES:
@@ -458,7 +482,7 @@ def qacct_observations(
                 exit_code=(exit_status, 0),
                 elapsed_seconds=_optional_duration_seconds(record, "ru_wallclock"),
                 raw_status=(
-                    "failed=" + failed_raw + " exit_status=" + str(exit_status)
+                    "failed=" + failed_raw + " exit_status=" + exit_status_raw
                 ),
                 job_id_raw=raw_id,
                 job_name=str(record.get("jobname") or "") or None,
@@ -840,6 +864,7 @@ __all__ = [
     "parse_qstat_xml",
     "parse_qsub_terse_output",
     "parse_sge_duration_seconds",
+    "parse_sge_exit_status_field",
     "parse_sge_failed_field",
     "poll_job",
     "qacct_observations",

@@ -35,6 +35,7 @@ from ichor.hpc.active_learning.submit.sge import (
     parse_qacct_output,
     parse_qstat_xml,
     parse_sge_duration_seconds,
+    parse_sge_exit_status_field,
     parse_sge_failed_field,
     parse_qsub_terse_output,
     poll_job,
@@ -301,6 +302,7 @@ def test_qacct_success_and_failure_contracts():
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
+        (0, (0, None)),
         ("0", (0, None)),
         ("24 : migrated", (24, "migrated")),
         ("25  : rescheduling", (25, "rescheduling")),
@@ -321,6 +323,97 @@ def test_sge_failed_field_accepts_numeric_code_with_diagnostic_annotation(
 def test_sge_failed_field_rejects_malformed_or_out_of_range_values(value):
     with pytest.raises(ValueError):
         parse_sge_failed_field(value)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("0", (0, None)),
+        ("139 (Segmentation fault)", (139, "Segmentation fault")),
+        (
+            "139                  (Segmentation fault)",
+            (139, "Segmentation fault"),
+        ),
+    ],
+)
+def test_sge_exit_status_accepts_numeric_code_with_parenthesized_diagnostic(
+    value,
+    expected,
+):
+    assert parse_sge_exit_status_field(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "Segmentation fault",
+        "-1",
+        "139 Segmentation fault",
+        "139 ()",
+        "139 (bad) trailing",
+        "139 (bad (nested))",
+        "139 (bad\nannotation)",
+        "9999999999",
+    ],
+)
+def test_sge_exit_status_rejects_malformed_or_out_of_range_values(value):
+    with pytest.raises(ValueError):
+        parse_sge_exit_status_field(value)
+
+
+def test_qacct_annotated_signal_exit_is_terminal_failure_with_raw_diagnostic():
+    record = dict(
+        parse_qacct_output(QACCT)[0],
+        failed="0",
+        exit_status="139                  (Segmentation fault)",
+    )
+
+    observation = qacct_observations([record])[0]
+
+    assert observation.status is JobStatus.FAILED
+    assert observation.exit_code == (139, 0)
+    assert observation.raw_status == (
+        "failed=0 exit_status=139                  (Segmentation fault)"
+    )
+
+
+def test_qacct_full_array_with_one_annotated_signal_is_199_complete_1_failed():
+    records = []
+    for native_task_id in range(1, 201):
+        records.append(
+            {
+                "jobnumber": "898513",
+                "taskid": str(native_task_id),
+                "jobname": "ichor-methanol-ariadne-10",
+                "owner": "q81036tb",
+                "failed": "0",
+                "exit_status": (
+                    "139 (Segmentation fault)"
+                    if native_task_id == 77
+                    else "0"
+                ),
+                "ru_wallclock": "24s",
+            }
+        )
+
+    observations = qacct_observations(records)
+    summary = aggregate_states(
+        "898513",
+        observations,
+        expected_task_count=200,
+        submission_kind="array",
+        strict_parent_job_id=False,
+    )
+
+    assert summary.is_terminal is True
+    assert summary.n_completed == 199
+    assert summary.n_failed == 1
+    assert summary.n_missing == 0
+    failed = [item for item in observations if item.status is JobStatus.FAILED]
+    assert len(failed) == 1
+    assert failed[0].job_id == "898513_76"
+    assert failed[0].exit_code == (139, 0)
 
 
 @pytest.mark.parametrize("failed", ["24 : migrated", "25  : rescheduling"])
@@ -425,6 +518,20 @@ def test_sge_resource_usage_accepts_annotated_reschedule_record():
     assert len(rows) == 1
     assert rows[0]["job_id"] == "898176_0"
     assert rows[0]["state"] == "REQUEUED"
+
+
+def test_sge_resource_usage_accepts_annotated_signal_exit():
+    record = dict(
+        parse_qacct_output(QACCT)[0],
+        failed="0",
+        exit_status="139 (Segmentation fault)",
+    )
+
+    rows = parse_sge_usage_records([record], job_id="898176")
+
+    assert len(rows) == 1
+    assert rows[0]["state"] == "FAILED"
+    assert rows[0]["exit_code"] == "139:0"
 
 
 def test_sge_resource_usage_queries_through_recorded_scheduler(tmp_path):

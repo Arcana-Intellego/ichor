@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import getpass
 import hashlib
 import json
 import os
@@ -40,6 +41,7 @@ from ichor.hpc.active_learning.daemon.state import (
 from ichor.hpc.active_learning.daemon.daemon import Daemon, TickStatus
 from ichor.hpc.active_learning.daemon.phase_executor import PhaseResult
 from ichor.hpc.active_learning.daemon.submission_intent import (
+    ARIADNE_TERMINAL_POSTPROCESS_REASON,
     ariadne_producer_environment_binding,
     intent_path,
     load_intent,
@@ -49,7 +51,19 @@ from ichor.hpc.active_learning.daemon.submission_intent import (
     record_queue_lifecycle,
     resolve_aimall_postprocess_source,
     resolve_ariadne_postprocess_source,
+    resolve_ariadne_terminal_postprocess_source,
     write_pre_submit_intent,
+)
+from ichor.hpc.active_learning.daemon.scheduler_recovery import (
+    classify_terminal_scheduler_evidence,
+    write_scheduler_terminal_receipt,
+)
+from ichor.hpc.active_learning.daemon.script_bundles import (
+    prepare_attempt_bundle,
+)
+from ichor.hpc.active_learning.submit.sacct_poll import (
+    JobObservation,
+    JobStatus,
 )
 from ichor.hpc.active_learning.cli import build_parser
 
@@ -1954,6 +1968,199 @@ def test_rebind_accepts_single_generation_ariadne_postprocess_only_boundary(
     )
     assert int(active["generation"]) == 1
     assert producer_environment["generation"] == 0
+
+
+def test_rebind_accepts_authenticated_terminal_ariadne_postprocess_boundary(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 1
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    active = read_active_environment_generation(
+        campaign,
+        expected_campaign_uid=str(state.campaign_uid),
+    )["generation"]
+    producer = write_pre_submit_intent(
+        campaign,
+        campaign_uid=str(state.campaign_uid),
+        phase_name=CampaignPhase.ARIADNE_ARRAY.value,
+        iteration=1,
+        expected_tasks=3,
+        decision_contract={
+            "failure_threshold_fraction": 0.25,
+            "config_sha256": "c" * 64,
+        },
+        scheduler_identity_kind="sge",
+        environment_generation=int(active["generation"]),
+        environment_generation_digest_sha256=str(active["digest_sha256"]),
+    )
+    bundle = prepare_attempt_bundle(
+        campaign,
+        CampaignPhase.ARIADNE_ARRAY.value,
+        1,
+        str(producer["submission_identity"]),
+        array_size=3,
+        max_log_files_per_directory=100,
+        logical_task_ids=[0, 1, 2],
+    )
+    task_digest = hashlib.sha256(b"0,1,2").hexdigest()
+    producer = mark_submitted(
+        campaign,
+        CampaignPhase.ARIADNE_ARRAY.value,
+        1,
+        "898513",
+        expected_tasks=3,
+        submission_metadata={
+            "array_recovery": {
+                "logical_total": 3,
+                "n_complete": 0,
+                "n_reuse": 0,
+                "n_retry": 3,
+            },
+            "logical_task_set_sha256": task_digest,
+            "script_bundle": str(bundle.root),
+        },
+    )
+    observations = [
+        JobObservation(
+            job_id="898513_" + str(task_id),
+            status=(
+                JobStatus.FAILED
+                if task_id == 1
+                else JobStatus.COMPLETED
+            ),
+            exit_code=((139, 0) if task_id == 1 else (0, 0)),
+            elapsed_seconds=24,
+            raw_status=(
+                "failed=0 exit_status=139 (Segmentation fault)"
+                if task_id == 1
+                else "failed=0 exit_status=0"
+            ),
+            job_name=str(producer["expected_job_name"]),
+            owner=getpass.getuser(),
+        )
+        for task_id in range(3)
+    ]
+    classification = classify_terminal_scheduler_evidence(
+        campaign,
+        producer,
+        observations,
+        queue_active=False,
+    )
+    write_scheduler_terminal_receipt(campaign, producer, classification)
+    mark_failed(
+        campaign,
+        CampaignPhase.ARIADNE_ARRAY.value,
+        1,
+        "parser-induced halt",
+    )
+    mark_superseded(
+        campaign,
+        CampaignPhase.ARIADNE_ARRAY.value,
+        1,
+        ARIADNE_TERMINAL_POSTPROCESS_REASON,
+    )
+    producer = load_intent(
+        campaign,
+        CampaignPhase.ARIADNE_ARRAY.value,
+        1,
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.array_recovery.logical_task_ids",
+        lambda *_args, **_kwargs: [0, 1, 2],
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.array_recovery.scan_array_tasks",
+        lambda *_args, **_kwargs: pytest.fail(
+            "terminal ARIADNE adoption must not scan outputs before resume"
+        ),
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.recovery_contracts."
+        "phase_recovery_contract_error",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.cluster_profile.profile_value",
+        lambda *_args, **_kwargs: "sge",
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.ariadne_publication."
+        "classify_ariadne_publication",
+        lambda *_args, **_kwargs: {
+            "state": "absent",
+            "archive_required": False,
+            "reason": "absent",
+            "files": [],
+        },
+    )
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
+
+    resolved = resolve_ariadne_terminal_postprocess_source(
+        campaign,
+        campaign_uid=str(state.campaign_uid),
+        iteration=1,
+        intent=producer,
+    )
+    result = rebind_environment(
+        campaign,
+        config=config,
+        scheduler_ownership_clear=True,
+    )
+
+    assert resolved["logical_total"] == 3
+    assert resolved["n_scheduler_completed"] == 2
+    assert resolved["n_scheduler_failed"] == 1
+    assert result["changed"] is True
+    assert result["transition_kind"] == "ariadne_terminal_postprocess_only"
+    assert result["producer_job_id"] == "898513"
+    assert result["n_scheduler_completed"] == 2
+    assert result["n_scheduler_failed"] == 1
+
+    rebound = read_active_environment_generation(
+        campaign,
+        expected_campaign_uid=str(state.campaign_uid),
+    )["generation"]
+    wrapper = write_pre_submit_intent(
+        campaign,
+        campaign_uid=str(state.campaign_uid),
+        phase_name=CampaignPhase.ARIADNE_ARRAY.value,
+        iteration=1,
+        expected_tasks=3,
+        decision_contract=dict(
+            resolved["postprocess_source"]["decision_contract"]
+        ),
+        postprocess_source=dict(resolved["postprocess_source"]),
+        scheduler_identity_kind="sge",
+        environment_generation=int(rebound["generation"]),
+        environment_generation_digest_sha256=str(rebound["digest_sha256"]),
+    )
+    from ichor.hpc.active_learning import cli as cli_module
+
+    monkeypatch.setattr(
+        cli_module,
+        "get_scheduler_backend",
+        lambda _kind: SimpleNamespace(),
+    )
+    replay, blockers = (
+        cli_module._resolve_terminal_submission_intents_for_apply(
+            campaign,
+            [wrapper],
+            persist_terminal_receipts=False,
+        )
+    )
+
+    assert blockers == []
+    assert replay[0]["ariadne_terminal_postprocess"] is True
+    assert replay[0]["producer_job_id"] == "898513"
+    assert replay[0]["intent_job_id"] == ""
 
 
 def test_postprocess_source_survives_repeated_local_failure_and_reconcile(

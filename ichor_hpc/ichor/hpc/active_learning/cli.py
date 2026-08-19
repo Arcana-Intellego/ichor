@@ -111,6 +111,7 @@ from .daemon.scheduler_recovery import (
     classify_terminal_scheduler_evidence,
     classify_unaccepted_scheduler_intent,
     load_scheduler_terminal_receipt,
+    scheduler_terminal_receipt_records_cancellation,
     scheduler_terminal_receipt_path,
     write_scheduler_terminal_receipt,
 )
@@ -2721,6 +2722,9 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
     aimall_recovery = payload.get(
         "_presentation_aimall_postprocess_recovery"
     )
+    ariadne_terminal = payload.get(
+        "_presentation_ariadne_terminal_postprocess"
+    )
     partial_recovery = payload.get("partial_array_recovery")
     scheduler_recovery = payload.get(
         "_presentation_scheduler_recovery"
@@ -2886,6 +2890,27 @@ def _status_current_activity(payload: Dict[str, Any]) -> str:
             + (" is" if total == 1 else " are")
             + " ready for local validation; resume will submit only "
             "structurally invalid or unfinished tasks."
+        )
+    if isinstance(ariadne_terminal, Mapping):
+        completed = int(
+            ariadne_terminal.get("n_scheduler_completed") or 0
+        )
+        failed = int(ariadne_terminal.get("n_scheduler_failed") or 0)
+        if daemon_active:
+            return (
+                "The daemon is validating all terminal ARIADNE output slots "
+                "locally; no ARIADNE scheduler job is being submitted."
+            )
+        return (
+            str(completed)
+            + " scheduler-completed ARIADNE output candidate"
+            + ("" if completed == 1 else "s")
+            + " and "
+            + str(failed)
+            + " scheduler-failed slot"
+            + ("" if failed == 1 else "s")
+            + " are ready for local validation; resume will submit no "
+            "ARIADNE job."
         )
     if (
         isinstance(partial_recovery, Mapping)
@@ -3496,6 +3521,15 @@ def _status_phase_outcome(payload: Dict[str, Any]) -> str:
     scheduler_recovery = payload.get(
         "_presentation_scheduler_recovery"
     )
+    if isinstance(
+        payload.get("_presentation_ariadne_terminal_postprocess"),
+        Mapping,
+    ):
+        return (
+            "the daemon will validate all terminal ARIADNE output slots "
+            "locally, submit no ARIADNE job, and continue to Phase B if the "
+            "frozen failure policy and allocation count pass"
+        )
     if isinstance(scheduler_recovery, Mapping):
         disposition = str(
             scheduler_recovery.get("publication_disposition") or ""
@@ -4990,6 +5024,29 @@ def _journal_operator_summary(
                 if skipped != 1:
                     description += "s"
             return description
+    if (
+        raw == "reconcile_resolved_terminal_intent"
+        and event.get("ariadne_terminal_postprocess") is True
+    ):
+        completed = _event_int(
+            event,
+            "scheduler_completed_task_candidates",
+        ) or 0
+        failed = _event_int(
+            event,
+            "scheduler_failed_task_candidates",
+        ) or 0
+        return (
+            "terminal ARIADNE intent resolved: "
+            + str(completed)
+            + " completed candidate"
+            + ("" if completed == 1 else "s")
+            + ", "
+            + str(failed)
+            + " failed slot"
+            + ("" if failed == 1 else "s")
+            + " retained for local validation, no tasks resubmitted"
+        )
     if raw == "reconcile_applied":
         config_changes = _event_int(event, "n_allowed_config_changes") or 0
 
@@ -5003,6 +5060,36 @@ def _journal_operator_summary(
                 + " configuration change"
                 + ("" if config_changes == 1 else "s")
                 + " applied"
+            )
+
+        terminal_ariadne_completed = _event_int(
+            event,
+            "ariadne_scheduler_completed_candidates",
+        )
+        terminal_ariadne_failed = _event_int(
+            event,
+            "ariadne_scheduler_failed_candidates",
+        )
+        terminal_ariadne_submitted = _event_int(
+            event,
+            "ariadne_tasks_resubmitted",
+        )
+        if (
+            event.get("ariadne_terminal_postprocess") is True
+            and terminal_ariadne_completed is not None
+            and terminal_ariadne_failed is not None
+            and terminal_ariadne_submitted == 0
+        ):
+            return _with_config_changes(
+                "reconcile applied; preserving "
+                + str(terminal_ariadne_completed)
+                + " scheduler-completed ARIADNE output candidate"
+                + ("" if terminal_ariadne_completed == 1 else "s")
+                + " and "
+                + str(terminal_ariadne_failed)
+                + " scheduler-failed slot"
+                + ("" if terminal_ariadne_failed == 1 else "s")
+                + " for local validation, no ARIADNE tasks resubmitted"
             )
 
         diversity_selected = _event_int(
@@ -8467,6 +8554,45 @@ def _ferebus_recovery_ledger_has_missing_map_failure(
         return False
 
 
+def _ariadne_terminal_postprocess_presentation_evidence(
+    campaign: Path,
+    state: CampaignState,
+) -> Optional[Dict[str, Any]]:
+    """Resolve authenticated scheduler-free ARIADNE recovery evidence."""
+    if state.phase is not CampaignPhase.ARIADNE_ARRAY:
+        return None
+    from .daemon.submission_intent import (
+        ARIADNE_TERMINAL_POSTPROCESS_REASON,
+        AriadneTerminalPostprocessNotApplicable,
+        load_intent,
+        resolve_ariadne_terminal_postprocess_source,
+    )
+
+    current = load_intent(
+        campaign,
+        state.phase.value,
+        int(state.iteration),
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+    if not isinstance(current, Mapping):
+        return None
+    if not (
+        str(current.get("reason") or "")
+        == ARIADNE_TERMINAL_POSTPROCESS_REASON
+        or isinstance(current.get("postprocess_source"), Mapping)
+    ):
+        return None
+    try:
+        return resolve_ariadne_terminal_postprocess_source(
+            campaign,
+            campaign_uid=str(state.campaign_uid),
+            iteration=int(state.iteration),
+            intent=current,
+        )
+    except AriadneTerminalPostprocessNotApplicable:
+        return None
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     campaign = resolve_campaign_dir(
         args.campaign_dir,
@@ -8720,6 +8846,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         None,
     )
     aimall_postprocess_recovery_status = None
+    ariadne_terminal_postprocess_status = None
     scalar_postprocess_recovery_status = None
     try:
         if supports_partial_array_recovery(state.phase):
@@ -8751,6 +8878,16 @@ def cmd_status(args: argparse.Namespace) -> int:
             dict(aimall_postprocess_recovery_status)
         )
         payload.pop("partial_array_recovery_error", None)
+    if state.phase is CampaignPhase.ARIADNE_ARRAY:
+        try:
+            ariadne_terminal_postprocess_status = (
+                _ariadne_terminal_postprocess_presentation_evidence(
+                    campaign,
+                    state,
+                )
+            )
+        except Exception:
+            ariadne_terminal_postprocess_status = None
     try:
         from .daemon.reconcile import (
             inspect_scalar_diversity_postprocess_recovery,
@@ -8967,6 +9104,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         presentation_payload[
             "_presentation_aimall_postprocess_recovery"
         ] = dict(aimall_postprocess_recovery_status)
+    if isinstance(ariadne_terminal_postprocess_status, Mapping):
+        presentation_payload[
+            "_presentation_ariadne_terminal_postprocess"
+        ] = dict(ariadne_terminal_postprocess_status)
     try:
         profile = require_cluster_profile()
         presentation_payload["_presentation_scheduler_kind"] = str(
@@ -9032,6 +9173,13 @@ def cmd_status(args: argparse.Namespace) -> int:
     ):
         payload["_presentation_aimall_postprocess_recovery"] = dict(
             aimall_postprocess_recovery_status
+        )
+    if (
+        not bool(getattr(args, "json", False))
+        and isinstance(ariadne_terminal_postprocess_status, Mapping)
+    ):
+        payload["_presentation_ariadne_terminal_postprocess"] = dict(
+            ariadne_terminal_postprocess_status
         )
     if (
         not bool(getattr(args, "json", False))
@@ -10398,6 +10546,82 @@ def _resolve_terminal_submission_intents_for_apply(
             })
             continue
         if not job_id:
+            if (
+                status == "PRE_SUBMIT"
+                and phase == CampaignPhase.ARIADNE_ARRAY.value
+                and isinstance(intent.get("postprocess_source"), Mapping)
+            ):
+                try:
+                    terminal = (
+                        _submission_intent.resolve_ariadne_terminal_postprocess_source(
+                            campaign,
+                            campaign_uid=str(intent.get("campaign_uid") or ""),
+                            iteration=int(iteration),
+                            intent=intent,
+                        )
+                    )
+                except _submission_intent.AriadneTerminalPostprocessNotApplicable:
+                    terminal = None
+                except Exception as exc:
+                    blocking.append(
+                        {
+                            "phase": phase,
+                            "iteration": iteration,
+                            "job_id": job_id,
+                            "expected_job_name": expected_job_name,
+                            "reason": (
+                                "terminal ARIADNE postprocess wrapper is invalid: "
+                                + type(exc).__name__
+                                + ": "
+                                + str(exc)
+                            ),
+                        }
+                    )
+                    continue
+                if terminal is not None:
+                    source = dict(terminal["postprocess_source"])
+                    receipt = dict(terminal["terminal_receipt"])
+                    terminal_candidates.append(
+                        {
+                            **intent_identity,
+                            "phase": phase,
+                            "iteration": iteration,
+                            "job_id": str(source["job_id"]),
+                            "producer_job_id": str(source["job_id"]),
+                            "producer_submission_identity": str(
+                                source["submission_identity"]
+                            ),
+                            "terminal_state": "LOCAL_POSTPROCESS_INTERRUPTED",
+                            "n_sacct_rows": len(receipt.get("outcomes", [])),
+                            "scheduler_recovery": False,
+                            "ariadne_terminal_postprocess": True,
+                            "n_completed": int(
+                                terminal["n_scheduler_completed"]
+                            ),
+                            "n_retry": int(terminal["n_scheduler_failed"]),
+                            "n_failed": int(terminal["n_scheduler_failed"]),
+                            "scheduler_observation_sha256": str(
+                                receipt["scheduler_observation_sha256"]
+                            ),
+                            "terminal_receipt": str(
+                                scheduler_terminal_receipt_path(
+                                    campaign,
+                                    phase=receipt["phase"],
+                                    iteration=int(receipt["iteration"]),
+                                    replacement_round=int(
+                                        receipt["replacement_round"]
+                                    ),
+                                    submission_identity=str(
+                                        receipt["submission_identity"]
+                                    ),
+                                )
+                            ),
+                            "terminal_receipt_sha256": str(
+                                receipt["receipt_sha256"]
+                            ),
+                        }
+                    )
+                    continue
             if status == "PRE_SUBMIT":
                 if not expected_job_name:
                     blocking.append({
@@ -10550,21 +10774,43 @@ def _resolve_terminal_submission_intents_for_apply(
             )
             continue
         if existing_terminal_receipt is not None:
+            ordinary_ariadne = bool(
+                not cancellation_owned
+                and phase == CampaignPhase.ARIADNE_ARRAY.value
+                and not scheduler_terminal_receipt_records_cancellation(
+                    existing_terminal_receipt
+                )
+            )
             terminal_candidates.append(
                 {
                     **intent_identity,
                     "phase": phase,
                     "iteration": iteration,
                     "job_id": job_id,
-                    "terminal_state": "USER_CANCELLED_TERMINAL",
+                    "terminal_state": (
+                        "COMPLETED"
+                        if ordinary_ariadne
+                        and int(existing_terminal_receipt["n_retry"]) == 0
+                        else "FAILED"
+                        if ordinary_ariadne
+                        else "USER_CANCELLED_TERMINAL"
+                    ),
                     "n_sacct_rows": len(
                         existing_terminal_receipt.get("outcomes", [])
                     ),
-                    "scheduler_recovery": True,
+                    "scheduler_recovery": not ordinary_ariadne,
+                    "ariadne_terminal_postprocess": ordinary_ariadne,
                     "n_completed": int(
                         existing_terminal_receipt["n_completed"]
                     ),
                     "n_retry": int(existing_terminal_receipt["n_retry"]),
+                    "n_failed": int(existing_terminal_receipt["n_retry"]),
+                    "scheduler_observation_sha256": str(
+                        existing_terminal_receipt.get(
+                            "scheduler_observation_sha256"
+                        )
+                        or ""
+                    ),
                     "terminal_receipt": str(
                         scheduler_terminal_receipt_path(
                             campaign,
@@ -10705,6 +10951,83 @@ def _resolve_terminal_submission_intents_for_apply(
                 }
             )
             continue
+        if phase == CampaignPhase.ARIADNE_ARRAY.value:
+            try:
+                classification = classify_terminal_scheduler_evidence(
+                    campaign,
+                    intent,
+                    observations,
+                    queue_active=False,
+                )
+                receipt = (
+                    write_scheduler_terminal_receipt(
+                        campaign,
+                        intent,
+                        classification,
+                    )
+                    if persist_terminal_receipts
+                    else None
+                )
+            except Exception as exc:
+                blocking.append(
+                    {
+                        "phase": phase,
+                        "iteration": iteration,
+                        "job_id": job_id,
+                        "expected_job_name": expected_job_name,
+                        "reason": (
+                            "terminal ARIADNE accounting is not recoverable: "
+                            + type(exc).__name__
+                            + ": "
+                            + str(exc)
+                        ),
+                    }
+                )
+                continue
+            n_failed = int(classification["n_retry"])
+            terminal_candidates.append(
+                {
+                    **intent_identity,
+                    "phase": phase,
+                    "iteration": iteration,
+                    "job_id": job_id,
+                    "terminal_state": (
+                        "COMPLETED" if n_failed == 0 else "FAILED"
+                    ),
+                    "n_sacct_rows": len(observations),
+                    "scheduler_recovery": False,
+                    "ariadne_terminal_postprocess": True,
+                    "n_completed": int(classification["n_completed"]),
+                    "n_retry": n_failed,
+                    "n_failed": n_failed,
+                    "scheduler_observation_sha256": str(
+                        classification["scheduler_observation_sha256"]
+                    ),
+                    "terminal_receipt": (
+                        None
+                        if receipt is None
+                        else str(
+                            scheduler_terminal_receipt_path(
+                                campaign,
+                                phase=receipt["phase"],
+                                iteration=int(receipt["iteration"]),
+                                replacement_round=int(
+                                    receipt["replacement_round"]
+                                ),
+                                submission_identity=str(
+                                    receipt["submission_identity"]
+                                ),
+                            )
+                        )
+                    ),
+                    "terminal_receipt_sha256": (
+                        None
+                        if receipt is None
+                        else str(receipt["receipt_sha256"])
+                    ),
+                }
+            )
+            continue
         terminal_state, reason, n_rows = _terminal_sacct_state_for_intent(
             job_id,
             observations,
@@ -10746,7 +11069,9 @@ def _resolve_terminal_submission_intents_for_apply(
     for candidate in terminal_candidates:
         terminal_state = str(candidate["terminal_state"])
         failure_reason = (
-            "user_cancelled_via_stop"
+            _submission_intent.ARIADNE_TERMINAL_POSTPROCESS_REASON
+            if bool(candidate.get("ariadne_terminal_postprocess", False))
+            else "user_cancelled_via_stop"
             if bool(candidate.get("scheduler_recovery", False))
             else "reconcile_apply_terminal_job:" + terminal_state
         )
@@ -11342,6 +11667,26 @@ def _publish_reconcile_intent_transitions(
             completion_receipt=(
                 dict(completion_receipt) if receipt_backed else None
             ),
+            ariadne_terminal_postprocess=bool(
+                item.get("ariadne_terminal_postprocess", False)
+            ),
+            scheduler_completed_task_candidates=(
+                int(item.get("n_completed") or 0)
+                if bool(item.get("ariadne_terminal_postprocess", False))
+                else None
+            ),
+            scheduler_failed_task_candidates=(
+                int(item.get("n_failed") or item.get("n_retry") or 0)
+                if bool(item.get("ariadne_terminal_postprocess", False))
+                else None
+            ),
+            scheduler_tasks_resubmitted=(
+                0
+                if bool(item.get("ariadne_terminal_postprocess", False))
+                else None
+            ),
+            terminal_receipt=item.get("terminal_receipt"),
+            terminal_receipt_sha256=item.get("terminal_receipt_sha256"),
         )
 
     for key, plan_record in planned.items():
@@ -12866,6 +13211,35 @@ def _reconcile_presentation(
             "validation"
         )
 
+    ariadne_terminal = getattr(
+        report,
+        "ariadne_terminal_postprocess_recovery",
+        None,
+    )
+    if isinstance(ariadne_terminal, Mapping) and ariadne_terminal:
+        completed = int(
+            ariadne_terminal.get("n_scheduler_completed") or 0
+        )
+        failed = int(ariadne_terminal.get("n_scheduler_failed") or 0)
+        planned.append(
+            (
+                "ARIADNE recovery",
+                "preserve "
+                + str(completed)
+                + " scheduler-completed output candidate"
+                + ("" if completed == 1 else "s")
+                + " and "
+                + str(failed)
+                + " scheduler-failed slot"
+                + ("" if failed == 1 else "s")
+                + " for local validation; submit zero ARIADNE tasks",
+            )
+        )
+        reason_parts.append(
+            "terminal ARIADNE outputs are awaiting scheduler-free local "
+            "validation"
+        )
+
     partial = getattr(report, "partial_array_recovery", None)
     if (
         isinstance(partial, Mapping)
@@ -12946,6 +13320,17 @@ def _reconcile_presentation(
         )
         for item in scheduler_cancellation
     }
+    ariadne_terminal_keys = (
+        {
+            (
+                CampaignPhase.ARIADNE_ARRAY.value,
+                int(ariadne_terminal.get("iteration") or 0),
+                str(ariadne_terminal.get("producer_job_id") or ""),
+            )
+        }
+        if isinstance(ariadne_terminal, Mapping)
+        else set()
+    )
     ordinary_repairs = [
         item
         for item in repairs
@@ -12955,6 +13340,12 @@ def _reconcile_presentation(
             str(item.get("job_id") or ""),
         )
         not in scheduler_recovery_keys
+        and (
+            str(item.get("phase") or ""),
+            int(item.get("iteration") or 0),
+            str(item.get("job_id") or ""),
+        )
+        not in ariadne_terminal_keys
     ]
     if ordinary_repairs:
         planned.append(
@@ -14319,6 +14710,30 @@ def _print_reconcile_applied_operator_report(
                 + str(completed)
                 + " scheduler-completed output candidate"
                 + ("" if completed == 1 else "s")
+                + " for local validation; reconcile submitted no work",
+            )
+        )
+    ariadne_terminal = getattr(
+        report,
+        "ariadne_terminal_postprocess_recovery",
+        None,
+    )
+    if isinstance(ariadne_terminal, Mapping):
+        completed = int(
+            ariadne_terminal.get("n_scheduler_completed") or 0
+        )
+        failed = int(ariadne_terminal.get("n_scheduler_failed") or 0)
+        applied_rows.append(
+            (
+                "ARIADNE recovery",
+                "retained "
+                + str(completed)
+                + " scheduler-completed candidate"
+                + ("" if completed == 1 else "s")
+                + " and "
+                + str(failed)
+                + " scheduler-failed slot"
+                + ("" if failed == 1 else "s")
                 + " for local validation; reconcile submitted no work",
             )
         )
@@ -16762,6 +17177,31 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             if scheduler_recoveries
             else {}
         )
+        terminal_ariadne = getattr(
+            report,
+            "ariadne_terminal_postprocess_recovery",
+            None,
+        )
+        terminal_ariadne_event_fields = (
+            {
+                "ariadne_terminal_postprocess": True,
+                "ariadne_scheduler_completed_candidates": int(
+                    terminal_ariadne.get("n_scheduler_completed") or 0
+                ),
+                "ariadne_scheduler_failed_candidates": int(
+                    terminal_ariadne.get("n_scheduler_failed") or 0
+                ),
+                "ariadne_original_job_id": str(
+                    terminal_ariadne.get("producer_job_id") or ""
+                ),
+                "ariadne_tasks_resubmitted": 0,
+                "ariadne_validation_disposition": str(
+                    terminal_ariadne.get("validation") or ""
+                ),
+            }
+            if isinstance(terminal_ariadne, Mapping)
+            else {}
+        )
         environment_binding_repair = (
             _reconcile_environment_config_binding_repair(
                 campaign,
@@ -16851,6 +17291,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             **aimall_event_fields,
             **scalar_event_fields,
             **scheduler_event_fields,
+            **terminal_ariadne_event_fields,
         )
     except Exception:
         pass
@@ -18302,6 +18743,46 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
                 "  preserved re-poll error: "
                 + str(scheduler_repoll.get("error"))
             )
+    ariadne_terminal = payload.get(
+        "_presentation_ariadne_terminal_postprocess"
+    )
+    if isinstance(ariadne_terminal, Mapping):
+        if ariadne_terminal.get("error"):
+            lines.append(
+                _preflight_check_line(
+                    "ARIADNE terminal postprocessing",
+                    False,
+                    "scheduler evidence is invalid"
+                    + (
+                        ": " + str(ariadne_terminal.get("error"))
+                        if verbose
+                        else ""
+                    ),
+                )
+            )
+        else:
+            completed = int(
+                ariadne_terminal.get("n_scheduler_completed") or 0
+            )
+            failed = int(
+                ariadne_terminal.get("n_scheduler_failed") or 0
+            )
+            lines.append(
+                _preflight_check_line(
+                    "ARIADNE terminal postprocessing",
+                    True,
+                    "resume will validate "
+                    + str(completed)
+                    + " scheduler-completed candidate"
+                    + ("" if completed == 1 else "s")
+                    + " and "
+                    + str(failed)
+                    + " scheduler-failed slot"
+                    + ("" if failed == 1 else "s")
+                    + " locally and submit no ARIADNE job",
+                    warn=True,
+                )
+            )
     ferebus_staging = payload.get(
         "_presentation_ferebus_staging_recovery"
     )
@@ -18857,6 +19338,7 @@ def evaluate_campaign_preflight(
     presentation_stop: Dict[str, Any] = {}
     presentation_diversity_transition: Optional[Dict[str, Any]] = None
     presentation_ferebus_staging: Optional[Dict[str, Any]] = None
+    presentation_ariadne_terminal: Optional[Dict[str, Any]] = None
     presentation_environment: Optional[Dict[str, Any]] = None
     presentation_transaction: Optional[Dict[str, Any]] = None
     presentation_scheduler_repoll: Optional[Dict[str, Any]] = None
@@ -19221,6 +19703,23 @@ def evaluate_campaign_preflight(
                     )
                 )
 
+            if state.phase is CampaignPhase.ARIADNE_ARRAY:
+                try:
+                    presentation_ariadne_terminal = (
+                        _ariadne_terminal_postprocess_presentation_evidence(
+                            campaign,
+                            state,
+                        )
+                    )
+                except Exception as exc:
+                    presentation_ariadne_terminal = {
+                        "error": type(exc).__name__ + ": " + str(exc),
+                    }
+                    condition = "blocked"
+                    issues.append(
+                        "terminal ARIADNE postprocessing evidence is invalid"
+                    )
+
             if state.phase in {
                 CampaignPhase.PHASE_A_DIVERSITY,
                 CampaignPhase.PHASE_B_DIVERSITY,
@@ -19300,6 +19799,10 @@ def evaluate_campaign_preflight(
     payload["_presentation_ferebus_staging_recovery"] = (
         presentation_ferebus_staging
     )
+    if presentation_ariadne_terminal is not None:
+        payload["_presentation_ariadne_terminal_postprocess"] = dict(
+            presentation_ariadne_terminal
+        )
     payload["_presentation_environment_generation"] = presentation_environment
     if presentation_scheduler_repoll is not None:
         payload["_presentation_scheduler_repoll"] = (

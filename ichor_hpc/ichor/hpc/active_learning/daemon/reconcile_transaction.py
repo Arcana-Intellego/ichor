@@ -717,7 +717,11 @@ def build_reconcile_commit_plan(
             and str(item.get("target_status") or "") == "FAILED"
         ):
             item["target_status"] = "SUPERSEDED"
-            item["reason"] = "reconcile_apply_retry"
+            item["reason"] = (
+                _submission_intent.ARIADNE_TERMINAL_POSTPROCESS_REASON
+                if bool(item.get("ariadne_terminal_postprocess", False))
+                else "reconcile_apply_retry"
+            )
             item.pop("completion_receipt", None)
         path = _submission_intent.intent_path(campaign, phase, iteration)
         after_payload = _submission_intent.prepare_reconcile_terminal_transition(

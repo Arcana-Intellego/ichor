@@ -187,7 +187,9 @@ def parse_sge_usage_records(
             failed, _failed_description = sge.parse_sge_failed_field(
                 record.get("failed")
             )
-            exit_status = int(str(record.get("exit_status") or ""))
+            exit_status, _exit_status_description = (
+                sge.parse_sge_exit_status_field(record.get("exit_status"))
+            )
             elapsed_seconds = sge.parse_sge_duration_seconds(
                 record.get("ru_wallclock") or "0"
             )

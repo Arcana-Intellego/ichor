@@ -75,6 +75,13 @@ _POSTPROCESS_SOURCE_PHASES = (
     | _GAUSSIAN_POSTPROCESS_PHASES
 )
 _SCALAR_LOGICAL_TASK_SET_SHA256 = hashlib.sha256(b"0").hexdigest()
+ARIADNE_TERMINAL_POSTPROCESS_REASON = (
+    "reconcile_apply_ariadne_terminal_postprocess"
+)
+
+
+class AriadneTerminalPostprocessNotApplicable(ValueError):
+    """The intent belongs to another supported ARIADNE recovery path."""
 
 
 def submission_kind_for_phase(phase_name: str) -> str:
@@ -770,7 +777,10 @@ def resolve_ariadne_postprocess_source(
             raise ValueError(
                 "postprocess source wrapper must be PRE_SUBMIT, FAILED or SUPERSEDED"
             )
-        if status == "SUPERSEDED" and reason != "reconcile_apply_retry":
+        if status == "SUPERSEDED" and reason not in {
+            "reconcile_apply_retry",
+            ARIADNE_TERMINAL_POSTPROCESS_REASON,
+        }:
             raise ValueError(
                 "superseded postprocess source wrapper has an unsupported reason"
             )
@@ -779,11 +789,17 @@ def resolve_ariadne_postprocess_source(
         source = _validated_postprocess_source(nested)
     else:
         if status != "FAILED" and not (
-            status == "SUPERSEDED" and reason == "reconcile_apply_retry"
+            status == "SUPERSEDED"
+            and reason
+            in {
+                "reconcile_apply_retry",
+                ARIADNE_TERMINAL_POSTPROCESS_REASON,
+            }
         ):
             raise ValueError(
                 "all-complete ARIADNE producer must be FAILED or "
-                "SUPERSEDED by reconcile_apply_retry"
+                "SUPERSEDED by reconcile_apply_retry or authenticated terminal "
+                "postprocessing"
             )
         job_id = current.get("job_id")
         if not isinstance(job_id, str) or not job_id:
@@ -859,6 +875,115 @@ def resolve_ariadne_postprocess_source(
         )
     _validate_postprocess_source_environment(campaign_dir, source)
     return source
+
+
+def resolve_ariadne_terminal_postprocess_source(
+    campaign_dir: Union[str, Path],
+    *,
+    campaign_uid: str,
+    iteration: int,
+    intent: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Resolve an ordinary terminal ARIADNE array for local validation.
+
+    This path is intentionally distinct from scheduler-cancellation recovery.
+    The original full-array producer must have been retired by reconcile with
+    the dedicated terminal-postprocess reason and must own a complete,
+    authenticated scheduler-terminal receipt.
+    """
+    from .array_recovery import logical_task_ids
+    from .scheduler_recovery import (
+        load_scheduler_terminal_receipt,
+        scheduler_terminal_receipt_records_cancellation,
+    )
+
+    iteration_value = _exact_int(
+        iteration,
+        "terminal postprocess iteration",
+    )
+    task_ids = tuple(
+        int(value)
+        for value in logical_task_ids(
+            campaign_dir,
+            CampaignPhase.ARIADNE_ARRAY,
+            iteration_value,
+        )
+    )
+    if not task_ids or task_ids != tuple(range(len(task_ids))):
+        raise ValueError(
+            "terminal ARIADNE postprocess task identities are not canonical"
+        )
+    task_digest = hashlib.sha256(
+        ",".join(str(value) for value in task_ids).encode("ascii")
+    ).hexdigest()
+    source = resolve_ariadne_postprocess_source(
+        campaign_dir,
+        campaign_uid=str(campaign_uid),
+        iteration=iteration_value,
+        logical_total=len(task_ids),
+        logical_task_set_sha256=task_digest,
+        intent=intent,
+    )
+    producers = [
+        record
+        for record in intent_attempt_records(
+            campaign_dir,
+            CampaignPhase.ARIADNE_ARRAY.value,
+            iteration_value,
+            expected_campaign_uid=str(campaign_uid),
+        )
+        if str(record.get("attempt_id") or "") == str(source["attempt_id"])
+        and str(record.get("submission_identity") or "")
+        == str(source["submission_identity"])
+        and str(record.get("job_id") or "") == str(source["job_id"])
+    ]
+    if len(producers) != 1:
+        raise ValueError(
+            "terminal ARIADNE postprocess source does not resolve to one "
+            "producer attempt"
+        )
+    producer = dict(producers[0])
+    if (
+        str(producer.get("status") or "") != "SUPERSEDED"
+        or str(producer.get("reason") or "")
+        != ARIADNE_TERMINAL_POSTPROCESS_REASON
+    ):
+        raise AriadneTerminalPostprocessNotApplicable(
+            "terminal ARIADNE producer was not retired for local "
+            "postprocessing"
+        )
+    if producer.get("decision_contract") != source["decision_contract"]:
+        raise ValueError(
+            "terminal ARIADNE producer decision contract mismatch"
+        )
+    receipt = load_scheduler_terminal_receipt(campaign_dir, producer)
+    if receipt is None:
+        raise ValueError(
+            "terminal ARIADNE producer has no scheduler-terminal receipt"
+        )
+    if scheduler_terminal_receipt_records_cancellation(receipt):
+        raise ValueError(
+            "terminal ARIADNE postprocess source belongs to scheduler "
+            "cancellation recovery"
+        )
+    if (
+        str(receipt.get("scheduler_acceptance") or "") != "accepted"
+        or tuple(int(value) for value in receipt["logical_task_ids"])
+        != task_ids
+        or int(receipt.get("n_completed", -1))
+        + int(receipt.get("n_retry", -1))
+        != len(task_ids)
+    ):
+        raise ValueError(
+            "terminal ARIADNE scheduler evidence does not cover its full task set"
+        )
+    return {
+        "postprocess_source": dict(source),
+        "terminal_receipt": dict(receipt),
+        "logical_total": len(task_ids),
+        "n_scheduler_completed": int(receipt["n_completed"]),
+        "n_scheduler_failed": int(receipt["n_retry"]),
+    }
 
 
 def gaussian_postprocess_task_contract(

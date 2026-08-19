@@ -81,6 +81,21 @@ def _scheduler_cancellation_transition_boundary(
         attempts,
         key=lambda record: int(record.get("attempt_sequence", 0)),
     )
+    if phase is CampaignPhase.ARIADNE_ARRAY:
+        from .daemon.submission_intent import (
+            ARIADNE_TERMINAL_POSTPROCESS_REASON,
+        )
+
+        if (
+            str(latest_attempt.get("reason") or "")
+            == ARIADNE_TERMINAL_POSTPROCESS_REASON
+            or isinstance(latest_attempt.get("postprocess_source"), Mapping)
+        ):
+            # Ordinary terminal ARIADNE adoption is validated by the stricter
+            # postprocess-only boundary below.  It must not be weakened into a
+            # scheduler-cancellation transition merely because both paths use
+            # the same schema-2 terminal receipt.
+            return None
     recovery_identities = {
         str(recovery["intent"].get("submission_identity") or "")
         for recovery in recoveries
@@ -425,6 +440,52 @@ def _validate_allocation_check_transition_boundary(
     }
 
 
+def _validate_ariadne_postprocess_publication(
+    campaign: Path,
+    state: Any,
+    *,
+    boundary_label: str,
+) -> str:
+    from .daemon.ariadne_publication import classify_ariadne_publication
+
+    publication = classify_ariadne_publication(
+        campaign,
+        int(state.iteration),
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+    publication_state = str(publication.get("state") or "")
+    replayable_states = {
+        "absent",
+        "incomplete",
+        "stale_results_binding",
+        "archive_incomplete",
+    }
+    if publication_state == "complete" and not bool(
+        publication.get("accepted", False)
+    ):
+        raise ExecutionIdentityError(
+            "environment transition at an "
+            + str(boundary_label)
+            + " ARIADNE boundary is blocked by a complete rejected batch "
+            "decision"
+        )
+    if publication_state not in replayable_states and not (
+        publication_state == "complete"
+        and bool(publication.get("accepted", False))
+    ):
+        raise ExecutionIdentityError(
+            "environment transition at an "
+            + str(boundary_label)
+            + " ARIADNE boundary requires derived publication to be absent, "
+            "recoverably incomplete, or an accepted uncommitted publication; "
+            "observed "
+            + (publication_state or "unknown")
+            + ": "
+            + str(publication.get("reason") or "")
+        )
+    return publication_state
+
+
 def _validate_ariadne_retry_transition_boundary(
     campaign: Path,
     state: Any,
@@ -451,6 +512,74 @@ def _validate_ariadne_retry_transition_boundary(
             "environment transition at ARIADNE_ARRAY failed its recovery contract: "
             + str(contract_error)
         )
+
+    from .daemon.submission_intent import (
+        ARIADNE_TERMINAL_POSTPROCESS_REASON,
+        AriadneTerminalPostprocessNotApplicable,
+        load_intent,
+        resolve_ariadne_terminal_postprocess_source,
+    )
+
+    current_intent = load_intent(
+        campaign,
+        phase.value,
+        int(state.iteration),
+        expected_campaign_uid=str(state.campaign_uid),
+    )
+    terminal_marker = bool(
+        isinstance(current_intent, Mapping)
+        and (
+            str(current_intent.get("reason") or "")
+            == ARIADNE_TERMINAL_POSTPROCESS_REASON
+            or isinstance(current_intent.get("postprocess_source"), Mapping)
+        )
+    )
+    terminal_context: Optional[Dict[str, Any]] = None
+    if terminal_marker:
+        try:
+            terminal_context = resolve_ariadne_terminal_postprocess_source(
+                campaign,
+                campaign_uid=str(state.campaign_uid),
+                iteration=int(state.iteration),
+                intent=current_intent,
+            )
+        except AriadneTerminalPostprocessNotApplicable:
+            terminal_context = None
+        except Exception as exc:
+            raise ExecutionIdentityError(
+                "environment transition at terminal ARIADNE postprocessing "
+                "could not validate scheduler evidence: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:200]
+            ) from exc
+    if terminal_context is not None:
+        publication_state = _validate_ariadne_postprocess_publication(
+            campaign,
+            state,
+            boundary_label="terminal",
+        )
+        source = dict(terminal_context["postprocess_source"])
+        return {
+            "transition_kind": "ariadne_terminal_postprocess_only",
+            "logical_total": int(terminal_context["logical_total"]),
+            "n_scheduler_completed": int(
+                terminal_context["n_scheduler_completed"]
+            ),
+            "n_scheduler_failed": int(
+                terminal_context["n_scheduler_failed"]
+            ),
+            "producer_submission_identity": str(source["submission_identity"]),
+            "producer_job_id": str(source["job_id"]),
+            "producer_environment_generation": int(
+                source["environment_generation"]
+            ),
+            "producer_environment_generation_digest_sha256": str(
+                source["environment_generation_digest_sha256"]
+            ),
+            "publication_state": publication_state,
+            "postprocess_source": source,
+        }
 
     try:
         scan = (
@@ -517,40 +646,12 @@ def _validate_ariadne_retry_transition_boundary(
             + str(logical_total)
         )
 
-    from .daemon.ariadne_publication import classify_ariadne_publication
     from .daemon.submission_intent import resolve_ariadne_postprocess_source
-
-    publication = classify_ariadne_publication(
+    publication_state = _validate_ariadne_postprocess_publication(
         campaign,
-        int(state.iteration),
-        expected_campaign_uid=str(state.campaign_uid),
+        state,
+        boundary_label="all-complete",
     )
-    publication_state = str(publication.get("state") or "")
-    replayable_states = {
-        "absent",
-        "incomplete",
-        "stale_results_binding",
-        "archive_incomplete",
-    }
-    if publication_state == "complete" and not bool(
-        publication.get("accepted", False)
-    ):
-        raise ExecutionIdentityError(
-            "environment transition at an all-complete ARIADNE boundary is "
-            "blocked by a complete rejected batch decision"
-        )
-    if publication_state not in replayable_states and not (
-        publication_state == "complete"
-        and bool(publication.get("accepted", False))
-    ):
-        raise ExecutionIdentityError(
-            "environment transition at an all-complete ARIADNE boundary requires "
-            "derived publication to be absent, recoverably incomplete, or an "
-            "accepted uncommitted publication; observed "
-            + (publication_state or "unknown")
-            + ": "
-            + str(publication.get("reason") or "")
-        )
     expected_task_set_sha256 = hashlib.sha256(
         ",".join(str(task_id) for task_id in expected_task_ids).encode("ascii")
     ).hexdigest()

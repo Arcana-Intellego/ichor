@@ -737,6 +737,34 @@ def test_preflight_reports_scheduler_free_phase_b_publication_adoption():
     assert "zero scheduler submissions" in output
 
 
+def test_preflight_reports_scheduler_free_terminal_ariadne_validation():
+    payload = {
+        "ready": True,
+        "all_backends_present": True,
+        "backend_availability": {},
+        "campaign_config": {"ok": True},
+        "pool_feasibility": {"ok": True},
+        "campaign_state": {
+            "ok": True,
+            "condition": "ready",
+            "phase": CampaignPhase.ARIADNE_ARRAY.value,
+            "iteration": 10,
+        },
+        "_presentation_ariadne_terminal_postprocess": {
+            "logical_total": 200,
+            "n_scheduler_completed": 199,
+            "n_scheduler_failed": 1,
+        },
+    }
+
+    output = cli_mod._format_preflight(payload)
+
+    assert "[WARN] ARIADNE terminal postprocessing" in output
+    assert "199 scheduler-completed candidates" in output
+    assert "1 scheduler-failed slot" in output
+    assert "submit no ARIADNE job" in output
+
+
 def test_campaign_preflight_does_not_treat_its_background_child_as_an_owner(
     tmp_path,
     monkeypatch,
@@ -2931,6 +2959,227 @@ def test_reconcile_recovers_stranded_sge_ferebus_reschedule_as_one_retry(
     assert receipt["retry_logical_task_ids"] == [4]
 
 
+def test_reconcile_classifies_mixed_terminal_ariadne_for_local_postprocess(
+    tmp_path,
+    monkeypatch,
+):
+    import hashlib
+
+    from ichor.hpc.active_learning.daemon.scheduler_recovery import (
+        load_scheduler_terminal_receipt,
+    )
+    from ichor.hpc.active_learning.daemon.script_bundles import (
+        prepare_attempt_bundle,
+    )
+    from ichor.hpc.active_learning.submit.sacct_poll import (
+        JobObservation,
+        JobStatus,
+    )
+
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=40)
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 10
+    state.pending_jobs[state.phase.value] = "898513"
+    _write_locked_state(campaign, state)
+    pre_submit = submission_intent.write_pre_submit_intent(
+        campaign,
+        campaign_uid=state.campaign_uid,
+        phase_name=state.phase.value,
+        iteration=state.iteration,
+        expected_tasks=200,
+        decision_contract={
+            "failure_threshold_fraction": 0.25,
+            "config_sha256": "c" * 64,
+        },
+        scheduler_identity_kind="sge",
+        environment_generation=0,
+        environment_generation_digest_sha256="e" * 64,
+    )
+    bundle = prepare_attempt_bundle(
+        campaign,
+        state.phase.value,
+        state.iteration,
+        str(pre_submit["submission_identity"]),
+        array_size=200,
+        max_log_files_per_directory=5000,
+        logical_task_ids=list(range(200)),
+    )
+    task_digest = hashlib.sha256(
+        ",".join(str(value) for value in range(200)).encode("ascii")
+    ).hexdigest()
+    submission_intent.mark_submitted(
+        campaign,
+        state.phase.value,
+        state.iteration,
+        "898513",
+        expected_tasks=200,
+        submission_metadata={
+            "array_recovery": {
+                "logical_total": 200,
+                "n_complete": 0,
+                "n_reuse": 0,
+                "n_retry": 200,
+            },
+            "logical_task_set_sha256": task_digest,
+            "script_bundle": str(bundle.root),
+        },
+    )
+    intent = submission_intent.load_intent(
+        campaign,
+        state.phase.value,
+        state.iteration,
+    )
+    owner = cli_mod.current_scheduler_user()
+    observations = [
+        JobObservation(
+            job_id="898513_" + str(task_id),
+            status=(
+                JobStatus.FAILED
+                if task_id == 76
+                else JobStatus.COMPLETED
+            ),
+            exit_code=((139, 0) if task_id == 76 else (0, 0)),
+            elapsed_seconds=24,
+            raw_status=(
+                "failed=0 exit_status=139 (Segmentation fault)"
+                if task_id == 76
+                else "failed=0 exit_status=0"
+            ),
+            job_name=str(intent["expected_job_name"]),
+            owner=owner,
+        )
+        for task_id in range(200)
+    ]
+
+    class TerminalSgeBackend:
+        display_name = "Sun Grid Engine"
+        queue_command = "qstat"
+
+        def find_active_job_by_id(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                active=False,
+                inconclusive=False,
+                error=None,
+            )
+
+        def poll_job(self, *_args, **_kwargs):
+            return list(observations)
+
+    monkeypatch.setattr(
+        cli_mod,
+        "get_scheduler_backend",
+        lambda _kind: TerminalSgeBackend(),
+    )
+
+    preview, blockers = cli_mod._resolve_terminal_submission_intents_for_apply(
+        campaign,
+        [intent],
+        persist_terminal_receipts=False,
+    )
+
+    assert blockers == []
+    assert len(preview) == 1
+    assert preview[0]["ariadne_terminal_postprocess"] is True
+    assert preview[0]["n_completed"] == 199
+    assert preview[0]["n_failed"] == 1
+    assert preview[0]["n_retry"] == 1
+    assert preview[0]["reason"] == (
+        submission_intent.ARIADNE_TERMINAL_POSTPROCESS_REASON
+    )
+    assert load_scheduler_terminal_receipt(campaign, intent) is None
+
+    applied, blockers = cli_mod._resolve_terminal_submission_intents_for_apply(
+        campaign,
+        [intent],
+        persist_terminal_receipts=True,
+    )
+
+    assert blockers == []
+    assert applied[0]["ariadne_terminal_postprocess"] is True
+    receipt = load_scheduler_terminal_receipt(campaign, intent)
+    assert receipt is not None
+    assert receipt["n_completed"] == 199
+    assert receipt["n_retry"] == 1
+    assert receipt["retry_logical_task_ids"] == [76]
+
+    from ichor.hpc.active_learning.daemon.reconcile import propose_recovery
+
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.array_recovery.logical_task_ids",
+        lambda *_args, **_kwargs: list(range(200)),
+    )
+    monkeypatch.setattr(
+        submission_intent,
+        "_validate_postprocess_source_environment",
+        lambda *_args, **_kwargs: None,
+    )
+    preview_report = propose_recovery(
+        campaign,
+        _terminal_submission_intents=applied,
+    )
+    assert preview_report.partial_array_recovery is None
+    assert preview_report.ariadne_terminal_postprocess_recovery == {
+        "state": "terminal_postprocess_only",
+        "phase": CampaignPhase.ARIADNE_ARRAY.value,
+        "iteration": 10,
+        "replacement_round": 0,
+        "logical_total": 200,
+        "n_scheduler_completed": 199,
+        "n_scheduler_failed": 1,
+        "scheduler_jobs_submitted": 0,
+        "validation": "pending_local_output_validation",
+        "producer_job_id": "898513",
+        "producer_submission_identity": str(intent["submission_identity"]),
+        "scheduler_observation_sha256": str(
+            receipt["scheduler_observation_sha256"]
+        ),
+        "terminal_receipt": str(applied[0]["terminal_receipt"]),
+        "terminal_receipt_sha256": str(receipt["receipt_sha256"]),
+    }
+
+    submission_intent.mark_failed(
+        campaign,
+        CampaignPhase.ARIADNE_ARRAY.value,
+        10,
+        "parser-induced halt",
+    )
+    submission_intent.mark_superseded(
+        campaign,
+        CampaignPhase.ARIADNE_ARRAY.value,
+        10,
+        submission_intent.ARIADNE_TERMINAL_POSTPROCESS_REASON,
+    )
+    state.phase = CampaignPhase.HALTED
+    state.pending_jobs = {}
+    write_state(
+        campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME,
+        state,
+    )
+    append_event(
+        campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
+        "halt",
+        from_phase=CampaignPhase.ARIADNE_ARRAY.value,
+        iteration=10,
+        reason="parser-induced halt",
+    )
+
+    replay_report = propose_recovery(campaign)
+    assert replay_report.partial_array_recovery is None
+    assert replay_report.ariadne_terminal_postprocess_recovery == (
+        preview_report.ariadne_terminal_postprocess_recovery
+    )
+
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 11
+    write_state(
+        campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME,
+        state,
+    )
+    future_report = propose_recovery(campaign)
+    assert future_report.ariadne_terminal_postprocess_recovery is None
+
+
 def test_verbose_reconcile_reports_exact_scheduler_accounting_blocker(
     tmp_path,
     monkeypatch,
@@ -4735,6 +4984,26 @@ def test_journal_reconcile_summary_reports_ariadne_reuse_without_resubmission():
     ) in output
 
 
+def test_journal_reconcile_summary_reports_terminal_ariadne_local_validation():
+    event = {
+        "event": "reconcile_applied",
+        "phase": CampaignPhase.ARIADNE_ARRAY.value,
+        "iteration": 10,
+        "ariadne_terminal_postprocess": True,
+        "ariadne_scheduler_completed_candidates": 199,
+        "ariadne_scheduler_failed_candidates": 1,
+        "ariadne_tasks_resubmitted": 0,
+        "ariadne_original_job_id": "898513",
+    }
+
+    output = cli_mod._format_journal_events([event], verbose=False)
+
+    assert "RECONCILE" in output
+    assert "199 scheduler-completed ARIADNE output candidates" in output
+    assert "1 scheduler-failed slot" in output
+    assert "no ARIADNE tasks resubmitted" in output
+
+
 def test_journal_reconcile_summary_reports_aimall_local_reuse():
     event = {
         "event": "reconcile_applied",
@@ -4769,6 +5038,28 @@ def test_status_aimall_recovery_does_not_promise_zero_retries():
 
     assert "validate the scheduler-completed AIMAll output candidates" in outcome
     assert "submit only structurally invalid or unfinished AIMAll tasks" in outcome
+
+
+def test_status_terminal_ariadne_recovery_promises_local_validation_only():
+    payload = {
+        "phase": CampaignPhase.ARIADNE_ARRAY.value,
+        "iteration": 10,
+        "max_iterations": 40,
+        "_presentation_ariadne_terminal_postprocess": {
+            "logical_total": 200,
+            "n_scheduler_completed": 199,
+            "n_scheduler_failed": 1,
+        },
+    }
+
+    activity = cli_mod._status_current_activity(payload)
+    outcome = cli_mod._status_phase_outcome(payload)
+
+    assert "199 scheduler-completed ARIADNE output candidates" in activity
+    assert "1 scheduler-failed slot" in activity
+    assert "resume will submit no ARIADNE job" in activity
+    assert "validate all terminal ARIADNE output slots locally" in outcome
+    assert "frozen failure policy and allocation count pass" in outcome
 
 
 def test_journal_reconcile_summary_reports_diversity_local_adoption():

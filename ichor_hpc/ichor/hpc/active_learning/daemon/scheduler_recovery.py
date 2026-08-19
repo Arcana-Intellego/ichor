@@ -784,6 +784,28 @@ def load_scheduler_terminal_receipt(
     )
 
 
+def scheduler_terminal_receipt_records_cancellation(
+    receipt: Mapping[str, Any],
+) -> bool:
+    """Return whether terminal evidence belongs to an ICHOR cancellation path."""
+    if str(receipt.get("scheduler_acceptance") or "") == "not_accepted":
+        return True
+    if str(receipt.get("accounting_exception") or "") in {
+        "sge_deleted_before_start",
+        "submission_stopped_before_acceptance",
+    }:
+        return True
+    for outcome in receipt.get("outcomes") or []:
+        if not isinstance(outcome, Mapping):
+            continue
+        if str(outcome.get("status") or "").upper() == "CANCELLED":
+            return True
+        raw_status = str(outcome.get("raw_status") or "")
+        if re.search(r"(?:^|\s)failed=(?:24|25)(?:\s|$)", raw_status):
+            return True
+    return False
+
+
 def scheduler_terminal_recoveries(
     campaign_dir: Union[str, Path],
     *,
@@ -1434,6 +1456,7 @@ __all__ = [
     "read_scheduler_terminal_receipt",
     "require_current_phase_recovery_authority",
     "scheduler_terminal_receipt_path",
+    "scheduler_terminal_receipt_records_cancellation",
     "scheduler_terminal_recoveries",
     "validate_scheduler_terminal_receipt",
     "write_phase_recovery_ledger",

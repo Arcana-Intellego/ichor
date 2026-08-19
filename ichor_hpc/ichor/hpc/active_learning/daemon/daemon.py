@@ -3692,7 +3692,13 @@ class Daemon:
             _validate_ariadne_retry_transition_boundary,
         )
         from .array_recovery import scan_array_tasks
-        from .submission_intent import ACTIVE_STATUSES, load_intent
+        from .submission_intent import (
+            ARIADNE_TERMINAL_POSTPROCESS_REASON,
+            ACTIVE_STATUSES,
+            AriadneTerminalPostprocessNotApplicable,
+            load_intent,
+            resolve_ariadne_terminal_postprocess_source,
+        )
 
         current = load_intent(
             self.campaign_dir,
@@ -3702,6 +3708,28 @@ class Daemon:
         )
         if current is None:
             return None
+        terminal_marker = bool(
+            str(current.get("reason") or "")
+            == ARIADNE_TERMINAL_POSTPROCESS_REASON
+            or isinstance(current.get("postprocess_source"), Mapping)
+        )
+        if terminal_marker:
+            try:
+                terminal = resolve_ariadne_terminal_postprocess_source(
+                    self.campaign_dir,
+                    campaign_uid=str(state.campaign_uid),
+                    iteration=int(state.iteration),
+                    intent=current,
+                )
+            except AriadneTerminalPostprocessNotApplicable:
+                terminal = None
+            if terminal is not None:
+                source = terminal.get("postprocess_source")
+                if not isinstance(source, dict):
+                    raise ValueError(
+                        "terminal ARIADNE recovery has no producer source contract"
+                    )
+                return dict(source)
         scan = scan_array_tasks(
             self.campaign_dir,
             CampaignPhase.ARIADNE_ARRAY,
