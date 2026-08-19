@@ -11924,6 +11924,35 @@ def _apply_retry_phase_after_cleaned_halt(report, original_report) -> bool:
     return True
 
 
+def _propose_recovery_after_cleanup(
+    campaign: Path,
+    *,
+    allow_fresh_init_on_nonempty: bool,
+    active_reconcile_transaction_id: Optional[str],
+    artifact_snapshot: Any,
+    verification_level: str,
+    terminal_recoveries: Sequence[Mapping[str, Any]],
+) -> Any:
+    """Reinspect cleanup without discarding proven terminal ownership."""
+    preserved_terminal_recoveries = [
+        dict(item) for item in terminal_recoveries
+    ]
+    report = propose_recovery(
+        campaign,
+        allow_fresh_init_on_nonempty=allow_fresh_init_on_nonempty,
+        _active_reconcile_transaction_id=active_reconcile_transaction_id,
+        _terminal_submission_intents=preserved_terminal_recoveries,
+        artifact_snapshot=artifact_snapshot,
+        verification_level=verification_level,
+    )
+    _apply_terminal_intent_recovery_to_report(
+        report,
+        preserved_terminal_recoveries,
+        persist_for_apply=True,
+    )
+    return report
+
+
 def _apply_runtime_config_to_recovered_state(report, config: Optional[CampaignConfig]) -> None:
     if config is None:
         return
@@ -15856,6 +15885,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             )
             or ""
         ) or None
+    terminal_recoveries: List[Dict[str, Any]] = []
     try:
         report = propose_recovery(
             campaign,
@@ -16576,18 +16606,19 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
 
     if original_report.proposed_state.phase is CampaignPhase.HALTED:
         try:
-            report = propose_recovery(
+            report = _propose_recovery_after_cleanup(
                 campaign,
                 allow_fresh_init_on_nonempty=bool(
                     getattr(args, "allow_fresh_init", False)
                 ),
-                _active_reconcile_transaction_id=(
+                active_reconcile_transaction_id=(
                     str(transaction.payload["transaction_id"])
                     if transaction is not None
                     else None
                 ),
                 artifact_snapshot=artifact_snapshot,
                 verification_level=verification_level,
+                terminal_recoveries=terminal_recoveries,
             )
         except Exception as exc:
             _fail_reconcile_transaction(

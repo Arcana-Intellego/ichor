@@ -7578,6 +7578,89 @@ def test_cli_reconcile_reselects_after_terminal_intent_before_proposal(
     assert re.search(r"active work\s*: none", output)
 
 
+def test_reconcile_post_cleanup_reinspection_preserves_terminal_ariadne_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = tmp_path / "campaign"
+    state = fresh_campaign_state(max_iterations=40, campaign_uid="cli-test")
+    state.phase = CampaignPhase.ARIADNE_ARRAY
+    state.iteration = 10
+    state.pending_jobs = {CampaignPhase.ARIADNE_ARRAY.value: "898513"}
+    terminal = {
+        "phase": CampaignPhase.ARIADNE_ARRAY.value,
+        "iteration": 10,
+        "replacement_round": 0,
+        "job_id": "898513",
+        "submission_identity": "r0000-a0001-fixture",
+        "ariadne_terminal_postprocess": True,
+        "n_completed": 199,
+        "n_retry": 1,
+        "target_status": "FAILED",
+        "reason": submission_intent.ARIADNE_TERMINAL_POSTPROCESS_REASON,
+    }
+    report = SimpleNamespace(
+        proposed_state=state,
+        active_submission_intents=[dict(terminal)],
+        unsafe_reasons=[
+            "scheduler-inconclusive prepared scratch task(s) preserve "
+            "job ownership: 898513@ARIADNE_ARRAY",
+            "active submission intent(s) present: "
+            "ARIADNE_ARRAY@10 job_id=898513",
+        ],
+        blocking_artifacts=[
+            "prepared scratch ownership",
+            "active submission intent(s)",
+        ],
+        scratch_inventory=[
+            {
+                "status": "prepared",
+                "phase": CampaignPhase.ARIADNE_ARRAY.value,
+                "iteration": 10,
+                "job_id": "898513",
+            }
+        ],
+        receipt_backed_intent_repairs=[],
+    )
+    calls = []
+
+    def propose(*_args, **kwargs):
+        calls.append(dict(kwargs))
+        return report
+
+    monkeypatch.setattr(cli_mod, "propose_recovery", propose)
+    snapshot = SimpleNamespace()
+
+    result = cli_mod._propose_recovery_after_cleanup(
+        campaign,
+        allow_fresh_init_on_nonempty=False,
+        active_reconcile_transaction_id="a" * 32,
+        artifact_snapshot=snapshot,
+        verification_level="authority",
+        terminal_recoveries=[terminal],
+    )
+
+    assert result is report
+    assert calls == [
+        {
+            "allow_fresh_init_on_nonempty": False,
+            "_active_reconcile_transaction_id": "a" * 32,
+            "_terminal_submission_intents": [terminal],
+            "artifact_snapshot": snapshot,
+            "verification_level": "authority",
+        }
+    ]
+    assert report.active_submission_intents == []
+    assert report.unsafe_reasons == []
+    assert report.blocking_artifacts == []
+    assert report.scratch_inventory[0]["status"] == "terminal_intent"
+    assert (
+        report.proposed_state.pending_jobs[CampaignPhase.ARIADNE_ARRAY.value]
+        is None
+    )
+    assert report.receipt_backed_intent_repairs == [terminal]
+
+
 def test_reconcile_terminal_scheduler_recovery_without_changes_uses_resume(
     tmp_path,
     monkeypatch,
