@@ -322,6 +322,15 @@ def test_status_allows_safe_environment_rebind_on_resume():
             "resource implementation ICHOR package-tree identity kind is unsupported",
             "legacy_identity_insufficient",
         ),
+        (
+            "prepared FEREBUS task map is missing: FEREBUS_TASK_MAP.json",
+            "interrupted_ferebus_staging",
+        ),
+        (
+            "backend_submission_failed: pre-submit staging failed for FEREBUS: "
+            "FerebusTaskRunnerError: FEREBUS task map is missing or symlinked",
+            "interrupted_ferebus_staging",
+        ),
     ],
 )
 def test_operator_failure_classifier_distinguishes_identity_failures(
@@ -349,6 +358,10 @@ def test_operator_failure_classifier_distinguishes_identity_failures(
         (
             "resource implementation ICHOR package-tree identity kind is unsupported",
             "affected tasks may need retry",
+        ),
+        (
+            "prepared FEREBUS task map is missing: FEREBUS_TASK_MAP.json",
+            "preview reconcile",
         ),
     ],
 )

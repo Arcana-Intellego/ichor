@@ -91,6 +91,7 @@ from .script_bundles import (
     AttemptBundle,
     bundle_root,
     prepare_attempt_bundle,
+    read_array_task_map,
     read_source_array_task_ids,
     scheduler_log_paths,
     write_attempt_script,
@@ -2919,6 +2920,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         staging: Path,
         *,
         n_tasks: int,
+        staging_context: Optional[Any] = None,
+        staging_context_resolver: Optional[Callable[[], Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Classify reusable FEREBUS tasks after an explicit cancellation."""
         from .ferebus_task_runner import (
@@ -2929,6 +2932,28 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
         recoveries = self._scheduler_cancel_recovery_sources(state, phase_name)
         if not recoveries:
             return None
+        from .ferebus_staging_recovery import (
+            FerebusStagingRecoveryContext,
+        )
+
+        if not isinstance(staging_context, FerebusStagingRecoveryContext):
+            raise BackendSubmissionError(
+                "FEREBUS terminal recovery requires a staging authority context"
+            )
+        if int(staging_context.n_tasks) != int(n_tasks):
+            raise BackendSubmissionError(
+                "FEREBUS staging authority task count changed before recovery"
+            )
+        recovery_identities = {
+            str(item["intent"].get("submission_identity") or "")
+            for item in recoveries
+        }
+        if recovery_identities != set(
+            staging_context.source_submission_identities
+        ):
+            raise BackendSubmissionError(
+                "FEREBUS staging authority and terminal receipts disagree"
+            )
         assessments = self._scheduler_recovery_environment_assessments(
             recoveries
         )
@@ -2969,35 +2994,113 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 "the canonical task map"
             )
         reusable = []
-        invalid = [
-            {
-                "task_id": int(task_id),
-                "reason": "environment_equivalence_unproven",
-            }
-            for task_id in sorted(
-                scheduler_completed_candidates.difference(
-                    completed_candidates
+        invalid = []
+        if not staging_context.has_authenticated_producer_task_map:
+            if staging_context.disposition not in {
+                "absent",
+                "input_only",
+                "partial_preparation",
+            }:
+                raise BackendSubmissionError(
+                    "FEREBUS terminal recovery has no task map in "
+                    + staging_context.disposition
+                    + " staging"
+                )
+            invalid.append(
+                {
+                    "scope": "staging",
+                    "reason": "producer_task_map_unavailable",
+                    "scheduler_completed_candidates": len(
+                        scheduler_completed_candidates
+                    ),
+                }
+            )
+        else:
+            invalid.extend(
+                {
+                    "task_id": int(task_id),
+                    "reason": "environment_equivalence_unproven",
+                }
+                for task_id in sorted(
+                    scheduler_completed_candidates.difference(
+                        completed_candidates
+                    )
                 )
             )
-        ]
-        for logical_task_id in sorted(completed_candidates):
-            try:
-                validate_task_receipt(staging, logical_task_id)
-            except (FerebusTaskRunnerError, OSError, ValueError) as exc:
-                invalid.append(
-                    {
-                        "task_id": int(logical_task_id),
-                        "reason": type(exc).__name__ + ": " + str(exc)[:160],
-                    }
-                )
-                continue
-            reusable.append(int(logical_task_id))
+            for logical_task_id in sorted(completed_candidates):
+                try:
+                    validate_task_receipt(staging, logical_task_id)
+                except (FerebusTaskRunnerError, OSError, ValueError) as exc:
+                    invalid.append(
+                        {
+                            "task_id": int(logical_task_id),
+                            "reason": type(exc).__name__
+                            + ": "
+                            + str(exc)[:160],
+                        }
+                    )
+                    continue
+                reusable.append(int(logical_task_id))
         reusable_set = set(reusable)
         retry = [
             logical_task_id
             for logical_task_id in range(int(n_tasks))
             if logical_task_id not in reusable_set
         ]
+        if staging_context_resolver is not None:
+            refreshed_context = staging_context_resolver()
+            if not isinstance(
+                refreshed_context,
+                FerebusStagingRecoveryContext,
+            ) or any(
+                left != right
+                for left, right in (
+                    (
+                        refreshed_context.disposition,
+                        staging_context.disposition,
+                    ),
+                    (
+                        refreshed_context.manifest_sha256,
+                        staging_context.manifest_sha256,
+                    ),
+                    (
+                        refreshed_context.manifest_identity_sha256,
+                        staging_context.manifest_identity_sha256,
+                    ),
+                    (
+                        refreshed_context.task_map_sha256,
+                        staging_context.task_map_sha256,
+                    ),
+                    (
+                        tuple(refreshed_context.source_submission_identities),
+                        tuple(staging_context.source_submission_identities),
+                    ),
+                    (
+                        tuple(refreshed_context.completed_logical_task_ids),
+                        tuple(staging_context.completed_logical_task_ids),
+                    ),
+                    (
+                        tuple(refreshed_context.retry_logical_task_ids),
+                        tuple(staging_context.retry_logical_task_ids),
+                    ),
+                )
+            ):
+                raise BackendSubmissionError(
+                    "FEREBUS staging recovery evidence changed during local "
+                    "candidate validation"
+                )
+            if staging_context.has_authenticated_producer_task_map:
+                for logical_task_id in reusable:
+                    try:
+                        validate_task_receipt(staging, logical_task_id)
+                    except (FerebusTaskRunnerError, OSError, ValueError) as exc:
+                        raise BackendSubmissionError(
+                            "FEREBUS reusable output changed before recovery "
+                            "ledger publication: "
+                            + type(exc).__name__
+                            + ": "
+                            + str(exc)
+                        ) from exc
         source_digest = hashlib.sha256(
             ",".join(
                 str(item["receipt"]["receipt_sha256"]) for item in recoveries
@@ -3047,6 +3150,12 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             "reusable_logical_task_ids": reusable,
             "retry_logical_task_ids": retry,
             "ledger": ledger,
+            "staging_disposition": staging_context.disposition,
+            "staging_has_task_map": bool(
+                staging_context.has_authenticated_producer_task_map
+            ),
+            "source_transaction_id": staging_context.source_transaction_id,
+            "original_job_ids": list(staging_context.source_job_ids),
         }
 
     def _recover_cancelled_diversity_phase(
@@ -3371,6 +3480,140 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 return result
             import inspect
 
+            from .ferebus_staging_recovery import (
+                FerebusStagingRecoveryContext,
+                archive_partial_ferebus_preparation,
+                classify_ferebus_staging_recovery,
+                is_redundant_committed_parent_staging,
+            )
+
+            artifact_snapshot = getattr(
+                self,
+                "_committed_artifact_snapshot",
+                None,
+            )
+
+            def _has_redundant_committed_parent_staging() -> bool:
+                if is_initial:
+                    return False
+                return is_redundant_committed_parent_staging(
+                    self.campaign_dir,
+                    campaign_uid=str(state.campaign_uid),
+                    target_reference_data_version=int(tv),
+                    parent_model_version=int(
+                        getattr(state, "models_version", -1)
+                    ),
+                    replacement_round=int(
+                        getattr(state, "replacement_round", 0)
+                    ),
+                    artifact_snapshot=artifact_snapshot,
+                    models_dir_name=self.models_dir_name,
+                )
+
+            def _classify_ferebus_staging() -> FerebusStagingRecoveryContext:
+                reference_view = None
+                if artifact_snapshot is not None:
+                    try:
+                        reference_view = artifact_snapshot.reference_view(tv)
+                        artifact_snapshot.assert_ferebus_heads_unchanged(
+                            self.campaign_dir,
+                            reference_version=int(tv),
+                            parent_model_version=(
+                                None
+                                if is_initial
+                                else int(getattr(state, "models_version", tv - 1))
+                            ),
+                        )
+                    except Exception as exc:
+                        raise BackendSubmissionError(
+                            "FEREBUS reference authority changed during staging "
+                            "recovery: "
+                            + type(exc).__name__
+                            + ": "
+                            + str(exc)
+                        ) from exc
+                try:
+                    context = classify_ferebus_staging_recovery(
+                        self.campaign_dir,
+                        campaign_uid=str(state.campaign_uid),
+                        phase=phase_name,
+                        iteration=int(getattr(state, "iteration", 0)),
+                        replacement_round=int(
+                            getattr(state, "replacement_round", 0)
+                        ),
+                        reference_data_version=int(tv),
+                        reference_head_manifest_sha256=(
+                            None
+                            if reference_view is None
+                            else str(reference_view.head_manifest_sha256)
+                        ),
+                        reference_view_sha256=(
+                            None
+                            if reference_view is None
+                            else str(reference_view.cumulative_view_sha256)
+                        ),
+                        config=self.config,
+                        models_dir_name=self.models_dir_name,
+                    )
+                except Exception as exc:
+                    raise BackendSubmissionError(
+                        "FEREBUS staging recovery evidence could not be "
+                        "authenticated: "
+                        + type(exc).__name__
+                        + ": "
+                        + str(exc)
+                    ) from exc
+                if context.disposition == "contradictory":
+                    raise BackendSubmissionError(
+                        "FEREBUS staging recovery evidence is contradictory: "
+                        + str(context.reason)
+                    )
+                return context
+
+            initial_staging_context = (
+                None
+                if _has_redundant_committed_parent_staging()
+                else _classify_ferebus_staging()
+            )
+            if (
+                initial_staging_context is not None
+                and initial_staging_context.requires_restore
+            ):
+                raise BackendSubmissionError(
+                    "FEREBUS terminal producer staging is archived by an "
+                    "interrupted reconcile; run reconcile --apply before resume"
+                )
+            if (
+                initial_staging_context is not None
+                and initial_staging_context.disposition == "partial_preparation"
+            ):
+                from . import submission_intent as _preparation_intent
+
+                preparation_intent = _preparation_intent.load_active_intent(
+                    self.campaign_dir,
+                    phase_name,
+                    int(getattr(state, "iteration", 0)),
+                    expected_campaign_uid=str(state.campaign_uid),
+                )
+                if (
+                    not isinstance(preparation_intent, Mapping)
+                    or str(preparation_intent.get("status") or "")
+                    != "PRE_SUBMIT"
+                ):
+                    raise BackendSubmissionError(
+                        "partial FEREBUS preparation has no active PRE_SUBMIT intent"
+                    )
+                archive_partial_ferebus_preparation(
+                    self.campaign_dir,
+                    initial_staging_context,
+                    attempt_id=str(preparation_intent.get("attempt_id") or ""),
+                )
+                initial_staging_context = _classify_ferebus_staging()
+                if initial_staging_context.disposition != "absent":
+                    raise BackendSubmissionError(
+                        "partial FEREBUS preparation could not be reset safely"
+                    )
+
             try:
                 stage_parameters = inspect.signature(
                     _stg.stage_ferebus_inputs
@@ -3439,12 +3682,24 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         scheduler_jobs_submitted=0,
                     )
                 return result
+            staging_context = _classify_ferebus_staging()
+            if staging_context.requires_restore:
+                raise BackendSubmissionError(
+                    "FEREBUS terminal producer staging must be restored by "
+                    "reconcile before scheduler submission"
+                )
+            if staging_context.disposition == "absent":
+                raise BackendSubmissionError(
+                    "FEREBUS input staging disappeared after preparation"
+                )
             ferebus_recovery = (
                 self._prepare_scheduler_cancelled_ferebus_recovery(
                     state,
                     phase_name,
                     staging,
                     n_tasks=expected_ferebus_tasks,
+                    staging_context=staging_context,
+                    staging_context_resolver=_classify_ferebus_staging,
                 )
             )
             ferebus_retry_ids = (
@@ -3472,6 +3727,15 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         )
                     ),
                     recovery_source="scheduler_cancellation",
+                    staging_disposition=str(
+                        ferebus_recovery.get("staging_disposition") or ""
+                    ),
+                    source_transaction_id=ferebus_recovery.get(
+                        "source_transaction_id"
+                    ),
+                    original_job_ids=list(
+                        ferebus_recovery.get("original_job_ids") or []
+                    ),
                 )
             if not ferebus_retry_ids:
                 return self._parse_ferebus_postprocess(
@@ -3479,7 +3743,10 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     phase_name,
                     [],
                 )
-            if ferebus_recovery is not None:
+            if (
+                ferebus_recovery is not None
+                and bool(ferebus_recovery.get("staging_has_task_map"))
+            ):
                 from .ferebus_task_runner import quarantine_task_outputs
 
                 quarantine_root = (
@@ -3567,6 +3834,13 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 else resources.walltime_for(phase_name) if resources is not None else 24
             )
             prepared: Dict[str, Any] = {}
+            reuse_prepared_inputs = staging_context.disposition in {
+                "prepared",
+                "terminal_producer",
+            }
+            require_existing_task_map_match = (
+                staging_context.disposition == "terminal_producer"
+            )
 
             def _prepared_ferebus_runtime(
                 _working_dir: Path,
@@ -3714,6 +3988,58 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 script_path: Path,
                 script_binding: Mapping[str, Any],
             ) -> None:
+                current_staging = _classify_ferebus_staging()
+                if current_staging.disposition not in {
+                    "prepared",
+                    "terminal_producer",
+                }:
+                    raise BackendSubmissionError(
+                        "FEREBUS generated runtime changed before scheduler "
+                        "submission: "
+                        + current_staging.disposition
+                    )
+                if (
+                    int(current_staging.n_tasks) != expected_ferebus_tasks
+                    or current_staging.manifest_identity_sha256
+                    != staging_context.manifest_identity_sha256
+                    or tuple(current_staging.source_submission_identities)
+                    != tuple(staging_context.source_submission_identities)
+                    or tuple(current_staging.completed_logical_task_ids)
+                    != tuple(staging_context.completed_logical_task_ids)
+                    or tuple(current_staging.retry_logical_task_ids)
+                    != tuple(staging_context.retry_logical_task_ids)
+                    or tuple(current_staging.source_job_ids)
+                    != tuple(staging_context.source_job_ids)
+                ):
+                    raise BackendSubmissionError(
+                        "FEREBUS staging authority changed before scheduler "
+                        "submission"
+                    )
+                if (
+                    staging_context.has_authenticated_task_map
+                    and current_staging.task_map_sha256
+                    != staging_context.task_map_sha256
+                ):
+                    raise BackendSubmissionError(
+                        "FEREBUS producer task map changed before scheduler "
+                        "submission"
+                    )
+                if bundle.array_task_map is None or tuple(
+                    read_array_task_map(bundle.array_task_map)
+                ) != tuple(ferebus_retry_ids):
+                    raise BackendSubmissionError(
+                        "FEREBUS retry task map changed before scheduler submission"
+                    )
+                if (
+                    ferebus_recovery is not None
+                    and bool(ferebus_recovery.get("staging_has_task_map"))
+                ):
+                    from .ferebus_task_runner import validate_task_receipt
+
+                    for logical_task_id in ferebus_recovery[
+                        "reusable_logical_task_ids"
+                    ]:
+                        validate_task_receipt(staging, int(logical_task_id))
                 _submission_intent.bind_submission_script(
                     self.campaign_dir,
                     phase_name,
@@ -3723,6 +4049,21 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     binding_path=str(script_binding["path"]),
                     binding_sha256=str(script_binding["sha256"]),
                 )
+                rebound_intent = _submission_intent.load_active_intent(
+                    self.campaign_dir,
+                    phase_name,
+                    int(getattr(state, "iteration", 0)),
+                    expected_campaign_uid=str(state.campaign_uid),
+                )
+                if (
+                    not isinstance(rebound_intent, Mapping)
+                    or str(rebound_intent.get("status") or "") != "PRE_SUBMIT"
+                    or str(rebound_intent.get("submission_identity") or "")
+                    != identity
+                ):
+                    raise BackendSubmissionError(
+                        "FEREBUS submission intent changed before scheduler acceptance"
+                    )
 
             from ..ferebus_prior import backend_kernel_token
 
@@ -3756,12 +4097,9 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                 expected_tasks=expected_ferebus_tasks,
                 submitted_tasks=len(ferebus_retry_ids),
                 scheduler_task_map=bundle.array_task_map,
-                reuse_prepared_inputs=(ferebus_recovery is not None),
-                require_existing_task_map_match=bool(
-                    ferebus_recovery is not None
-                    and ferebus_recovery[
-                        "reusable_logical_task_ids"
-                    ]
+                reuse_prepared_inputs=reuse_prepared_inputs,
+                require_existing_task_map_match=(
+                    require_existing_task_map_match
                 ),
                 expected_job_name=expected_job_name,
                 submit_runner=self.sbatch_runner,

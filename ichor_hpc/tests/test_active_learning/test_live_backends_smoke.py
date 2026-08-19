@@ -1750,6 +1750,7 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
     )
 
     cfg = CampaignConfig()
+    cfg.system_name = "WATER"
     prior = resolve_ferebus_prior_contract(cfg)
     cfg.resources.default_walltime_hours = 9
     cfg.resources.ferebus_walltime_hours = 2
@@ -1785,7 +1786,7 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
     }
     row_identity_payload = {
         "schema_version": stg.FEREBUS_ROW_IDENTITIES_SCHEMA_VERSION,
-        "campaign_uid": "backend-smoke",
+        "campaign_uid": "campaign-uid",
         "reference_data_version": 4,
         "reference_data_view_sha256": "b" * 64,
         "source_rows": source_rows,
@@ -1844,7 +1845,7 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
         json.dumps(
             {
                 "schema_version": stg.FEREBUS_TASK_SCHEMA_VERSION,
-                "campaign_uid": "backend-smoke",
+                "campaign_uid": "campaign-uid",
                 "system": "WATER",
                 "reference_data_version": 4,
                 "reference_data_head_manifest_sha256": "a" * 64,
@@ -1855,6 +1856,7 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
                 "atoms": ["O1", "H2", "H3"],
                 "n_atoms": 3,
                 "n_tasks": 3,
+                "job_details": stg.FEREBUS_JOB_DETAILS,
                 "prior_mean_contract": prior.to_dict(),
                 "kernel_contract": {
                     "family": "periodic_rbf",
@@ -1987,6 +1989,10 @@ def test_live_ferebus_submit_uses_pyferebus_wrapper(tmp_path, monkeypatch):
             json.dumps(manifest), encoding="utf-8", newline="\n"
         )
         overrides = kwargs["prepared_callback"](working, script, generated)
+        pyferebus_wrap._write_structured_task_map(
+            working,
+            executable=overrides.get("path_to_executable") or "ferebus",
+        )
         submitted_script = Path(overrides["submission_script_path"])
         submitted_script.write_text("#!/bin/sh\n", encoding="utf-8")
         from ichor.hpc.active_learning.daemon.script_bundles import (

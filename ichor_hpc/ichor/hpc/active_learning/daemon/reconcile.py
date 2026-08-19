@@ -422,6 +422,7 @@ class ReconciliationReport:
     ariadne_results_recovery: Optional[Dict[str, Any]] = None
     ariadne_publication_recovery: Optional[Dict[str, Any]] = None
     ferebus_candidate_recovery: Optional[Dict[str, Any]] = None
+    ferebus_staging_recovery: Optional[Dict[str, Any]] = None
     aimall_quality_revalidation: Optional[Dict[str, Any]] = None
     bootstrap_handoff: Optional[Dict[str, Any]] = None
     phase_a_handoff: Optional[Dict[str, Any]] = None
@@ -2089,6 +2090,196 @@ def propose_recovery(
     has_model_iteration_staging = model_iteration_staging.is_dir()
     recoverable_ferebus_staging = False
     recoverable_ferebus_reason = ""
+    ferebus_staging_recovery: Optional[Dict[str, Any]] = None
+    ferebus_recovery_phase = None
+    ferebus_recovery_iteration = None
+    if last_phase in {
+        CampaignPhase.INITIAL_FEREBUS.value,
+        CampaignPhase.FEREBUS.value,
+    }:
+        ferebus_recovery_phase = str(last_phase)
+        ferebus_recovery_iteration = int(
+            last_iter if last_iter is not None else 0
+        )
+    elif existing is not None and existing.phase in {
+        CampaignPhase.INITIAL_FEREBUS,
+        CampaignPhase.FEREBUS,
+    }:
+        ferebus_recovery_phase = existing.phase.value
+        ferebus_recovery_iteration = int(existing.iteration)
+    elif existing is not None and isinstance(existing.lifecycle_context, dict):
+        lifecycle_phase = str(
+            existing.lifecycle_context.get("from_phase") or ""
+        )
+        if lifecycle_phase in {
+            CampaignPhase.INITIAL_FEREBUS.value,
+            CampaignPhase.FEREBUS.value,
+        }:
+            ferebus_recovery_phase = lifecycle_phase
+            ferebus_recovery_iteration = int(existing.iteration)
+    snapshot_reference_versions = tuple(
+        getattr(artifact_snapshot, "valid_reference_data_versions", ())
+        if artifact_snapshot is not None
+        else ()
+    )
+    snapshot_model_versions = tuple(
+        getattr(artifact_snapshot, "valid_model_versions", ())
+        if artifact_snapshot is not None
+        else ()
+    )
+    if (
+        ferebus_recovery_phase is None
+        and snapshot_reference_versions
+        and (
+            not snapshot_model_versions
+            or max(snapshot_reference_versions)
+            == max(snapshot_model_versions) + 1
+        )
+    ):
+        ferebus_recovery_iteration = int(max(snapshot_reference_versions))
+        ferebus_recovery_phase = (
+            CampaignPhase.INITIAL_FEREBUS.value
+            if ferebus_recovery_iteration == 0
+            else CampaignPhase.FEREBUS.value
+        )
+    ferebus_recovery_uid = (
+        str(existing.campaign_uid)
+        if existing is not None
+        else (
+            str(artifact_snapshot.campaign_uids[0])
+            if artifact_snapshot is not None
+            and len(set(artifact_snapshot.campaign_uids)) == 1
+            else None
+        )
+    )
+    if (
+        ferebus_recovery_phase is not None
+        and ferebus_recovery_iteration is not None
+        and ferebus_recovery_uid is not None
+    ):
+        try:
+            from ..config import CampaignConfig
+            from .ferebus_staging_recovery import (
+                classify_ferebus_staging_recovery,
+                is_redundant_committed_parent_staging,
+            )
+
+            ferebus_config = None
+            config_path = campaign / "campaign.yaml"
+            if config_path.is_file() and not config_path.is_symlink():
+                try:
+                    ferebus_config = CampaignConfig.from_yaml(config_path)
+                except Exception:
+                    # Reconcile's existing configuration review owns the
+                    # user-facing malformed-config decision.
+                    ferebus_config = None
+            reference_view = (
+                artifact_snapshot.reference_view(ferebus_recovery_iteration)
+                if artifact_snapshot is not None
+                and ferebus_recovery_iteration
+                in set(artifact_snapshot.valid_reference_data_versions)
+                else None
+            )
+            parent_model_version = int(
+                getattr(existing, "models_version", -1)
+                if existing is not None
+                else (
+                    max(snapshot_model_versions)
+                    if snapshot_model_versions
+                    else -1
+                )
+            )
+            redundant_parent_staging = (
+                ferebus_recovery_phase == CampaignPhase.FEREBUS.value
+                and is_redundant_committed_parent_staging(
+                    campaign,
+                    campaign_uid=ferebus_recovery_uid,
+                    target_reference_data_version=ferebus_recovery_iteration,
+                    parent_model_version=parent_model_version,
+                    replacement_round=int(
+                        getattr(existing, "replacement_round", 0)
+                        if existing is not None
+                        else 0
+                    ),
+                    artifact_snapshot=artifact_snapshot,
+                )
+            )
+            if redundant_parent_staging:
+                recoverable_ferebus_staging = True
+                recoverable_ferebus_reason = (
+                    "FEREBUS iteration-staging belongs to authenticated "
+                    "committed model parent "
+                    + str(parent_model_version)
+                )
+            else:
+                staging_recovery = classify_ferebus_staging_recovery(
+                    campaign,
+                    campaign_uid=ferebus_recovery_uid,
+                    phase=ferebus_recovery_phase,
+                    iteration=ferebus_recovery_iteration,
+                    replacement_round=int(
+                        getattr(existing, "replacement_round", 0)
+                        if existing is not None
+                        else 0
+                    ),
+                    reference_data_version=ferebus_recovery_iteration,
+                    reference_head_manifest_sha256=(
+                        None
+                        if reference_view is None
+                        else str(reference_view.head_manifest_sha256)
+                    ),
+                    reference_view_sha256=(
+                        None
+                        if reference_view is None
+                        else str(reference_view.cumulative_view_sha256)
+                    ),
+                    config=ferebus_config,
+                )
+                ferebus_staging_recovery = staging_recovery.summary()
+                if staging_recovery.disposition == "contradictory":
+                    unsafe_reasons.append(
+                        "FEREBUS staging recovery evidence is contradictory: "
+                        + str(staging_recovery.reason)[:300]
+                    )
+                    blocking_artifacts.append("FEREBUS staging recovery")
+                elif (
+                    staging_recovery.source_submission_identities
+                    and staging_recovery.disposition
+                    in {
+                        "absent",
+                        "input_only",
+                        "terminal_producer",
+                        "archived_terminal_producer",
+                    }
+                ):
+                    recoverable_ferebus_staging = True
+                    if (
+                        staging_recovery.disposition
+                        == "archived_terminal_producer"
+                    ):
+                        recoverable_ferebus_reason = (
+                            "FEREBUS terminal producer staging is recoverable "
+                            "from reconcile transaction "
+                            + str(staging_recovery.source_transaction_id)
+                        )
+                    elif staging_recovery.disposition == "terminal_producer":
+                        recoverable_ferebus_reason = (
+                            "FEREBUS iteration-staging is bound to terminal "
+                            "scheduler producer evidence"
+                        )
+                    else:
+                        recoverable_ferebus_reason = (
+                            "FEREBUS inputs are safe for a fresh retry because "
+                            "no recoverable producer outputs remain"
+                        )
+        except Exception as exc:
+            unsafe_reasons.append(
+                "FEREBUS staging recovery inspection failed: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:300]
+            )
+            blocking_artifacts.append("FEREBUS staging recovery")
     if (
         has_model_iteration_staging
         and not model_iteration_staging.is_symlink()
@@ -2256,10 +2447,16 @@ def propose_recovery(
         blocking_artifacts.append("dangling reference-data staging")
     if recoverable_ferebus_staging:
         trusted_artifacts.append(recoverable_ferebus_reason)
-        notes.append(
-            "complete FEREBUS staging is protected for quality-policy "
-            "reevaluation or idempotent commit"
-        )
+        if isinstance(ferebus_staging_recovery, dict):
+            notes.append(
+                "FEREBUS staging recovery disposition: "
+                + str(ferebus_staging_recovery.get("disposition") or "unknown")
+            )
+        else:
+            notes.append(
+                "complete FEREBUS staging is protected for quality-policy "
+                "reevaluation or idempotent commit"
+            )
     if dangling_models or (has_model_iteration_staging and not recoverable_ferebus_staging):
         unsafe_reasons.append("dangling model staging directories exist")
         blocking_artifacts.append("dangling model staging")
@@ -3054,39 +3251,71 @@ def propose_recovery(
         and not active_intents
         and not unsafe_reasons
     ):
-        handoff_recovery = None
-        if combined_handoffs:
-            handoff_recovery = max(
-                combined_handoffs,
-                key=lambda decision: _RECOVERY_PHASE_PROGRESS.get(
-                    decision.phase,
-                    -1,
+        if (
+            isinstance(ferebus_staging_recovery, dict)
+            and ferebus_staging_recovery.get("source_submission_identities")
+            and str(ferebus_staging_recovery.get("disposition") or "")
+            in {
+                "absent",
+                "input_only",
+                "terminal_producer",
+                "archived_terminal_producer",
+            }
+        ):
+            phase_recovery = RecoveryDecision(
+                phase=CampaignPhase(
+                    str(ferebus_staging_recovery["phase"])
+                ),
+                iteration=int(ferebus_staging_recovery["iteration"]),
+                replacement_round=int(
+                    ferebus_staging_recovery.get("replacement_round") or 0
+                ),
+                reason=(
+                    "recover interrupted FEREBUS producer staging and validate "
+                    "scheduler-completed task candidates"
+                ),
+                trusted_artifact=str(
+                    ferebus_staging_recovery.get("producer_path") or ""
                 ),
             )
-        if (
-            partial_array_decision is not None
-            and (
-                handoff_recovery is None
-                or _RECOVERY_PHASE_PROGRESS.get(partial_array_decision.phase, -1)
-                >= _RECOVERY_PHASE_PROGRESS.get(handoff_recovery.phase, -1)
-            )
-        ):
-            phase_recovery = partial_array_decision
-        elif handoff_recovery is not None:
-            phase_recovery = handoff_recovery
         else:
-            phase_recovery = select_recovery_phase(
-                campaign,
-                recovered,
-                valid_reference_data_versions=valid_reference_data_versions,
-                valid_model_versions=valid_model_versions,
-                existing_loaded=existing_loaded,
-                last_phase=last_phase,
-                last_iteration=last_iter,
-                last_phase_retryable=last_phase_retryable,
-                verification=verification_level,
-                artifact_snapshot=artifact_snapshot,
-            )
+            handoff_recovery = None
+            if combined_handoffs:
+                handoff_recovery = max(
+                    combined_handoffs,
+                    key=lambda decision: _RECOVERY_PHASE_PROGRESS.get(
+                        decision.phase,
+                        -1,
+                    ),
+                )
+            if (
+                partial_array_decision is not None
+                and (
+                    handoff_recovery is None
+                    or _RECOVERY_PHASE_PROGRESS.get(
+                        partial_array_decision.phase, -1
+                    )
+                    >= _RECOVERY_PHASE_PROGRESS.get(
+                        handoff_recovery.phase, -1
+                    )
+                )
+            ):
+                phase_recovery = partial_array_decision
+            elif handoff_recovery is not None:
+                phase_recovery = handoff_recovery
+            else:
+                phase_recovery = select_recovery_phase(
+                    campaign,
+                    recovered,
+                    valid_reference_data_versions=valid_reference_data_versions,
+                    valid_model_versions=valid_model_versions,
+                    existing_loaded=existing_loaded,
+                    last_phase=last_phase,
+                    last_iteration=last_iter,
+                    last_phase_retryable=last_phase_retryable,
+                    verification=verification_level,
+                    artifact_snapshot=artifact_snapshot,
+                )
         _append_recovery_candidate(recovery_candidates, phase_recovery)
 
     # choose a safe re-entry phase. If we have NOTHING committed, start at
@@ -3487,6 +3716,11 @@ def propose_recovery(
             else None
         ),
         ferebus_candidate_recovery=ferebus_candidate_recovery,
+        ferebus_staging_recovery=(
+            dict(ferebus_staging_recovery)
+            if isinstance(ferebus_staging_recovery, dict)
+            else None
+        ),
         bootstrap_handoff=bootstrap_handoff,
         phase_a_handoff=phase_a_handoff,
         artifact_snapshot=artifact_snapshot,

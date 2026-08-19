@@ -620,6 +620,20 @@ def test_ferebus_runner_keeps_success_when_optional_quality_fails(
     assert receipt["exit_code"] == 0
     assert "quality_measurement" not in receipt
     assert validate_task_receipts(tmp_path)["n_tasks"] == 1
+    from ichor.hpc.active_learning.daemon.ferebus_staging_recovery import (
+        _inspect_tree,
+    )
+
+    inspection = _inspect_tree(tmp_path)
+    assert inspection.disposition == "prepared"
+    assert inspection.producer_bound_task_ids == (0,)
+
+    model.write_bytes(b"changed-after-receipt")
+    changed = _inspect_tree(tmp_path)
+    assert changed.disposition == "prepared"
+    assert changed.producer_bound_task_ids == (0,)
+    with pytest.raises(FerebusTaskRunnerError):
+        task_runner.validate_task_receipt(tmp_path, 0)
 
 
 def test_submit_ferebus_keeps_sbatch_directives_before_shell_commands(tmp_path):

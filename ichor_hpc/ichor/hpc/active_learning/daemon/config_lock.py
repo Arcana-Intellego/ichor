@@ -1713,10 +1713,14 @@ def clean_reentry_staging(
     phase: CampaignPhase,
     *,
     archive_identity: Optional[str] = None,
+    preserve_ferebus_iteration_staging: bool = False,
 ) -> List[str]:
     campaign = Path(campaign_dir)
     archived: List[str] = []
-    if phase in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS):
+    if (
+        phase in (CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS)
+        and not preserve_ferebus_iteration_staging
+    ):
         target = trained_models_dir(campaign) / "iteration-staging"
         if target.exists():
             _ensure_inside_campaign(campaign, target)
@@ -1908,6 +1912,7 @@ def clean_model_iteration_staging_for_reconcile(
     verification: str = "authority",
     artifact_snapshot: Optional[Any] = None,
     archive_identity: Optional[str] = None,
+    preserve_ferebus_iteration_staging: bool = False,
 ) -> List[str]:
     campaign = Path(campaign_dir)
     with trained_models_commit_lock(campaign):
@@ -1917,6 +1922,9 @@ def clean_model_iteration_staging_for_reconcile(
             verification=verification,
             artifact_snapshot=artifact_snapshot,
             archive_identity=archive_identity,
+            preserve_ferebus_iteration_staging=(
+                preserve_ferebus_iteration_staging
+            ),
         )
 
 
@@ -1927,6 +1935,7 @@ def _clean_model_iteration_staging_locked(
     verification: str = "authority",
     artifact_snapshot: Optional[Any] = None,
     archive_identity: Optional[str] = None,
+    preserve_ferebus_iteration_staging: bool = False,
 ) -> List[str]:
     model_versioning = TrainedModelVersioning(trained_models_dir(campaign))
     archived_paths: List[str] = []
@@ -1945,6 +1954,9 @@ def _clean_model_iteration_staging_locked(
         )
         dangling.rename(archive)
         archived_paths.append(str(archive))
+
+    if preserve_ferebus_iteration_staging:
+        return archived_paths
 
     target = model_versioning.parent / "iteration-staging"
     if not target.exists():

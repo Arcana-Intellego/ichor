@@ -533,6 +533,8 @@ def _live_smoke_config(campaign_dir):
     )
 
     config = CampaignConfig(max_iterations=1, poll_interval_seconds=1)
+    config.system_name = "WATER"
+    config.ferebus.kernel = "rbf"
     config.point_allocation.bootstrap_training_size = 2
     config.point_allocation.bootstrap_internal_validation_size = 2
     config.point_allocation.bootstrap_external_validation_size = 2

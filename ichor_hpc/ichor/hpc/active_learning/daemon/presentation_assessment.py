@@ -112,6 +112,28 @@ def classify_operator_failure(value: Any) -> OperatorFailureAssessment:
                 "then preview reconcile"
             ),
         )
+    if "FEREBUS" in upper and any(
+        token in upper
+        for token in (
+            "STAGING RECOVERY",
+            "PRODUCER STAGING",
+            "PRODUCER TASK MAP",
+            "PREPARED FEREBUS TASK MAP IS MISSING",
+            "FEREBUS TASK MAP IS MISSING",
+            "FEREBUS_TASK_MAP.JSON",
+        )
+    ):
+        return OperatorFailureAssessment(
+            family="interrupted_ferebus_staging",
+            summary=(
+                "FEREBUS runtime preparation was interrupted while recoverable "
+                "producer evidence remained"
+            ),
+            action=(
+                "preview reconcile so the recorded FEREBUS producer staging "
+                "can be restored before resume"
+            ),
+        )
     if any(
         token in upper
         for token in (

@@ -904,6 +904,18 @@ def _halt_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecom
                 command=_reconcile_cmd(campaign),
             )
         failure = classify_operator_failure(reason)
+        if failure.family == "interrupted_ferebus_staging":
+            return StatusRecommendation(
+                code="halted_backend_submission_failed",
+                severity="required",
+                primary=failure.action,
+                why=failure.summary,
+                command=_reconcile_cmd(campaign),
+                details=[
+                    "reconcile submits no scheduler work",
+                    "resume validates historical outputs before retrying only unresolved tasks",
+                ],
+            )
         if failure.family in {
             "ichor_source_drift",
             "ariadne_native_drift",

@@ -143,6 +143,11 @@ from .daemon.reconcile import (
     stateful_campaign_artifacts,
     write_proposed_state,
 )
+from .daemon.ferebus_staging_recovery import (
+    classify_ferebus_staging_recovery,
+    is_redundant_committed_parent_staging,
+    restore_archived_ferebus_producer_staging,
+)
 from .daemon.artifact_snapshot import (
     ArtefactSnapshotError,
     build_committed_artifact_snapshot,
@@ -8359,6 +8364,109 @@ def _load_scheduler_recovery_status(
         }
 
 
+def _ferebus_staging_presentation_evidence(
+    campaign: Path,
+    state: CampaignState,
+    *,
+    artifact_snapshot: Optional[Any],
+    config: Optional[CampaignConfig] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return control-only FEREBUS staging recovery evidence for operators."""
+    if state.phase not in {
+        CampaignPhase.INITIAL_FEREBUS,
+        CampaignPhase.FEREBUS,
+    }:
+        return None
+    if (
+        state.phase == CampaignPhase.FEREBUS
+        and is_redundant_committed_parent_staging(
+            campaign,
+            campaign_uid=str(state.campaign_uid),
+            target_reference_data_version=int(state.reference_data_version),
+            parent_model_version=int(state.models_version),
+            replacement_round=int(state.replacement_round),
+            artifact_snapshot=artifact_snapshot,
+        )
+    ):
+        return None
+    try:
+        reference_view = (
+            None
+            if artifact_snapshot is None
+            else artifact_snapshot.reference_view(
+                int(state.reference_data_version)
+            )
+        )
+        context = classify_ferebus_staging_recovery(
+            campaign,
+            campaign_uid=str(state.campaign_uid),
+            phase=state.phase.value,
+            iteration=int(state.iteration),
+            replacement_round=int(state.replacement_round),
+            reference_data_version=int(state.reference_data_version),
+            reference_head_manifest_sha256=(
+                None
+                if reference_view is None
+                else str(reference_view.head_manifest_sha256)
+            ),
+            reference_view_sha256=(
+                None
+                if reference_view is None
+                else str(reference_view.cumulative_view_sha256)
+            ),
+            config=config,
+        )
+        return context.summary()
+    except Exception as exc:
+        return {
+            "disposition": "contradictory",
+            "reason": type(exc).__name__ + ": " + str(exc),
+        }
+
+
+def _ferebus_recovery_ledger_has_missing_map_failure(
+    campaign: Path,
+    state: CampaignState,
+) -> bool:
+    """Identify ledgers produced by the historical per-task map-missing bug."""
+    if state.phase not in {
+        CampaignPhase.INITIAL_FEREBUS,
+        CampaignPhase.FEREBUS,
+    }:
+        return False
+    try:
+        from .daemon.scheduler_recovery import (
+            phase_recovery_ledger_path,
+            read_phase_recovery_ledger,
+        )
+
+        path = phase_recovery_ledger_path(
+            campaign,
+            phase=state.phase.value,
+            iteration=int(state.iteration),
+            replacement_round=int(state.replacement_round),
+        )
+        if not path.is_file() or path.is_symlink():
+            return False
+        ledger = read_phase_recovery_ledger(path)
+        invalid = ledger.get("invalid_completed_tasks")
+        if not isinstance(invalid, list) or not invalid:
+            return False
+        reasons = [
+            str(item.get("reason") or "").upper()
+            for item in invalid
+            if isinstance(item, Mapping)
+        ]
+        return bool(reasons) and all(
+            "TASK MAP" in reason
+            or "TASK_MAP" in reason
+            or "FEREBUS_TASK_MAP.JSON" in reason
+            for reason in reasons
+        )
+    except Exception:
+        return False
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     campaign = resolve_campaign_dir(
         args.campaign_dir,
@@ -8698,6 +8806,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         config_review_status = invalid_config_review_evidence(
             type(exc).__name__ + ": " + str(exc)
         )
+    status_snapshot: Optional[Any] = None
     try:
         from .daemon.artifact_contracts import (
             artifact_manifest_status,
@@ -8749,6 +8858,66 @@ def cmd_status(args: argparse.Namespace) -> int:
         campaign,
         state,
     )
+    ferebus_staging_evidence = _ferebus_staging_presentation_evidence(
+        campaign,
+        state,
+        artifact_snapshot=status_snapshot,
+        config=cfg,
+    )
+    if isinstance(ferebus_staging_evidence, Mapping):
+        presentation_payload[
+            "_presentation_ferebus_staging_recovery"
+        ] = dict(ferebus_staging_evidence)
+        disposition = str(
+            ferebus_staging_evidence.get("disposition") or ""
+        )
+        if disposition == "contradictory":
+            scheduler_recovery_status = {
+                "state": "invalid",
+                "phase": state.phase.value,
+                "iteration": int(state.iteration),
+                "replacement_round": int(state.replacement_round),
+                "error": str(
+                    ferebus_staging_evidence.get("reason")
+                    or "FEREBUS staging recovery evidence is contradictory"
+                ),
+            }
+        elif (
+            ferebus_staging_evidence.get("source_submission_identities")
+            and (
+                scheduler_recovery_status is None
+                or disposition == "archived_terminal_producer"
+                or _ferebus_recovery_ledger_has_missing_map_failure(
+                    campaign,
+                    state,
+                )
+            )
+        ):
+            scheduler_recovery_status = {
+                "state": "awaiting_validation",
+                "phase": state.phase.value,
+                "iteration": int(state.iteration),
+                "replacement_round": int(state.replacement_round),
+                "n_terminal_receipts": len(
+                    ferebus_staging_evidence.get(
+                        "terminal_receipt_paths", []
+                    )
+                ),
+                "n_scheduler_completed": int(
+                    ferebus_staging_evidence.get(
+                        "scheduler_completed_candidates", 0
+                    )
+                ),
+                "n_scheduler_retry": int(
+                    ferebus_staging_evidence.get(
+                        "known_retry_candidates", 0
+                    )
+                ),
+                "original_job_ids": list(
+                    ferebus_staging_evidence.get("source_job_ids", [])
+                ),
+                "staging_disposition": disposition,
+            }
     if scheduler_recovery_status is not None:
         presentation_payload[
             "_presentation_scheduler_recovery"
@@ -10758,6 +10927,7 @@ def _perform_reconcile_apply_mutations(
     data_staging_archive_mode: Optional[str],
     verification: str = "authority",
     artifact_snapshot: Optional[Any] = None,
+    campaign_config: Optional[CampaignConfig] = None,
 ) -> Dict[str, Any]:
     """Perform only lossless, transaction-recorded reconcile mutations."""
     transaction_payload = getattr(transaction, "payload", None)
@@ -10774,6 +10944,7 @@ def _perform_reconcile_apply_mutations(
         "archived_scripts": [],
         "archived_data_staging": [],
         "archived_model_staging": [],
+        "ferebus_staging_restore": None,
         "archived_reference_data_staging": [],
         "archived_reentry_staging": [],
         "archived_ariadne_publication": [],
@@ -10870,6 +11041,84 @@ def _perform_reconcile_apply_mutations(
             result["ferebus_retrain_archive"] = [str(archived)]
             transaction.record_paths("archive_ferebus_retrain", [str(archived)])
 
+    ferebus_staging = getattr(report, "ferebus_staging_recovery", None)
+    preserve_ferebus_iteration_staging = (
+        isinstance(ferebus_staging, Mapping)
+        and str(ferebus_staging.get("disposition") or "")
+        in {"terminal_producer", "archived_terminal_producer"}
+    )
+    if (
+        isinstance(ferebus_staging, Mapping)
+        and str(ferebus_staging.get("disposition") or "")
+        == "archived_terminal_producer"
+    ):
+        reference_version = int(
+            ferebus_staging.get("iteration")
+            if ferebus_staging.get("iteration") is not None
+            else report.proposed_state.reference_data_version
+        )
+        reference_view = (
+            artifact_snapshot.reference_view(reference_version)
+            if artifact_snapshot is not None
+            else None
+        )
+        current_context = classify_ferebus_staging_recovery(
+            campaign,
+            campaign_uid=str(report.proposed_state.campaign_uid),
+            phase=str(ferebus_staging.get("phase") or ""),
+            iteration=int(ferebus_staging.get("iteration") or 0),
+            replacement_round=int(
+                ferebus_staging.get("replacement_round") or 0
+            ),
+            reference_data_version=reference_version,
+            reference_head_manifest_sha256=(
+                None
+                if reference_view is None
+                else str(reference_view.head_manifest_sha256)
+            ),
+            reference_view_sha256=(
+                None
+                if reference_view is None
+                else str(reference_view.cumulative_view_sha256)
+            ),
+            config=campaign_config,
+        )
+        if (
+            current_context.disposition
+            != "archived_terminal_producer"
+            or str(current_context.source_transaction_id or "")
+            != str(ferebus_staging.get("source_transaction_id") or "")
+            or str(current_context.task_map_sha256 or "")
+            != str(ferebus_staging.get("task_map_sha256") or "")
+            or tuple(current_context.completed_logical_task_ids)
+            != tuple(
+                int(value)
+                for value in ferebus_staging.get(
+                    "completed_logical_task_ids", []
+                )
+            )
+        ):
+            raise ValueError(
+                "FEREBUS staging recovery evidence changed after preview"
+            )
+        if archive_identity is None:
+            raise ValueError(
+                "FEREBUS producer staging restoration requires a transaction identity"
+            )
+        restoration = restore_archived_ferebus_producer_staging(
+            campaign,
+            current_context,
+            transaction_id=archive_identity,
+        )
+        result["ferebus_staging_restore"] = restoration
+        restored_paths = [str(restoration["restored_path"])]
+        if restoration.get("archived_input_path"):
+            restored_paths.append(str(restoration["archived_input_path"]))
+        transaction.record_paths(
+            "restore_ferebus_producer_staging",
+            restored_paths,
+        )
+
     if force_resubmit_array and isinstance(partial_array, dict):
         if archive_existing_array_outputs:
             archived_outputs = archive_existing_array_task_outputs(
@@ -10958,6 +11207,9 @@ def _perform_reconcile_apply_mutations(
             verification=verification,
             artifact_snapshot=artifact_snapshot,
             archive_identity=archive_identity,
+            preserve_ferebus_iteration_staging=(
+                preserve_ferebus_iteration_staging
+            ),
         )
         result["archived_model_staging"] = paths
         transaction.record_paths("archive_model_staging", paths)
@@ -10977,6 +11229,7 @@ def _perform_reconcile_apply_mutations(
         campaign,
         report.proposed_state.phase,
         archive_identity=archive_identity,
+        preserve_ferebus_iteration_staging=preserve_ferebus_iteration_staging,
     )
     result["archived_reentry_staging"] = paths
     transaction.record_paths("archive_reentry_staging", paths)
@@ -12740,6 +12993,42 @@ def _reconcile_presentation(
             )
             reason_parts.append("a completed FEREBUS candidate can be recovered")
 
+    ferebus_staging = getattr(report, "ferebus_staging_recovery", None)
+    if isinstance(ferebus_staging, Mapping) and ferebus_staging.get(
+        "source_submission_identities"
+    ):
+        disposition = str(ferebus_staging.get("disposition") or "")
+        completed = int(
+            ferebus_staging.get("scheduler_completed_candidates") or 0
+        )
+        retry = int(ferebus_staging.get("known_retry_candidates") or 0)
+        if disposition == "archived_terminal_producer":
+            planned.append(
+                (
+                    "FEREBUS staging",
+                    "restore the authenticated terminal producer from reconcile "
+                    "transaction "
+                    + str(ferebus_staging.get("source_transaction_id") or ""),
+                )
+            )
+            reason_parts.append(
+                "interrupted FEREBUS producer staging requires restoration"
+            )
+        planned.append(
+            (
+                "FEREBUS recovery",
+                "preserve "
+                + str(completed)
+                + " scheduler-completed task candidate"
+                + ("" if completed == 1 else "s")
+                + " for local validation; "
+                + str(retry)
+                + " known unfinished task"
+                + ("" if retry == 1 else "s")
+                + " will be retried",
+            )
+        )
+
     state_differs = _reconcile_state_differs(current, proposed)
     if (
         state_differs
@@ -13916,6 +14205,7 @@ def _print_reconcile_applied_operator_report(
     archived_ariadne_publication: Sequence[str] = (),
     archived_scalar_diversity_publication: Sequence[str] = (),
     ferebus_retrain_archive: Sequence[str] = (),
+    ferebus_staging_restore: Optional[Mapping[str, Any]] = None,
     archived_array_outputs: Sequence[str] = (),
     refreshed_array_ledger: Optional[Mapping[str, Any]] = None,
     config_review: Any = None,
@@ -13990,6 +14280,17 @@ def _print_reconcile_applied_operator_report(
         ("FEREBUS output", "archived " + _reconcile_relative_path(campaign, item))
         for item in ferebus_retrain_archive
     )
+    if isinstance(ferebus_staging_restore, Mapping):
+        applied_rows.append(
+            (
+                "FEREBUS staging",
+                "restored terminal producer at "
+                + _reconcile_relative_path(
+                    campaign,
+                    ferebus_staging_restore.get("restored_path"),
+                ),
+            )
+        )
     if refreshed_array_ledger is not None:
         applied_rows.append(
             (
@@ -15711,6 +16012,17 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         "update_config_lock",
         "publish_intent_transitions",
     ]
+    ferebus_staging_recovery = getattr(
+        report,
+        "ferebus_staging_recovery",
+        None,
+    )
+    if (
+        isinstance(ferebus_staging_recovery, Mapping)
+        and str(ferebus_staging_recovery.get("disposition") or "")
+        == "archived_terminal_producer"
+    ):
+        planned_operations.insert(0, "restore_ferebus_producer_staging")
     if _aimall_upstream_gaussian_recovery_evidence(report) is not None:
         planned_operations.insert(0, "restore_gaussian_task_membership")
     completed_staging_records = list(
@@ -15768,6 +16080,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             data_staging_archive_mode=data_staging_archive_mode,
             verification=verification_level,
             artifact_snapshot=artifact_snapshot,
+            campaign_config=config,
         )
     except Exception as exc:
         _fail_reconcile_transaction(
@@ -15787,6 +16100,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     archived_scripts = list(mutation_result["archived_scripts"])
     archived = list(mutation_result["archived_data_staging"])
     removed_model_staging = list(mutation_result["archived_model_staging"])
+    ferebus_staging_restore = mutation_result["ferebus_staging_restore"]
     archived_reference_data_staging = list(
         mutation_result["archived_reference_data_staging"]
     )
@@ -15819,6 +16133,18 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         + list(archived_array_outputs)
         + list(archived)
         + list(removed_model_staging)
+        + (
+            []
+            if not isinstance(ferebus_staging_restore, Mapping)
+            else [
+                str(path)
+                for path in (
+                    ferebus_staging_restore.get("restored_path"),
+                    ferebus_staging_restore.get("archived_input_path"),
+                )
+                if path
+            ]
+        )
         + list(archived_reference_data_staging)
         + list(ferebus_retrain_archive)
         + list(removed)
@@ -16462,6 +16788,37 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             ),
             archived_staging_path=(archived[0] if archived else None),
             archived_reference_data_staging_paths=archived_reference_data_staging,
+            ferebus_staging_disposition=(
+                str(
+                    (getattr(report, "ferebus_staging_recovery", {}) or {}).get(
+                        "disposition"
+                    )
+                    or ""
+                )
+                or None
+            ),
+            ferebus_staging_source_transaction=(
+                (getattr(report, "ferebus_staging_recovery", {}) or {}).get(
+                    "source_transaction_id"
+                )
+            ),
+            ferebus_original_job_ids=(
+                list(
+                    (getattr(report, "ferebus_staging_recovery", {}) or {}).get(
+                        "source_job_ids", []
+                    )
+                )
+            ),
+            ferebus_scheduler_completed_candidates=int(
+                (getattr(report, "ferebus_staging_recovery", {}) or {}).get(
+                    "scheduler_completed_candidates", 0
+                )
+            ),
+            ferebus_known_retry_candidates=int(
+                (getattr(report, "ferebus_staging_recovery", {}) or {}).get(
+                    "known_retry_candidates", 0
+                )
+            ),
             n_archived_scripts_paths=len(archived_scripts),
             archived_scripts_path=(archived_scripts[0] if archived_scripts else None),
             archived_ariadne_publication_path=(
@@ -16564,6 +16921,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             archived_scalar_diversity_publication
         ),
         ferebus_retrain_archive=ferebus_retrain_archive,
+        ferebus_staging_restore=ferebus_staging_restore,
         archived_array_outputs=archived_array_outputs,
         refreshed_array_ledger=refreshed,
         config_review=config_review,
@@ -17939,6 +18297,60 @@ def _format_preflight(payload: Dict[str, Any], *, verbose: bool = False) -> str:
                 "  preserved re-poll error: "
                 + str(scheduler_repoll.get("error"))
             )
+    ferebus_staging = payload.get(
+        "_presentation_ferebus_staging_recovery"
+    )
+    if (
+        isinstance(ferebus_staging, Mapping)
+        and ferebus_staging.get("source_submission_identities")
+    ):
+        staging_disposition = str(
+            ferebus_staging.get("disposition") or ""
+        )
+        completed = int(
+            ferebus_staging.get("scheduler_completed_candidates") or 0
+        )
+        retry = int(
+            ferebus_staging.get("known_retry_candidates") or 0
+        )
+        if staging_disposition == "archived_terminal_producer":
+            staging_detail = (
+                "reconcile must restore the authenticated producer before "
+                "resume"
+            )
+            staging_ready = False
+        elif staging_disposition == "terminal_producer":
+            staging_detail = (
+                "resume will validate "
+                + str(completed)
+                + " historical output"
+                + ("" if completed == 1 else "s")
+                + " and submit only "
+                + str(retry)
+                + " unresolved task"
+                + ("" if retry == 1 else "s")
+            )
+            staging_ready = True
+        else:
+            staging_detail = (
+                "producer outputs are unavailable; resume will safely prepare "
+                + str(int(ferebus_staging.get("n_tasks") or 0))
+                + " retry tasks"
+            )
+            staging_ready = staging_disposition in {
+                "absent",
+                "input_only",
+                "partial_preparation",
+                "prepared",
+            }
+        lines.append(
+            _preflight_check_line(
+                "FEREBUS staging recovery",
+                staging_ready,
+                staging_detail,
+                warn=staging_ready,
+            )
+        )
     environment_generation = payload.get(
         "_presentation_environment_generation"
     )
@@ -18439,6 +18851,7 @@ def evaluate_campaign_preflight(
     presentation_contract: Optional[Dict[str, Any]] = None
     presentation_stop: Dict[str, Any] = {}
     presentation_diversity_transition: Optional[Dict[str, Any]] = None
+    presentation_ferebus_staging: Optional[Dict[str, Any]] = None
     presentation_environment: Optional[Dict[str, Any]] = None
     presentation_transaction: Optional[Dict[str, Any]] = None
     presentation_scheduler_repoll: Optional[Dict[str, Any]] = None
@@ -18826,6 +19239,35 @@ def evaluate_campaign_preflight(
                         "reason": type(exc).__name__ + ": " + str(exc),
                     }
 
+            # A transaction-bound scheduler re-poll owns this launch.  Its
+            # staging is intentionally preserved and must not be reclassified
+            # as an idle recovery tree before terminal accounting is known.
+            presentation_ferebus_staging = (
+                None
+                if scheduler_repoll_authority is not None
+                else _ferebus_staging_presentation_evidence(
+                    campaign,
+                    state,
+                    artifact_snapshot=preflight_snapshot,
+                    config=loaded_config,
+                )
+            )
+            if isinstance(presentation_ferebus_staging, Mapping):
+                staging_disposition = str(
+                    presentation_ferebus_staging.get("disposition") or ""
+                )
+                if staging_disposition == "contradictory":
+                    condition = "blocked"
+                    issues.append(
+                        "FEREBUS staging recovery evidence is contradictory"
+                    )
+                elif staging_disposition == "archived_terminal_producer":
+                    if condition != "blocked":
+                        condition = "reconcile_required"
+                    issues.append(
+                        "FEREBUS producer staging must be restored by reconcile"
+                    )
+
             state_summary = {
                 "ok": not issues,
                 "condition": condition,
@@ -18849,6 +19291,9 @@ def evaluate_campaign_preflight(
     payload["_presentation_config_review"] = presentation_config_review
     payload["_presentation_diversity_transition"] = (
         presentation_diversity_transition
+    )
+    payload["_presentation_ferebus_staging_recovery"] = (
+        presentation_ferebus_staging
     )
     payload["_presentation_environment_generation"] = presentation_environment
     if presentation_scheduler_repoll is not None:
