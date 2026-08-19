@@ -37,10 +37,10 @@ from ichor.hpc.active_learning.ferebus_prior import (
 )
 
 
-def _manifest(*, n_tasks: int = 6):
+def _manifest(*, n_tasks: int = 6, reference_data_version: int = 8):
     return {
         "campaign_uid": "campaign-uid",
-        "reference_data_version": 8,
+        "reference_data_version": int(reference_data_version),
         "n_tasks": n_tasks,
     }
 
@@ -52,12 +52,17 @@ def _inspection(
     bound_task_ids=(),
     task_map_sha256: str = "a" * 64,
     manifest_identity_sha256: str = "b" * 64,
+    reference_data_version: int = 8,
 ):
     has_map = disposition == "prepared"
     return recovery._TreeInspection(
         disposition=disposition,
         path=Path(path),
-        manifest=(None if disposition == "absent" else _manifest()),
+        manifest=(
+            None
+            if disposition == "absent"
+            else _manifest(reference_data_version=reference_data_version)
+        ),
         task_map=(
             {"task_map_sha256": task_map_sha256} if has_map else None
         ),
@@ -363,6 +368,65 @@ def test_multiple_archived_terminal_producers_fail_closed(tmp_path, monkeypatch)
 
     assert context.disposition == "contradictory"
     assert "multiple archived" in context.reason
+
+
+def test_prior_reference_archive_does_not_conflict_with_terminal_producer(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = tmp_path / "campaign"
+    canonical = campaign / "TRAINED_MODELS" / "iteration-staging"
+    canonical_tree = _inspection(canonical, "input_only")
+    parent_path = canonical.with_name(
+        "iteration-staging.before-reconcile-" + "1" * 32
+    )
+    producer_path = canonical.with_name(
+        "iteration-staging.before-reconcile-" + "2" * 32
+    )
+    parent = _inspection(
+        parent_path,
+        "prepared",
+        bound_task_ids=(),
+        reference_data_version=7,
+    )
+    producer = _inspection(
+        producer_path,
+        "prepared",
+        bound_task_ids=(0, 1, 2, 3, 5),
+    )
+    monkeypatch.setattr(recovery, "_inspect_tree", lambda path: canonical_tree)
+    monkeypatch.setattr(
+        recovery,
+        "_archive_candidates",
+        lambda *args, **kwargs: (
+            ("1" * 32, parent_path, parent),
+            ("2" * 32, producer_path, producer),
+        ),
+    )
+    monkeypatch.setattr(
+        recovery,
+        "_terminal_sources",
+        lambda *args, **kwargs: _terminal_sources(),
+    )
+    monkeypatch.setattr(
+        recovery,
+        "_validate_historical_executable",
+        lambda *args, **kwargs: None,
+    )
+
+    context = classify_ferebus_staging_recovery(
+        campaign,
+        campaign_uid="campaign-uid",
+        phase="FEREBUS",
+        iteration=8,
+        reference_data_version=8,
+    )
+
+    assert context.disposition == "archived_terminal_producer"
+    assert context.producer_path == producer_path
+    assert context.source_transaction_id == "2" * 32
+    assert context.completed_logical_task_ids == (0, 1, 2, 3, 5)
+    assert context.retry_logical_task_ids == (4,)
 
 
 def test_archive_discovery_requires_committed_transaction_operation(

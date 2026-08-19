@@ -13732,6 +13732,11 @@ def _print_reconcile_artefacts(
         _print_reconcile_list("script sample", display)
     if verbose and getattr(report, "notes", []):
         _print_reconcile_list("diagnostic notes", [str(item) for item in report.notes])
+    if verbose and getattr(report, "unsafe_reasons", []):
+        _print_reconcile_list(
+            "raw blockers",
+            [str(item) for item in report.unsafe_reasons],
+        )
     if verbose and getattr(report, "trusted_artifacts", []):
         _print_reconcile_list("trusted artefacts", [str(item) for item in report.trusted_artifacts])
     if verbose and getattr(report, "blocking_artifacts", []):

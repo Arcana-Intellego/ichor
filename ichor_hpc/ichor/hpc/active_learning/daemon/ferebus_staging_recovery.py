@@ -798,6 +798,11 @@ def classify_ferebus_staging_recovery(
         iteration=int(iteration),
         models_dir_name=models_dir_name,
     )
+    expected_reference = (
+        int(iteration)
+        if reference_data_version is None
+        else int(reference_data_version)
+    )
     prepared_archives = []
     archive_errors = []
     for transaction_id, archived, inspection in archive_records:
@@ -813,6 +818,33 @@ def classify_ferebus_staging_recovery(
             archive_errors.append(
                 str(archived) + ": " + (inspection.reason or inspection.disposition)
             )
+            continue
+        archive_manifest = inspection.manifest
+        if not isinstance(archive_manifest, Mapping):
+            archive_errors.append(
+                str(archived) + ": FEREBUS staging manifest is unavailable"
+            )
+            continue
+        archive_uid = str(archive_manifest.get("campaign_uid") or "")
+        if archive_uid != str(campaign_uid):
+            archive_errors.append(
+                str(archived) + ": FEREBUS staging campaign identity mismatch"
+            )
+            continue
+        try:
+            archive_reference = int(
+                archive_manifest.get("reference_data_version", -1)
+            )
+        except (TypeError, ValueError):
+            archive_errors.append(
+                str(archived) + ": FEREBUS staging reference identity is malformed"
+            )
+            continue
+        if archive_reference != expected_reference:
+            # A reconcile for iteration N can legitimately archive the
+            # completed model-N-1 staging before later archiving the interrupted
+            # producer for reference N.  The former is authenticated history,
+            # not a competing producer for this recovery boundary.
             continue
         try:
             validate_manifest(inspection)

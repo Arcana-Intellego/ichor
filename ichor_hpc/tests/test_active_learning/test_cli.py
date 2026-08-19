@@ -2978,6 +2978,44 @@ def test_verbose_reconcile_reports_exact_scheduler_accounting_blocker(
     assert "qacct field failed is malformed" in output
 
 
+def test_verbose_reconcile_artefacts_include_raw_recovery_blocker(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    for helper_name in (
+        "_reconcile_bootstrap_summary",
+        "_reconcile_phase_a_summary",
+        "_reconcile_scripts_summary",
+        "_reconcile_staging_summary",
+        "_reconcile_model_staging_summary",
+        "_reconcile_reference_data_staging_summary",
+        "_reconcile_reference_commit_summary",
+    ):
+        monkeypatch.setattr(cli_mod, helper_name, lambda *_args, **_kwargs: "none")
+    report = SimpleNamespace(
+        committed_reference_data_versions=[8],
+        valid_reference_data_versions=[8],
+        committed_model_versions=[7],
+        valid_model_versions=[7],
+        ferebus_candidate_recovery=None,
+        script_inventory={},
+        notes=[],
+        unsafe_reasons=[
+            "FEREBUS staging recovery evidence is contradictory: "
+            "reference identity mismatch"
+        ],
+        trusted_artifacts=[],
+        blocking_artifacts=["FEREBUS staging recovery"],
+    )
+
+    cli_mod._print_reconcile_artefacts(tmp_path, report, {}, verbose=True)
+
+    output = capsys.readouterr().out
+    assert "raw blockers:" in output
+    assert "reference identity mismatch" in output
+
+
 def test_pre_submit_stop_records_no_scheduler_acceptance_receipt(
     tmp_path,
     monkeypatch,
