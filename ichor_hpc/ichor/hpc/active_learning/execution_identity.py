@@ -129,24 +129,57 @@ def _scheduler_cancellation_transition_boundary(
     }
 
 
-def _validate_ferebus_transition_boundary(campaign: Path, state: Any) -> None:
-    """Require a clean, committed-data-only FEREBUS submission boundary."""
+def _validate_ferebus_transition_boundary(
+    campaign: Path,
+    state: Any,
+    *,
+    config: CampaignConfig,
+    artifact_snapshot: Any,
+) -> Dict[str, Any]:
+    """Require a clean or authenticated terminal-producer FEREBUS boundary."""
+    from .daemon.ferebus_staging_recovery import (
+        classify_ferebus_staging_recovery,
+    )
     from .daemon.recovery_contracts import phase_recovery_contract_error
     from .layout import qm_reference_data_dir, trained_models_dir
     from .versioning.reference_data import ReferenceDataVersioning
     from .versioning.trained_models import TrainedModelVersioning
 
     phase = CampaignPhase(state.phase)
-    staging = trained_models_dir(campaign) / "iteration-staging"
-    if staging.exists() or staging.is_symlink():
+    iteration = int(state.iteration)
+    reference_version = int(state.reference_data_version)
+    replacement_round = int(getattr(state, "replacement_round", 0))
+    try:
+        staging_context = classify_ferebus_staging_recovery(
+            campaign,
+            campaign_uid=str(state.campaign_uid),
+            phase=phase.value,
+            iteration=iteration,
+            replacement_round=replacement_round,
+            reference_data_version=reference_version,
+            config=config,
+        )
+    except Exception as exc:
         raise ExecutionIdentityError(
             "environment transition at "
             + phase.value
-            + " requires reconcile to archive TRAINED_MODELS/iteration-staging first"
+            + " could not classify FEREBUS staging recovery evidence: "
+            + type(exc).__name__
+            + ": "
+            + str(exc)
+        ) from exc
+    if staging_context.disposition not in {"absent", "terminal_producer"}:
+        detail = staging_context.reason or staging_context.disposition
+        raise ExecutionIdentityError(
+            "environment transition at "
+            + phase.value
+            + " requires reconcile to archive or restore "
+            "TRAINED_MODELS/iteration-staging first; observed "
+            + staging_context.disposition
+            + ": "
+            + detail
         )
 
-    iteration = int(state.iteration)
-    reference_version = int(state.reference_data_version)
     model_version = int(state.models_version)
     if phase is CampaignPhase.INITIAL_FEREBUS:
         expected = (0, 0, -1)
@@ -195,6 +228,56 @@ def _validate_ferebus_transition_boundary(campaign: Path, state: Any) -> None:
             + " failed its recovery contract: "
             + str(contract_error)
         )
+
+    if staging_context.disposition == "absent":
+        return {"transition_kind": "ferebus_retry"}
+
+    try:
+        reference_view = artifact_snapshot.reference_view(reference_version)
+        authenticated_context = classify_ferebus_staging_recovery(
+            campaign,
+            campaign_uid=str(state.campaign_uid),
+            phase=phase.value,
+            iteration=iteration,
+            replacement_round=replacement_round,
+            reference_data_version=reference_version,
+            reference_head_manifest_sha256=str(
+                reference_view.head_manifest_sha256
+            ),
+            reference_view_sha256=str(reference_view.cumulative_view_sha256),
+            config=config,
+        )
+    except Exception as exc:
+        raise ExecutionIdentityError(
+            "environment transition at "
+            + phase.value
+            + " could not authenticate restored FEREBUS producer staging: "
+            + type(exc).__name__
+            + ": "
+            + str(exc)
+        ) from exc
+    if authenticated_context.disposition != "terminal_producer":
+        raise ExecutionIdentityError(
+            "restored FEREBUS producer staging changed during environment "
+            "transition validation: observed "
+            + authenticated_context.disposition
+            + ": "
+            + (authenticated_context.reason or "no reason recorded")
+        )
+    return {
+        "transition_kind": "ferebus_terminal_producer_recovery",
+        "ferebus_staging_disposition": authenticated_context.disposition,
+        "scheduler_completed_candidates": len(
+            authenticated_context.completed_logical_task_ids
+        ),
+        "known_retry_candidates": len(
+            authenticated_context.retry_logical_task_ids
+        ),
+        "source_job_ids": list(authenticated_context.source_job_ids),
+        "source_submission_identities": list(
+            authenticated_context.source_submission_identities
+        ),
+    }
 
 
 def inspect_allocation_check_transition_boundary(
@@ -2408,6 +2491,7 @@ def _inspect_environment_transition_boundary(
     aimall_transition_pending = False
     gaussian_transition_pending = False
     allocation_check_transition_pending = False
+    ferebus_transition_pending = False
     scheduler_cancel_transition = None
     if preserved_repoll is not None:
         transition_context = {
@@ -2466,8 +2550,7 @@ def _inspect_environment_transition_boundary(
             )
         transition_context = {"transition_kind": "reference_commit_recovery"}
     elif state.phase in {CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS}:
-        _validate_ferebus_transition_boundary(campaign, state)
-        transition_context = {"transition_kind": "ferebus_retry"}
+        ferebus_transition_pending = True
     elif state.phase is CampaignPhase.ARIADNE_ARRAY:
         transition_context = _validate_ariadne_retry_transition_boundary(
             campaign,
@@ -2623,6 +2706,13 @@ def _inspect_environment_transition_boundary(
         verification="authority",
         snapshot=snapshot,
     )
+    if ferebus_transition_pending:
+        transition_context = _validate_ferebus_transition_boundary(
+            campaign,
+            state,
+            config=config,
+            artifact_snapshot=snapshot,
+        )
     if diversity_transition_pending:
         transition_context = _validate_scalar_diversity_transition_boundary(
             campaign,
@@ -2800,6 +2890,7 @@ def advance_environment_generation(
     aimall_transition_pending = False
     gaussian_transition_pending = False
     allocation_check_transition_pending = False
+    ferebus_transition_pending = False
     scheduler_cancel_transition = None
     if preserved_repoll is not None:
         transition_context = {
@@ -2860,8 +2951,7 @@ def advance_environment_generation(
             )
         transition_context = {"transition_kind": "reference_commit_recovery"}
     elif state.phase in {CampaignPhase.INITIAL_FEREBUS, CampaignPhase.FEREBUS}:
-        _validate_ferebus_transition_boundary(campaign, state)
-        transition_context = {"transition_kind": "ferebus_retry"}
+        ferebus_transition_pending = True
     elif state.phase is CampaignPhase.ARIADNE_ARRAY:
         transition_context = _validate_ariadne_retry_transition_boundary(
             campaign,
@@ -3025,6 +3115,13 @@ def advance_environment_generation(
         verification="authority",
         snapshot=snapshot,
     )
+    if ferebus_transition_pending:
+        transition_context = _validate_ferebus_transition_boundary(
+            campaign,
+            state,
+            config=config,
+            artifact_snapshot=snapshot,
+        )
     if diversity_transition_pending:
         transition_context = _validate_scalar_diversity_transition_boundary(
             campaign,

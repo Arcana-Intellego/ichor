@@ -697,8 +697,7 @@ def _patch_phase_b_transition(
         lambda _self: 0,
     )
     monkeypatch.setattr(
-        "ichor.hpc.active_learning.daemon.recovery_contracts."
-        "phase_recovery_contract_error",
+        "ichor.hpc.active_learning.daemon.recovery_contracts.phase_recovery_contract_error",
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
@@ -2323,7 +2322,8 @@ def test_rebind_accepts_clean_pre_submission_ferebus_boundary(
         _changed_generation,
     )
     monkeypatch.setattr(
-        "ichor.hpc.active_learning.daemon.recovery_contracts.phase_recovery_contract_error",
+        "ichor.hpc.active_learning.daemon.recovery_contracts."
+        "phase_recovery_contract_error",
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
@@ -2359,6 +2359,101 @@ def test_rebind_accepts_clean_pre_submission_ferebus_boundary(
     assert rebound.phase is phase
     assert rebound.reference_data_version == reference_version
     assert rebound.models_version == model_version
+
+
+def test_rebind_accepts_restored_terminal_ferebus_producer_staging(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import (
+        artifact_snapshot,
+        ferebus_staging_recovery,
+    )
+    from ichor.hpc.active_learning.versioning import reference_data, trained_models
+
+    campaign, config, state = _rebind_campaign(tmp_path, monkeypatch)
+    state.phase = CampaignPhase.FEREBUS
+    state.iteration = 8
+    state.reference_data_version = 8
+    state.models_version = 7
+    write_state(campaign / ".DATA" / "ACTIVE_LEARNING" / "state.json", state)
+    staging = campaign / "TRAINED_MODELS" / "iteration-staging"
+    staging.mkdir(parents=True)
+    monkeypatch.setattr(
+        execution_identity_module,
+        "capture_environment_generation",
+        _changed_generation,
+    )
+    monkeypatch.setattr(
+        "ichor.hpc.active_learning.daemon.recovery_contracts."
+        "phase_recovery_contract_error",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        reference_data.ReferenceDataVersioning,
+        "current_version",
+        lambda _self: 8,
+    )
+    monkeypatch.setattr(
+        trained_models.TrainedModelVersioning,
+        "current_version",
+        lambda _self: 7,
+    )
+    reference_view = SimpleNamespace(
+        head_manifest_sha256="a" * 64,
+        cumulative_view_sha256="b" * 64,
+    )
+    snapshot = SimpleNamespace(reference_view=lambda _version: reference_view)
+    monkeypatch.setattr(
+        artifact_snapshot,
+        "build_committed_artifact_snapshot",
+        lambda *_args, **_kwargs: snapshot,
+    )
+    context = ferebus_staging_recovery.FerebusStagingRecoveryContext(
+        "terminal_producer",
+        staging,
+        producer_path=staging,
+        phase="FEREBUS",
+        iteration=8,
+        scheduler_identity_kind="sge",
+        n_tasks=6,
+        completed_logical_task_ids=(0, 1, 2, 3, 5),
+        retry_logical_task_ids=(4,),
+        source_job_ids=("898506",),
+        source_submission_identities=("r0000-a0001-23c06fdc",),
+        task_map_sha256="c" * 64,
+        reason="canonical staging is bound to terminal scheduler evidence",
+    )
+    classifier_calls = []
+
+    def classify(*_args, **kwargs):
+        classifier_calls.append(kwargs)
+        return context
+
+    monkeypatch.setattr(
+        ferebus_staging_recovery,
+        "classify_ferebus_staging_recovery",
+        classify,
+    )
+
+    result = rebind_environment(
+        campaign,
+        config=config,
+        scheduler_ownership_clear=True,
+    )
+
+    assert result["changed"] is True
+    assert result["transition_kind"] == "ferebus_terminal_producer_recovery"
+    assert result["scheduler_completed_candidates"] == 5
+    assert result["known_retry_candidates"] == 1
+    assert result["source_job_ids"] == ["898506"]
+    assert classifier_calls
+    assert all(call["config"] is config for call in classifier_calls)
+    assert any(
+        call.get("reference_head_manifest_sha256") == "a" * 64
+        and call.get("reference_view_sha256") == "b" * 64
+        for call in classifier_calls
+    )
 
 
 def test_rebind_requires_reconcile_to_archive_failed_ferebus_staging(
