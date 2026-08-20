@@ -2334,6 +2334,27 @@ def test_reconcile_ariadne_residue(
         "quarantine_root",
         lambda _campaign: campaign / ".Q",
     )
+    old_attempt = campaign / ".Q" / "iteration-000010" / "old-retry"
+    old_retained = old_attempt / "seed-000077"
+    old_retained.mkdir(parents=True)
+    (old_retained / "result.json").write_bytes(b"failed producer\n")
+    old_source = (
+        campaign
+        / "ACTIVE_LEARNING"
+        / "iteration-000010"
+        / "ariadne"
+        / "seeds"
+        / "seed-000077"
+    )
+    ariadne_quarantine.write_quarantine_manifest(
+        campaign,
+        old_attempt,
+        iteration=10,
+        source_paths=[old_source],
+        target_paths=[old_retained],
+    )
+    old_source.mkdir(parents=True)
+    (old_source / "result.json").write_bytes(b"successful retry\n")
     results_path = ariadne_results_path(iter_dir)
     decision_path = ariadne_batch_decision_path(iter_dir)
     scientific_bytes = {

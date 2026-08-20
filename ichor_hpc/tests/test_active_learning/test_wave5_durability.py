@@ -111,6 +111,8 @@ def test_ariadne_quarantine_inventory_and_explicit_clean(tmp_path):
         source_paths=[source],
         target_paths=[retained],
     )
+    source.mkdir(parents=True)
+    (source / "result.json").write_bytes(b"new retry output\n")
 
     inventory = inventory_quarantine(campaign)
     assert inventory["errors"] == []
@@ -210,6 +212,21 @@ def test_residue_move_replay(
     assert authority["errors"] == []
     assert authority["attempts"][0]["status"] == "prepared"
     assert residue.is_dir()
+
+    target = Path(authority["attempts"][0]["attempt_path"]) / residue.name
+    shutil.copytree(residue, target)
+    with pytest.raises(
+        AriadneQuarantineError,
+        match="exists at source and target",
+    ):
+        retain_ariadne_transaction_residue(
+            campaign,
+            iteration=4,
+            task_map=task_map,
+            campaign_uid=_CAMPAIGN_UID,
+            authority_identity="completion-receipt-a",
+        )
+    shutil.rmtree(target)
 
     monkeypatch.setattr(ariadne_quarantine.os, "replace", real_replace)
     replay = retain_ariadne_transaction_residue(

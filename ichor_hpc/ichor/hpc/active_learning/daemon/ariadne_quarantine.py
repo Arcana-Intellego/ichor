@@ -422,12 +422,10 @@ def _read_manifest(path: Path, campaign_dir: Path) -> Dict[str, Any]:
         source = campaign_dir / Path(source_relative)
         if _campaign_relative_source(campaign_dir, source) != source_relative:
             raise AriadneQuarantineError("ARIADNE quarantine source path is not canonical")
-        source_exists = source.exists() or source.is_symlink()
         target_exists = target.exists() or target.is_symlink()
-        if source_exists and target_exists:
-            raise AriadneQuarantineError(
-                "ARIADNE quarantine contains both source and retained evidence"
-            )
+        # A successful retry may legitimately recreate the canonical source
+        # path after the failed producer tree has been retained.  The retained
+        # target remains the immutable evidence owned by this manifest.
         evidence_path = target if target_exists else source
         if evidence_path.is_symlink() or not evidence_path.is_dir():
             raise AriadneQuarantineError(
