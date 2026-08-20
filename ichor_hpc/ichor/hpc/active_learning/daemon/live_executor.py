@@ -9475,6 +9475,22 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         )
                     else:
                         deferred_journal_events.append(relaxation_event)
+                    geometry_event = {
+                        "event": "phase_b_geometry_novelty_relaxed",
+                        "phase": phase_name,
+                        "iteration": int(state.iteration),
+                        "reason": str(relaxation.get("reason", "unknown")),
+                        "n_admitted": int(relaxation.get("n_admitted", 0)),
+                        "effective_min_separation_angstrom": relaxation.get(
+                            "effective_min_separation_angstrom"
+                        ),
+                        "n_candidates": int(phase_b_manifest.get("n_candidates", 0)),
+                    }
+                    if emit_success_events:
+                        geometry_name = str(geometry_event.pop("event"))
+                        self._journal_event(geometry_name, **geometry_event)
+                    else:
+                        deferred_journal_events.append(geometry_event)
         success_event = {
             "event": "phase_succeeded_live",
             "phase": phase_name,

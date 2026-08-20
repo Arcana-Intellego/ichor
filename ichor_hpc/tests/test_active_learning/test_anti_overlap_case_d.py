@@ -527,13 +527,15 @@ def test_scaled_min_separation_rescues_farthest_non_duplicate(tmp_path):
     assert dedup["n_kept"] == 1
     assert dedup["n_dropped"] == 2
     assert (iter_dir / "protocol" / "GEOMETRY_NOVELTY_SCALE.json").is_file()
+    # A compute worker must never append to the shared NFS journal. Its
+    # authenticated sidecar is mirrored by the daemon during scheduler polls.
     journal = campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson"
-    events = [
-        json.loads(line)
-        for line in journal.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert any(
-        event.get("event") == "phase_b_geometry_novelty_relaxed"
-        for event in events
+    assert not journal.exists()
+    from ichor.hpc.active_learning.daemon.phase_progress import progress_path
+
+    progress = json.loads(
+        progress_path(campaign, "PHASE_B_DIVERSITY", "worker").read_text(
+            encoding="utf-8"
+        )
     )
+    assert progress["status"] == "completed"

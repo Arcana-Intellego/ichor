@@ -8790,11 +8790,25 @@ def cmd_status(args: argparse.Namespace) -> int:
         payload["seed_selection_progress"] = progress_status
     status_journal_events: List[Dict[str, Any]] = []
     try:
-        from .daemon.journal import tail_events
+        from .daemon.journal import inspect_journal_integrity, tail_events
 
+        integrity = inspect_journal_integrity(paths["journal"])
+        if integrity.disposition != "valid":
+            if integrity.repairable:
+                payload["journal_error"] = (
+                    "recoverable journal telemetry damage: "
+                    + integrity.disposition
+                    + "; valid campaign state and scientific authority are unchanged"
+                )
+            else:
+                payload["journal_error"] = (
+                    "unsafe journal corruption: " + integrity.reason
+                )
+            raise RuntimeError(payload["journal_error"])
         status_journal_events = tail_events(paths["journal"], max_records=4096)
     except Exception as exc:
-        payload["journal_error"] = type(exc).__name__ + ": " + str(exc)
+        if not payload.get("journal_error"):
+            payload["journal_error"] = type(exc).__name__ + ": " + str(exc)
     try:
         from .execution_identity import read_active_environment_generation
 
@@ -11365,6 +11379,7 @@ def _perform_reconcile_apply_mutations(
         "archived_reentry_staging": [],
         "archived_ariadne_publication": [],
         "ariadne_transaction_residue_quarantine": None,
+        "journal_repair": None,
         "archived_scalar_diversity_publication": [],
         "aimall_upstream_gaussian_recovery": None,
         "retired_completed_staging": {
@@ -11377,6 +11392,36 @@ def _perform_reconcile_apply_mutations(
             "n_preserved": 0,
         },
     }
+    journal_recovery = getattr(report, "journal_recovery", None)
+    if isinstance(journal_recovery, Mapping) and bool(
+        journal_recovery.get("repairable", False)
+    ):
+        from ichor.hpc.active_learning.daemon.journal import (
+            repair_journal_integrity,
+        )
+
+        journal_result = repair_journal_integrity(
+            campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson",
+            journal_recovery,
+            archive_dir=(
+                campaign
+                / DEFAULT_DATA_SUBDIR
+                / "journal_quarantine"
+            ),
+            lock_timeout_seconds=(
+                int(campaign_config.runtime.ledger_lock_timeout_seconds)
+                if campaign_config is not None
+                else 30
+            ),
+        )
+        result["journal_repair"] = journal_result
+        transaction.record_paths(
+            "repair_journal_append_damage",
+            [
+                str(journal_result["archive_path"]),
+                str(journal_result["journal_path"]),
+            ],
+        )
     residue_recovery = getattr(report, "ariadne_transaction_residue", None)
     if isinstance(residue_recovery, Mapping) and bool(
         residue_recovery.get("cleanup_required", False)
@@ -12296,6 +12341,11 @@ def _reconcile_cleanable_reasons(report: Any) -> List[str]:
         )
     if "stale ARIADNE publication" in reasons:
         cleanable.append("stale ARIADNE publication")
+    journal_recovery = getattr(report, "journal_recovery", None)
+    if isinstance(journal_recovery, Mapping) and bool(
+        journal_recovery.get("repairable", False)
+    ):
+        cleanable.append("recoverable journal telemetry damage")
     residue = getattr(report, "ariadne_transaction_residue", None)
     if isinstance(residue, Mapping) and bool(
         residue.get("cleanup_required", False)
@@ -13208,6 +13258,19 @@ def _reconcile_presentation(
 
     cleanup_rows, reason_parts, warnings, preserved = _reconcile_cleanup_rows(report)
     planned: List[Tuple[str, str]] = list(cleanup_rows)
+    journal_recovery = getattr(report, "journal_recovery", None)
+    if isinstance(journal_recovery, Mapping) and bool(
+        journal_recovery.get("repairable", False)
+    ):
+        planned.append(
+            (
+                "campaign journal",
+                "archive the exact damaged bytes and retain "
+                + str(int(journal_recovery.get("retained_records") or 0))
+                + " valid records with one authenticated telemetry gap",
+            )
+        )
+        reason_parts.append("recoverable journal telemetry damage requires repair")
     transaction_recovery = getattr(
         report,
         "reconcile_transaction_recovery",
@@ -16713,6 +16776,11 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         "update_config_lock",
         "publish_intent_transitions",
     ]
+    journal_recovery = getattr(report, "journal_recovery", None)
+    if isinstance(journal_recovery, Mapping) and bool(
+        journal_recovery.get("repairable", False)
+    ):
+        planned_operations.insert(0, "repair_journal_append_damage")
     ariadne_transaction_residue = getattr(
         report,
         "ariadne_transaction_residue",
@@ -16824,6 +16892,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     ariadne_residue_quarantine = mutation_result[
         "ariadne_transaction_residue_quarantine"
     ]
+    journal_repair_result = mutation_result.get("journal_repair")
     archived_scalar_diversity_publication = list(
         mutation_result["archived_scalar_diversity_publication"]
     )
@@ -17557,6 +17626,27 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             if isinstance(ariadne_residue_quarantine, Mapping)
             else {}
         )
+        journal_event_fields = (
+            {
+                "journal_repair_disposition": str(
+                    journal_repair_result.get("disposition") or ""
+                ),
+                "journal_original_sha256": str(
+                    journal_repair_result.get("original_sha256") or ""
+                ),
+                "journal_repaired_sha256": str(
+                    journal_repair_result.get("repaired_sha256") or ""
+                ),
+                "journal_omitted_bytes": int(
+                    journal_repair_result.get("omitted_bytes") or 0
+                ),
+                "journal_raw_archive": str(
+                    journal_repair_result.get("archive_path") or ""
+                ),
+            }
+            if isinstance(journal_repair_result, Mapping)
+            else {}
+        )
         environment_binding_repair = (
             _reconcile_environment_config_binding_repair(
                 campaign,
@@ -17642,6 +17732,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
                 in {"current", "unbound_first_start"}
                 else "campaign_config_generation_binding_advanced"
             ),
+            **journal_event_fields,
             **ariadne_event_fields,
             **aimall_event_fields,
             **scalar_event_fields,
@@ -19742,6 +19833,35 @@ def evaluate_campaign_preflight(
             elif state.phase is CampaignPhase.DONE:
                 condition = "complete"
                 issues.append("campaign is DONE; no live launch is required")
+
+            try:
+                from .daemon.journal import inspect_journal_integrity
+
+                journal_integrity = inspect_journal_integrity(
+                    campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson"
+                )
+                if journal_integrity.disposition != "valid":
+                    if journal_integrity.repairable:
+                        if condition != "blocked":
+                            condition = "reconcile_required"
+                        issues.insert(
+                            0,
+                            "recoverable campaign-journal telemetry damage must "
+                            "be repaired by reconcile before launch",
+                        )
+                    else:
+                        condition = "blocked"
+                        issues.insert(
+                            0,
+                            "campaign-journal evidence is corrupt and requires "
+                            "manual review",
+                        )
+            except Exception as exc:
+                condition = "blocked"
+                issues.insert(
+                    0,
+                    "campaign-journal integrity could not be assessed: " + str(exc),
+                )
 
             try:
                 from .daemon.stop_control import (

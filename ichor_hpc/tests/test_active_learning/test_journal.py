@@ -4,6 +4,7 @@ import json
 import multiprocessing as mp
 import os
 from pathlib import Path
+import socket
 
 import pytest
 
@@ -15,8 +16,10 @@ from ichor.hpc.active_learning.daemon.journal import (
     KNOWN_EVENT_TYPES,
     JournalCorruptionError,
     append_event,
+    inspect_journal_integrity,
     iter_events,
     read_events,
+    repair_journal_integrity,
 )
 
 
@@ -190,10 +193,9 @@ def _worker_append(path, count, tag):
 def test_concurrent_append_atomicity(tmp_path):
     """Multi-process appends must not produce malformed lines.
 
-    POSIX guarantees that write(2) of <= PIPE_BUF on an O_APPEND fd is
-    atomic with respect to concurrent writers; CSF4 (Linux) honours this.
-    Windows _O_APPEND is application-level and does not guarantee atomicity
-    across processes; the test is skipped there."""
+    This covers the directory mutex between local Linux processes. Distributed
+    filesystem safety comes from server-atomic mkdir, not PIPE_BUF or O_APPEND.
+    Windows process spawning does not preserve this test's import fixture."""
     j = tmp_path / "journal.ndjson"
     procs = []
     for tag in ("A", "B", "C", "D"):
@@ -208,3 +210,160 @@ def test_concurrent_append_atomicity(tmp_path):
     assert len(lines) == 4 * 50
     for ln in lines:
         json.loads(ln)   # must parse
+
+
+def _cross_host_overlap_fixture():
+    payload = {
+        "phase": "AIMALL",
+        "iteration": 14,
+        "replacement_round": 0,
+        "producer_kind": "scheduler",
+        "stage": "sge_scheduler_wait",
+        "status": "running",
+        "elapsed_seconds": 120.0,
+        "stage_elapsed_seconds": 120.0,
+        "job_id": "898600",
+        "attempt_id": "r0000-a0001-13f81f72",
+        "completed": 0,
+        "total": 1,
+        "unit": "tasks",
+        "running": 1,
+        "pending": 0,
+        "failed": 0,
+        "missing": 0,
+        "scientific_publication_complete": False,
+        "scheduler_identity_kind": "sge",
+    }
+    candidate = journal_module._encode_event(
+        "scheduler_progress",
+        payload,
+        ts="2026-08-20T12:03:12+00:00",
+    )
+    bad = (
+        b'13f81f72", "completed": 0, "total": 1, "unit": "tasks", '
+        b'"running": 1, "pending": 0, "failed": 0, "missing": 0, '
+        b'"scientific_publication_complete": false, '
+        b'"scheduler_identity_kind": "sge"}\n'
+    )
+    required_previous_length = len(candidate) - len(bad)
+    previous = None
+    for padding in range(4000):
+        trial = journal_module._encode_event(
+            "phase_activity_progress",
+            {
+                "phase": "AIMALL",
+                "iteration": 14,
+                "producer_kind": "worker",
+                "stage": "task",
+                "status": "running",
+                "padding": "x" * padding,
+            },
+            ts="2026-08-20T12:02:12+00:00",
+        )
+        if len(trial) == required_previous_length:
+            previous = trial
+            break
+    assert previous is not None
+    return previous + bad + candidate, bad
+
+
+def test_cross_host_progress_overlap_is_repaired_losslessly(tmp_path):
+    journal = tmp_path / "journal.ndjson"
+    raw, malformed = _cross_host_overlap_fixture()
+    journal.write_bytes(raw)
+
+    report = inspect_journal_integrity(journal)
+
+    assert report.disposition == "recoverable_cross_host_progress_overlap"
+    assert report.repairable is True
+    assert report.length == len(malformed)
+    result = repair_journal_integrity(
+        journal,
+        report.to_dict(),
+        archive_dir=tmp_path / "journal_quarantine",
+    )
+    assert Path(result["archive_path"]).read_bytes() == raw
+    assert inspect_journal_integrity(journal).disposition == "valid"
+    assert [event["event"] for event in iter_events(journal)] == [
+        "phase_activity_progress",
+        "scheduler_progress",
+    ]
+
+
+def test_unknown_interior_corruption_remains_unsafe(tmp_path):
+    journal = tmp_path / "journal.ndjson"
+    journal.write_text(
+        '{"ts":"2026-01-01T00:00:00Z","event":"ok"}\n'
+        'unrelated broken bytes\n'
+        '{"ts":"2026-01-01T00:00:01Z","event":"ok"}\n',
+        encoding="utf-8",
+    )
+
+    report = inspect_journal_integrity(journal)
+
+    assert report.disposition == "unsafe"
+    assert report.repairable is False
+
+
+def test_progress_like_suffix_without_matching_identity_remains_unsafe(tmp_path):
+    journal = tmp_path / "journal.ndjson"
+    raw, malformed = _cross_host_overlap_fixture()
+    lines = raw.splitlines(keepends=True)
+    journal.write_bytes(
+        lines[0] + b"deadbeef" + malformed[8:] + lines[2]
+    )
+
+    report = inspect_journal_integrity(journal)
+
+    assert report.disposition == "unsafe"
+    assert report.repairable is False
+
+
+def test_append_refuses_to_cement_torn_tail(tmp_path):
+    journal = tmp_path / "journal.ndjson"
+    journal.write_bytes(b'{"ts":"2026-01-01T00:00:00Z","event":"partial"')
+
+    with pytest.raises(JournalCorruptionError, match="unterminated tail"):
+        append_event(journal, "next")
+
+    assert inspect_journal_integrity(journal).disposition == "recoverable_torn_tail"
+
+
+def test_complete_but_unterminated_tail_is_recoverable_not_appendable(tmp_path):
+    journal = tmp_path / "journal.ndjson"
+    journal.write_bytes(b'{"ts":"2026-01-01T00:00:00Z","event":"complete"}')
+
+    report = inspect_journal_integrity(journal)
+
+    assert report.disposition == "recoverable_torn_tail"
+    assert report.valid_records == 0
+    with pytest.raises(JournalCorruptionError, match="unterminated"):
+        list(iter_events(journal))
+    with pytest.raises(JournalCorruptionError, match="unterminated tail"):
+        append_event(journal, "next")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="same-host liveness uses Linux /proc")
+def test_append_recovers_dead_same_host_directory_lock(tmp_path):
+    journal = tmp_path / "journal.ndjson"
+    lock_dir = tmp_path / "journal.ndjson.append-lock"
+    lock_dir.mkdir()
+    (lock_dir / "owner.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "host": socket.gethostname(),
+                "pid": 2_147_483_647,
+                "process_start_identity": "dead",
+                "nonce": "a" * 32,
+                "created_at_iso": "2026-01-01T00:00:00+00:00",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    append_event(journal, "after_dead_owner", lock_timeout_seconds=1)
+
+    assert not lock_dir.exists()
+    assert list(iter_events(journal))[0]["event"] == "after_dead_owner"

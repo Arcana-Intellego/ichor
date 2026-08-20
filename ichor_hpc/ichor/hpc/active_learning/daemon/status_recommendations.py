@@ -1383,11 +1383,18 @@ def build_status_recommendations(
             )
         ]
     if payload.get("journal_error"):
+        recoverable_journal = str(payload.get("journal_error") or "").startswith(
+            "recoverable journal telemetry damage:"
+        )
         return [
             StatusRecommendation(
                 code="journal_corrupt",
                 severity="required",
-                primary="run reconcile and inspect the corrupt journal segment",
+                primary=(
+                    "run reconcile to archive and repair the damaged journal telemetry"
+                    if recoverable_journal
+                    else "run reconcile and inspect the corrupt journal segment"
+                ),
                 why=_short_error(payload.get("journal_error")),
                 command=_reconcile_cmd(campaign),
             )

@@ -367,6 +367,9 @@ class Daemon:
     _queue_diagnostic_last_monotonic: Dict[str, float] = field(
         default_factory=dict, init=False, repr=False
     )
+    _mirrored_worker_progress: Dict[str, str] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         self.campaign_dir = Path(self.campaign_dir)
@@ -913,15 +916,94 @@ class Daemon:
         for record in reversed(records):
             if (
                 record.get("producer_kind") == "worker"
-                and record.get("status") == "completed"
-                and record.get("stage") == "split_publication"
                 and record.get("iteration") == int(state.iteration)
                 and record.get("replacement_round")
                 == int(getattr(state, "replacement_round", 0))
                 and str(record.get("job_id") or "") == str(job_id)
             ):
-                return True
+                self._mirror_worker_progress_record(record)
+                return bool(
+                    record.get("status") == "completed"
+                    and record.get("stage") == "split_publication"
+                )
         return False
+
+    def _mirror_worker_progress_record(self, record: Mapping[str, Any]) -> None:
+        """Mirror one authenticated compute-worker sidecar from the daemon host."""
+        counters = dict(record.get("counters") or {})
+        details = dict(record.get("details") or {})
+        identity = (
+            str(record.get("phase") or "")
+            + ":"
+            + str(record.get("iteration"))
+            + ":"
+            + str(record.get("replacement_round"))
+            + ":"
+            + str(record.get("job_id") or "")
+        )
+        content_identity = "|".join(
+            [
+                str(record.get("updated_at_iso") or ""),
+                str(record.get("stage") or ""),
+                str(record.get("status") or ""),
+                repr(sorted(counters.items())),
+                repr(sorted(details.items())),
+            ]
+        )
+        if self._mirrored_worker_progress.get(identity) == content_identity:
+            return
+        prior = self._mirrored_worker_progress.get(identity)
+        status = str(record.get("status") or "running")
+        event_type = (
+            "phase_activity_completed"
+            if status == "completed"
+            else "phase_activity_failed"
+            if status == "failed"
+            else "phase_activity_started"
+            if prior is None
+            else "phase_activity_progress"
+        )
+        payload: Dict[str, Any] = {
+            "phase": str(record.get("phase") or ""),
+            "iteration": int(record.get("iteration") or 0),
+            "replacement_round": int(record.get("replacement_round") or 0),
+            "producer_kind": "worker",
+            "stage": str(record.get("stage") or ""),
+            "status": status,
+            "elapsed_seconds": float(record.get("elapsed_seconds") or 0.0),
+            "stage_elapsed_seconds": float(
+                record.get("stage_elapsed_seconds") or 0.0
+            ),
+            "job_id": str(record.get("job_id") or ""),
+            "attempt_id": str(record.get("attempt_id") or ""),
+        }
+        for key in ("completed", "total", "unit"):
+            if counters.get(key) is not None:
+                payload[key] = counters[key]
+        for key in (
+            "running",
+            "pending",
+            "failed",
+            "missing",
+            "accepted",
+            "rejected",
+            "scientific_publication_complete",
+            "pending_reason",
+            "pending_queue",
+            "scheduler_native_state",
+            "path_count",
+            "control_hashes",
+            "reused_digests",
+            "bytes_hashed",
+            "fsync_count",
+            "strict_fallback",
+        ):
+            if isinstance(details.get(key), (str, int, bool)):
+                payload[key] = details[key]
+        if record.get("throughput") is not None:
+            payload["throughput"] = record["throughput"]
+        self._journal(event_type, **payload)
+        self._mirrored_worker_progress[identity] = content_identity
 
     def _pending_queue_diagnostics(
         self,

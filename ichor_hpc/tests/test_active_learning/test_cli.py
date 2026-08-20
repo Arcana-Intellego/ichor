@@ -23,8 +23,10 @@ from ichor.hpc.active_learning.daemon.job_names import live_job_name
 from ichor.hpc.active_learning.daemon.journal import (
     KNOWN_EVENT_TYPES,
     append_event,
+    inspect_journal_integrity,
     iter_events,
 )
+import ichor.hpc.active_learning.daemon.journal as journal_mod
 from ichor.hpc.active_learning.daemon.state import (
     CampaignPhase,
     CampaignState,
@@ -118,6 +120,60 @@ def _write_locked_state(campaign: Path, state) -> None:
         CampaignConfig.from_yaml(campaign / "campaign.yaml"),
         campaign_uid=str(state.campaign_uid),
     )
+
+
+def _write_recoverable_progress_overlap(journal: Path) -> bytes:
+    payload = {
+        "phase": "AIMALL",
+        "iteration": 14,
+        "replacement_round": 0,
+        "producer_kind": "scheduler",
+        "stage": "sge_scheduler_wait",
+        "status": "running",
+        "elapsed_seconds": 120.0,
+        "stage_elapsed_seconds": 120.0,
+        "job_id": "898600",
+        "attempt_id": "r0000-a0001-13f81f72",
+        "completed": 0,
+        "total": 1,
+        "unit": "tasks",
+        "running": 1,
+        "pending": 0,
+        "failed": 0,
+        "missing": 0,
+        "scientific_publication_complete": False,
+        "scheduler_identity_kind": "sge",
+    }
+    candidate = journal_mod._encode_event(
+        "scheduler_progress",
+        payload,
+        ts="2026-08-20T12:03:12+00:00",
+    )
+    bad = (
+        b'13f81f72", "completed": 0, "total": 1, "unit": "tasks", '
+        b'"running": 1, "pending": 0, "failed": 0, "missing": 0, '
+        b'"scientific_publication_complete": false, '
+        b'"scheduler_identity_kind": "sge"}\n'
+    )
+    required_previous_length = len(candidate) - len(bad)
+    for padding in range(4000):
+        previous = journal_mod._encode_event(
+            "phase_activity_progress",
+            {
+                "phase": "AIMALL",
+                "iteration": 14,
+                "producer_kind": "worker",
+                "stage": "task",
+                "status": "running",
+                "padding": "x" * padding,
+            },
+            ts="2026-08-20T12:02:12+00:00",
+        )
+        if len(previous) == required_previous_length:
+            raw = previous + bad + candidate
+            journal.write_bytes(raw)
+            return raw
+    raise AssertionError("could not construct overlap fixture")
 
 
 def _commit_training_and_model_versions(campaign: Path, versions):
@@ -2140,6 +2196,26 @@ def test_status_recommendations_cover_runtime_and_job_blockers(tmp_path):
     assert _recommendation_codes(campaign, {"shutdown_requested": True}) == [
         "shutdown_requested"
     ]
+
+
+def test_status_recommends_reconcile_for_repairable_journal_damage(tmp_path):
+    campaign = _campaign_with_config(tmp_path)
+
+    recommendation = build_status_recommendations(
+        campaign,
+        {
+            "journal_error": (
+                "recoverable journal telemetry damage: "
+                "recoverable_cross_host_progress_overlap"
+            )
+        },
+    )[0]
+
+    assert recommendation.code == "journal_corrupt"
+    assert "archive and repair" in recommendation.primary
+    assert recommendation.command == cli_mod._campaign_command(
+        campaign, "reconcile"
+    )
 
 
 def test_status_recommendations_cover_halted_reason_classes(tmp_path):
@@ -5751,6 +5827,43 @@ def test_reconcile_preview_discloses_repairable_state_backup(
     ) == 1
 
 
+def test_reconcile_preview_discloses_repairable_journal_overlap(tmp_path):
+    state = fresh_campaign_state(campaign_uid="journal-repair")
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 15
+    report = SimpleNamespace(
+        proposed_state=state,
+        unsafe_reasons=[],
+        blocking_artifacts=[],
+        active_submission_intents=[],
+        decision="SEED_SELECT: campaign authority is coherent",
+        journal_recovery={
+            "disposition": "recoverable_cross_host_progress_overlap",
+            "repairable": True,
+            "retained_records": 11447,
+        },
+    )
+
+    presentation = cli_mod._reconcile_presentation(
+        tmp_path,
+        report,
+        {
+            "contract_ok": True,
+            "missing_or_invalid_inputs": [],
+            "protected_artifacts": [],
+        },
+        config_review=SimpleNamespace(allowed_changes=[], blocked_changes=[]),
+        runtime_status={},
+    )
+
+    assert presentation.result == "ready to apply"
+    assert (
+        "campaign journal",
+        "archive the exact damaged bytes and retain 11447 valid records "
+        "with one authenticated telemetry gap",
+    ) in presentation.planned_changes
+
+
 def test_reconcile_safe_stale_binding_requires_resume_not_apply(
     tmp_path,
     monkeypatch,
@@ -7888,4 +8001,63 @@ def test_reconcile_apply_mutation_archives_incomplete_scalar_publication(
     assert Path(archives[0]).is_dir()
     assert recorded == [
         ("archive_scalar_diversity_publication", archives)
+    ]
+
+
+def test_reconcile_apply_repairs_authenticated_journal_overlap_only(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = _campaign_with_config(tmp_path)
+    state = fresh_campaign_state(max_iterations=40, campaign_uid="journal-repair")
+    state.phase = CampaignPhase.SEED_SELECT
+    state.iteration = 15
+    _write_locked_state(campaign, state)
+    journal = campaign / DEFAULT_DATA_SUBDIR / "journal.ndjson"
+    original = _write_recoverable_progress_overlap(journal)
+    recovery = inspect_journal_integrity(journal)
+    assert recovery.disposition == "recoverable_cross_host_progress_overlap"
+    report = SimpleNamespace(
+        proposed_state=state,
+        unsafe_reasons=[],
+        journal_recovery=recovery.to_dict(),
+        partial_array_recovery=None,
+    )
+    recorded = []
+
+    class Transaction:
+        payload = {"transaction_id": "b" * 32}
+
+        def record_paths(self, operation, paths):
+            values = list(paths)
+            if values:
+                recorded.append((str(operation), values))
+
+    monkeypatch.setattr(cli_mod, "clean_reentry_staging", lambda *a, **k: [])
+
+    result = cli_mod._perform_reconcile_apply_mutations(
+        campaign,
+        report,
+        transaction=Transaction(),
+        retrain_ferebus=False,
+        force_resubmit_array=False,
+        partial_array=None,
+        force_array_phase=CampaignPhase.SEED_SELECT,
+        force_array_iteration=15,
+        archive_existing_array_outputs=False,
+        data_staging_archive_mode=None,
+    )
+
+    repair = result["journal_repair"]
+    assert inspect_journal_integrity(journal).disposition == "valid"
+    assert Path(repair["archive_path"]).read_bytes() == original
+    assert repair["omitted_bytes"] == recovery.length
+    assert read_state(
+        campaign / DEFAULT_DATA_SUBDIR / DEFAULT_STATE_FILENAME
+    ).to_dict() == state.to_dict()
+    assert recorded == [
+        (
+            "repair_journal_append_damage",
+            [repair["archive_path"], repair["journal_path"]],
+        )
     ]

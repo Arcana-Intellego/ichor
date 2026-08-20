@@ -41,7 +41,7 @@ from .artifact_snapshot import (
     CommittedArtifactSnapshot,
     build_committed_artifact_snapshot,
 )
-from .journal import tail_events
+from .journal import inspect_journal_integrity, tail_events
 from .filesystem import campaign_owned_path
 from .recovery_contracts import (
     RecoveryDecision,
@@ -423,6 +423,7 @@ class ReconciliationReport:
     ariadne_results_recovery: Optional[Dict[str, Any]] = None
     ariadne_publication_recovery: Optional[Dict[str, Any]] = None
     ariadne_transaction_residue: Optional[Dict[str, Any]] = None
+    journal_recovery: Optional[Dict[str, Any]] = None
     ferebus_candidate_recovery: Optional[Dict[str, Any]] = None
     ferebus_staging_recovery: Optional[Dict[str, Any]] = None
     aimall_quality_revalidation: Optional[Dict[str, Any]] = None
@@ -1956,17 +1957,32 @@ def propose_recovery(
     last_phase_retryable = False
     last_halt_event = None
     journal_path = data / "journal.ndjson"
-    if journal_path.exists():
+    journal_recovery: Optional[Dict[str, Any]] = None
+    if journal_path.exists() or journal_path.is_symlink():
         try:
-            for event in tail_events(journal_path):
-                phase_hint = _journal_phase_hint(event)
-                if phase_hint:
-                    last_phase = str(phase_hint["phase"])
-                    last_phase_event = str(phase_hint.get("event") or "")
-                    last_phase_retryable = bool(phase_hint.get("retryable", False))
-                    last_iter = event.get("iteration", last_iter)
-                if str(event.get("event") or "") == "halt":
-                    last_halt_event = dict(event)
+            journal_integrity = inspect_journal_integrity(journal_path)
+            if journal_integrity.disposition != "valid":
+                journal_recovery = journal_integrity.to_dict()
+                if not (
+                    journal_integrity.repairable
+                    and existing_loaded
+                    and existing is not None
+                    and existing.phase is not CampaignPhase.HALTED
+                ):
+                    journal_recovery = None
+                    raise ValueError(
+                        "journal integrity disposition is "
+                        + journal_integrity.disposition
+                        + ": "
+                        + journal_integrity.reason
+                    )
+                notes.append(
+                    "recoverable journal telemetry damage: "
+                    + journal_integrity.disposition
+                    + "; campaign state and committed artefacts remain authoritative"
+                )
+            else:
+                journal_recovery = None
         except Exception as exc:
             journal_problem = (
                 "journal is corrupt or unreadable: "
@@ -1976,6 +1992,26 @@ def propose_recovery(
             )
             notes.append(journal_problem)
             unsafe_reasons.append(journal_problem)
+        if journal_recovery is None:
+            try:
+                for event in tail_events(journal_path):
+                    phase_hint = _journal_phase_hint(event)
+                    if phase_hint:
+                        last_phase = str(phase_hint["phase"])
+                        last_phase_event = str(phase_hint.get("event") or "")
+                        last_phase_retryable = bool(phase_hint.get("retryable", False))
+                        last_iter = event.get("iteration", last_iter)
+                    if str(event.get("event") or "") == "halt":
+                        last_halt_event = dict(event)
+            except Exception as exc:
+                journal_problem = (
+                    "journal is corrupt or unreadable: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                )
+                notes.append(journal_problem)
+                unsafe_reasons.append(journal_problem)
     # Bootstrap is the only sampling transaction that uses iteration zero.
     # A stale active-loop state must never redirect recovery away from it.
     bootstrap_iteration = 0
@@ -4426,6 +4462,11 @@ def propose_recovery(
         ariadne_transaction_residue=(
             dict(ariadne_transaction_residue)
             if isinstance(ariadne_transaction_residue, dict)
+            else None
+        ),
+        journal_recovery=(
+            dict(journal_recovery)
+            if isinstance(journal_recovery, dict)
             else None
         ),
         ferebus_candidate_recovery=ferebus_candidate_recovery,

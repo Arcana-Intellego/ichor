@@ -231,7 +231,18 @@ def test_daemon_observes_worker_publication_and_throttles_queue_diagnostics(
     )
 
     assert daemon._worker_publication_complete(state, state.phase, "9001") is True
+    assert daemon._worker_publication_complete(state, state.phase, "9001") is True
     assert daemon._worker_publication_complete(state, state.phase, "9002") is False
+    from ichor.hpc.active_learning.daemon.journal import iter_events
+
+    mirrored = list(
+        iter_events(tmp_path / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson")
+    )
+    assert [event["event"] for event in mirrored] == [
+        "phase_activity_completed"
+    ]
+    assert mirrored[0]["producer_kind"] == "worker"
+    assert mirrored[0]["job_id"] == "9001"
     first = daemon._pending_queue_diagnostics(
         job_id="9001",
         scheduler_identity={

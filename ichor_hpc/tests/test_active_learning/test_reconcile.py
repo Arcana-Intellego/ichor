@@ -11,7 +11,10 @@ import pytest
 import ichor.hpc.active_learning.daemon.reconcile as reconcile_mod
 import ichor.hpc.active_learning.daemon.recovery_contracts as recovery_contracts_mod
 from ichor.hpc.active_learning.acquisition.trajectory_pool import TrajectoryPool
-from ichor.hpc.active_learning.daemon.journal import append_event
+from ichor.hpc.active_learning.daemon.journal import (
+    JournalIntegrityDisposition,
+    append_event,
+)
 from ichor.hpc.active_learning.daemon.reconcile import (
     RECONCILE_SUFFIX,
     ReconciliationReport,
@@ -3583,6 +3586,72 @@ def test_propose_recovery_clears_shutdown_request(tmp_path):
     write_state(data / DEFAULT_STATE_FILENAME, existing)
     report = propose_recovery(campaign)
     assert report.proposed_state.shutdown_requested is False
+
+
+def test_propose_recovery_accepts_repairable_journal_with_valid_state(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, data, _, _ = _campaign_dirs(tmp_path)
+    existing = fresh_campaign_state()
+    write_state(data / DEFAULT_STATE_FILENAME, existing)
+    journal = data / "journal.ndjson"
+    journal.write_bytes(b"damaged\n")
+    monkeypatch.setattr(
+        reconcile_mod,
+        "inspect_journal_integrity",
+        lambda _path: JournalIntegrityDisposition(
+            disposition="recoverable_cross_host_progress_overlap",
+            repairable=True,
+            journal_path=str(journal),
+            segment_path=str(journal),
+            segment_sha256="a" * 64,
+            segment_size=8,
+            segment_identity=(1, 2, 8, 3, 4),
+            line_number=1,
+            offset=0,
+            length=8,
+            malformed_sha256="b" * 64,
+            valid_records=0,
+            retained_records=0,
+            reason="fixture overlap",
+        ),
+    )
+
+    report = propose_recovery(campaign)
+
+    assert report.existing_state_loaded is True
+    assert report.journal_recovery is not None
+    assert report.journal_recovery["repairable"] is True
+    assert not any("journal is corrupt" in reason for reason in report.unsafe_reasons)
+
+
+def test_propose_recovery_does_not_offer_journal_only_repair_for_halted_state(
+    tmp_path,
+    monkeypatch,
+):
+    campaign, data, _, _ = _campaign_dirs(tmp_path)
+    existing = fresh_campaign_state()
+    existing.phase = CampaignPhase.HALTED
+    write_state(data / DEFAULT_STATE_FILENAME, existing)
+    journal = data / "journal.ndjson"
+    journal.write_bytes(b"damaged\n")
+    monkeypatch.setattr(
+        reconcile_mod,
+        "inspect_journal_integrity",
+        lambda _path: JournalIntegrityDisposition(
+            disposition="recoverable_cross_host_progress_overlap",
+            repairable=True,
+            journal_path=str(journal),
+            segment_path=str(journal),
+            reason="fixture overlap",
+        ),
+    )
+
+    report = propose_recovery(campaign)
+
+    assert report.journal_recovery is None
+    assert any("journal is corrupt" in reason for reason in report.unsafe_reasons)
 
 
 def test_propose_recovery_reads_last_journal_transition(tmp_path):

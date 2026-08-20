@@ -388,16 +388,6 @@ def _phase_b_json_safe(value):
     return value
 
 
-def _append_phase_b_journal_event(campaign, event_type, **payload) -> None:
-    try:
-        from ..daemon.journal import append_event
-
-        journal_path = Path(campaign) / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson"
-        append_event(journal_path, event_type, **payload)
-    except Exception:
-        return
-
-
 def _phase_b_refill_after_anti_overlap(
     *,
     ordered_indices,
@@ -1361,17 +1351,6 @@ def _run_phase_b(args, campaign, config, *, progress_reporter: Any = None):
                 "safety_filter": safety_filter,
             }),
         )
-    if bool(relaxation.get("applied", False)):
-        _append_phase_b_journal_event(
-            campaign,
-            "phase_b_geometry_novelty_relaxed",
-            phase="PHASE_B_DIVERSITY",
-            iteration=int(args.iteration),
-            reason=str(relaxation.get("reason", "")),
-            n_admitted=int(relaxation.get("n_admitted", 0)),
-            effective_min_separation_angstrom=float(min_sep),
-            n_candidates=int(len(selected_frames)),
-        )
     if int(report.n_kept) <= 0:
         write_phase_b_failure("no_non_duplicate_candidate")
         if threshold_mode == "scaled":
@@ -1828,7 +1807,6 @@ def main(argv=None) -> int:
 
     progress_reporter = None
     try:
-        from ..daemon.journal import append_event
         from ..daemon.phase_progress import PhaseProgressReporter
         from ..daemon.state import DEFAULT_STATE_FILENAME, read_state
 
@@ -1840,22 +1818,6 @@ def main(argv=None) -> int:
             if int(args.iteration) == 0
             else "PHASE_B_DIVERSITY"
         )
-        journal_path = (
-            campaign / ".DATA" / "ACTIVE_LEARNING" / "journal.ndjson"
-        )
-
-        def journal_progress(event_type, payload):
-            append_event(
-                journal_path,
-                str(event_type),
-                max_bytes=int(config.runtime.journal_max_bytes),
-                retained_files=int(config.runtime.journal_retained_files),
-                lock_timeout_seconds=int(
-                    config.runtime.ledger_lock_timeout_seconds
-                ),
-                **dict(payload),
-            )
-
         progress_reporter = PhaseProgressReporter(
             campaign,
             campaign_uid=str(state.campaign_uid),
@@ -1874,7 +1836,9 @@ def main(argv=None) -> int:
                     os.environ.get("ICHOR_SUBMISSION_IDENTITY") or ""
                 ),
             },
-            journal_callback=journal_progress,
+            # Compute nodes publish only the authenticated atomic sidecar.
+            # The daemon mirrors it into the shared journal from one host.
+            journal_callback=None,
         )
         progress_reporter.start("handoff_validation")
     except Exception:
