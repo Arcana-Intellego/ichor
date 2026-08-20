@@ -792,6 +792,41 @@ def _halt_recommendation(campaign: Path, payload: Dict[str, Any]) -> StatusRecom
         else ""
     )
     upper = reason.upper()
+    ariadne_residue = payload.get(
+        "_presentation_ariadne_transaction_residue"
+    )
+    if isinstance(ariadne_residue, Mapping):
+        if ariadne_residue.get("error"):
+            return StatusRecommendation(
+                code="halted_contract_failure",
+                severity="blocked",
+                primary="preview reconcile and review the contradictory ARIADNE seed-tree evidence",
+                why="ARIADNE transaction-residue evidence could not be authenticated",
+                command=_reconcile_cmd(campaign),
+            )
+        accepted = int(ariadne_residue.get("accepted_tasks") or 0)
+        rejected = int(ariadne_residue.get("rejected_tasks") or 0)
+        residue_count = int(ariadne_residue.get("residue_count") or 0)
+        return StatusRecommendation(
+            code="halted_contract_failure",
+            severity="required",
+            primary="preview recovery of the authenticated ARIADNE transaction residue",
+            why=(
+                str(accepted)
+                + " accepted and "
+                + str(rejected)
+                + " rejected ARIADNE results remain authoritative; "
+                + str(residue_count)
+                + " partial runner director"
+                + ("y requires" if residue_count == 1 else "ies require")
+                + " retention before Phase B"
+            ),
+            command=_reconcile_cmd(campaign),
+            details=[
+                "reconcile submits no ARIADNE work",
+                "resume starts Phase B only after strict handoff validation",
+            ],
+        )
     if "PHASERESULT SUBMISSION METADATA REQUIRES A SUBMITTED JOB" in upper:
         return StatusRecommendation(
             code="halted_ferebus_quality_failed",
@@ -1493,6 +1528,11 @@ def build_status_recommendations(
         return [allocation_transition] + stale_pid
 
     if _phase(payload) == CampaignPhase.HALTED.value:
+        if isinstance(
+            payload.get("_presentation_ariadne_transaction_residue"),
+            Mapping,
+        ):
+            return [_halt_recommendation(campaign, payload)] + stale_pid
         environment_recommendation = _environment_launch_recommendation(
             campaign,
             payload,

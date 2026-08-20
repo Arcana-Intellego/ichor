@@ -1228,6 +1228,7 @@ def clean_stale_ariadne_seed_outputs(
     iteration: int,
     *,
     retry_array_task_ids: Optional[Sequence[int]] = None,
+    authority_identity: Optional[str] = None,
 ) -> List[str]:
     """Quarantine incomplete task directories before a bounded retry."""
     from datetime import datetime, timezone
@@ -1239,10 +1240,16 @@ def clean_stale_ariadne_seed_outputs(
         ariadne_seeds_dir,
     )
     from ..seed_identity import read_ariadne_task_map, task_for_array_task_id
+    from ..ariadne_seed_tree import (
+        AriadneSeedTreeError,
+        classify_ariadne_seed_tree,
+    )
     from .ariadne_quarantine import (
+        AriadneQuarantineError,
         ensure_quarantine_capacity,
         prepare_quarantine_manifest,
         quarantine_root,
+        retain_ariadne_transaction_residue,
         write_quarantine_manifest,
     )
 
@@ -1262,19 +1269,45 @@ def clean_stale_ariadne_seed_outputs(
         if retry_array_task_ids is not None
         else []
     )
+    try:
+        seed_tree = classify_ariadne_seed_tree(iter_dir, task_map)
+        retained_residue = retain_ariadne_transaction_residue(
+            campaign,
+            iteration=int(iteration),
+            task_map=task_map,
+            campaign_uid=str(task_map["campaign_uid"]),
+            authority_identity=(
+                str(authority_identity)
+                if authority_identity is not None
+                else (
+                    "bounded_retry_cleanup:"
+                    + ",".join(
+                        str(value) for value in sorted(set(task_ids))
+                    )
+                )
+            ),
+            context=seed_tree,
+        )
+    except (AriadneSeedTreeError, AriadneQuarantineError) as exc:
+        if "unexpected non-directory ARIADNE seed entry" in str(exc):
+            raise BackendSubmissionError(
+                "refusing to quarantine non-directory ARIADNE output: "
+                + str(exc).rsplit(": ", 1)[-1]
+            ) from exc
+        raise BackendSubmissionError(str(exc)) from exc
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
     quarantine = (
         quarantine_root(campaign)
         / active_iteration_name(int(iteration))
         / stamp
     )
-    moved: List[str] = []
+    moved: List[str] = list(retained_residue["retained_paths"])
+    canonical_moved: List[str] = []
     moved_sources: List[Path] = []
     candidates: List[Path] = []
     for task_id in task_ids:
         task = task_for_array_task_id(task_map, task_id)
         candidates.append(ariadne_seed_dir(iter_dir, int(task["seed_id"])))
-    candidates.extend(sorted(seeds_dir.glob(".seed-*.partial-*")))
     retained_candidates: List[Path] = []
     seen_candidates = set()
     for candidate in candidates:
@@ -1297,7 +1330,7 @@ def clean_stale_ariadne_seed_outputs(
             seen_candidates.add(identity)
             retained_candidates.append(candidate)
     if not retained_candidates:
-        return []
+        return moved
     ensure_quarantine_capacity(campaign, retained_candidates)
     quarantine.mkdir(parents=True, exist_ok=False)
     targets = [quarantine / candidate.name for candidate in retained_candidates]
@@ -1312,13 +1345,14 @@ def clean_stale_ariadne_seed_outputs(
         shutil.move(str(candidate), str(target))
         moved_sources.append(candidate)
         moved.append(str(target))
-    if moved:
+        canonical_moved.append(str(target))
+    if canonical_moved:
         write_quarantine_manifest(
             campaign,
             quarantine,
             iteration=int(iteration),
             source_paths=moved_sources,
-            target_paths=[Path(value) for value in moved],
+            target_paths=[Path(value) for value in canonical_moved],
         )
     return moved
 
@@ -5087,6 +5121,20 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                     if retry_file:
                         array_task_map = Path(str(retry_file))
             if phase_name == "ARIADNE_ARRAY":
+                from . import submission_intent as _submission_intent
+
+                cleanup_intent = _submission_intent.load_active_intent(
+                    self.campaign_dir,
+                    phase_name,
+                    int(getattr(state, "iteration", 0)),
+                    expected_campaign_uid=str(state.campaign_uid),
+                )
+                cleanup_authority = (
+                    "bounded_retry_cleanup:"
+                    + str(cleanup_intent["submission_identity"])
+                    if isinstance(cleanup_intent, Mapping)
+                    else None
+                )
                 removed = clean_stale_ariadne_seed_outputs(
                     self.campaign_dir,
                     int(getattr(state, "iteration", 0)),
@@ -5095,6 +5143,7 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
                         if array_task_map is None
                         else [int(x) for x in (recovery.get("retry_task_ids") or [])]
                     ),
+                    authority_identity=cleanup_authority,
                 )
                 if removed:
                     self._journal_event(
@@ -7961,6 +8010,8 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             ARIADNE_RESULTS_SCHEMA_VERSION,
             acquisition_maturity_audit_payload,
             load_seeds_picked,
+            read_ariadne_batch_decision,
+            read_ariadne_results_manifest,
             validate_ariadne_result,
             write_acquisition_maturity_audit,
             write_ariadne_landing_audit,
@@ -8255,6 +8306,20 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             return PhaseResult(
                 is_complete=True,
                 failure_reason="trajectory pool/seed selection SHA mismatch",
+            )
+        try:
+            from ..ariadne_seed_tree import classify_ariadne_seed_tree
+
+            seed_tree_context = classify_ariadne_seed_tree(iter_dir, task_map)
+        except Exception as exc:
+            return PhaseResult(
+                is_complete=True,
+                failure_reason=(
+                    "ariadne_seed_tree_invalid_before_postprocess: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                ),
             )
         kept_alphas = []
         flagged_count = 0
@@ -9038,6 +9103,43 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             accepted=int(len(accepted)),
             rejected=int(len(rejected)),
         )
+        try:
+            from .ariadne_quarantine import retain_ariadne_transaction_residue
+
+            seed_tree_context.assert_unchanged(task_map)
+            residue_retention = retain_ariadne_transaction_residue(
+                self.campaign_dir,
+                iteration=int(state.iteration),
+                task_map=task_map,
+                campaign_uid=str(state.campaign_uid),
+                authority_identity=str(
+                    postprocess_intent.get("submission_identity") or ""
+                ),
+                context=seed_tree_context,
+            )
+        except Exception as exc:
+            return PhaseResult(
+                is_complete=True,
+                failure_reason=(
+                    "ariadne_transaction_residue_quarantine_failed: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                ),
+            )
+        if int(residue_retention["residue_count"]) > 0:
+            self._journal_event(
+                "ariadne_stale_outputs_quarantined",
+                phase=phase_name,
+                iteration=int(state.iteration),
+                classification="ariadne_transaction_residue",
+                residue_count=int(residue_retention["residue_count"]),
+                task_ids=list(residue_retention["task_ids"]),
+                seed_ids=list(residue_retention["seed_ids"]),
+                quarantine_path=str(residue_retention["attempt_path"]),
+                retained_bytes=int(residue_retention["total_bytes"]),
+                n_resubmitted=0,
+            )
         self._report_runtime_progress("landing_classification")
         n_kept = len(accepted)
         n_rejected = len(rejected)
@@ -9089,15 +9191,6 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             "rejected": rejected,
         })
         self.artefact_log.append(str(manifest_path))
-        try:
-            from ..sampling_history import prewarm_sampling_history_cache
-
-            prewarm_sampling_history_cache(
-                iter_dir,
-                iteration=int(state.iteration),
-            )
-        except Exception:
-            pass
         self._report_runtime_progress(
             "audit_publication",
             completed=3,
@@ -9142,6 +9235,48 @@ class LiveBackendsPhaseExecutor(DryRunPhaseExecutor):
             total=int(expected_n),
             unit="seed results",
         )
+        try:
+            validated_results = read_ariadne_results_manifest(
+                iter_dir,
+                expected_iteration=int(state.iteration),
+                require_nonempty=bool(n_kept),
+            )
+            validated_decision = read_ariadne_batch_decision(
+                iter_dir,
+                expected_iteration=int(state.iteration),
+                expected_campaign_uid=str(state.campaign_uid),
+                expected_config_sha256=str(config_sha256),
+                expected_failure_threshold_fraction=float(
+                    failure_threshold_fraction
+                ),
+                require_accepted=not bool(decision_reasons),
+            )
+            if (
+                int(validated_results["n_accepted"]) != int(n_kept)
+                or int(validated_results["n_rejected"]) != int(n_rejected)
+                or bool(validated_decision["current_evaluation"]["accepted"])
+                != (not bool(decision_reasons))
+            ):
+                raise ValueError("ARIADNE self-validation count mismatch")
+        except Exception as exc:
+            return PhaseResult(
+                is_complete=True,
+                failure_reason=(
+                    "ariadne_publication_self_validation_failed: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)
+                ),
+            )
+        try:
+            from ..sampling_history import prewarm_sampling_history_cache
+
+            prewarm_sampling_history_cache(
+                iter_dir,
+                iteration=int(state.iteration),
+            )
+        except Exception:
+            pass
 
         if n_kept == 0:
             return PhaseResult(

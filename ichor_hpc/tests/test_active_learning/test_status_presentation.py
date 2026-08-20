@@ -564,6 +564,89 @@ def test_preflight_uses_the_same_reconcile_action_for_cancelled_array_config_dri
     assert command == cli._campaign_command(campaign, "reconcile")
 
 
+def test_preflight_recommends_reconcile_for_ariadne_transaction_residue(
+    tmp_path,
+    monkeypatch,
+):
+    campaign = tmp_path / "campaign"
+    state = fresh_campaign_state(max_iterations=40)
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 12
+    state.reference_data_version = 11
+    state.models_version = 11
+    payload = {
+        "all_backends_present": True,
+        "campaign_config": {"ok": True},
+        "pool_feasibility": {"ok": True},
+        "campaign_state": {
+            "ok": False,
+            "condition": "reconcile_required",
+            "phase": CampaignPhase.HALTED.value,
+            "iteration": 12,
+            "issues": [
+                "authenticated ARIADNE transaction residue must be retained"
+            ],
+        },
+        "_presentation_state": state,
+        "_presentation_artifact_contract": {"ok": True},
+        "_presentation_config_review": {
+            "state": "unchanged",
+            "n_allowed": 0,
+            "n_blocked": 0,
+        },
+        "_presentation_ariadne_transaction_residue": {
+            "classification": "ariadne_transaction_residue",
+            "accepted_tasks": 199,
+            "rejected_tasks": 1,
+            "residue_count": 1,
+            "cleanup_required": True,
+            "tasks_resubmitted": 0,
+        },
+    }
+    monkeypatch.setattr(
+        cli,
+        "_runtime_liveness_policy",
+        lambda _campaign: (300.0, 5.0),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_probe_daemon_lock",
+        lambda _path: {"lock_held": False},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_probe_daemon_lease",
+        lambda *_args, **_kwargs: {"lease_fresh": False},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_probe_background_daemon",
+        lambda *_args, **_kwargs: {"background_pid_alive": False},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_load_active_submission_intents",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        cli,
+        "_load_scheduler_recovery_status",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        cli,
+        "inspect_reconcile_transaction_recovery",
+        lambda *_args, **_kwargs: {"state": "none"},
+    )
+
+    action, command = cli._preflight_launch_advice(campaign, payload)
+
+    assert action == (
+        "preview recovery of the authenticated ARIADNE transaction residue"
+    )
+    assert command == cli._campaign_command(campaign, "reconcile")
+
+
 def test_preflight_does_not_tell_an_active_daemon_to_restart_for_config_error(
     tmp_path,
     monkeypatch,
@@ -1063,6 +1146,47 @@ def test_unsafe_diversity_transition_reports_actual_startup_failure(tmp_path):
     assert (
         cli._status_plain_reason(payload, result[0].code)
         == "terminal scheduler lifecycle is incomplete"
+    )
+
+
+def test_halted_ariadne_residue_requires_scheduler_free_reconcile(tmp_path):
+    campaign = tmp_path / "campaign"
+    payload = {
+        "phase": CampaignPhase.HALTED.value,
+        "iteration": 12,
+        "max_iterations": 40,
+        "reference_data_version": 11,
+        "models_version": 11,
+        "lock_held": False,
+        "background_pid_alive": False,
+        "pending_jobs": {},
+        "active_submission_intents": [],
+        "artifact_manifest_status": {
+            "reference_data": {"ok": True},
+            "models": {"ok": True},
+        },
+        "state_artifact_contract_status": {"ok": True},
+        "_presentation_ariadne_transaction_residue": {
+            "classification": "ariadne_transaction_residue",
+            "accepted_tasks": 199,
+            "rejected_tasks": 1,
+            "residue_count": 1,
+            "cleanup_required": True,
+            "tasks_resubmitted": 0,
+        },
+    }
+
+    result = recommendations.build_status_recommendations(campaign, payload)
+    payload["recommendations"] = [result[0].to_dict()]
+
+    assert result[0].code == "halted_contract_failure"
+    assert str(result[0].command).startswith("ichor-al-daemon reconcile")
+    assert "199 accepted and 1 rejected" in result[0].why
+    assert "must be retained before Phase B" in (
+        cli._status_current_activity(payload)
+    )
+    assert "must be retained before Phase B" in str(
+        cli._status_plain_reason(payload, result[0].code)
     )
 
 

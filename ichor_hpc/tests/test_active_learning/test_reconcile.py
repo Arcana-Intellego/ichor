@@ -2272,6 +2272,221 @@ def test_reconcile_reuses_accepted_ariadne_results_when_rejected_outputs_absent(
     assert not report.unsafe_reasons
 
 
+def test_reconcile_ariadne_residue(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning import cli as cli_mod
+    from ichor.hpc.active_learning.config import CampaignConfig
+    from ichor.hpc.active_learning.daemon import ariadne_quarantine
+    from ichor.hpc.active_learning.daemon.completion_receipts import (
+        evidence_records,
+        write_completion_receipt,
+    )
+    from ichor.hpc.active_learning.daemon.config_lock import (
+        canonical_config,
+        config_fingerprint,
+    )
+    from ichor.hpc.active_learning.handoff_manifests import (
+        ariadne_batch_decision_path,
+        ariadne_results_path,
+    )
+
+    _trust_marker_models(monkeypatch)
+    monkeypatch.setattr(
+        recovery_contracts_mod,
+        "verify_committed_model_version",
+        lambda *a, **k: None,
+    )
+    campaign, data, training, models = _campaign_dirs(tmp_path)
+    _write_pool(campaign)
+    _commit_training_and_model_versions(training, models, [0])
+    config = CampaignConfig()
+    config.to_yaml(campaign / "campaign.yaml")
+    state = fresh_campaign_state(max_iterations=3, campaign_uid="reconcile-test")
+    state.phase = CampaignPhase.HALTED
+    state.iteration = 1
+    state.reference_data_version = 0
+    state.models_version = 0
+    write_state(data / DEFAULT_STATE_FILENAME, state)
+    append_event(
+        data / "journal.ndjson",
+        "halt",
+        from_phase=CampaignPhase.PHASE_B_DIVERSITY.value,
+        iteration=1,
+        reason="invalid ARIADNE scientific seed directory",
+    )
+    iter_dir = _write_ariadne_handoff(
+        campaign,
+        1,
+        n=10,
+        n_rejected=1,
+    )
+    residue = (
+        active_ariadne_dir(iter_dir)
+        / "seeds"
+        / ".seed-000010.partial-task-9-pid-364470"
+    )
+    residue.mkdir()
+    (residue / "partial.json").write_bytes(b"partial\n")
+    monkeypatch.setattr(
+        ariadne_quarantine,
+        "quarantine_root",
+        lambda _campaign: campaign / ".Q",
+    )
+    results_path = ariadne_results_path(iter_dir)
+    decision_path = ariadne_batch_decision_path(iter_dir)
+    scientific_bytes = {
+        results_path: results_path.read_bytes(),
+        decision_path: decision_path.read_bytes(),
+    }
+    before = replace(
+        state,
+        phase=CampaignPhase.ARIADNE_ARRAY,
+        pending_jobs={CampaignPhase.ARIADNE_ARRAY.value: "898524"},
+    )
+    after = replace(
+        state,
+        phase=CampaignPhase.PHASE_B_DIVERSITY,
+        pending_jobs={},
+    )
+    write_completion_receipt(
+        campaign,
+        campaign_uid="reconcile-test",
+        phase=CampaignPhase.ARIADNE_ARRAY.value,
+        iteration=1,
+        replacement_round=0,
+        config_sha256=config_fingerprint(canonical_config(config)),
+        state_before=before,
+        state_after=after,
+        next_phase=CampaignPhase.PHASE_B_DIVERSITY.value,
+        next_iteration=1,
+        state_updates={},
+        evidence=evidence_records(
+            campaign,
+            [results_path, decision_path],
+        ),
+        job_id="898524",
+        expected_tasks=10,
+        submission_identity="r0000-a0001-residue",
+    )
+
+    report = propose_recovery(campaign)
+
+    assert report.proposed_state.phase is CampaignPhase.PHASE_B_DIVERSITY
+    assert not report.unsafe_reasons
+    recovery = report.ariadne_transaction_residue
+    assert recovery is not None
+    assert recovery["accepted_tasks"] == 9
+    assert recovery["rejected_tasks"] == 1
+    assert recovery["residue_count"] == 1
+    assert recovery["cleanup_required"] is True
+    assert recovery["tasks_resubmitted"] == 0
+    assert residue.is_dir()
+    assert all(
+        path.read_bytes() == content
+        for path, content in scientific_bytes.items()
+    )
+
+    attempt_id = ariadne_quarantine._transaction_residue_attempt_id(
+        campaign_uid="reconcile-test",
+        iteration=1,
+        task_map_sha256=str(recovery["task_map_sha256"]),
+        authority_identity=str(recovery["authority_identity"]),
+    )
+    interrupted_attempt = (
+        ariadne_quarantine.quarantine_root(campaign)
+        / "iteration-000001"
+        / attempt_id
+    )
+    interrupted_attempt.mkdir(parents=True)
+    temporary_manifest = interrupted_attempt / ".t-deadbeefcafe"
+    temporary_manifest.write_bytes(b"incomplete manifest")
+
+    report = propose_recovery(campaign)
+
+    assert not report.unsafe_reasons
+    assert report.ariadne_transaction_residue is not None
+    assert report.ariadne_transaction_residue["pre_manifest_attempt"] == {
+        "attempt_path": str(interrupted_attempt),
+        "temporary_paths": [str(temporary_manifest)],
+    }
+    assert residue.is_dir()
+    assert temporary_manifest.is_file()
+
+    class _Transaction:
+        payload = {"transaction_id": "residue-transaction"}
+
+        def __init__(self):
+            self.operations = []
+
+        def record_paths(self, operation, paths):
+            self.operations.append((operation, [str(path) for path in paths]))
+
+    transaction = _Transaction()
+    mutation = cli_mod._perform_reconcile_apply_mutations(
+        campaign,
+        report,
+        transaction=transaction,
+        retrain_ferebus=False,
+        force_resubmit_array=False,
+        partial_array=None,
+        force_array_phase=CampaignPhase.ARIADNE_ARRAY,
+        force_array_iteration=1,
+        archive_existing_array_outputs=False,
+        data_staging_archive_mode=None,
+    )
+
+    retained = mutation["ariadne_transaction_residue_quarantine"]
+    assert retained is not None
+    assert retained["residue_count"] == 1
+    assert not residue.exists()
+    assert all(Path(path).is_dir() for path in retained["retained_paths"])
+    assert transaction.operations[0][0] == (
+        "quarantine_ariadne_transaction_residue"
+    )
+    assert all(
+        path.read_bytes() == content
+        for path, content in scientific_bytes.items()
+    )
+
+    recovered = propose_recovery(campaign)
+    assert recovered.proposed_state.phase is CampaignPhase.PHASE_B_DIVERSITY
+    assert not recovered.unsafe_reasons
+
+
+def test_reconcile_residue_inspection_ignores_clean_unpublished_task_map(tmp_path):
+    from ichor.hpc.active_learning.handoff_manifests import (
+        ariadne_batch_decision_path,
+        ariadne_results_path,
+    )
+    from ichor.hpc.active_learning.seed_identity import read_ariadne_task_map
+
+    campaign, _data, _training, _models = _campaign_dirs(tmp_path)
+    iter_dir = _write_ariadne_handoff(campaign, 1, n=3)
+    ariadne_results_path(iter_dir).unlink()
+    ariadne_batch_decision_path(iter_dir).unlink()
+    task_map = read_ariadne_task_map(iter_dir, expected_iteration=1)
+
+    assert reconcile_mod._inspect_ariadne_transaction_residue_recovery(
+        campaign,
+        campaign_uid=str(task_map["campaign_uid"]),
+        iteration=1,
+    ) is None
+
+    partial = (
+        active_ariadne_dir(iter_dir)
+        / "seeds"
+        / ".seed-000001.partial-task-0-pid-42"
+    )
+    partial.mkdir()
+    assert reconcile_mod._inspect_ariadne_transaction_residue_recovery(
+        campaign,
+        campaign_uid=str(task_map["campaign_uid"]),
+        iteration=1,
+    ) is None
+
+
 def test_reconcile_uses_frozen_ariadne_contract_after_partition_change(
     tmp_path,
     monkeypatch,

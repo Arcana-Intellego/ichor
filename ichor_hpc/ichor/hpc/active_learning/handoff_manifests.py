@@ -20,9 +20,7 @@ from .layout import (
     active_iteration_dir,
     active_phase_b_dir,
     active_seed_selection_dir,
-    ariadne_seeds_dir,
     bootstrap_selection_dir,
-    parse_seed_directory_name,
 )
 from .selection_origins import (
     SEED_SELECTION_ORIGINS,
@@ -1318,26 +1316,15 @@ def read_ariadne_results_manifest(
     tasks_by_seed_id = {
         int(task["seed_id"]): dict(task) for task in task_map["tasks"]
     }
-    seeds_root = ariadne_seeds_dir(iter_dir)
-    expected_seed_names = {
-        Path(str(task["seed_directory"])).name for task in task_map["tasks"]
-    }
-    if seeds_root.exists() or seeds_root.is_symlink():
-        if seeds_root.is_symlink() or not seeds_root.is_dir():
-            raise HandoffManifestError("ARIADNE seeds root is not a regular directory")
-        for child in seeds_root.iterdir():
-            if child.is_symlink() or not child.is_dir():
-                raise HandoffManifestError(
-                    "unexpected non-directory ARIADNE seed entry: " + child.name
-                )
-            try:
-                parse_seed_directory_name(child.name)
-            except ValueError as exc:
-                raise HandoffManifestError(str(exc)) from exc
-            if child.name not in expected_seed_names:
-                raise HandoffManifestError(
-                    "ARIADNE seed directory is outside TASK_MAP: " + child.name
-                )
+    from .ariadne_seed_tree import (
+        AriadneSeedTreeError,
+        require_clean_ariadne_seed_tree,
+    )
+
+    try:
+        require_clean_ariadne_seed_tree(Path(iter_dir), task_map)
+    except AriadneSeedTreeError as exc:
+        raise HandoffManifestError(str(exc)) from exc
     if expected_n is None or int(expected_n) != int(task_map["n_tasks"]):
         raise HandoffManifestError("ARIADNE results/task-map count mismatch")
     seen = set()

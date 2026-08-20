@@ -631,6 +631,49 @@ def test_ariadne_manifest_rejects_noncanonical_orphan_seed_directory(tmp_path):
         read_ariadne_results_manifest(iter_dir, expected_iteration=1)
 
 
+def test_ariadne_manifest_requires_transaction_residue_quarantine(tmp_path):
+    iter_dir, _, _ = _write_canonical_handoff(tmp_path)
+    residue = (
+        active_ariadne_dir(iter_dir)
+        / "seeds"
+        / ".seed-000001.partial-task-0-pid-364470"
+    )
+    residue.mkdir()
+    (residue / "partial.json").write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(
+        HandoffManifestError,
+        match="recoverable ARIADNE transaction residue requires quarantine",
+    ):
+        read_ariadne_results_manifest(iter_dir, expected_iteration=1)
+
+
+@pytest.mark.parametrize(
+    "name, message",
+    [
+        (
+            ".seed-000001.partial-task-1-pid-364470",
+            "does not match TASK_MAP",
+        ),
+        (
+            ".seed-000001.partial-task-0",
+            "invalid ARIADNE transaction residue name",
+        ),
+    ],
+)
+def test_ariadne_manifest_rejects_ambiguous_transaction_residue(
+    tmp_path,
+    name,
+    message,
+):
+    iter_dir, _, _ = _write_canonical_handoff(tmp_path)
+    residue = active_ariadne_dir(iter_dir) / "seeds" / name
+    residue.mkdir()
+
+    with pytest.raises(HandoffManifestError, match=message):
+        read_ariadne_results_manifest(iter_dir, expected_iteration=1)
+
+
 def test_read_ariadne_manifest_wraps_malformed_iteration(tmp_path):
     iter_dir = tmp_path / "iteration-000001"
     write_ariadne_results_manifest(iter_dir, {

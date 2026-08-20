@@ -3565,6 +3565,58 @@ def test_ariadne_parser_handles_missing_result_json(tmp_path):
     assert any("result.json" in str(event.get("reason")) for event in rejected)
 
 
+def test_ariadne_parser_quarantines_transaction_residue_before_publication(
+    tmp_path,
+    monkeypatch,
+):
+    from ichor.hpc.active_learning.daemon import ariadne_quarantine
+    from ichor.hpc.active_learning.daemon.ariadne_quarantine import (
+        inventory_quarantine,
+    )
+    from ichor.hpc.active_learning.handoff_manifests import (
+        read_ariadne_results_manifest,
+    )
+
+    campaign = tmp_path / "campaign"
+    monkeypatch.setattr(
+        ariadne_quarantine,
+        "quarantine_root",
+        lambda _campaign: campaign / ".Q",
+    )
+    ex = _make_executor(tmp_path)
+    _seed_ariadne_pool(campaign, iteration=4)
+    iter_dir = active_iteration_dir(campaign, 4)
+    failed_seed = ariadne_seed_dir(iter_dir, 2)
+    shutil.rmtree(failed_seed)
+    residue = (
+        ariadne_seeds_dir(iter_dir)
+        / ".seed-000002.partial-task-1-pid-364470"
+    )
+    residue.mkdir()
+    (residue / "partial.json").write_bytes(b"partial\n")
+    state = SimpleNamespace(
+        iteration=4,
+        campaign_uid="m16-test",
+        models_version=0,
+    )
+
+    result = ex._parse_ariadne_array_postprocess(
+        state,
+        CampaignPhase("ARIADNE_ARRAY"),
+        observations=[],
+    )
+
+    assert result.failure_reason is None
+    assert not residue.exists()
+    handoff = read_ariadne_results_manifest(iter_dir, expected_iteration=4)
+    assert handoff["n_accepted"] == 2
+    assert handoff["n_rejected"] == 1
+    quarantine = inventory_quarantine(campaign)
+    assert quarantine["errors"] == []
+    assert len(quarantine["attempts"]) == 1
+    assert quarantine["attempts"][0]["status"] == "retained_failure"
+
+
 def test_ariadne_parser_all_results_unreadable_fails(tmp_path):
     ex = _make_executor(tmp_path)
     pool = _seed_ariadne_pool(tmp_path / "campaign", iteration=4)

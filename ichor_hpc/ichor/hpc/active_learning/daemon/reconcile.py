@@ -422,6 +422,7 @@ class ReconciliationReport:
     ariadne_terminal_postprocess_recovery: Optional[Dict[str, Any]] = None
     ariadne_results_recovery: Optional[Dict[str, Any]] = None
     ariadne_publication_recovery: Optional[Dict[str, Any]] = None
+    ariadne_transaction_residue: Optional[Dict[str, Any]] = None
     ferebus_candidate_recovery: Optional[Dict[str, Any]] = None
     ferebus_staging_recovery: Optional[Dict[str, Any]] = None
     aimall_quality_revalidation: Optional[Dict[str, Any]] = None
@@ -432,6 +433,334 @@ class ReconciliationReport:
         repr=False,
     )
     deep_verification_required: bool = False
+
+
+def _inspect_ariadne_transaction_residue_recovery(
+    campaign: Path,
+    *,
+    campaign_uid: str,
+    iteration: int,
+) -> Optional[Dict[str, Any]]:
+    """Authenticate legacy residue without parsing scientific coordinates."""
+    from ..ariadne_seed_tree import (
+        classify_ariadne_seed_tree,
+        parse_ariadne_transaction_residue_name,
+    )
+    from ..layout import active_iteration_dir, active_iteration_name
+    from ..seed_identity import read_ariadne_task_map
+    from ..versioning.manifest import sha256_file
+    from .completion_receipts import (
+        inventory_completion_receipts,
+        validate_completion_reference,
+    )
+    from .ariadne_quarantine import (
+        _inspect_pre_manifest_attempt,
+        _transaction_residue_attempt_id,
+        inventory_quarantine_authority,
+        quarantine_root,
+    )
+
+    campaign = Path(campaign).resolve()
+    iter_dir = active_iteration_dir(campaign, int(iteration))
+    task_map_path = iter_dir / "ariadne" / "TASK_MAP.json"
+    if not task_map_path.exists() and not task_map_path.is_symlink():
+        return None
+    task_map = read_ariadne_task_map(
+        iter_dir,
+        expected_iteration=int(iteration),
+    )
+    if str(task_map.get("campaign_uid") or "") != str(campaign_uid):
+        raise ValueError("ARIADNE transaction-residue campaign UID mismatch")
+    context = classify_ariadne_seed_tree(iter_dir, task_map)
+
+    quarantine = inventory_quarantine_authority(campaign)
+    transaction_attempts = [
+        item
+        for item in quarantine["attempts"]
+        if int(item.get("iteration", -1)) == int(iteration)
+        and str(item.get("attempt_id") or "").startswith(
+            "transaction-residue-"
+        )
+    ]
+    if not context.residues and not any(
+        str(item.get("status") or "") == "prepared"
+        for item in transaction_attempts
+    ) and not quarantine["errors"]:
+        return None
+    from ..handoff_manifests import (
+        ariadne_batch_decision_path,
+        ariadne_results_path,
+    )
+
+    results_path = ariadne_results_path(iter_dir)
+    decision_path = ariadne_batch_decision_path(iter_dir)
+    if (
+        not results_path.is_file()
+        or results_path.is_symlink()
+        or not decision_path.is_file()
+        or decision_path.is_symlink()
+    ):
+        return None
+
+    summary = ariadne_results_recovery_summary(
+        campaign,
+        int(iteration),
+        expected_campaign_uid=str(campaign_uid),
+        verification="authority",
+    )
+    receipts = inventory_completion_receipts(
+        campaign,
+        expected_campaign_uid=str(campaign_uid),
+    )
+    if receipts["errors"]:
+        raise ValueError("phase-completion receipt inventory is invalid")
+    matching = []
+    for record in receipts["records"]:
+        payload = record["payload"]
+        if (
+            str(payload.get("phase") or "") == CampaignPhase.ARIADNE_ARRAY.value
+            and int(payload.get("iteration", -1)) == int(iteration)
+            and int(payload.get("replacement_round", -1)) == 0
+            and str(payload.get("next_phase") or "")
+            == CampaignPhase.PHASE_B_DIVERSITY.value
+            and int(payload.get("next_iteration", -1)) == int(iteration)
+        ):
+            validated = validate_completion_reference(
+                campaign,
+                record["reference"],
+                expected_campaign_uid=str(campaign_uid),
+            )
+            matching.append(
+                {
+                    "path": str(record["path"]),
+                    "reference": dict(record["reference"]),
+                    "payload": dict(validated),
+                }
+            )
+    if len(matching) != 1:
+        raise ValueError(
+            "ARIADNE transaction residue requires one exact completion receipt"
+        )
+    completion = matching[0]
+    completion_payload = completion["payload"]
+    if (
+        int(completion_payload.get("expected_tasks") or -1)
+        != int(summary["expected_tasks"])
+        or not str(completion_payload.get("job_id") or "")
+        or not str(completion_payload.get("submission_identity") or "")
+    ):
+        raise ValueError(
+            "ARIADNE transaction residue completion producer is incomplete"
+        )
+    required_evidence = {
+        results_path.relative_to(campaign).as_posix(),
+        decision_path.relative_to(campaign).as_posix(),
+    }
+    completion_evidence = {
+        str(item.get("path") or "")
+        for item in list(completion_payload.get("evidence") or [])
+        if isinstance(item, Mapping)
+    }
+    if not required_evidence.issubset(completion_evidence):
+        raise ValueError(
+            "ARIADNE transaction residue completion receipt lacks handoff evidence"
+        )
+    authority_identity = str(completion["payload"]["receipt_id"])
+    task_map_sha256 = sha256_file(task_map_path)
+    intended_attempt_id = _transaction_residue_attempt_id(
+        campaign_uid=str(campaign_uid),
+        iteration=int(iteration),
+        task_map_sha256=task_map_sha256,
+        authority_identity=authority_identity,
+    )
+    intended_attempt_dir = (
+        quarantine_root(campaign)
+        / active_iteration_name(int(iteration))
+        / intended_attempt_id
+    )
+    pre_manifest_attempt = None
+    if quarantine["errors"]:
+        try:
+            pre_manifest_attempt = _inspect_pre_manifest_attempt(
+                campaign,
+                intended_attempt_dir,
+                source_residue_present=bool(context.residues),
+            )
+        except Exception as exc:
+            raise ValueError(
+                "ARIADNE quarantine ownership evidence is invalid"
+            ) from exc
+        intended_identity = intended_attempt_dir.resolve(strict=False)
+        unrelated_errors = [
+            error
+            for error in quarantine["errors"]
+            if Path(str(error.get("path") or "")).resolve(strict=False)
+            != intended_identity
+        ]
+        if pre_manifest_attempt is None or unrelated_errors:
+            raise ValueError(
+                "ARIADNE quarantine ownership evidence is invalid"
+            )
+    unrelated_prepared = [
+        item
+        for item in quarantine["attempts"]
+        if str(item.get("status") or "") == "prepared"
+        and str(item.get("attempt_id") or "") != intended_attempt_id
+    ]
+    if unrelated_prepared:
+        raise ValueError(
+            "an unrelated prepared ARIADNE quarantine attempt requires review"
+        )
+    retained_attempts = [
+        item
+        for item in transaction_attempts
+        if str(item.get("attempt_id") or "") == intended_attempt_id
+    ]
+    if len(retained_attempts) > 1:
+        raise ValueError("duplicate ARIADNE transaction-residue attempt identity")
+    retained_attempt = retained_attempts[0] if retained_attempts else None
+    if not context.residues and retained_attempt is None:
+        return None
+
+    task_by_id = {
+        int(task["array_task_id"]): dict(task)
+        for task in list(task_map.get("tasks") or [])
+    }
+    retained_residues = []
+    if retained_attempt is not None:
+        status = str(retained_attempt.get("status") or "")
+        for entry in list(retained_attempt.get("entries") or []):
+            source_relative = str(entry.get("source_relative_path") or "")
+            source = Path(
+                os.path.abspath(
+                    os.path.normpath(str(campaign / Path(source_relative)))
+                )
+            )
+            if source.parent != context.seeds_root:
+                raise ValueError(
+                    "ARIADNE transaction-residue source path is noncanonical"
+                )
+            seed_id, task_id, pid = parse_ariadne_transaction_residue_name(
+                source.name
+            )
+            task = task_by_id.get(task_id)
+            if task is None or int(task.get("seed_id", -1)) != seed_id:
+                raise ValueError(
+                    "retained ARIADNE transaction residue conflicts with TASK_MAP"
+                )
+            tree_sha256 = entry.get("tree_sha256")
+            if not isinstance(tree_sha256, str):
+                raise ValueError(
+                    "transaction-residue quarantine lacks replay identity"
+                )
+            retained_relative = str(entry.get("retained_relative_path") or "")
+            normalized_retained_relative = (
+                retained_relative.replace("\\", "/")
+                if os.sep == "\\"
+                else retained_relative
+            )
+            if normalized_retained_relative.rsplit("/", 1)[-1] != source.name:
+                raise ValueError(
+                    "ARIADNE transaction-residue target path is noncanonical"
+                )
+            retained_path = quarantine_root(campaign) / Path(retained_relative)
+            source_exists = source.exists() or source.is_symlink()
+            retained_exists = retained_path.exists() or retained_path.is_symlink()
+            if source_exists and retained_exists:
+                raise ValueError(
+                    "ARIADNE transaction residue exists at source and quarantine"
+                )
+            if status == "retained_failure" and (
+                source_exists
+                or retained_path.is_symlink()
+                or not retained_path.is_dir()
+            ):
+                raise ValueError(
+                    "retained ARIADNE transaction residue is incomplete"
+                )
+            if status == "prepared" and (
+                source_exists == retained_exists
+                or source.is_symlink()
+                or retained_path.is_symlink()
+            ):
+                raise ValueError(
+                    "prepared ARIADNE transaction-residue move is contradictory"
+                )
+            retained_residues.append(
+                {
+                    "source_path": str(source),
+                    "retained_path": str(retained_path),
+                    "name": source.name,
+                    "seed_id": seed_id,
+                    "array_task_id": task_id,
+                    "pid": pid,
+                    "bytes": int(entry["bytes"]),
+                    "tree_sha256": tree_sha256,
+                    "root_identity": None,
+                }
+            )
+    if context.residues and retained_residues:
+        if not {residue.name for residue in context.residues}.issubset(
+            {str(residue["name"]) for residue in retained_residues}
+        ):
+            raise ValueError(
+                "prepared ARIADNE transaction residue conflicts with source evidence"
+            )
+
+    context.assert_unchanged(task_map)
+    source_residues = [
+        {
+            "source_path": str(residue.path),
+            "name": residue.name,
+            "seed_id": int(residue.seed_id),
+            "array_task_id": int(residue.array_task_id),
+            "pid": int(residue.pid),
+            "bytes": int(residue.total_bytes),
+            "n_files": int(residue.n_files),
+            "tree_sha256": str(residue.tree_sha256),
+            "root_identity": list(residue.root_identity),
+        }
+        for residue in context.residues
+    ]
+    effective_residues = retained_residues or source_residues
+    return {
+        "classification": "ariadne_transaction_residue",
+        "iteration": int(iteration),
+        "replacement_round": 0,
+        "task_map_path": str(task_map_path),
+        "task_map_sha256": task_map_sha256,
+        "completion_receipt": completion,
+        "authority_identity": authority_identity,
+        "producer_job_id": completion["payload"].get("job_id"),
+        "expected_tasks": int(summary["expected_tasks"]),
+        "accepted_tasks": int(summary["accepted_tasks"]),
+        "rejected_tasks": int(summary["rejected_tasks"]),
+        "missing_rejected_outputs": int(summary["missing_rejected_outputs"]),
+        "tasks_resubmitted": 0,
+        "residue_count": len(effective_residues),
+        "residues": effective_residues,
+        "source_residues": source_residues,
+        "source_residue_present": bool(source_residues),
+        "cleanup_required": bool(
+            source_residues
+            or (
+                retained_attempt is not None
+                and str(retained_attempt.get("status") or "") == "prepared"
+            )
+        ),
+        "quarantine_attempt": (
+            {
+                "attempt_id": str(retained_attempt["attempt_id"]),
+                "status": str(retained_attempt["status"]),
+                "manifest_path": str(retained_attempt["manifest_path"]),
+                "manifest_sha256": str(retained_attempt["manifest_sha256"]),
+                "attempt_path": str(retained_attempt["attempt_path"]),
+            }
+            if retained_attempt is not None
+            else None
+        ),
+        "pre_manifest_attempt": pre_manifest_attempt,
+    }
 
 
 def _candidate_payload(decision: RecoveryDecision) -> Dict[str, Any]:
@@ -3074,11 +3403,34 @@ def propose_recovery(
             )
         )
         blocking_artifacts.append(".DATA/STAGING")
+    ariadne_transaction_residue: Optional[Dict[str, Any]] = None
+    residue_iteration = int(getattr(recovered, "iteration", 0))
+    if residue_iteration > 0:
+        try:
+            ariadne_transaction_residue = (
+                _inspect_ariadne_transaction_residue_recovery(
+                    campaign,
+                    campaign_uid=str(recovered.campaign_uid),
+                    iteration=residue_iteration,
+                )
+            )
+        except Exception as exc:
+            unsafe_reasons.append(
+                "ARIADNE transaction residue is contradictory: "
+                + type(exc).__name__
+                + ": "
+                + str(exc)[:180]
+            )
+            blocking_artifacts.append("ARIADNE transaction residue")
     try:
         partial_iteration_handoffs = active_iteration_handoff_decisions(
             campaign,
             recovered,
-            verification=verification_level,
+            verification=(
+                "authority"
+                if isinstance(ariadne_transaction_residue, dict)
+                else verification_level
+            ),
             artifact_snapshot=artifact_snapshot,
         )
     except Exception as exc:
@@ -3088,6 +3440,63 @@ def propose_recovery(
             + type(exc).__name__
             + ": "
             + str(exc)[:180]
+        )
+    if isinstance(ariadne_transaction_residue, dict):
+        conflicting_residue_handoffs = [
+            decision
+            for decision in partial_iteration_handoffs
+            if int(decision.iteration)
+            == int(ariadne_transaction_residue["iteration"])
+            and decision.phase is not CampaignPhase.PHASE_B_DIVERSITY
+        ]
+        if conflicting_residue_handoffs:
+            unsafe_reasons.append(
+                "ARIADNE transaction residue conflicts with a downstream "
+                "active-iteration handoff"
+            )
+            blocking_artifacts.append("downstream active-iteration handoff")
+        partial_iteration_handoffs = [
+            decision
+            for decision in partial_iteration_handoffs
+            if int(decision.iteration)
+            != int(ariadne_transaction_residue["iteration"])
+            or decision.phase is not CampaignPhase.PHASE_B_DIVERSITY
+        ]
+        residue_decision = RecoveryDecision(
+            phase=CampaignPhase.PHASE_B_DIVERSITY,
+            iteration=int(ariadne_transaction_residue["iteration"]),
+            replacement_round=0,
+            reason=(
+                "PHASE_B_DIVERSITY: accepted ARIADNE publication has "
+                "recoverable runner transaction residue"
+            ),
+            trusted_artifact=str(
+                ariadne_transaction_residue["completion_receipt"]["path"]
+            ),
+        )
+        partial_iteration_handoffs.append(residue_decision)
+        trusted_artifacts.append(
+            "accepted ARIADNE publication with recoverable transaction residue"
+        )
+        notes.append(
+            str(ariadne_transaction_residue["accepted_tasks"])
+            + " accepted ARIADNE results and "
+            + str(ariadne_transaction_residue["rejected_tasks"])
+            + " rejected task"
+            + (
+                " is"
+                if int(ariadne_transaction_residue["rejected_tasks"]) == 1
+                else "s are"
+            )
+            + " preserved; "
+            + str(ariadne_transaction_residue["residue_count"])
+            + " transaction residue director"
+            + (
+                "y requires"
+                if int(ariadne_transaction_residue["residue_count"]) == 1
+                else "ies require"
+            )
+            + " quarantine"
         )
     if len(partial_iteration_handoffs) > 1:
         unsafe_reasons.append(
@@ -3788,14 +4197,33 @@ def propose_recovery(
         and not preserve_scheduler_repoll_state
     ):
         try:
-            _validate_recovered_state_contract(
-                campaign,
-                recovered,
-                bootstrap_handoff=bootstrap_handoff,
-                phase_a_handoff=phase_a_handoff,
-                verification=verification_level,
-                artifact_snapshot=artifact_snapshot,
-            )
+            if (
+                isinstance(ariadne_transaction_residue, dict)
+                and recovered.phase is CampaignPhase.PHASE_B_DIVERSITY
+                and int(recovered.iteration)
+                == int(ariadne_transaction_residue["iteration"])
+            ):
+                validate_phase_recovery_contract(
+                    campaign,
+                    recovered,
+                    verification="authority",
+                    artifact_snapshot=artifact_snapshot,
+                )
+                verify_state_referenced_artifacts(
+                    campaign,
+                    recovered,
+                    verification=verification_level,
+                    snapshot=artifact_snapshot,
+                )
+            else:
+                _validate_recovered_state_contract(
+                    campaign,
+                    recovered,
+                    bootstrap_handoff=bootstrap_handoff,
+                    phase_a_handoff=phase_a_handoff,
+                    verification=verification_level,
+                    artifact_snapshot=artifact_snapshot,
+                )
         except Exception as exc:
             recovered.phase = CampaignPhase.HALTED
             reason = (
@@ -3908,20 +4336,37 @@ def propose_recovery(
 
     ariadne_results_recovery: Optional[Dict[str, Any]] = None
     if recovered.phase is CampaignPhase.PHASE_B_DIVERSITY:
-        try:
-            ariadne_results_recovery = ariadne_results_recovery_summary(
-                campaign,
-                int(recovered.iteration),
-                str(recovered.campaign_uid),
-                verification=verification_level,
-            )
-        except Exception as exc:
-            unsafe_reasons.append(
-                "ARIADNE recovery summary failed: "
-                + type(exc).__name__
-                + ": "
-                + str(exc)[:180]
-            )
+        if isinstance(ariadne_transaction_residue, dict):
+            ariadne_results_recovery = {
+                "expected_tasks": int(
+                    ariadne_transaction_residue["expected_tasks"]
+                ),
+                "accepted_tasks": int(
+                    ariadne_transaction_residue["accepted_tasks"]
+                ),
+                "rejected_tasks": int(
+                    ariadne_transaction_residue["rejected_tasks"]
+                ),
+                "missing_rejected_outputs": int(
+                    ariadne_transaction_residue["missing_rejected_outputs"]
+                ),
+                "tasks_resubmitted": 0,
+            }
+        else:
+            try:
+                ariadne_results_recovery = ariadne_results_recovery_summary(
+                    campaign,
+                    int(recovered.iteration),
+                    str(recovered.campaign_uid),
+                    verification=verification_level,
+                )
+            except Exception as exc:
+                unsafe_reasons.append(
+                    "ARIADNE recovery summary failed: "
+                    + type(exc).__name__
+                    + ": "
+                    + str(exc)[:180]
+                )
 
     return ReconciliationReport(
         proposed_state=recovered,
@@ -3976,6 +4421,11 @@ def propose_recovery(
         ariadne_publication_recovery=(
             dict(ariadne_publication_recovery)
             if isinstance(ariadne_publication_recovery, dict)
+            else None
+        ),
+        ariadne_transaction_residue=(
+            dict(ariadne_transaction_residue)
+            if isinstance(ariadne_transaction_residue, dict)
             else None
         ),
         ferebus_candidate_recovery=ferebus_candidate_recovery,
